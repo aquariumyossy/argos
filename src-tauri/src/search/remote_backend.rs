@@ -175,11 +175,10 @@ pub fn hybrid_search(
     };
 
     if local_hits.is_empty() && remote_hits.is_empty() {
+        // Only fail hard when *both* sides error. A successful empty local result
+        // plus an unreachable remote must still open the popup (empty query case).
         if let (Some(le), Some(re)) = (&local_err, &remote_err) {
             return Err(format!("ローカル・リモートとも失敗: {le} / {re}"));
-        }
-        if let Some(e) = local_err.or(remote_err) {
-            return Err(e);
         }
         return Ok(Vec::new());
     }

@@ -126,13 +126,14 @@ dependencies = [
 
 [[package]]
 name = "argos"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "arboard",
  "axum",
  "calamine",
  "chrono",
  "dirs 6.0.0",
+ "encoding_rs",
  "enigo",
  "lindera",
  "lindera-tantivy",

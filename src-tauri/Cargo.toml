@@ -1,6 +1,6 @@
 [package]
 name = "argos"
-version = "1.0.3"
+version = "1.0.4"
 description = "Argos — local desktop instant search"
 authors = ["Shuhei Yoshida"]
 license = "Apache-2.0"
@@ -51,3 +51,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 axum = "0.8"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
+encoding_rs = "0.8"
