@@ -460,7 +460,9 @@ export default function Settings() {
                 ）を設定してから再インデックスします。すでに UNC で登録している場合は空のままで構いません
               </li>
               <li>「リモート」タブで「リモート検索サーバを有効にする」をオンにします</li>
-              <li>表示された共有トークンを控えます（クライアントに同じ値を入れます）</li>
+              <li>
+                共有トークンを控えます（初回有効化時に乱数が自動生成されます。クライアントに同じ値を入れます）
+              </li>
               <li>
                 Windows ファイアウォールでポート（既定 <code>17890</code>）の受信を許可します
               </li>
@@ -477,6 +479,10 @@ export default function Settings() {
               <li>「接続テスト」で確認してから設定を保存します</li>
             </ol>
             <ul className="howto-tips">
+              <li>
+                トークンは <code>%APPDATA%\Argos\argos.db</code>{" "}
+                に保存されます。漏洩が疑われる場合はホストで「トークンを再生成」し、全クライアントを更新してください
+              </li>
               <li>
                 ホストが <code>C:\...</code>{" "}
                 などローカルパスだけを索引していると、クライアントではプレビューはできてもファイルを開けないことがあります
@@ -1003,6 +1009,11 @@ export default function Settings() {
                 トークンを再生成
               </button>
             </div>
+            <p className="field-hint">
+              初回有効化時に UUID 乱数が自動生成されます。任意の文字列への変更や「トークンを再生成」も可能です。トークンは{" "}
+              <code>%APPDATA%\Argos\argos.db</code>{" "}
+              に保存されます。漏洩時は再生成のうえ、全クライアントのリモートトークンを更新してください。
+            </p>
             <p className="field-hint">
               クライアント用 URL の例: <code>{clientUrlHint}</code>
               （トークンもクライアントに同じものを設定）
