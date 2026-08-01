@@ -1,0 +1,47 @@
+:root {
+  --bg: #f3f0e8;
+  --bg-elevated: #fffdf8;
+  --ink: #1c1a16;
+  --muted: #6a6458;
+  --line: #d4cdc0;
+  --accent: #1f4d3a;
+  --accent-soft: #dce8e2;
+  --highlight: #ffe566;
+  --danger: #8b2e2e;
+  --font-ui: "IBM Plex Sans JP", "Segoe UI", "Hiragino Sans", sans-serif;
+  --font-mono: "IBM Plex Mono", "Consolas", monospace;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c3bbae;
+  border-radius: 4px;
+}

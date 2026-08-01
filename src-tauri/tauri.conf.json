@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Argos",
+  "version": "1.0.3",
+  "identifier": "com.argos.search",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Argos",
+        "width": 780,
+        "height": 600,
+        "visible": false,
+        "resizable": true
+      },
+      {
+        "label": "popup",
+        "title": "Argos",
+        "width": 640,
+        "height": 520,
+        "minWidth": 320,
+        "minHeight": 280,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "resizable": true,
+        "skipTaskbar": true,
+        "center": true,
+        "focus": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "category": "Utility",
+    "shortDescription": "ローカル知識ベースを一瞬で検索するデスクトップアプリ",
+    "longDescription": "ドラッグした文字列をローカル知識ベースから瞬時に検索する Windows デスクトップアプリ。ファイル監視・全文検索・LAN リモート検索に対応。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Japanese", "English"],
+        "displayLanguageSelector": false,
+        "installerIcon": "icons/icon.ico",
+        "startMenuFolder": "Argos"
+      }
+    }
+  }
+}

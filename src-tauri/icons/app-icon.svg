@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Source art for Argos app icon (concept A: dog profile).
+       Raster master: app-icon.png — regenerate with: npx tauri icon icons/app-icon.png -->
+  <rect width="1024" height="1024" fill="#f3f0e8"/>
+  <path fill="#1f4d3a" d="
+    M 180 1024
+    L 180 780
+    C 180 620, 210 500, 290 410
+    C 330 360, 350 290, 345 230
+    C 340 160, 385 110, 460 95
+    C 540 78, 620 105, 680 165
+    C 720 205, 770 225, 830 220
+    C 900 214, 960 260, 985 340
+    C 1010 420, 1000 500, 960 560
+    C 925 610, 880 640, 820 655
+    C 780 670, 755 720, 745 790
+    C 730 900, 680 980, 580 1024
+    Z
+  "/>
+  <!-- Floppy ear lobe -->
+  <path fill="#1f4d3a" d="
+    M 300 250
+    C 220 300, 175 420, 185 560
+    C 192 660, 240 740, 320 780
+    C 350 720, 365 640, 370 560
+    C 376 460, 380 350, 400 290
+    C 370 260, 335 250, 300 250
+    Z
+  "/>
+  <!-- Ear fold -->
+  <path d="M 380 250 C 340 360, 320 480, 325 620"
+        fill="none" stroke="#f3f0e8" stroke-width="14" stroke-linecap="round"/>
+  <!-- Eye (cream almond + green pupil) -->
+  <ellipse cx="640" cy="360" rx="36" ry="46" fill="#f3f0e8" transform="rotate(-20 640 360)"/>
+  <circle cx="648" cy="365" r="12" fill="#1f4d3a"/>
+  <!-- Nose highlight -->
+  <circle cx="970" cy="420" r="14" fill="#f3f0e8"/>
+</svg>
