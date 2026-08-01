@@ -99,6 +99,14 @@ function escapeRegExp(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** File extension from a hit path (e.g. "html", "pdf"). */
+function extFromPath(path: string): string {
+  const base = path.replace(/\\/g, "/").split("/").pop() ?? "";
+  const i = base.lastIndexOf(".");
+  if (i <= 0 || i === base.length - 1) return "";
+  return base.slice(i + 1).toLowerCase();
+}
+
 export default function Popup() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -499,6 +507,14 @@ export default function Popup() {
                         リモート
                       </span>
                     ) : null}
+                    {(() => {
+                      const ext = extFromPath(hit.path);
+                      return ext ? (
+                        <span className="hit-ext" title={hit.path}>
+                          {ext}
+                        </span>
+                      ) : null;
+                    })()}
                     📄 {highlight(hit.title, query, hit.highlightTerms)}
                   </div>
                   <div className="hit-snippet">

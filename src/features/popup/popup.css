@@ -314,6 +314,20 @@
   vertical-align: 1px;
 }
 
+.hit-ext {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  vertical-align: 1px;
+}
+
 .popup-error {
   margin: 0 12px 8px;
   padding: 8px 10px;
