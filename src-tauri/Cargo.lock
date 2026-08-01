@@ -133,6 +133,7 @@ dependencies = [
  "calamine",
  "chrono",
  "dirs 6.0.0",
+ "encoding_rs",
  "enigo",
  "lindera",
  "lindera-tantivy",

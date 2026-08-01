@@ -1,3 +1,5 @@
+mod html;
+
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -18,6 +20,7 @@ pub fn extract_file(path: &Path) -> Result<ExtractedDoc, String> {
         .to_lowercase();
     match ext.as_str() {
         "txt" | "md" | "markdown" => extract_text(path),
+        "html" | "htm" => extract_html(path),
         "pdf" => extract_pdf(path),
         "docx" => extract_docx(path),
         "doc" => extract_doc(path),
@@ -34,7 +37,8 @@ pub fn is_supported(path: &Path) -> bool {
             .unwrap_or("")
             .to_lowercase()
             .as_str(),
-        "txt" | "md" | "markdown" | "pdf" | "docx" | "doc" | "jtd" | "xls" | "xlsx"
+        "txt" | "md" | "markdown" | "html" | "htm" | "pdf" | "docx" | "doc" | "jtd" | "xls"
+            | "xlsx"
     )
 }
 
@@ -48,6 +52,19 @@ fn extract_text(path: &Path) -> Result<ExtractedDoc, String> {
     Ok(ExtractedDoc {
         title,
         pages: vec![content],
+    })
+}
+
+fn extract_html(path: &Path) -> Result<ExtractedDoc, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let decoded = html::decode_html_bytes(&bytes);
+    let (doc_title, text) = html::html_to_text(&decoded);
+    if !text.chars().any(|c| !c.is_whitespace()) {
+        return Err(SKIP_NO_TEXT.into());
+    }
+    Ok(ExtractedDoc {
+        title: doc_title.unwrap_or_else(|| file_title(path)),
+        pages: vec![text],
     })
 }
 

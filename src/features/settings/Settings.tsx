@@ -80,6 +80,7 @@ const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] =
   { name: "walkdir", license: "MIT OR Unlicense" },
   { name: "pdf-extract", license: "MIT" },
   { name: "calamine", license: "MIT" },
+  { name: "encoding_rs", license: "Apache-2.0 OR MIT", note: "HTML の文字コード判定・デコード" },
   { name: "quick-xml / zip", license: "MIT" },
   { name: "rwml", license: "MIT" },
   { name: "rjtd-core", license: "Apache-2.0" },
@@ -387,7 +388,7 @@ export default function Settings() {
             <h2>Argos とは</h2>
             <p className="muted">
               任意のアプリで文字列を選択しショートカットを押すと、登録フォルダ内の PDF / DOCX / DOC /
-              JTD / XLS / XLSX / TXT / Markdown から全文検索し、結果をポップアップで表示します。
+              JTD / XLS / XLSX / TXT / Markdown / HTML から全文検索し、結果をポップアップで表示します。
             </p>
           </section>
 
@@ -684,7 +685,7 @@ export default function Settings() {
           <section>
             <h2>インデックス</h2>
             <p className="muted">
-              登録フォルダ内の PDF / DOCX / DOC / JTD / XLS / XLSX / TXT / Markdown
+              登録フォルダ内の PDF / DOCX / DOC / JTD / XLS / XLSX / TXT / Markdown / HTML
               を検索用に登録します。既存フォルダのファイル変更は自動監視されるため、通常はフォルダ追加時の自動索引だけで十分です。全フォルダ再構築は、索引の不整合を直すときだけ使ってください。
             </p>
             <button
