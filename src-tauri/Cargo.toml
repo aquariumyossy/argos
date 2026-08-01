@@ -2,7 +2,8 @@
 name = "argos"
 version = "1.0.3"
 description = "Argos — local desktop instant search"
-authors = ["Argos"]
+authors = ["Shuhei Yoshida"]
+license = "Apache-2.0"
 edition = "2021"
 
 [lib]
