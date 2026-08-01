@@ -63,9 +63,18 @@ fn extract_html(path: &Path) -> Result<ExtractedDoc, String> {
         return Err(SKIP_NO_TEXT.into());
     }
     Ok(ExtractedDoc {
-        title: doc_title.unwrap_or_else(|| file_title(path)),
+        title: html_display_title(doc_title, path),
         pages: vec![text],
     })
+}
+
+/// Search list title: page `<title>` when present, but always include filename (with extension).
+fn html_display_title(page_title: Option<String>, path: &Path) -> String {
+    let file_name = file_title(path);
+    match page_title {
+        Some(page) if !page.is_empty() && page != file_name => format!("{} ({})", page, file_name),
+        _ => file_name,
+    }
 }
 
 fn extract_pdf(path: &Path) -> Result<ExtractedDoc, String> {
@@ -277,4 +286,27 @@ pub fn chunk_pages(pages: &[String], size: usize, overlap: usize) -> Vec<Chunk> 
 pub fn content_hash(bytes: &[u8]) -> String {
     let h = xxhash_rust::xxh64::xxh64(bytes, 0);
     format!("{h:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn html_display_title_uses_filename_with_extension() {
+        let path = Path::new("C:\\docs\\report.html");
+        assert_eq!(
+            html_display_title(Some("契約書".into()), path),
+            "契約書 (report.html)"
+        );
+        assert_eq!(html_display_title(None, path), "report.html");
+        assert_eq!(html_display_title(Some("report.html".into()), path), "report.html");
+    }
+
+    #[test]
+    fn html_display_title_htm_extension() {
+        let path = Path::new("C:\\docs\\index.htm");
+        assert_eq!(html_display_title(Some("Home".into()), path), "Home (index.htm)");
+    }
 }
