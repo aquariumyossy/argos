@@ -261,11 +261,11 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn attach_main_window_handlers(window: &WebviewWindow) {
-    let window = window.clone();
-    window.on_window_event(move |event| {
+    let handle = window.clone();
+    window.clone().on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            if let Err(e) = window.hide() {
+            if let Err(e) = handle.hide() {
                 eprintln!("argos: hide main window failed: {e}");
             }
         }
