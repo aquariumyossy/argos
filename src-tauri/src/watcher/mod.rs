@@ -5,8 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tauri::{AppHandle, Emitter};
 
-use crate::indexer::Indexer;
+use crate::indexer::{IndexAction, Indexer};
 use crate::pathutil;
 
 enum WatcherCmd {
@@ -41,6 +42,7 @@ impl WatcherHandle {
 pub fn start_watcher(
     folders: Vec<String>,
     indexer: Arc<Indexer>,
+    app: AppHandle,
 ) -> Result<WatcherHandle, String> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<WatcherCmd>();
     let handle = WatcherHandle { cmd_tx };
@@ -99,9 +101,12 @@ pub fn start_watcher(
                         continue;
                     }
                     let batch = std::mem::take(&mut pending);
+                    let mut folders_updated = false;
                     for (path, removed) in batch {
                         if removed {
-                            let _ = indexer.remove_path(&path);
+                            if indexer.remove_path(&path).is_ok() {
+                                folders_updated = true;
+                            }
                             continue;
                         }
                         if !path.is_file() {
@@ -119,7 +124,14 @@ pub fn start_watcher(
                         if folder.is_empty() {
                             continue;
                         }
-                        let _ = indexer.index_path(&folder, &path);
+                        match indexer.index_path(&folder, &path) {
+                            Ok(IndexAction::Indexed) => folders_updated = true,
+                            Ok(IndexAction::Skipped) => {}
+                            Err(e) => eprintln!("index error {}: {e}", path.display()),
+                        }
+                    }
+                    if folders_updated {
+                        let _ = app.emit("folders-updated", ());
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

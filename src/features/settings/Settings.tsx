@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./settings.css";
 
@@ -143,6 +144,20 @@ export default function Settings() {
 
   useEffect(() => {
     void reload().catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("folders-updated", () => {
+      void invoke<FolderRow[]>("list_folders")
+        .then(setFolders)
+        .catch(console.error);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
   }, []);
 
   async function saveSettings() {

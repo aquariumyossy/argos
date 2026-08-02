@@ -99,14 +99,21 @@ impl Indexer {
         stats
     }
 
-    pub fn index_path(&self, folder: &str, path: &Path) -> Result<(), String> {
+    pub fn index_path(&self, folder: &str, path: &Path) -> Result<IndexAction, String> {
+        if !path.is_file() || !extractor::is_supported(path) {
+            return Ok(IndexAction::Skipped);
+        }
+        let excludes = self.load_excludes()?;
+        if is_excluded(path, &excludes) {
+            return Ok(IndexAction::Skipped);
+        }
         let public_path = self
             .db
             .get_folder_by_path(folder)
             .map_err(|e| e.to_string())?
             .map(|f| f.public_path)
             .unwrap_or_default();
-        self.index_one(folder, &public_path, path).map(|_| ())
+        self.index_one(folder, &public_path, path)
     }
 
     pub fn remove_path(&self, path: &Path) -> Result<(), String> {
@@ -217,7 +224,7 @@ impl IndexStats {
     }
 }
 
-enum IndexAction {
+pub enum IndexAction {
     Indexed,
     Skipped,
 }

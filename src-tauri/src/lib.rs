@@ -167,7 +167,7 @@ pub fn run() {
                 });
             }
 
-            match watcher::start_watcher(folders, indexer) {
+            match watcher::start_watcher(folders, indexer, app.handle().clone()) {
                 Ok(handle) => {
                     app.state::<Arc<AppState>>().set_watcher(handle);
                 }
