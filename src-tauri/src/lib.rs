@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WindowEvent,
+    AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -99,10 +100,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            show_main(app);
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -144,6 +142,7 @@ pub fn run() {
             app.global_shortcut().register(parsed)?;
 
             if let Some(main) = app.get_webview_window("main") {
+                attach_main_window_handlers(&main);
                 let _ = main.hide();
             }
             if let Some(popup) = app.get_webview_window("popup") {
@@ -261,10 +260,58 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn show_main(app: &AppHandle) {
+fn attach_main_window_handlers(window: &WebviewWindow) {
+    let window = window.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Err(e) = window.hide() {
+                eprintln!("argos: hide main window failed: {e}");
+            }
+        }
+    });
+}
+
+fn create_main_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")?;
+    let window = WebviewWindowBuilder::from_config(app, config)
+        .ok()?
+        .build()
+        .map_err(|e| {
+            eprintln!("argos: failed to recreate main window: {e}");
+            e
+        })
+        .ok()?;
+    attach_main_window_handlers(&window);
+    Some(window)
+}
+
+fn ensure_main_window(app: &AppHandle) -> Option<WebviewWindow> {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.set_focus();
+        return Some(w);
+    }
+    eprintln!("argos: main window missing; recreating");
+    create_main_window(app)
+}
+
+pub fn show_main(app: &AppHandle) {
+    let Some(w) = ensure_main_window(app) else {
+        eprintln!("argos: settings window unavailable");
+        return;
+    };
+    if let Err(e) = w.unminimize() {
+        eprintln!("argos: unminimize main window failed: {e}");
+    }
+    if let Err(e) = w.show() {
+        eprintln!("argos: show main window failed: {e}");
+    }
+    if let Err(e) = w.set_focus() {
+        eprintln!("argos: focus main window failed: {e}");
     }
 }
 
