@@ -1,7 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  applyPreviewHighlights,
+  clearPreviewHighlights,
+  collectPreviewHighlightTerms,
+  isMarkdownPath,
+  renderMarkdownHtml,
+} from "./markdownPreview";
 import "./popup.css";
 
 type ResizeDirection =
@@ -105,6 +112,49 @@ function extFromPath(path: string): string {
   const i = base.lastIndexOf(".");
   if (i <= 0 || i === base.length - 1) return "";
   return base.slice(i + 1).toLowerCase();
+}
+
+function PreviewBody({
+  hit,
+  query,
+}: {
+  hit: SearchHit;
+  query: string;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const isMarkdown = isMarkdownPath(hit.path);
+  const markdownHtml = useMemo(() => {
+    if (!isMarkdown) return "";
+    return renderMarkdownHtml(hit.previewText);
+  }, [hit.previewText, isMarkdown]);
+  const highlightTerms = useMemo(
+    () => collectPreviewHighlightTerms(query, hit.highlightTerms),
+    [query, hit.highlightTerms],
+  );
+
+  useEffect(() => {
+    if (!isMarkdown) return;
+    const el = containerRef.current;
+    if (!el) return;
+    applyPreviewHighlights(el, highlightTerms);
+    return () => clearPreviewHighlights();
+  }, [highlightTerms, isMarkdown, markdownHtml]);
+
+  if (isMarkdown) {
+    return (
+      <div
+        ref={containerRef}
+        className="preview-body preview-body--markdown"
+        dangerouslySetInnerHTML={{ __html: markdownHtml }}
+      />
+    );
+  }
+
+  return (
+    <pre className="preview-body">
+      {highlight(hit.previewText, query, hit.highlightTerms)}
+    </pre>
+  );
 }
 
 export default function Popup() {
@@ -479,9 +529,7 @@ export default function Popup() {
               フォルダを開く
             </button>
           </div>
-          <pre className="preview-body">
-            {highlight(preview.previewText, query, preview.highlightTerms)}
-          </pre>
+          <PreviewBody hit={preview} query={query} />
           <div className="hint">Esc で一覧に戻る</div>
         </section>
       ) : (
