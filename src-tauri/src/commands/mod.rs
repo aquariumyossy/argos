@@ -10,7 +10,7 @@ use crate::remote_server;
 use crate::search::{self, SearchHit};
 use crate::selection;
 use crate::state::AppState;
-use crate::{hide_popup_window, show_popup};
+use crate::{hide_popup_window, show_main, show_popup};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -309,10 +309,7 @@ pub fn get_lan_ip_hint() -> Option<String> {
 
 #[tauri::command]
 pub fn show_settings_window(app: AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
+    show_main(&app);
 }
 
 #[tauri::command]
