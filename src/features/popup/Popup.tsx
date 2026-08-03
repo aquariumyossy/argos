@@ -41,7 +41,32 @@ type SearchPayload = {
 
 type SearchWordRow = { id: number; word: string };
 
+type SearchScopeRow = { path: string; label: string; isRoot: boolean };
+
+type SearchScopesResult = {
+  recent: SearchScopeRow[];
+  scopes: SearchScopeRow[];
+};
+
 const SEARCH_DEBOUNCE_MS = 220;
+
+/** Parent directory of a Windows / UNC file path. */
+function parentDir(path: string): string | null {
+  const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
+  const i = normalized.lastIndexOf("\\");
+  if (i <= 0) return null;
+  const parent = normalized.slice(0, i);
+  if (/^[A-Za-z]:$/.test(parent)) return `${parent}\\`;
+  if (!parent || parent === "\\") return null;
+  return parent;
+}
+
+function scopeChipLabel(path: string, label?: string | null): string {
+  if (label && label.trim()) return label.trim();
+  const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
+  const base = normalized.split("\\").filter(Boolean).pop();
+  return base || path;
+}
 
 /** Split query for highlight using the same delimiters as the Rust parser (outside quotes). */
 function highlightTermsFromQuery(query: string): string[] {
@@ -165,15 +190,27 @@ export default function Popup() {
   const [searching, setSearching] = useState(false);
   const [actionError, setActionError] = useState("");
   const [wordPickerOpen, setWordPickerOpen] = useState(false);
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [searchWords, setSearchWords] = useState<SearchWordRow[]>([]);
+  const [searchScopes, setSearchScopes] = useState<SearchScopeRow[]>([]);
+  const [recentScopes, setRecentScopes] = useState<SearchScopeRow[]>([]);
+  const [scopeFilter, setScopeFilter] = useState("");
+  const [scopePath, setScopePath] = useState<string | null>(null);
+  const [scopeLabel, setScopeLabel] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const scopeFilterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const wordPickerRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchSeq = useRef(0);
+  const scopePathRef = useRef<string | null>(null);
 
-  const runSearch = useCallback(async (q: string) => {
+  useEffect(() => {
+    scopePathRef.current = scopePath;
+  }, [scopePath]);
+
+  const runSearch = useCallback(async (q: string, pathPrefix?: string | null) => {
     const seq = ++searchSeq.current;
     const trimmed = q.trim();
     if (!trimmed) {
@@ -185,8 +222,12 @@ export default function Popup() {
       return;
     }
     setSearching(true);
+    const prefix = pathPrefix !== undefined ? pathPrefix : scopePathRef.current;
     try {
-      const next = await invoke<SearchHit[]>("search_query", { query: trimmed });
+      const next = await invoke<SearchHit[]>("search_query", {
+        query: trimmed,
+        pathPrefix: prefix && prefix.trim() ? prefix.trim() : null,
+      });
       if (seq !== searchSeq.current) return;
       setHits(next);
       setIndex(0);
@@ -201,13 +242,51 @@ export default function Popup() {
   }, []);
 
   const scheduleSearch = useCallback(
-    (q: string) => {
+    (q: string, pathPrefix?: string | null) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(() => {
-        void runSearch(q);
+        void runSearch(q, pathPrefix);
       }, SEARCH_DEBOUNCE_MS);
     },
     [runSearch],
+  );
+
+  const clearScope = useCallback(() => {
+    setScopePath(null);
+    setScopeLabel(null);
+    scopePathRef.current = null;
+  }, []);
+
+  const applyScope = useCallback(
+    (path: string | null, label: string | null) => {
+      setScopePath(path);
+      setScopeLabel(label);
+      scopePathRef.current = path;
+      setFolderPickerOpen(false);
+      setScopeFilter("");
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (path && path.trim()) {
+        const chip = scopeChipLabel(path, label);
+        void invoke("push_recent_search_scope", {
+          path,
+          label: chip,
+        }).catch((e) => console.error(e));
+      }
+      void runSearch(query, path);
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+      });
+    },
+    [query, runSearch],
+  );
+
+  const rescopeToHitFolder = useCallback(
+    (filePath: string) => {
+      const dir = parentDir(filePath);
+      if (!dir) return;
+      applyScope(dir, scopeChipLabel(dir));
+    },
+    [applyScope],
   );
 
   useEffect(() => {
@@ -215,6 +294,7 @@ export default function Popup() {
     listen<SearchPayload>("search-results", (event) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       searchSeq.current += 1;
+      clearScope();
       setQuery(event.payload.query);
       setHits(event.payload.hits);
       setIndex(0);
@@ -222,6 +302,7 @@ export default function Popup() {
       setActionError("");
       setSearching(false);
       setWordPickerOpen(false);
+      setFolderPickerOpen(false);
       setHelpOpen(false);
       // Allow edit immediately after shortcut search
       requestAnimationFrame(() => {
@@ -235,24 +316,26 @@ export default function Popup() {
       unlisten?.();
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, []);
+  }, [clearScope]);
 
   useEffect(() => {
-    if (!wordPickerOpen && !helpOpen) return;
+    if (!wordPickerOpen && !helpOpen && !folderPickerOpen) return;
     const onPointerDown = (e: MouseEvent) => {
       if (wordPickerRef.current?.contains(e.target as Node)) return;
       setWordPickerOpen(false);
+      setFolderPickerOpen(false);
       setHelpOpen(false);
     };
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [wordPickerOpen, helpOpen]);
+  }, [wordPickerOpen, helpOpen, folderPickerOpen]);
 
   const openWordPicker = useCallback(async () => {
     try {
       const words = await invoke<SearchWordRow[]>("list_search_words");
       setSearchWords(words);
       setHelpOpen(false);
+      setFolderPickerOpen(false);
       setWordPickerOpen(true);
     } catch (e) {
       console.error(e);
@@ -260,10 +343,50 @@ export default function Popup() {
     }
   }, []);
 
+  const openFolderPicker = useCallback(async () => {
+    try {
+      const trimmed = query.trim();
+      const result = await invoke<SearchScopesResult>("list_search_scopes", {
+        query: trimmed || null,
+      });
+      setRecentScopes(result.recent ?? []);
+      setSearchScopes(result.scopes ?? []);
+      setHelpOpen(false);
+      setWordPickerOpen(false);
+      setScopeFilter("");
+      setFolderPickerOpen(true);
+      requestAnimationFrame(() => {
+        scopeFilterRef.current?.focus();
+      });
+    } catch (e) {
+      console.error(e);
+      setActionError(String(e));
+    }
+  }, [query]);
+
   const toggleHelp = useCallback(() => {
     setWordPickerOpen(false);
+    setFolderPickerOpen(false);
     setHelpOpen((v) => !v);
   }, []);
+
+  const filteredRecentScopes = useMemo(() => {
+    const q = scopeFilter.trim().toLowerCase();
+    if (!q) return recentScopes;
+    return recentScopes.filter(
+      (s) =>
+        s.label.toLowerCase().includes(q) || s.path.toLowerCase().includes(q),
+    );
+  }, [recentScopes, scopeFilter]);
+
+  const filteredScopes = useMemo(() => {
+    const q = scopeFilter.trim().toLowerCase();
+    if (!q) return searchScopes;
+    return searchScopes.filter(
+      (s) =>
+        s.label.toLowerCase().includes(q) || s.path.toLowerCase().includes(q),
+    );
+  }, [searchScopes, scopeFilter]);
 
   const appendSearchWord = useCallback(
     (word: string) => {
@@ -311,6 +434,14 @@ export default function Popup() {
     setPreview(hit);
   }, [hits, index]);
 
+  const hidePopup = useCallback(async () => {
+    clearScope();
+    setFolderPickerOpen(false);
+    setWordPickerOpen(false);
+    setHelpOpen(false);
+    await invoke("hide_popup");
+  }, [clearScope]);
+
   useEffect(() => {
     if (preview) return;
     const active = listRef.current?.querySelector<HTMLElement>(".hit.active");
@@ -321,6 +452,10 @@ export default function Popup() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
+        if (folderPickerOpen) {
+          setFolderPickerOpen(false);
+          return;
+        }
         if (wordPickerOpen) {
           setWordPickerOpen(false);
           return;
@@ -333,10 +468,10 @@ export default function Popup() {
           setPreview(null);
           return;
         }
-        void invoke("hide_popup");
+        void hidePopup();
         return;
       }
-      if (wordPickerOpen || helpOpen) return;
+      if (wordPickerOpen || helpOpen || folderPickerOpen) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setIndex((i) => Math.min(i + 1, Math.max(hits.length - 1, 0)));
@@ -364,7 +499,17 @@ export default function Popup() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [helpOpen, hits.length, openFolder, openSelected, preview, showPreview, wordPickerOpen]);
+  }, [
+    folderPickerOpen,
+    helpOpen,
+    hidePopup,
+    hits.length,
+    openFolder,
+    openSelected,
+    preview,
+    showPreview,
+    wordPickerOpen,
+  ]);
 
   const startWindowDrag = useCallback(async (e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -443,6 +588,23 @@ export default function Popup() {
           />
           <button
             type="button"
+            className="popup-scope-btn"
+            title="検索対象フォルダを絞る"
+            aria-label="検索対象フォルダを絞る"
+            aria-expanded={folderPickerOpen}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => {
+              if (folderPickerOpen) {
+                setFolderPickerOpen(false);
+              } else {
+                void openFolderPicker();
+              }
+            }}
+          >
+            @
+          </button>
+          <button
+            type="button"
             className="popup-help-btn"
             title="検索構文のヒント"
             aria-label="検索構文のヒント"
@@ -514,7 +676,87 @@ export default function Popup() {
               )}
             </div>
           ) : null}
+          {folderPickerOpen ? (
+            <div
+              className="popup-folder-picker"
+              role="listbox"
+              aria-label="検索対象フォルダ"
+            >
+              <input
+                ref={scopeFilterRef}
+                className="popup-folder-filter"
+                value={scopeFilter}
+                placeholder="フォルダ名で絞り込み…"
+                spellCheck={false}
+                onMouseDown={(e) => e.stopPropagation()}
+                onChange={(e) => setScopeFilter(e.target.value)}
+              />
+              {filteredScopes.length === 0 && filteredRecentScopes.length === 0 ? (
+                <div className="popup-word-empty">
+                  {recentScopes.length === 0 && searchScopes.length === 0
+                    ? query.trim()
+                      ? "この検索語にヒットするフォルダがありません。"
+                      : "検索対象フォルダがありません。設定からフォルダを追加してください。"
+                    : "一致するフォルダがありません。"}
+                </div>
+              ) : (
+                <ul>
+                  {filteredRecentScopes.map((s) => (
+                    <li key={`recent:${s.path}`}>
+                      <button
+                        type="button"
+                        role="option"
+                        className="scope-recent"
+                        title={s.path}
+                        onClick={() => applyScope(s.path, s.label)}
+                      >
+                        <span className="scope-kind">直近</span>
+                        <span className="scope-label">{s.label}</span>
+                      </button>
+                    </li>
+                  ))}
+                  {filteredRecentScopes.length > 0 && filteredScopes.length > 0 ? (
+                    <li className="scope-sep" aria-hidden="true" />
+                  ) : null}
+                  {filteredScopes.map((s) => (
+                    <li key={s.path}>
+                      <button
+                        type="button"
+                        role="option"
+                        className={s.isRoot ? "scope-root" : "scope-sub"}
+                        title={s.path}
+                        onClick={() => applyScope(s.path, s.label)}
+                      >
+                        {s.isRoot ? (
+                          <span className="scope-kind">ルート</span>
+                        ) : null}
+                        <span className="scope-label">{s.label}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
         </div>
+        {scopePath ? (
+          <div className="popup-scope-chip-row">
+            <span className="popup-scope-chip" title={scopePath}>
+              <span className="popup-scope-chip-at">@</span>
+              {scopeChipLabel(scopePath, scopeLabel)}
+              <button
+                type="button"
+                className="popup-scope-chip-clear"
+                title="フォルダ絞り込みを解除"
+                aria-label="フォルダ絞り込みを解除"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={() => applyScope(null, null)}
+              >
+                ×
+              </button>
+            </span>
+          </div>
+        ) : null}
       </header>
 
       {preview ? (
@@ -527,6 +769,15 @@ export default function Popup() {
             </button>
             <button type="button" onClick={() => void openFolder(preview.path)}>
               フォルダを開く
+            </button>
+            <button
+              type="button"
+              className="preview-rescope-btn"
+              title="このフォルダ内で再検索"
+              aria-label="このフォルダ内で再検索"
+              onClick={() => rescopeToHitFolder(preview.path)}
+            >
+              🔍
             </button>
           </div>
           <PreviewBody hit={preview} query={query} />
@@ -578,17 +829,31 @@ export default function Popup() {
                     </div>
                   ) : null}
                 </div>
-                <button
-                  type="button"
-                  className="hit-folder-btn"
-                  title="フォルダを開く (Shift+Enter)"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void openFolder(hit.path);
-                  }}
-                >
-                  📁
-                </button>
+                <div className="hit-actions">
+                  <button
+                    type="button"
+                    className="hit-folder-btn"
+                    title="このフォルダ内で再検索"
+                    aria-label="このフォルダ内で再検索"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      rescopeToHitFolder(hit.path);
+                    }}
+                  >
+                    🔍
+                  </button>
+                  <button
+                    type="button"
+                    className="hit-folder-btn"
+                    title="フォルダを開く (Shift+Enter)"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void openFolder(hit.path);
+                    }}
+                  >
+                    📁
+                  </button>
+                </div>
               </li>
             ))
           )}

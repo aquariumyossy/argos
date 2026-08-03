@@ -71,6 +71,17 @@ pub struct SearchWordRow {
     pub word: String,
 }
 
+/// Recently used search folder scopes (persisted in settings key-value).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentSearchScope {
+    pub path: String,
+    pub label: String,
+}
+
+pub const MAX_RECENT_SEARCH_SCOPES: usize = 3;
+const RECENT_SEARCH_SCOPES_KEY: &str = "recent_search_scopes";
+
 pub struct Db {
     conn: parking_lot::Mutex<rusqlite::Connection>,
 }
@@ -434,6 +445,67 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM search_words WHERE id=?1", [id])?;
         Ok(())
+    }
+
+    pub fn list_recent_search_scopes(&self) -> Vec<RecentSearchScope> {
+        let conn = self.conn.lock();
+        let value: Result<String, _> = conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [RECENT_SEARCH_SCOPES_KEY],
+            |r| r.get(0),
+        );
+        let Ok(raw) = value else {
+            return Vec::new();
+        };
+        serde_json::from_str::<Vec<RecentSearchScope>>(&raw)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| !s.path.trim().is_empty())
+            .take(MAX_RECENT_SEARCH_SCOPES)
+            .collect()
+    }
+
+    pub fn push_recent_search_scope(
+        &self,
+        path: &str,
+        label: &str,
+    ) -> Result<Vec<RecentSearchScope>, rusqlite::Error> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(self.list_recent_search_scopes());
+        }
+        let label = {
+            let t = label.trim();
+            if t.is_empty() {
+                path.to_string()
+            } else {
+                t.to_string()
+            }
+        };
+
+        let mut next: Vec<RecentSearchScope> = Vec::with_capacity(MAX_RECENT_SEARCH_SCOPES);
+        next.push(RecentSearchScope {
+            path: path.to_string(),
+            label,
+        });
+        for s in self.list_recent_search_scopes() {
+            if s.path.eq_ignore_ascii_case(path) {
+                continue;
+            }
+            next.push(s);
+            if next.len() >= MAX_RECENT_SEARCH_SCOPES {
+                break;
+            }
+        }
+
+        let raw = serde_json::to_string(&next).unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![RECENT_SEARCH_SCOPES_KEY, raw],
+        )?;
+        Ok(next)
     }
 
     pub fn folder_id_by_path(&self, path: &str) -> Result<Option<i64>, rusqlite::Error> {

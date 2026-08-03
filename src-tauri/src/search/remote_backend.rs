@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Settings;
 
-use super::{SearchBackend, SearchHit};
+use super::{filter_hits_by_path_prefix, SearchBackend, SearchHit};
 
 #[derive(Serialize)]
 struct SearchRequest<'a> {
     query: &'a str,
     limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_prefix: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -92,13 +94,31 @@ impl RemoteArgosBackend {
 }
 
 impl SearchBackend for RemoteArgosBackend {
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<SearchHit>, String> {
         let url = format!("{}/search", self.base_url);
+        let scope = path_prefix
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        // Ask remote for more when scoping; older servers ignore path_prefix so we post-filter.
+        let request_limit = if scope.is_some() {
+            (limit * 4).max(limit)
+        } else {
+            limit
+        };
         let resp = self
             .client
             .post(&url)
             .header(reqwest::header::AUTHORIZATION, self.auth_header())
-            .json(&SearchRequest { query, limit })
+            .json(&SearchRequest {
+                query,
+                limit: request_limit,
+                path_prefix: scope,
+            })
             .send()
             .map_err(|e| format!("リモート検索に失敗: {e}"))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -114,6 +134,9 @@ impl SearchBackend for RemoteArgosBackend {
         for hit in &mut hits {
             hit.source = "remote".into();
         }
+        // Always post-filter: covers old remotes that ignore path_prefix.
+        let mut hits = filter_hits_by_path_prefix(hits, scope);
+        hits.truncate(limit);
         Ok(hits)
     }
 
@@ -149,10 +172,11 @@ pub fn hybrid_search(
     remote: &RemoteArgosBackend,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> Result<Vec<SearchHit>, String> {
     let (local_res, remote_res) = std::thread::scope(|scope| {
-        let local_handle = scope.spawn(|| local.search(query, limit));
-        let remote_handle = scope.spawn(|| remote.search(query, limit));
+        let local_handle = scope.spawn(|| local.search(query, limit, path_prefix));
+        let remote_handle = scope.spawn(|| remote.search(query, limit, path_prefix));
         (local_handle.join(), remote_handle.join())
     });
 
