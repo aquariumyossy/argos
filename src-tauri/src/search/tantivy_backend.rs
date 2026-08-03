@@ -14,6 +14,8 @@ use tantivy::schema::{
 use tantivy::tokenizer::TokenStream;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term, TantivyDocument};
 
+use crate::pathutil;
+
 use super::{SearchBackend, SearchHit};
 
 const CHUNK_SIZE: usize = 800;
@@ -663,7 +665,12 @@ fn make_snippet(body: &str, query: &str, highlight_terms: &[String], radius: usi
 }
 
 impl SearchBackend for TantivyBackend {
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<SearchHit>, String> {
         let q = query.trim();
         if q.is_empty() {
             return Ok(vec![]);
@@ -680,13 +687,22 @@ impl SearchBackend for TantivyBackend {
 
         let highlight_terms = self.highlight_terms_for(&parsed)?;
         let proximity_tokens = self.proximity_tokens_for(&parsed)?;
+        let scope = path_prefix
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         eprintln!(
-            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?}",
-            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens
+            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?}",
+            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope
         );
 
         let searcher = self.reader.searcher();
-        let fetch_n = (limit * 8).max(40);
+        // Over-fetch more when scoping by path so post-filter can still fill `limit`.
+        let fetch_n = if scope.is_some() {
+            (limit * 40).max(200)
+        } else {
+            (limit * 8).max(40)
+        };
         let top = searcher
             .search(&*tantivy_q, &TopDocs::with_limit(fetch_n))
             .map_err(|e| e.to_string())?;
@@ -706,6 +722,11 @@ impl SearchBackend for TantivyBackend {
             let Some(mut hit) = self.hit_from_doc(score, &doc, q, &highlight_terms) else {
                 continue;
             };
+            if let Some(ref prefix) = scope {
+                if !pathutil::path_starts_with(&hit.path, prefix) {
+                    continue;
+                }
+            }
             let haystack = format!("{} {}", hit.title, hit.preview_text);
 
             if parsed

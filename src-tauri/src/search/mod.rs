@@ -7,6 +7,7 @@ pub use remote_backend::{hybrid_search, RemoteArgosBackend};
 pub use tantivy_backend::TantivyBackend;
 
 use crate::db::Settings;
+use crate::pathutil;
 
 /// Normalized search hit shared by all backends (Tantivy / remote Argos).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,8 +27,26 @@ pub struct SearchHit {
 }
 
 pub trait SearchBackend: Send + Sync {
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String>;
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+    ) -> Result<Vec<SearchHit>, String>;
     fn preview(&self, hit_id: &str) -> Result<Option<SearchHit>, String>;
+}
+
+/// Keep hits whose path is under `path_prefix` (Windows-aware). Empty/None = no filter.
+pub fn filter_hits_by_path_prefix(
+    hits: Vec<SearchHit>,
+    path_prefix: Option<&str>,
+) -> Vec<SearchHit> {
+    let Some(prefix) = path_prefix.map(str::trim).filter(|s| !s.is_empty()) else {
+        return hits;
+    };
+    hits.into_iter()
+        .filter(|h| pathutil::path_starts_with(&h.path, prefix))
+        .collect()
 }
 
 /// Route search according to `search_mode` in settings.
@@ -36,17 +55,18 @@ pub fn run_search(
     local: &TantivyBackend,
     query: &str,
     limit: usize,
+    path_prefix: Option<&str>,
 ) -> Result<Vec<SearchHit>, String> {
     match settings.search_mode.as_str() {
         "remote" => {
             let remote = RemoteArgosBackend::from_settings(settings)?;
-            remote.search(query, limit)
+            remote.search(query, limit, path_prefix)
         }
         "hybrid" => {
             let remote = RemoteArgosBackend::from_settings(settings)?;
-            hybrid_search(local, &remote, query, limit)
+            hybrid_search(local, &remote, query, limit, path_prefix)
         }
-        _ => local.search(query, limit),
+        _ => local.search(query, limit, path_prefix),
     }
 }
 

@@ -6,6 +6,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{ExcludePathRow, FolderRow, SearchWordRow, Settings};
 use crate::indexer::IndexStats;
+use crate::pathutil;
 use crate::remote_server;
 use crate::search::{self, SearchHit};
 use crate::selection;
@@ -17,6 +18,126 @@ use crate::{hide_popup_window, show_main, show_popup};
 pub struct SearchPayload {
     pub query: String,
     pub hits: Vec<SearchHit>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchScopeRow {
+    pub path: String,
+    pub label: String,
+    pub is_root: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchScopesResult {
+    pub recent: Vec<SearchScopeRow>,
+    pub scopes: Vec<SearchScopeRow>,
+}
+
+const MAX_SUBFOLDERS_PER_ROOT: usize = 400;
+/// Wider than typical UI `max_results` so scope picker can see more matching folders.
+const SCOPE_QUERY_HIT_LIMIT: usize = 200;
+
+fn folder_display_name(path: &str) -> String {
+    let simplified = pathutil::simplify_windows_path(path);
+    simplified
+        .rsplit('\\')
+        .find(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn parent_dir(path: &str) -> Option<String> {
+    let simplified = pathutil::simplify_windows_path(path);
+    let truncated = simplified.trim_end_matches('\\');
+    let (parent, name) = match truncated.rfind('\\') {
+        Some(i) => (&truncated[..i], &truncated[i + 1..]),
+        None => return None,
+    };
+    if name.is_empty() {
+        return None;
+    }
+    // Keep drive root like `C:` as `C:\`
+    if parent.len() == 2 && parent.as_bytes()[1] == b':' {
+        return Some(format!("{parent}\\"));
+    }
+    if parent.is_empty() {
+        // UNC `\\server\share\file` → parent `\\server\share` handled by rfind;
+        // bare `\\server` shouldn't appear as a file parent we care about.
+        return None;
+    }
+    Some(parent.to_string())
+}
+
+fn relative_label(root: &str, dir: &str) -> String {
+    let root = pathutil::simplify_windows_path(root);
+    let dir = pathutil::simplify_windows_path(dir);
+    if dir.eq_ignore_ascii_case(&root) {
+        return folder_display_name(&root);
+    }
+    if !pathutil::path_starts_with(&dir, &root) {
+        return folder_display_name(&dir);
+    }
+    let rest = dir[root.len()..].trim_start_matches('\\');
+    if rest.is_empty() {
+        folder_display_name(&root)
+    } else {
+        rest.replace('\\', "/")
+    }
+}
+
+fn collect_search_scopes(
+    folders: &[FolderRow],
+    list_paths: impl Fn(i64) -> Result<Vec<String>, String>,
+) -> Result<Vec<SearchScopeRow>, String> {
+    use std::collections::BTreeMap;
+
+    let mut out: Vec<SearchScopeRow> = Vec::new();
+    for folder in folders.iter().filter(|f| f.enabled) {
+        let root = pathutil::effective_public_root(&folder.path, &folder.public_path);
+        out.push(SearchScopeRow {
+            path: root.clone(),
+            label: folder_display_name(&root),
+            is_root: true,
+        });
+
+        let paths = list_paths(folder.id)?;
+        // BTreeMap keeps labels sorted for stable UI.
+        let mut subdirs: BTreeMap<String, String> = BTreeMap::new();
+        for file_path in paths {
+            let mut current = parent_dir(&file_path);
+            while let Some(dir) = current {
+                if !pathutil::path_starts_with(&dir, &root) {
+                    break;
+                }
+                if dir.eq_ignore_ascii_case(&root) {
+                    break;
+                }
+                let key = dir.to_ascii_lowercase();
+                subdirs.entry(key).or_insert_with(|| dir.clone());
+                if subdirs.len() >= MAX_SUBFOLDERS_PER_ROOT {
+                    break;
+                }
+                current = parent_dir(&dir);
+            }
+            if subdirs.len() >= MAX_SUBFOLDERS_PER_ROOT {
+                break;
+            }
+        }
+
+        let mut subs: Vec<SearchScopeRow> = subdirs
+            .into_values()
+            .map(|path| SearchScopeRow {
+                label: relative_label(&root, &path),
+                path,
+                is_root: false,
+            })
+            .collect();
+        subs.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+        out.extend(subs);
+    }
+    Ok(out)
 }
 
 pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
@@ -34,7 +155,7 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
     let backend = state.backend.clone();
     let q = query.clone();
     let hits = tauri::async_runtime::spawn_blocking(move || {
-        search::run_search(&settings, backend.as_ref(), &q, limit)
+        search::run_search(&settings, backend.as_ref(), &q, limit, None)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -212,10 +333,105 @@ pub fn remove_search_word(state: State<'_, Arc<AppState>>, id: i64) -> Result<()
 pub fn search_query(
     state: State<'_, Arc<AppState>>,
     query: String,
+    path_prefix: Option<String>,
 ) -> Result<Vec<SearchHit>, String> {
     let settings = state.settings.read().clone();
     let limit = settings.max_results;
-    search::run_search(&settings, state.backend.as_ref(), &query, limit)
+    let prefix = path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    search::run_search(
+        &settings,
+        state.backend.as_ref(),
+        &query,
+        limit,
+        prefix,
+    )
+}
+
+#[tauri::command]
+pub fn list_search_scopes(
+    state: State<'_, Arc<AppState>>,
+    query: Option<String>,
+) -> Result<SearchScopesResult, String> {
+    let folders = state.db.list_folders().map_err(|e| e.to_string())?;
+    let db = state.db.clone();
+    let all = collect_search_scopes(&folders, |folder_id| {
+        db.list_file_paths_by_folder(folder_id)
+            .map_err(|e| e.to_string())
+    })?;
+
+    let recent: Vec<SearchScopeRow> = state
+        .db
+        .list_recent_search_scopes()
+        .into_iter()
+        .map(|s| SearchScopeRow {
+            path: s.path,
+            label: s.label,
+            is_root: false,
+        })
+        .collect();
+
+    let filtered = match query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => all,
+        Some(q) => {
+            let settings = state.settings.read().clone();
+            let hits = search::run_search(
+                &settings,
+                state.backend.as_ref(),
+                q,
+                SCOPE_QUERY_HIT_LIMIT,
+                None,
+            )?;
+            if hits.is_empty() {
+                Vec::new()
+            } else {
+                all.into_iter()
+                    .filter(|scope| {
+                        hits.iter()
+                            .any(|h| pathutil::path_starts_with(&h.path, &scope.path))
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    // Prefer recent at the top; drop duplicates from the main list.
+    let scopes = filtered
+        .into_iter()
+        .filter(|scope| {
+            !recent
+                .iter()
+                .any(|r| r.path.eq_ignore_ascii_case(&scope.path))
+        })
+        .collect();
+
+    Ok(SearchScopesResult { recent, scopes })
+}
+
+#[tauri::command]
+pub fn push_recent_search_scope(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    label: String,
+) -> Result<Vec<SearchScopeRow>, String> {
+    let rows = state
+        .db
+        .push_recent_search_scope(&path, &label)
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|s| SearchScopeRow {
+            path: s.path,
+            label: s.label,
+            is_root: false,
+        })
+        .collect())
 }
 
 #[tauri::command]

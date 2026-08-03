@@ -197,6 +197,8 @@ pub fn run() {
             commands::update_search_word,
             commands::remove_search_word,
             commands::search_query,
+            commands::list_search_scopes,
+            commands::push_recent_search_scope,
             commands::hide_popup,
             commands::open_hit,
             commands::open_containing_folder,
