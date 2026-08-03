@@ -1,6 +1,6 @@
 [package]
 name = "argos"
-version = "1.0.6"
+version = "1.1.0"
 description = "Argos — local desktop instant search"
 authors = ["Shuhei Yoshida"]
 license = "Apache-2.0"
