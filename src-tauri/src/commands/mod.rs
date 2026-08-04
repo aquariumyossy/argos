@@ -366,6 +366,17 @@ pub fn remove_search_word(
 }
 
 #[tauri::command]
+pub fn clear_search_words(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<u64, String> {
+    let n = state.db.clear_search_words().map_err(|e| e.to_string())?;
+    state.refresh_user_dict();
+    emit_search_words_updated(&app);
+    Ok(n)
+}
+
+#[tauri::command]
 pub fn import_search_words(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -399,6 +410,23 @@ pub fn search_query(
         &query,
         limit,
         prefix,
+        &user_dict,
+    )
+}
+
+#[tauri::command]
+pub fn search_path_matches(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    path: String,
+) -> Result<Vec<SearchHit>, String> {
+    let settings = state.settings.read().clone();
+    let user_dict = state.user_dict.read().clone();
+    search::run_path_matches(
+        &settings,
+        state.backend.as_ref(),
+        &query,
+        &path,
         &user_dict,
     )
 }

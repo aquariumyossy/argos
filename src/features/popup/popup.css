@@ -615,6 +615,40 @@
   margin-bottom: 12px;
 }
 
+.preview-occ-nav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.preview-occ-nav button {
+  border: 1px solid var(--line);
+  background: var(--bg-elevated);
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.preview-occ-nav button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.preview-occ-nav button:not(:disabled):hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.preview-occ-label {
+  min-width: 5em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .preview-actions button {
   border: 1px solid var(--line);
   background: var(--bg-elevated);

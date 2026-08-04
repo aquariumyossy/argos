@@ -801,14 +801,17 @@ fn make_snippet(body: &str, query: &str, highlight_terms: &[String], radius: usi
     snip
 }
 
-impl SearchBackend for TantivyBackend {
-    fn search(
+impl TantivyBackend {
+    /// Score-ranked chunk hits, optionally scoped by path prefix. Does not dedupe by path.
+    /// When `exact_path` is set, AND a path TermQuery so all chunks of that file are retrieved.
+    fn search_scored(
         &self,
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
         pos_filter_enabled: bool,
-    ) -> Result<Vec<SearchHit>, String> {
+        exact_path: Option<&str>,
+    ) -> Result<Vec<(f32, SearchHit)>, String> {
         let q = query.trim();
         if q.is_empty() {
             return Ok(vec![]);
@@ -829,9 +832,14 @@ impl SearchBackend for TantivyBackend {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        // Use path as stored in the index (hit.path), not simplified — STRING TermQuery is exact.
+        let exact = exact_path
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         eprintln!(
-            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} pos_filter={}",
-            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, pos_filter_enabled
+            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exact_path={:?} pos_filter={}",
+            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, exact, pos_filter_enabled
         );
         eprintln!(
             "argos: highlight_terms={:?} content_for_includes={:?}",
@@ -844,15 +852,30 @@ impl SearchBackend for TantivyBackend {
                 .unwrap_or_default()
         );
 
+        let wrap_path = |inner: Box<dyn Query>| -> Box<dyn Query> {
+            if let Some(ref p) = exact {
+                let path_term = Term::from_field_text(self.fields.path, p);
+                let path_q = TermQuery::new(path_term, IndexRecordOption::Basic);
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, inner),
+                    (Occur::Must, Box::new(path_q)),
+                ]))
+            } else {
+                inner
+            }
+        };
+
         let searcher = self.reader.searcher();
         // Over-fetch more when scoping by path so post-filter can still fill `limit`.
-        let fetch_n = if scope.is_some() {
+        let fetch_n = if exact.is_some() {
+            limit.max(50)
+        } else if scope.is_some() {
             (limit * 40).max(200)
         } else {
             (limit * 8).max(40)
         };
         let mut top = searcher
-            .search(&*tantivy_q, &TopDocs::with_limit(fetch_n))
+            .search(&*wrap_path(tantivy_q), &TopDocs::with_limit(fetch_n))
             .map_err(|e| e.to_string())?;
         eprintln!("argos: tantivy_raw_hits={}", top.len());
 
@@ -864,7 +887,7 @@ impl SearchBackend for TantivyBackend {
         if top.is_empty() && pos_filter_enabled && !proximity_tokens.is_empty() {
             if let Some(loose_q) = self.build_parsed_query(&parsed, false)? {
                 top = searcher
-                    .search(&*loose_q, &TopDocs::with_limit(fetch_n))
+                    .search(&*wrap_path(loose_q), &TopDocs::with_limit(fetch_n))
                     .map_err(|e| e.to_string())?;
                 used_loose_retrieval = true;
                 eprintln!(
@@ -929,6 +952,60 @@ impl SearchBackend for TantivyBackend {
         }
 
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        Ok(scored)
+    }
+
+    /// All matching chunks for one file, ordered by chunk_id (for preview navigation).
+    pub fn matches_for_path(
+        &self,
+        query: &str,
+        path: &str,
+        limit: usize,
+        pos_filter_enabled: bool,
+    ) -> Result<Vec<SearchHit>, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut scored =
+            self.search_scored(query, limit, None, pos_filter_enabled, Some(path))?;
+        // Fallback if TermQuery missed due to path normalization drift: prefix scope.
+        if scored.is_empty() {
+            scored = self.search_scored(query, limit, Some(path), pos_filter_enabled, None)?;
+            scored.retain(|(_, hit)| {
+                pathutil::simplify_windows_path(&hit.path)
+                    .eq_ignore_ascii_case(&pathutil::simplify_windows_path(path))
+            });
+        }
+        scored.sort_by(|a, b| {
+            let ca = a.1.chunk_id.unwrap_or(0);
+            let cb = b.1.chunk_id.unwrap_or(0);
+            ca.cmp(&cb)
+                .then_with(|| a.1.page.unwrap_or(0).cmp(&b.1.page.unwrap_or(0)))
+        });
+        let hits: Vec<SearchHit> = scored
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .take(limit)
+            .collect();
+        eprintln!(
+            "argos: path_matches={} path={}",
+            hits.len(),
+            pathutil::simplify_windows_path(path)
+        );
+        Ok(hits)
+    }
+}
+
+impl SearchBackend for TantivyBackend {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+        pos_filter_enabled: bool,
+    ) -> Result<Vec<SearchHit>, String> {
+        let scored = self.search_scored(query, limit, path_prefix, pos_filter_enabled, None)?;
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut seen_paths = HashSet::new();
         for (_, hit) in scored {
@@ -1176,6 +1253,60 @@ mod tests {
             terms.iter().any(|t| t == "光景"),
             "expected 光景 in highlight_terms: {terms:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matches_for_path_returns_multiple_chunks() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-path-matches-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index");
+
+        // Marker spaced so it lands in several 800-char chunks.
+        let filler = "あ".repeat(700);
+        let body = format!(
+            "損害賠償について。{filler}次に損害賠償を述べる。{filler}最後に損害賠償。"
+        );
+        let path = dir.join("multi.txt");
+        let path_str = path.to_str().unwrap().to_string();
+        std::fs::write(&path, &body).unwrap();
+        backend
+            .index_file(
+                &path,
+                &path_str,
+                dir.to_str().unwrap(),
+                1,
+                body.len() as u64,
+                &crate::extractor::ExtractedDoc {
+                    title: "multi".into(),
+                    pages: vec![body],
+                },
+            )
+            .expect("index");
+
+        let list = backend.search("損害賠償", 10, None, false).expect("search");
+        assert_eq!(list.len(), 1, "list stays one hit per file");
+
+        let matches = backend
+            .matches_for_path("損害賠償", &path_str, 50, false)
+            .expect("path matches");
+        assert!(
+            matches.len() >= 2,
+            "expected multiple chunks, got {}",
+            matches.len()
+        );
+        assert!(matches.iter().all(|h| h.path == path_str));
+        let chunk_ids: Vec<_> = matches.iter().map(|h| h.chunk_id).collect();
+        let mut sorted = chunk_ids.clone();
+        sorted.sort();
+        assert_eq!(chunk_ids, sorted, "chunks ordered by chunk_id");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

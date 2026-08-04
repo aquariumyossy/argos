@@ -109,6 +109,25 @@ pub fn run_preview(
     }
 }
 
+const PATH_MATCHES_LIMIT: usize = 50;
+
+/// Matching chunks for one file (local index only). Used by preview occurrence navigation.
+pub fn run_path_matches(
+    settings: &Settings,
+    local: &TantivyBackend,
+    query: &str,
+    path: &str,
+    user_dict: &UserDictMatcher,
+) -> Result<Vec<SearchHit>, String> {
+    let rewritten = apply_user_dictionary(query, user_dict);
+    local.matches_for_path(
+        &rewritten,
+        path,
+        PATH_MATCHES_LIMIT,
+        settings.pos_filter_enabled,
+    )
+}
+
 pub fn normalize_search_mode(mode: &str) -> String {
     match mode {
         "remote" | "hybrid" => mode.into(),
