@@ -230,18 +230,22 @@ impl TantivyBackend {
         let mut seen = HashSet::new();
         let mut nouns = Vec::new();
         let mut others = Vec::new();
-        // Align indexed tokens with morph drop decisions by surface.
-        for surface in indexed {
+        // Align indexed tokens with morph drop decisions by surface / coverage.
+        for surface in &indexed {
             if surface.trim().is_empty() {
                 continue;
             }
-            if drop_surfaces.contains(&surface) {
+            if drop_surfaces.contains(surface)
+                || drop_surfaces
+                    .iter()
+                    .any(|d| d != surface && d.contains(surface.as_str()))
+            {
                 continue;
             }
-            if is_index_symbol_token(&surface) {
+            if is_index_symbol_token(surface) {
                 continue;
             }
-            if !pos_filter && super::morph::is_noise_highlight_term(&surface) {
+            if !pos_filter && super::morph::is_noise_highlight_term(surface) {
                 continue;
             }
             if !seen.insert(surface.clone()) {
@@ -249,19 +253,34 @@ impl TantivyBackend {
             }
             let is_noun = morph
                 .iter()
-                .any(|t| t.surface == surface && t.major_pos == "名詞");
+                .any(|t| (t.surface == *surface || t.surface.contains(surface.as_str())) && t.major_pos == "名詞");
             if pos_filter && is_noun {
-                nouns.push(surface);
+                nouns.push(surface.clone());
             } else {
-                others.push(surface);
+                others.push(surface.clone());
             }
         }
+
+        // If the index tokenizer split a kept morph surface (見慣れ → 見+慣れ), the
+        // pieces are already in `others`. Also keep the exact indexed token when it
+        // equals a kept morph surface. Never inject morph-only strings that are absent
+        // from `indexed` — those TermQueries cannot hit the inverted index.
         let mut content = Vec::new();
         content.extend(nouns);
         content.extend(others);
         if content.is_empty() {
-            // Last resort: morph-only filter (may still help debugging).
-            return self.morph.lock().content_surfaces(query, pos_filter);
+            // Loosen: keep any indexed token that is not a symbol / legacy stop / single kana.
+            for surface in indexed {
+                if surface.trim().is_empty()
+                    || is_index_symbol_token(&surface)
+                    || super::morph::is_noise_highlight_term(&surface)
+                {
+                    continue;
+                }
+                if seen.insert(surface.clone()) {
+                    content.push(surface);
+                }
+            }
         }
         Ok(content)
     }
@@ -511,29 +530,25 @@ fn is_index_symbol_token(t: &str) -> bool {
         matches!(
             c,
             '(' | ')'
-                | '\u{300c}'
-                | '\u{300d}'
-                | '\u{3001}'
-                | '\u{3002}'
-                | '\u{30fb}'
+                | '\u{300c}' // 「
+                | '\u{300d}' // 」
+                | '\u{3001}' // 、
+                | '\u{3002}' // 。
+                | '\u{30fb}' // ・
                 | '"'
                 | '\''
-                | '\u{ff08}'
-                | '\u{ff09}'
-                | '、'
-                | '。'
+                | '\u{ff08}' // （
+                | '\u{ff09}' // ）
                 | '，'
                 | ','
                 | '.'
                 | '!'
                 | '？'
                 | '?'
-                | '!'
                 | '：'
                 | ':'
                 | '；'
                 | ';'
-                | '・'
                 | '/'
                 | '\\'
                 | '…'
@@ -836,19 +851,38 @@ impl SearchBackend for TantivyBackend {
         } else {
             (limit * 8).max(40)
         };
-        let top = searcher
+        let mut top = searcher
             .search(&*tantivy_q, &TopDocs::with_limit(fetch_n))
             .map_err(|e| e.to_string())?;
         eprintln!("argos: tantivy_raw_hits={}", top.len());
 
+        // POS-filtered TermQuery can miss when the inverted index lacks those exact
+        // surfaces (tokenizer drift / partial index) even though the stored body
+        // contains the nouns. Fall back to a looser retrieval query, then keep the
+        // content proximity filter so chips stay on 光景 / 見慣れ — not そうした / い.
+        let mut used_loose_retrieval = false;
+        if top.is_empty() && pos_filter_enabled && !proximity_tokens.is_empty() {
+            if let Some(loose_q) = self.build_parsed_query(&parsed, false)? {
+                top = searcher
+                    .search(&*loose_q, &TopDocs::with_limit(fetch_n))
+                    .map_err(|e| e.to_string())?;
+                used_loose_retrieval = true;
+                eprintln!(
+                    "argos: pos_filter_raw_empty -> loose_retrieval hits={}",
+                    top.len()
+                );
+            }
+        }
+
         // Phrase-only: require the phrase string; free tokens keep half-overlap rule.
         // With POS filtering, tokens are already contentful — requiring half of them
         // drops useful noun-only hits (e.g. query has 光景+見慣れ but a doc only has 光景).
+        // Loose retrieval must still require a content-term substring overlap.
         let min_overlap = if proximity_tokens.is_empty() {
             0
         } else if parsed.includes.is_empty() {
             proximity_tokens.len().min(1)
-        } else if pos_filter_enabled {
+        } else if pos_filter_enabled || used_loose_retrieval {
             1
         } else {
             ((proximity_tokens.len() + 1) / 2).max(1)
@@ -967,5 +1001,181 @@ mod tests {
         let p = parse_query_syntax("契約-慰謝料");
         assert_eq!(p.includes, vec!["契約-慰謝料"]);
         assert!(p.excludes.is_empty());
+    }
+
+    #[test]
+    fn loose_fallback_keeps_content_substring_hits() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-loose-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index");
+
+        // Junk doc: common debris tokens only (no content nouns from the query).
+        let junk = "そうしたことはない。いてもよい。";
+        let junk_doc = crate::extractor::ExtractedDoc {
+            title: "junk".into(),
+            pages: vec![junk.into()],
+        };
+        let junk_file = dir.join("junk.txt");
+        std::fs::write(&junk_file, junk).unwrap();
+        backend
+            .index_file(
+                &junk_file,
+                junk_file.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                1,
+                1,
+                &junk_doc,
+            )
+            .expect("index junk");
+
+        // Good doc: full sentence with 光景 / 見慣れ.
+        let good = "そうした光景を見慣れています";
+        let good_doc = crate::extractor::ExtractedDoc {
+            title: "good".into(),
+            pages: vec![good.into()],
+        };
+        let good_file = dir.join("good.txt");
+        std::fs::write(&good_file, good).unwrap();
+        backend
+            .index_file(
+                &good_file,
+                good_file.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                1,
+                1,
+                &good_doc,
+            )
+            .expect("index good");
+
+        let hits = backend
+            .search(good, 10, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "expected the good doc to match"
+        );
+        assert!(
+            hits[0].path.contains("good"),
+            "junk-only debris must not outrank content doc: {:?}",
+            hits[0].path
+        );
+        assert!(
+            hits[0].highlight_terms.iter().any(|t| t == "光景"),
+            "chips must prefer content noun: {:?}",
+            hits[0].highlight_terms
+        );
+        assert!(
+            !hits[0].highlight_terms.iter().any(|t| t == "そうした" || t == "い"),
+            "chips must not be debris: {:?}",
+            hits[0].highlight_terms
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sentence_query_hits_doc_with_only_noun() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-noun-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index");
+        let body = "この光景は印象的だった。";
+        let extracted = crate::extractor::ExtractedDoc {
+            title: "only-noun".into(),
+            pages: vec![body.into()],
+        };
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, body).unwrap();
+        backend
+            .index_file(
+                &file,
+                file.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                1,
+                1,
+                &extracted,
+            )
+            .expect("index");
+
+        let hits = backend
+            .search("そうした光景を見慣れています", 10, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "doc containing only 光景 should still match sentence query"
+        );
+        assert!(hits[0].highlight_terms.iter().any(|t| t == "光景"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sentence_query_hits_indexed_nouns() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index");
+        let sentence = "そうした光景を見慣れています";
+        let indexed = backend.tokenize_ja(sentence).expect("tokenize");
+        eprintln!("indexed tokens={indexed:?}");
+        let content = backend.content_tokens(sentence, true).expect("content");
+        eprintln!("content tokens={content:?}");
+
+        let body = format!("前文。{sentence}。後文。");
+        let extracted = crate::extractor::ExtractedDoc {
+            title: "scene".into(),
+            pages: vec![body.clone()],
+        };
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, &body).unwrap();
+        backend
+            .index_file(&file, file.to_str().unwrap(), dir.to_str().unwrap(), 1, 1, &extracted)
+            .expect("index");
+
+        // Direct term probe
+        for tok in &content {
+            let q = BooleanQuery::new(backend.term_in_title_or_body(tok));
+            let searcher = backend.reader.searcher();
+            let top = searcher
+                .search(&q, &TopDocs::with_limit(5))
+                .expect("search term");
+            eprintln!("term {tok:?} hits={}", top.len());
+        }
+
+        let hits = backend
+            .search(sentence, 10, None, true)
+            .expect("search sentence");
+        eprintln!(
+            "sentence hits={} terms={:?}",
+            hits.len(),
+            hits.first().map(|h| &h.highlight_terms)
+        );
+        assert!(
+            !hits.is_empty(),
+            "expected hits for {sentence}; tokens={content:?}"
+        );
+        let terms = &hits[0].highlight_terms;
+        assert!(
+            terms.iter().any(|t| t == "光景"),
+            "expected 光景 in highlight_terms: {terms:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

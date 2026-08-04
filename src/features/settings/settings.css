@@ -88,7 +88,7 @@ label {
 }
 
 .options-form .field-hint {
-  margin: -2px 0 12px;
+  margin: 4px 0 12px;
 }
 
 .options-form .row-check {
@@ -109,9 +109,20 @@ select {
 }
 
 .field-hint {
-  margin: -4px 0 14px;
+  margin: 8px 0 14px;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* Hints after buttons / lists need clear clearance (no negative pull-up). */
+.row + .field-hint,
+ul + .field-hint,
+button + .field-hint {
+  margin-top: 10px;
+}
+
+.field-hint + .field-hint {
+  margin-top: 6px;
 }
 
 .row {

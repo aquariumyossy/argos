@@ -221,6 +221,20 @@ export default function Popup() {
     scopePathRef.current = scopePath;
   }, [scopePath]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("search-words-updated", () => {
+      void invoke<SearchWordRow[]>("list_search_words")
+        .then(setSearchWords)
+        .catch(console.error);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   const runSearch = useCallback(async (q: string, pathPrefix?: string | null) => {
     const seq = ++searchSeq.current;
     const trimmed = q.trim();

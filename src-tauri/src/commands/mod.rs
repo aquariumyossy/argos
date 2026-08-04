@@ -298,8 +298,13 @@ pub fn list_search_words(state: State<'_, Arc<AppState>>) -> Result<Vec<SearchWo
     state.db.list_search_words().map_err(|e| e.to_string())
 }
 
+fn emit_search_words_updated(app: &AppHandle) {
+    let _ = app.emit("search-words-updated", ());
+}
+
 #[tauri::command]
 pub fn add_search_word(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     word: String,
     reading: Option<String>,
@@ -316,11 +321,13 @@ pub fn add_search_word(
         .add_search_word(&word, &reading, &pos_label)
         .map_err(|e| e.to_string())?;
     state.refresh_user_dict();
+    emit_search_words_updated(&app);
     Ok(row)
 }
 
 #[tauri::command]
 pub fn update_search_word(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     id: i64,
     word: String,
@@ -342,18 +349,25 @@ pub fn update_search_word(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "検索ワードが見つかりません".to_string())?;
     state.refresh_user_dict();
+    emit_search_words_updated(&app);
     Ok(row)
 }
 
 #[tauri::command]
-pub fn remove_search_word(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+pub fn remove_search_word(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
     state.db.remove_search_word(id).map_err(|e| e.to_string())?;
     state.refresh_user_dict();
+    emit_search_words_updated(&app);
     Ok(())
 }
 
 #[tauri::command]
 pub fn import_search_words(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     entries: Vec<SearchWordImport>,
 ) -> Result<SearchWordImportResult, String> {
@@ -362,6 +376,7 @@ pub fn import_search_words(
         .import_search_words(&entries)
         .map_err(|e| e.to_string())?;
     state.refresh_user_dict();
+    emit_search_words_updated(&app);
     Ok(result)
 }
 

@@ -169,6 +169,28 @@ export default function Settings() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("search-words-updated", () => {
+      void invoke<SearchWordRow[]>("list_search_words")
+        .then(setSearchWords)
+        .catch(console.error);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  // Settings window stays mounted; refresh when opening this tab.
+  useEffect(() => {
+    if (tab !== "words") return;
+    void invoke<SearchWordRow[]>("list_search_words")
+      .then(setSearchWords)
+      .catch(console.error);
+  }, [tab]);
+
   async function saveSettings() {
     if (!settings) return;
     const saved = await invoke<SettingsData>("update_settings", { settings });
