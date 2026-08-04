@@ -238,10 +238,10 @@ impl TantivyBackend {
             if drop_surfaces.contains(&surface) {
                 continue;
             }
-            if !pos_filter && super::morph::is_noise_highlight_term(&surface) {
+            if is_index_symbol_token(&surface) {
                 continue;
             }
-            if pos_filter && is_index_symbol_token(&surface) {
+            if !pos_filter && super::morph::is_noise_highlight_term(&surface) {
                 continue;
             }
             if !seen.insert(surface.clone()) {
