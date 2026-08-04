@@ -211,21 +211,10 @@ pub fn hybrid_search(
         return Ok(Vec::new());
     }
 
-    let mut out = Vec::with_capacity(limit);
-    let mut li = 0usize;
-    let mut ri = 0usize;
-    while out.len() < limit && (li < local_hits.len() || ri < remote_hits.len()) {
-        if li < local_hits.len() {
-            out.push(local_hits[li].clone());
-            li += 1;
-            if out.len() >= limit {
-                break;
-            }
-        }
-        if ri < remote_hits.len() {
-            out.push(remote_hits[ri].clone());
-            ri += 1;
-        }
-    }
+    let mut out = Vec::with_capacity(local_hits.len() + remote_hits.len());
+    out.extend(local_hits);
+    out.extend(remote_hits);
+    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.truncate(limit);
     Ok(out)
 }
