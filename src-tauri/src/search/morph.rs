@@ -61,6 +61,13 @@ impl MorphToken {
         if self.is_particle_or_auxiliary() {
             return true;
         }
+        // Demonstratives / discourse glue: そうした / この / そして …
+        if matches!(
+            self.major_pos.as_str(),
+            "連体詞" | "接続詞" | "感動詞"
+        ) {
+            return true;
+        }
         // 「し」「さ」「れ」等は動詞扱いのため major_pos だけでは落ちない。
         if self.is_light_or_dependent_verb() || is_legacy_stop_surface(&self.surface) {
             return true;
@@ -70,6 +77,15 @@ impl MorphToken {
             return true;
         }
         false
+    }
+
+    /// Nouns / adjectives / content verbs kept for search.
+    pub fn is_content_pos(&self) -> bool {
+        !self.should_drop_for_content()
+            && matches!(
+                self.major_pos.as_str(),
+                "名詞" | "動詞" | "形容詞" | "形容動詞" | "UNK" | "未知語"
+            )
     }
 
     /// Drop only pure punctuation for phrase token sequences (keep 助詞).
@@ -153,6 +169,10 @@ impl MorphAnalyzer {
         let tokens = self.analyze(text)?;
         let mut seen = std::collections::HashSet::new();
         let mut content = Vec::new();
+        // When POS filter is on, prefer 名詞 first so ranking/chips focus on
+        // substantive terms (光景) over glue like そうした / conjugation debris.
+        let mut nouns = Vec::new();
+        let mut others = Vec::new();
         for t in tokens {
             let drop = if pos_filter_enabled {
                 t.should_drop_for_content()
@@ -162,9 +182,22 @@ impl MorphAnalyzer {
             if drop {
                 continue;
             }
-            if seen.insert(t.surface.clone()) {
-                content.push(t.surface);
+            if !seen.insert(t.surface.clone()) {
+                continue;
             }
+            if pos_filter_enabled && t.major_pos == "名詞" {
+                nouns.push(t.surface);
+            } else {
+                others.push(t.surface);
+            }
+        }
+        if pos_filter_enabled && !nouns.is_empty() {
+            // Keep nouns + remaining content verbs/adjectives, nouns first.
+            content.extend(nouns);
+            content.extend(others);
+        } else {
+            content.extend(nouns);
+            content.extend(others);
         }
         if content.is_empty() {
             // Do not re-introduce filtered morph debris (e.g. し). Fall back to the
@@ -454,5 +487,26 @@ mod tests {
         assert!(tokens.iter().any(|t| t == "契約" || t == "作成"));
         assert!(!is_noise_highlight_term("契約"));
         assert!(is_noise_highlight_term("し"));
+    }
+
+    #[test]
+    fn content_surfaces_prefers_noun_over_rentaishi() {
+        let morph = MorphAnalyzer::new().expect("morph");
+        let tokens = morph
+            .content_surfaces("そうした光景を見慣れています", true)
+            .expect("tokenize");
+        assert!(
+            !tokens.iter().any(|t| t == "そうした" || t == "い"),
+            "rentaishi / debris must be dropped: {tokens:?}"
+        );
+        assert!(
+            tokens.iter().any(|t| t == "光景"),
+            "noun 光景 must remain: {tokens:?}"
+        );
+        // Nouns should be ordered before other content.
+        let noun_pos = tokens.iter().position(|t| t == "光景").unwrap();
+        if let Some(verb_pos) = tokens.iter().position(|t| t == "見慣れ") {
+            assert!(noun_pos < verb_pos, "nouns first: {tokens:?}");
+        }
     }
 }

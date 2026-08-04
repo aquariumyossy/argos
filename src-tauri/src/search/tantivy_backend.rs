@@ -711,10 +711,14 @@ impl SearchBackend for TantivyBackend {
             .map_err(|e| e.to_string())?;
 
         // Phrase-only: require the phrase string; free tokens keep half-overlap rule.
+        // With POS filtering, tokens are already contentful — requiring half of them
+        // drops useful noun-only hits (e.g. query has 光景+見慣れ but a doc only has 光景).
         let min_overlap = if proximity_tokens.is_empty() {
             0
         } else if parsed.includes.is_empty() {
             proximity_tokens.len().min(1)
+        } else if pos_filter_enabled {
+            1
         } else {
             ((proximity_tokens.len() + 1) / 2).max(1)
         };
