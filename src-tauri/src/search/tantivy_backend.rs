@@ -16,27 +16,18 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term, TantivyD
 
 use crate::pathutil;
 
+use super::morph::MorphAnalyzer;
 use super::{SearchBackend, SearchHit};
 
 const CHUNK_SIZE: usize = 800;
 const CHUNK_OVERLAP: usize = 100;
-
-/// Particles / function words that hurt recall when required.
-const STOP_TOKENS: &[&str] = &[
-    "\u{306e}", "\u{3092}", "\u{306b}", "\u{306f}", "\u{304c}", "\u{3082}", "\u{3068}", "\u{3067}",
-    "\u{3078}", "\u{3084}", "\u{304b}", "\u{306a}\u{3069}", "\u{3088}\u{308a}", "\u{304b}\u{3089}",
-    "\u{307e}\u{3067}", "\u{3066}", "\u{305f}", "\u{308c}", "\u{305b}", "\u{3057}", "\u{3055}",
-    "\u{3044}\u{308b}", "\u{3042}\u{308b}", "\u{3059}\u{308b}", "\u{306a}\u{308b}",
-    "\u{308c}\u{308b}", "\u{3089}\u{308c}\u{308b}", "\u{3067}\u{3059}", "\u{307e}\u{3059}",
-    "\u{3067}\u{3057}\u{305f}", "\u{307e}\u{3057}\u{305f}", "\u{3068}\u{3044}\u{3046}",
-    "\u{3068}\u{3057}\u{3066}", "\u{306b}\u{3064}\u{3044}\u{3066}",
-];
 
 pub struct TantivyBackend {
     index: Index,
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     fields: Fields,
+    morph: Mutex<MorphAnalyzer>,
 }
 
 struct Fields {
@@ -89,6 +80,8 @@ impl TantivyBackend {
         let tokenizer = LinderaTokenizer::from_segmenter(segmenter);
         index.tokenizers().register("lang_ja", tokenizer);
 
+        let morph = MorphAnalyzer::new()?;
+
         let writer = index.writer(50_000_000).map_err(|e| e.to_string())?;
         let reader = index
             .reader_builder()
@@ -112,6 +105,7 @@ impl TantivyBackend {
                 chunk_id,
                 doc_key,
             },
+            morph: Mutex::new(morph),
         })
     }
 
@@ -197,6 +191,8 @@ impl TantivyBackend {
         Ok(chunks.len())
     }
 
+    /// Kept for Tantivy tokenizer parity / debugging; prefer morph helpers for query tokens.
+    #[allow(dead_code)]
     fn tokenize_ja(&self, text: &str) -> Result<Vec<String>, String> {
         let mut tokenizer = self
             .index
@@ -211,39 +207,14 @@ impl TantivyBackend {
         Ok(out)
     }
 
-    fn content_tokens(&self, query: &str) -> Result<Vec<String>, String> {
-        let raw = self.tokenize_ja(query)?;
-        let mut seen = HashSet::new();
-        let mut content = Vec::new();
-        for t in raw {
-            let t = t.trim().to_string();
-            if t.is_empty() {
-                continue;
-            }
-            if STOP_TOKENS.contains(&t.as_str()) {
-                continue;
-            }
-            if t.chars().all(|c| {
-                matches!(
-                    c,
-                    '(' | ')' | '\u{300c}' | '\u{300d}' | '\u{3001}' | '\u{3002}' | '\u{30fb}'
-                )
-            }) {
-                continue;
-            }
-            if seen.insert(t.clone()) {
-                content.push(t);
-            }
-        }
-        if content.is_empty() {
-            let fallback = self.tokenize_ja(query)?;
-            if fallback.is_empty() {
-                content.push(query.trim().to_string());
-            } else {
-                content = fallback;
-            }
-        }
-        Ok(content)
+    /// Free OR terms: POS filter drops 助詞/助動詞 when enabled.
+    fn content_tokens(&self, query: &str, pos_filter: bool) -> Result<Vec<String>, String> {
+        self.morph.lock().content_surfaces(query, pos_filter)
+    }
+
+    /// Phrase / user-dict terms: keep particles so index positions align.
+    fn phrase_tokens(&self, query: &str) -> Result<Vec<String>, String> {
+        self.morph.lock().phrase_surfaces(query)
     }
 
     fn term_in_title_or_body(&self, tok: &str) -> Box<dyn Query> {
@@ -276,18 +247,22 @@ impl TantivyBackend {
         Some(Box::new(BooleanQuery::new(per_field)))
     }
 
-    fn build_parsed_query(&self, parsed: &ParsedQuery) -> Result<Option<Box<dyn Query>>, String> {
+    fn build_parsed_query(
+        &self,
+        parsed: &ParsedQuery,
+        pos_filter: bool,
+    ) -> Result<Option<Box<dyn Query>>, String> {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
         for raw in &parsed.includes {
-            let tokens = self.content_tokens(raw)?;
+            let tokens = self.content_tokens(raw, pos_filter)?;
             for tok in tokens {
                 clauses.push((Occur::Should, self.term_in_title_or_body(&tok)));
             }
         }
 
         for phrase in &parsed.phrases {
-            let tokens = self.content_tokens(phrase)?;
+            let tokens = self.phrase_tokens(phrase)?;
             if let Some(q) = self.phrase_in_title_or_body(&tokens) {
                 // Quoted phrases are required (Google-like).
                 clauses.push((Occur::Must, q));
@@ -295,14 +270,14 @@ impl TantivyBackend {
         }
 
         for raw in &parsed.excludes {
-            let tokens = self.content_tokens(raw)?;
+            let tokens = self.content_tokens(raw, pos_filter)?;
             for tok in tokens {
                 clauses.push((Occur::MustNot, self.term_in_title_or_body(&tok)));
             }
         }
 
         for phrase in &parsed.exclude_phrases {
-            let tokens = self.content_tokens(phrase)?;
+            let tokens = self.phrase_tokens(phrase)?;
             if let Some(q) = self.phrase_in_title_or_body(&tokens) {
                 clauses.push((Occur::MustNot, q));
             }
@@ -318,7 +293,11 @@ impl TantivyBackend {
         Ok(Some(Box::new(BooleanQuery::new(clauses))))
     }
 
-    fn highlight_terms_for(&self, parsed: &ParsedQuery) -> Result<Vec<String>, String> {
+    fn highlight_terms_for(
+        &self,
+        parsed: &ParsedQuery,
+        pos_filter: bool,
+    ) -> Result<Vec<String>, String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         let mut push = |s: String| {
@@ -328,24 +307,28 @@ impl TantivyBackend {
         };
         for raw in &parsed.includes {
             push(raw.clone());
-            for tok in self.content_tokens(raw)? {
+            for tok in self.content_tokens(raw, pos_filter)? {
                 push(tok);
             }
         }
         for phrase in &parsed.phrases {
             push(phrase.clone());
-            for tok in self.content_tokens(phrase)? {
+            for tok in self.phrase_tokens(phrase)? {
                 push(tok);
             }
         }
         Ok(out)
     }
 
-    fn proximity_tokens_for(&self, parsed: &ParsedQuery) -> Result<Vec<String>, String> {
+    fn proximity_tokens_for(
+        &self,
+        parsed: &ParsedQuery,
+        pos_filter: bool,
+    ) -> Result<Vec<String>, String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for raw in &parsed.includes {
-            for tok in self.content_tokens(raw)? {
+            for tok in self.content_tokens(raw, pos_filter)? {
                 if seen.insert(tok.clone()) {
                     out.push(tok);
                 }
@@ -404,16 +387,21 @@ impl TantivyBackend {
     }
 }
 
-fn is_stop_token(t: &str) -> bool {
-    STOP_TOKENS.contains(&t)
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ParsedQuery {
     includes: Vec<String>,
     phrases: Vec<String>,
     excludes: Vec<String>,
     exclude_phrases: Vec<String>,
+}
+
+/// Short function-word surfaces to skip when guessing snippet anchors.
+fn is_stop_token(t: &str) -> bool {
+    matches!(
+        t,
+        "の" | "を" | "に" | "は" | "が" | "も" | "と" | "で" | "へ" | "や" | "か" | "など"
+            | "より" | "から" | "まで" | "て" | "た" | "れ" | "せ" | "し" | "さ"
+    )
 }
 
 fn is_query_delimiter(c: char) -> bool {
@@ -670,6 +658,7 @@ impl SearchBackend for TantivyBackend {
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
         let q = query.trim();
         if q.is_empty() {
@@ -681,19 +670,19 @@ impl SearchBackend for TantivyBackend {
             return Ok(vec![]);
         }
 
-        let Some(tantivy_q) = self.build_parsed_query(&parsed)? else {
+        let Some(tantivy_q) = self.build_parsed_query(&parsed, pos_filter_enabled)? else {
             return Ok(vec![]);
         };
 
-        let highlight_terms = self.highlight_terms_for(&parsed)?;
-        let proximity_tokens = self.proximity_tokens_for(&parsed)?;
+        let highlight_terms = self.highlight_terms_for(&parsed, pos_filter_enabled)?;
+        let proximity_tokens = self.proximity_tokens_for(&parsed, pos_filter_enabled)?;
         let scope = path_prefix
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         eprintln!(
-            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?}",
-            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope
+            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} pos_filter={}",
+            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, pos_filter_enabled
         );
 
         let searcher = self.reader.searcher();

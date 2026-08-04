@@ -21,6 +21,8 @@ pub struct Settings {
     pub remote_url: String,
     pub remote_token: String,
     pub remote_timeout_ms: u32,
+    /// Drop 助詞/助動詞 from free query tokens (default true).
+    pub pos_filter_enabled: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +43,7 @@ impl Default for Settings {
             remote_url: String::new(),
             remote_token: String::new(),
             remote_timeout_ms: 3000,
+            pos_filter_enabled: true,
         }
     }
 }
@@ -69,6 +72,28 @@ pub struct ExcludePathRow {
 pub struct SearchWordRow {
     pub id: i64,
     pub word: String,
+    #[serde(default)]
+    pub reading: String,
+    #[serde(default)]
+    pub pos_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWordImport {
+    pub word: String,
+    #[serde(default)]
+    pub reading: String,
+    #[serde(default)]
+    pub pos_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWordImportResult {
+    pub added: u32,
+    pub updated: u32,
+    pub skipped: u32,
 }
 
 /// Recently used search folder scopes (persisted in settings key-value).
@@ -126,6 +151,8 @@ impl Db {
             CREATE TABLE IF NOT EXISTS search_words (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               word TEXT NOT NULL UNIQUE,
+              reading TEXT NOT NULL DEFAULT '',
+              pos_label TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL
             );
             "#,
@@ -133,6 +160,15 @@ impl Db {
         // Migrate older DBs that lack public_path
         let _ = conn.execute(
             "ALTER TABLE folders ADD COLUMN public_path TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // User-dictionary metadata columns (CSV import).
+        let _ = conn.execute(
+            "ALTER TABLE search_words ADD COLUMN reading TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_words ADD COLUMN pos_label TEXT NOT NULL DEFAULT ''",
             [],
         );
         // Ensure FK is on for this connection (WAL batch may not stick across all cases)
@@ -186,6 +222,9 @@ impl Db {
                     "remote_timeout_ms" => {
                         s.remote_timeout_ms = row.1.parse().unwrap_or(3000)
                     }
+                    "pos_filter_enabled" => {
+                        s.pos_filter_enabled = row.1 == "1" || row.1 == "true"
+                    }
                     _ => {}
                 }
             }
@@ -214,6 +253,10 @@ impl Db {
             ("remote_url", s.remote_url.clone()),
             ("remote_token", s.remote_token.clone()),
             ("remote_timeout_ms", s.remote_timeout_ms.to_string()),
+            (
+                "pos_filter_enabled",
+                if s.pos_filter_enabled { "1" } else { "0" }.to_string(),
+            ),
         ];
         for (k, v) in pairs {
             conn.execute(
@@ -394,22 +437,42 @@ impl Db {
 
     pub fn list_search_words(&self) -> Result<Vec<SearchWordRow>, rusqlite::Error> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT id, word FROM search_words ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, word, COALESCE(reading, ''), COALESCE(pos_label, '')
+             FROM search_words ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(SearchWordRow {
                 id: row.get(0)?,
                 word: row.get(1)?,
+                reading: row.get(2)?,
+                pos_label: row.get(3)?,
             })
         })?;
         Ok(rows.flatten().collect())
     }
 
-    pub fn add_search_word(&self, word: &str) -> Result<SearchWordRow, rusqlite::Error> {
+    pub fn add_search_word(
+        &self,
+        word: &str,
+        reading: &str,
+        pos_label: &str,
+    ) -> Result<SearchWordRow, rusqlite::Error> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
+        let reading = reading.trim();
+        let pos_label = if pos_label.trim().is_empty() {
+            "ユーザ辞書"
+        } else {
+            pos_label.trim()
+        };
         conn.execute(
-            "INSERT OR IGNORE INTO search_words(word, created_at) VALUES(?1, ?2)",
-            rusqlite::params![word, now],
+            "INSERT INTO search_words(word, reading, pos_label, created_at)
+             VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(word) DO UPDATE SET
+               reading=excluded.reading,
+               pos_label=excluded.pos_label",
+            rusqlite::params![word, reading, pos_label, now],
         )?;
         let id: i64 = conn.query_row(
             "SELECT id FROM search_words WHERE word=?1",
@@ -419,6 +482,8 @@ impl Db {
         Ok(SearchWordRow {
             id,
             word: word.to_string(),
+            reading: reading.to_string(),
+            pos_label: pos_label.to_string(),
         })
     }
 
@@ -426,11 +491,32 @@ impl Db {
         &self,
         id: i64,
         word: &str,
+        reading: Option<&str>,
+        pos_label: Option<&str>,
     ) -> Result<Option<SearchWordRow>, rusqlite::Error> {
         let conn = self.conn.lock();
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT COALESCE(reading, ''), COALESCE(pos_label, '') FROM search_words WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let Some((old_reading, old_pos)) = existing else {
+            return Ok(None);
+        };
+        let reading = reading.unwrap_or(old_reading.as_str()).trim();
+        let pos_label = pos_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if old_pos.is_empty() {
+                "ユーザ辞書"
+            } else {
+                old_pos.as_str()
+            });
         let n = conn.execute(
-            "UPDATE search_words SET word=?1 WHERE id=?2",
-            rusqlite::params![word, id],
+            "UPDATE search_words SET word=?1, reading=?2, pos_label=?3 WHERE id=?4",
+            rusqlite::params![word, reading, pos_label, id],
         )?;
         if n == 0 {
             return Ok(None);
@@ -438,6 +524,8 @@ impl Db {
         Ok(Some(SearchWordRow {
             id,
             word: word.to_string(),
+            reading: reading.to_string(),
+            pos_label: pos_label.to_string(),
         }))
     }
 
@@ -445,6 +533,42 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM search_words WHERE id=?1", [id])?;
         Ok(())
+    }
+
+    pub fn import_search_words(
+        &self,
+        entries: &[SearchWordImport],
+    ) -> Result<SearchWordImportResult, rusqlite::Error> {
+        let mut added = 0u32;
+        let mut updated = 0u32;
+        let mut skipped = 0u32;
+        for entry in entries {
+            let word = entry.word.trim();
+            if word.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let existed: bool = {
+                let conn = self.conn.lock();
+                conn.query_row(
+                    "SELECT 1 FROM search_words WHERE word=?1",
+                    [word],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false)
+            };
+            self.add_search_word(word, &entry.reading, &entry.pos_label)?;
+            if existed {
+                updated += 1;
+            } else {
+                added += 1;
+            }
+        }
+        Ok(SearchWordImportResult {
+            added,
+            updated,
+            skipped,
+        })
     }
 
     pub fn list_recent_search_scopes(&self) -> Vec<RecentSearchScope> {

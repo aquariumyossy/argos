@@ -196,6 +196,7 @@ pub fn run() {
             commands::add_search_word,
             commands::update_search_word,
             commands::remove_search_word,
+            commands::import_search_words,
             commands::search_query,
             commands::list_search_scopes,
             commands::push_recent_search_scope,

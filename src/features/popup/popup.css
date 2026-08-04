@@ -236,6 +236,33 @@
   box-shadow: 0 8px 20px rgba(40, 36, 28, 0.12);
 }
 
+.popup-word-picker-actions {
+  padding: 6px 8px 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.popup-word-register-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  padding: 6px 10px;
+  border-radius: 3px;
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.popup-word-register-btn:hover:not(:disabled) {
+  background: var(--bg-elevated);
+}
+
+.popup-word-register-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .popup-word-picker ul {
   list-style: none;
   margin: 0;

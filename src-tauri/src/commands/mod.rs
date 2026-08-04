@@ -4,7 +4,9 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::db::{ExcludePathRow, FolderRow, SearchWordRow, Settings};
+use crate::db::{
+    ExcludePathRow, FolderRow, SearchWordImport, SearchWordImportResult, SearchWordRow, Settings,
+};
 use crate::indexer::IndexStats;
 use crate::pathutil;
 use crate::remote_server;
@@ -153,9 +155,10 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
 
     let settings = state.settings.read().clone();
     let backend = state.backend.clone();
+    let user_dict = state.user_dict.read().clone();
     let q = query.clone();
     let hits = tauri::async_runtime::spawn_blocking(move || {
-        search::run_search(&settings, backend.as_ref(), &q, limit, None)
+        search::run_search(&settings, backend.as_ref(), &q, limit, None, &user_dict)
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -299,12 +302,21 @@ pub fn list_search_words(state: State<'_, Arc<AppState>>) -> Result<Vec<SearchWo
 pub fn add_search_word(
     state: State<'_, Arc<AppState>>,
     word: String,
+    reading: Option<String>,
+    pos_label: Option<String>,
 ) -> Result<SearchWordRow, String> {
     let word = word.trim().to_string();
     if word.is_empty() {
         return Err("検索ワードが空です".into());
     }
-    state.db.add_search_word(&word).map_err(|e| e.to_string())
+    let reading = reading.unwrap_or_default();
+    let pos_label = pos_label.unwrap_or_default();
+    let row = state
+        .db
+        .add_search_word(&word, &reading, &pos_label)
+        .map_err(|e| e.to_string())?;
+    state.refresh_user_dict();
+    Ok(row)
 }
 
 #[tauri::command]
@@ -312,21 +324,45 @@ pub fn update_search_word(
     state: State<'_, Arc<AppState>>,
     id: i64,
     word: String,
+    reading: Option<String>,
+    pos_label: Option<String>,
 ) -> Result<SearchWordRow, String> {
     let word = word.trim().to_string();
     if word.is_empty() {
         return Err("検索ワードが空です".into());
     }
-    state
+    let row = state
         .db
-        .update_search_word(id, &word)
+        .update_search_word(
+            id,
+            &word,
+            reading.as_deref(),
+            pos_label.as_deref(),
+        )
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "検索ワードが見つかりません".to_string())
+        .ok_or_else(|| "検索ワードが見つかりません".to_string())?;
+    state.refresh_user_dict();
+    Ok(row)
 }
 
 #[tauri::command]
 pub fn remove_search_word(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    state.db.remove_search_word(id).map_err(|e| e.to_string())
+    state.db.remove_search_word(id).map_err(|e| e.to_string())?;
+    state.refresh_user_dict();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn import_search_words(
+    state: State<'_, Arc<AppState>>,
+    entries: Vec<SearchWordImport>,
+) -> Result<SearchWordImportResult, String> {
+    let result = state
+        .db
+        .import_search_words(&entries)
+        .map_err(|e| e.to_string())?;
+    state.refresh_user_dict();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -341,12 +377,14 @@ pub fn search_query(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let user_dict = state.user_dict.read().clone();
     search::run_search(
         &settings,
         state.backend.as_ref(),
         &query,
         limit,
         prefix,
+        &user_dict,
     )
 }
 
@@ -381,12 +419,14 @@ pub fn list_search_scopes(
         None => all,
         Some(q) => {
             let settings = state.settings.read().clone();
+            let user_dict = state.user_dict.read().clone();
             let hits = search::run_search(
                 &settings,
                 state.backend.as_ref(),
                 q,
                 SCOPE_QUERY_HIT_LIMIT,
                 None,
+                &user_dict,
             )?;
             if hits.is_empty() {
                 Vec::new()

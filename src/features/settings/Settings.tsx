@@ -20,6 +20,7 @@ type SettingsData = {
   remoteUrl: string;
   remoteToken: string;
   remoteTimeoutMs: number;
+  posFilterEnabled: boolean;
 };
 
 type FolderRow = {
@@ -30,7 +31,12 @@ type FolderRow = {
   indexedCount: number;
 };
 type ExcludePathRow = { id: number; path: string };
-type SearchWordRow = { id: number; word: string };
+type SearchWordRow = {
+  id: number;
+  word: string;
+  reading?: string;
+  posLabel?: string;
+};
 
 type TabId = "howto" | "folders" | "words" | "options" | "remote" | "credits";
 
@@ -125,6 +131,9 @@ export default function Settings() {
     }
     if (!SEARCH_MODE_OPTIONS.some((o) => o.value === s.searchMode)) {
       s.searchMode = "local";
+    }
+    if (typeof s.posFilterEnabled !== "boolean") {
+      s.posFilterEnabled = true;
     }
     setSettings(s);
     const nextFolders = await invoke<FolderRow[]>("list_folders");
@@ -318,6 +327,107 @@ export default function Settings() {
       setEditingWordDraft("");
     }
     await reload();
+  }
+
+  function parseSearchWordsCsv(text: string): {
+    word: string;
+    reading: string;
+    posLabel: string;
+  }[] {
+    const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+    const out: { word: string; reading: string; posLabel: string }[] = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const parts: string[] = [];
+      let cur = "";
+      let inQuotes = false;
+      for (let i = 0; i < trimmed.length; i += 1) {
+        const ch = trimmed[i];
+        if (ch === '"') {
+          inQuotes = !inQuotes;
+          continue;
+        }
+        if (ch === "," && !inQuotes) {
+          parts.push(cur.trim());
+          cur = "";
+          continue;
+        }
+        cur += ch;
+      }
+      parts.push(cur.trim());
+      if (parts[0]?.toLowerCase() === "surface" || parts[0] === "表層形") continue;
+      const word = parts[0] ?? "";
+      if (!word) continue;
+      if (parts.length >= 3) {
+        out.push({
+          word,
+          posLabel: parts[1] || "ユーザ辞書",
+          reading: parts[2] || "",
+        });
+      } else if (parts.length === 2) {
+        out.push({ word, posLabel: parts[1] || "ユーザ辞書", reading: "" });
+      } else {
+        out.push({ word, posLabel: "ユーザ辞書", reading: "" });
+      }
+    }
+    return out;
+  }
+
+  function escapeCsv(s: string): string {
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  }
+
+  function importSearchWordsCsv() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".csv,text/csv,text/plain";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const entries = parseSearchWordsCsv(text);
+        if (entries.length === 0) {
+          setMessage("CSV に有効な行がありません");
+          return;
+        }
+        const result = await invoke<{
+          added: number;
+          updated: number;
+          skipped: number;
+        }>("import_search_words", { entries });
+        setMessage(
+          `CSV 取り込み: 追加 ${result.added} / 更新 ${result.updated} / スキップ ${result.skipped}`,
+        );
+        await reload();
+      } catch (err) {
+        setMessage(`CSV 取り込み失敗: ${String(err)}`);
+      }
+    };
+    input.click();
+  }
+
+  function exportSearchWordsCsv() {
+    const lines = searchWords.map((w) => {
+      const reading = w.reading ?? "";
+      const pos = w.posLabel || "ユーザ辞書";
+      if (reading || (w.posLabel && w.posLabel !== "ユーザ辞書")) {
+        return `${escapeCsv(w.word)},${escapeCsv(pos)},${escapeCsv(reading)}`;
+      }
+      return escapeCsv(w.word);
+    });
+    const blob = new Blob([`${lines.join("\n")}\n`], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "argos-search-words.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+    setMessage("CSV を書き出しました");
   }
 
   async function runReindex() {
@@ -726,11 +836,12 @@ export default function Settings() {
           <section>
             <h2>検索ワード登録</h2>
             <p className="muted">
-              よく使う検索語句を登録できます。検索ポップアップの「＋」から、入力中の検索文字列へ追加できます。
+              法律用語などの複合語を登録すると、検索時に隣接フレーズとして扱われます（索引の分解は変えないため、部分語でもヒットします）。
+              各種設定の品詞フィルタと連携し、登録語内の助詞は除外されません。検索ポップアップの「＋」から挿入・その場登録もできます。
             </p>
             <div className="row">
               <input
-                placeholder="例: 契約書 / 議事録"
+                placeholder="例: 弁済による代位 / 損害賠償"
                 value={wordInput}
                 onChange={(e) => setWordInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -744,6 +855,21 @@ export default function Settings() {
                 追加
               </button>
             </div>
+            <div className="row" style={{ marginTop: "0.5rem" }}>
+              <button type="button" onClick={() => importSearchWordsCsv()}>
+                CSV 取り込み
+              </button>
+              <button
+                type="button"
+                onClick={() => exportSearchWordsCsv()}
+                disabled={searchWords.length === 0}
+              >
+                CSV 書き出し
+              </button>
+            </div>
+            <p className="field-hint">
+              CSV 形式: 1列（表層）または 表層,品詞,読み。法令から抽出した用語リストの一括登録向けです。
+            </p>
             <ul>
               {searchWords.length === 0 ? (
                 <li className="empty">検索ワードはまだ登録されていません</li>
@@ -947,6 +1073,19 @@ export default function Settings() {
               />
               Windows ログオン時に自動起動
             </label>
+            <label className="row-check">
+              <input
+                type="checkbox"
+                checked={settings.posFilterEnabled}
+                onChange={(e) =>
+                  setSettings({ ...settings, posFilterEnabled: e.target.checked })
+                }
+              />
+              助詞・助動詞を検索から除外する（品詞フィルタ）
+            </label>
+            <p className="field-hint">
+              自然文クエリのノイズを減らします。ユーザ辞書や &quot;フレーズ&quot; 内の助詞は除外しません。
+            </p>
             <button type="button" className="primary" onClick={() => void saveSettings()}>
               設定を保存
             </button>

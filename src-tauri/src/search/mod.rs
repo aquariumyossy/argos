@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+pub mod morph;
 pub mod remote_backend;
 pub mod tantivy_backend;
 
+pub use morph::{apply_user_dictionary, MorphAnalyzer, UserDictMatcher};
 pub use remote_backend::{hybrid_search, RemoteArgosBackend};
 pub use tantivy_backend::TantivyBackend;
 
@@ -32,6 +34,7 @@ pub trait SearchBackend: Send + Sync {
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String>;
     fn preview(&self, hit_id: &str) -> Result<Option<SearchHit>, String>;
 }
@@ -49,24 +52,38 @@ pub fn filter_hits_by_path_prefix(
         .collect()
 }
 
-/// Route search according to `search_mode` in settings.
+/// Apply client user-dictionary quoting, then route by `search_mode`.
+///
+/// Dictionary rewrite runs on the client so remote hosts receive `"phrase"` syntax
+/// without needing the client's word list. POS filtering uses each side's local index
+/// tokenizer (host settings for remote hits).
 pub fn run_search(
     settings: &Settings,
     local: &TantivyBackend,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
+    user_dict: &UserDictMatcher,
 ) -> Result<Vec<SearchHit>, String> {
+    let rewritten = apply_user_dictionary(query, user_dict);
+    let pos_filter = settings.pos_filter_enabled;
     match settings.search_mode.as_str() {
         "remote" => {
             let remote = RemoteArgosBackend::from_settings(settings)?;
-            remote.search(query, limit, path_prefix)
+            remote.search(&rewritten, limit, path_prefix, pos_filter)
         }
         "hybrid" => {
             let remote = RemoteArgosBackend::from_settings(settings)?;
-            hybrid_search(local, &remote, query, limit, path_prefix)
+            hybrid_search(
+                local,
+                &remote,
+                &rewritten,
+                limit,
+                path_prefix,
+                pos_filter,
+            )
         }
-        _ => local.search(query, limit, path_prefix),
+        _ => local.search(&rewritten, limit, path_prefix, pos_filter),
     }
 }
 

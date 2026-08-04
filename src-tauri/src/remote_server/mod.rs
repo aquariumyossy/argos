@@ -14,6 +14,7 @@ use crate::search::{filter_hits_by_path_prefix, SearchBackend, SearchHit, Tantiv
 struct ServerState {
     backend: Arc<TantivyBackend>,
     token: Arc<String>,
+    pos_filter_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -94,8 +95,11 @@ async fn search(
         limit
     };
     let prefix_for_filter = path_prefix.clone();
+    let pos_filter = state
+        .pos_filter_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mut hits = tauri::async_runtime::spawn_blocking(move || {
-        backend.search(&query, fetch_limit, path_prefix.as_deref())
+        backend.search(&query, fetch_limit, path_prefix.as_deref(), pos_filter)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -146,7 +150,14 @@ impl RemoteServerHandle {
     }
 
     /// Apply settings: stop existing server, start if enabled.
-    pub fn sync(&self, enabled: bool, port: u32, token: &str, backend: Arc<TantivyBackend>) {
+    pub fn sync(
+        &self,
+        enabled: bool,
+        port: u32,
+        token: &str,
+        backend: Arc<TantivyBackend>,
+        pos_filter_enabled: bool,
+    ) {
         self.stop();
         if !enabled {
             return;
@@ -166,6 +177,9 @@ impl RemoteServerHandle {
         let state = ServerState {
             backend,
             token: Arc::new(token.to_string()),
+            pos_filter_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                pos_filter_enabled,
+            )),
         };
         let app = Router::new()
             .route("/health", get(health))

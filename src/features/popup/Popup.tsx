@@ -39,7 +39,7 @@ type SearchPayload = {
   hits: SearchHit[];
 };
 
-type SearchWordRow = { id: number; word: string };
+type SearchWordRow = { id: number; word: string; reading?: string; posLabel?: string };
 
 type SearchScopeRow = { path: string; label: string; isRoot: boolean };
 
@@ -403,6 +403,39 @@ export default function Popup() {
     [query, scheduleSearch],
   );
 
+  const registerCurrentQueryWord = useCallback(async () => {
+    const word = query.trim();
+    if (!word) {
+      setActionError("登録する検索語が空です");
+      return;
+    }
+    let toRegister = word;
+    const input = inputRef.current;
+    if (input && input.selectionStart != null && input.selectionEnd != null) {
+      const start = input.selectionStart;
+      const end = input.selectionEnd;
+      if (end > start) {
+        toRegister = query.slice(start, end).trim() || word;
+      }
+    }
+    if (toRegister === word && /[\s\u3000,\uFF0C\u3001]/.test(word)) {
+      const parts = word.split(/[\s\u3000,\uFF0C\u3001]+/).filter(Boolean);
+      const last = parts[parts.length - 1]
+        ?.replace(/^-+/, "")
+        .replace(/^"|"$/g, "");
+      if (last) toRegister = last;
+    }
+    try {
+      await invoke("add_search_word", { word: toRegister });
+      const words = await invoke<SearchWordRow[]>("list_search_words");
+      setSearchWords(words);
+      setActionError("");
+      scheduleSearch(query);
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, [query, scheduleSearch]);
+
   const openSelected = useCallback(async () => {
     const hit = hits[index];
     if (!hit) return;
@@ -655,9 +688,19 @@ export default function Popup() {
           ) : null}
           {wordPickerOpen ? (
             <div className="popup-word-picker" role="listbox" aria-label="登録済み検索ワード">
+              <div className="popup-word-picker-actions">
+                <button
+                  type="button"
+                  className="popup-word-register-btn"
+                  onClick={() => void registerCurrentQueryWord()}
+                  disabled={!query.trim()}
+                >
+                  入力中の語を辞書登録
+                </button>
+              </div>
               {searchWords.length === 0 ? (
                 <div className="popup-word-empty">
-                  登録済みの検索ワードはありません。設定の「検索ワード登録」から追加できます。
+                  登録済みの検索ワードはありません。上のボタンまたは設定の「検索ワード登録」から追加できます。
                 </div>
               ) : (
                 <ul>

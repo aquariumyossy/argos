@@ -99,6 +99,7 @@ impl SearchBackend for RemoteArgosBackend {
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        _pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
         let url = format!("{}/search", self.base_url);
         let scope = path_prefix
@@ -173,10 +174,13 @@ pub fn hybrid_search(
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
+    pos_filter_enabled: bool,
 ) -> Result<Vec<SearchHit>, String> {
     let (local_res, remote_res) = std::thread::scope(|scope| {
-        let local_handle = scope.spawn(|| local.search(query, limit, path_prefix));
-        let remote_handle = scope.spawn(|| remote.search(query, limit, path_prefix));
+        let local_handle =
+            scope.spawn(|| local.search(query, limit, path_prefix, pos_filter_enabled));
+        let remote_handle =
+            scope.spawn(|| remote.search(query, limit, path_prefix, pos_filter_enabled));
         (local_handle.join(), remote_handle.join())
     });
 

@@ -7,6 +7,7 @@ use crate::db::{Db, Settings};
 use crate::indexer::Indexer;
 use crate::remote_server::RemoteServerHandle;
 use crate::search::tantivy_backend::TantivyBackend;
+use crate::search::UserDictMatcher;
 use crate::watcher::WatcherHandle;
 
 pub struct AppState {
@@ -18,6 +19,8 @@ pub struct AppState {
     pub remote_server: RemoteServerHandle,
     /// Set during app setup after the FS watcher thread starts.
     pub watcher: RwLock<Option<WatcherHandle>>,
+    /// Client-side user dictionary for query phrase forcing.
+    pub user_dict: RwLock<UserDictMatcher>,
 }
 
 impl AppState {
@@ -35,6 +38,7 @@ impl AppState {
         let backend = Arc::new(TantivyBackend::open(&index_dir)?);
         let indexer = Arc::new(Indexer::new(db.clone(), backend.clone()));
         let remote_server = RemoteServerHandle::new();
+        let user_dict = Self::build_user_dict(&db);
 
         Ok(Self {
             db,
@@ -44,7 +48,22 @@ impl AppState {
             indexer,
             remote_server,
             watcher: RwLock::new(None),
+            user_dict: RwLock::new(user_dict),
         })
+    }
+
+    pub fn build_user_dict(db: &Db) -> UserDictMatcher {
+        let words = db
+            .list_search_words()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.word);
+        UserDictMatcher::from_words(words)
+    }
+
+    pub fn refresh_user_dict(&self) {
+        let matcher = Self::build_user_dict(&self.db);
+        *self.user_dict.write() = matcher;
     }
 
     pub fn set_watcher(&self, handle: WatcherHandle) {
@@ -64,15 +83,16 @@ impl AppState {
     }
 
     pub fn sync_remote_server(&self) {
-        let (enabled, port, token) = {
+        let (enabled, port, token, pos_filter) = {
             let s = self.settings.read();
             (
                 s.remote_server_enabled,
                 s.remote_server_port,
                 s.remote_server_token.clone(),
+                s.pos_filter_enabled,
             )
         };
         self.remote_server
-            .sync(enabled, port, &token, self.backend.clone());
+            .sync(enabled, port, &token, self.backend.clone(), pos_filter);
     }
 }
