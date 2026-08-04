@@ -4,7 +4,7 @@ pub mod morph;
 pub mod remote_backend;
 pub mod tantivy_backend;
 
-pub use morph::{apply_user_dictionary, MorphAnalyzer, UserDictMatcher};
+pub use morph::{apply_user_dictionary, is_noise_highlight_term, MorphAnalyzer, UserDictMatcher};
 pub use remote_backend::{hybrid_search, RemoteArgosBackend};
 pub use tantivy_backend::TantivyBackend;
 

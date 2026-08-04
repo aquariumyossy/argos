@@ -15,6 +15,8 @@ pub struct MorphToken {
     pub surface: String,
     /// e.g. 名詞 / 動詞 / 助詞 / 助動詞 / 記号 / UNK
     pub major_pos: String,
+    /// IPADIC 品詞細分類1 (自立 / 非自立 / 接尾 / …)
+    pub pos_detail1: String,
 }
 
 impl MorphToken {
@@ -41,9 +43,33 @@ impl MorphToken {
             })
     }
 
+    /// 動詞の活用断片・付属的動詞（し / いる / れる など）
+    pub fn is_light_or_dependent_verb(&self) -> bool {
+        if self.major_pos != "動詞" {
+            return false;
+        }
+        matches!(self.pos_detail1.as_str(), "非自立" | "接尾")
+            || is_legacy_stop_surface(&self.surface)
+            || is_single_hiragana(&self.surface)
+    }
+
     /// Drop for free (non-phrase) content search when POS filter is on.
     pub fn should_drop_for_content(&self) -> bool {
-        self.is_particle_or_auxiliary() || self.is_symbol() || self.surface.trim().is_empty()
+        if self.surface.trim().is_empty() || self.is_symbol() {
+            return true;
+        }
+        if self.is_particle_or_auxiliary() {
+            return true;
+        }
+        // 「し」「さ」「れ」等は動詞扱いのため major_pos だけでは落ちない。
+        if self.is_light_or_dependent_verb() || is_legacy_stop_surface(&self.surface) {
+            return true;
+        }
+        // ひらがな1文字は検索ノイズになりやすい（活用語尾・助詞の分解残骸）。
+        if is_single_hiragana(&self.surface) {
+            return true;
+        }
+        false
     }
 
     /// Drop only pure punctuation for phrase token sequences (keep 助詞).
@@ -81,7 +107,20 @@ impl MorphAnalyzer {
                     .map(|s| (*s).to_string())
                     .unwrap_or_else(|| "UNK".into())
             };
-            out.push(MorphToken { surface, major_pos });
+            let pos_detail1 = if let Some(d) = token.get("part_of_speech_subcategory_1") {
+                d.to_string()
+            } else {
+                let details = token.details();
+                details
+                    .get(1)
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_default()
+            };
+            out.push(MorphToken {
+                surface,
+                major_pos,
+                pos_detail1,
+            });
         }
         Ok(out)
     }
@@ -115,11 +154,12 @@ impl MorphAnalyzer {
         let mut seen = std::collections::HashSet::new();
         let mut content = Vec::new();
         for t in tokens {
-            if pos_filter_enabled {
-                if t.should_drop_for_content() {
-                    continue;
-                }
-            } else if is_legacy_stop_surface(&t.surface) || t.is_symbol() {
+            let drop = if pos_filter_enabled {
+                t.should_drop_for_content()
+            } else {
+                is_legacy_stop_surface(&t.surface) || t.is_symbol()
+            };
+            if drop {
                 continue;
             }
             if seen.insert(t.surface.clone()) {
@@ -127,26 +167,35 @@ impl MorphAnalyzer {
             }
         }
         if content.is_empty() {
-            // Fallback: keep all non-empty surfaces (or raw text).
-            let tokens = self.analyze(text)?;
-            for t in tokens {
-                let s = t.surface.trim();
-                if !s.is_empty() {
-                    content.push(s.to_string());
-                }
-            }
-            if content.is_empty() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    content.push(trimmed.to_string());
-                }
+            // Do not re-introduce filtered morph debris (e.g. し). Fall back to the
+            // raw query only when it itself is not an obvious stop fragment.
+            let trimmed = text.trim();
+            if !trimmed.is_empty()
+                && !is_legacy_stop_surface(trimmed)
+                && !is_single_hiragana(trimmed)
+            {
+                content.push(trimmed.to_string());
             }
         }
         Ok(content)
     }
 }
 
-/// Legacy surface stop list used when POS filter is disabled (parity with older builds).
+fn is_single_hiragana(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => ('\u{3041}'..='\u{3096}').contains(&c),
+        _ => false,
+    }
+}
+
+/// True for surfaces that should not appear as search-result chips.
+pub fn is_noise_highlight_term(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || is_legacy_stop_surface(t) || is_single_hiragana(t)
+}
+
+/// Legacy surface stop list (also applied under POS filter for conjugation debris).
 fn is_legacy_stop_surface(t: &str) -> bool {
     const STOP: &[&str] = &[
         "\u{306e}", "\u{3092}", "\u{306b}", "\u{306f}", "\u{304c}", "\u{3082}", "\u{3068}", "\u{3067}",
@@ -390,5 +439,20 @@ mod tests {
             phrase.iter().any(|t| t == "による" || t.contains("よる")),
             "phrase must keep particle: {phrase:?}"
         );
+    }
+
+    #[test]
+    fn content_surfaces_drops_shi_conjugation() {
+        let morph = MorphAnalyzer::new().expect("morph");
+        let tokens = morph
+            .content_surfaces("契約書を作成しました", true)
+            .expect("tokenize");
+        assert!(
+            !tokens.iter().any(|t| t == "し"),
+            "conjugation し must be dropped: {tokens:?}"
+        );
+        assert!(tokens.iter().any(|t| t == "契約" || t == "作成"));
+        assert!(!is_noise_highlight_term("契約"));
+        assert!(is_noise_highlight_term("し"));
     }
 }

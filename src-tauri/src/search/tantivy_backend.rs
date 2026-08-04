@@ -16,7 +16,7 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term, TantivyD
 
 use crate::pathutil;
 
-use super::morph::MorphAnalyzer;
+use super::morph::{is_noise_highlight_term, MorphAnalyzer};
 use super::{SearchBackend, SearchHit};
 
 const CHUNK_SIZE: usize = 800;
@@ -301,20 +301,34 @@ impl TantivyBackend {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         let mut push = |s: String| {
-            if !s.is_empty() && seen.insert(s.clone()) {
-                out.push(s);
+            if s.is_empty() || !seen.insert(s.clone()) {
+                return;
             }
+            if pos_filter && is_noise_highlight_term(&s) {
+                return;
+            }
+            out.push(s);
         };
         for raw in &parsed.includes {
-            push(raw.clone());
-            for tok in self.content_tokens(raw, pos_filter)? {
+            let tokens = self.content_tokens(raw, pos_filter)?;
+            // Prefer filtered morph tokens for chips. Keep the raw include only when
+            // it is itself a single content token (or POS filter is off).
+            if !pos_filter {
+                push(raw.clone());
+            } else if tokens.len() == 1 && tokens[0] == *raw {
+                push(raw.clone());
+            }
+            for tok in tokens {
                 push(tok);
             }
         }
         for phrase in &parsed.phrases {
+            // Show the registered/quoted phrase as one chip; skip particle pieces.
             push(phrase.clone());
-            for tok in self.phrase_tokens(phrase)? {
-                push(tok);
+            if !pos_filter {
+                for tok in self.phrase_tokens(phrase)? {
+                    push(tok);
+                }
             }
         }
         Ok(out)
