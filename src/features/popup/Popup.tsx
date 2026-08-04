@@ -150,6 +150,13 @@ function extFromPath(path: string): string {
   return base.slice(i + 1).toLowerCase();
 }
 
+/** Relative match strength within the current result set (1–5). */
+function scoreLevel(score: number, maxScore: number): number {
+  if (maxScore <= 0) return 1;
+  const ratio = score / maxScore;
+  return Math.min(5, Math.max(1, Math.ceil(ratio * 5)));
+}
+
 function PreviewBody({
   hit,
   query,
@@ -491,6 +498,14 @@ export default function Popup() {
     },
     [hits, index],
   );
+
+  const openSettings = useCallback(async () => {
+    try {
+      await invoke("show_settings_window");
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, []);
 
   const showPreview = useCallback(async () => {
     const hit = hits[index];
@@ -954,70 +969,97 @@ export default function Popup() {
                 : "検索文字列を入力するか、文書上で選択してショートカットを押してください。"}
             </li>
           ) : (
-            hits.map((hit, i) => (
-              <li
-                key={`${hit.source}-${hit.id}`}
-                className={i === index ? "hit active" : "hit"}
-                onMouseEnter={() => setIndex(i)}
-                onDoubleClick={() => void openSelected()}
-              >
-                <div className="hit-main">
-                  <div className="hit-title">
-                    {hit.source === "remote" ? (
-                      <span className="hit-source" title="リモート">
-                        リモート
-                      </span>
-                    ) : null}
-                    {(() => {
-                      const ext = extFromPath(hit.path);
-                      return ext ? (
-                        <span className="hit-ext" title={hit.path}>
-                          {ext}
-                        </span>
-                      ) : null;
-                    })()}
-                    📄 {highlight(hit.title, query, hit.highlightTerms)}
-                  </div>
-                  <div className="hit-snippet">
-                    {highlight(hit.snippet, query, hit.highlightTerms)}
-                  </div>
-                  {hit.highlightTerms && hit.highlightTerms.length > 0 ? (
-                    <div className="hit-terms">
-                      {hit.highlightTerms.map((t) => (
-                        <span key={t} className="hit-term">
-                          {t}
-                        </span>
-                      ))}
+            (() => {
+              const maxScore = Math.max(...hits.map((h) => h.score), 0);
+              return hits.map((hit, i) => {
+                const level = scoreLevel(hit.score, maxScore);
+                return (
+                  <li
+                    key={`${hit.source}-${hit.id}`}
+                    className={i === index ? "hit active" : "hit"}
+                    onMouseEnter={() => setIndex(i)}
+                    onDoubleClick={() => void openSelected()}
+                  >
+                    <div className="hit-main">
+                      <div className="hit-title-row">
+                        <div className="hit-title">
+                          {hit.source === "remote" ? (
+                            <span className="hit-source" title="リモート">
+                              リモート
+                            </span>
+                          ) : null}
+                          {(() => {
+                            const ext = extFromPath(hit.path);
+                            return ext ? (
+                              <span className="hit-ext" title={hit.path}>
+                                {ext}
+                              </span>
+                            ) : null;
+                          })()}
+                          📄 {highlight(hit.title, query, hit.highlightTerms)}
+                        </div>
+                        <div
+                          className="hit-score"
+                          aria-label={`マッチ度 ${level}/5`}
+                          title={`マッチ度 ${level}/5`}
+                        >
+                          {[1, 2, 3, 4, 5].map((n) => (
+                            <span
+                              key={n}
+                              className={
+                                n <= level
+                                  ? "hit-score-dot filled"
+                                  : "hit-score-dot"
+                              }
+                            />
+                          ))}
+                        </div>
+                      </div>
+                      <div className="hit-snippet">
+                        {highlight(hit.snippet, query, hit.highlightTerms)}
+                      </div>
+                      <div className="hit-path" title={hit.path}>
+                        {hit.path}
+                      </div>
+                      {hit.highlightTerms && hit.highlightTerms.length > 0 ? (
+                        <div className="hit-terms">
+                          {hit.highlightTerms.map((t) => (
+                            <span key={t} className="hit-term">
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
-                </div>
-                <div className="hit-actions">
-                  <button
-                    type="button"
-                    className="hit-folder-btn"
-                    title="このフォルダ内で再検索"
-                    aria-label="このフォルダ内で再検索"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      rescopeToHitFolder(hit.path);
-                    }}
-                  >
-                    🔍
-                  </button>
-                  <button
-                    type="button"
-                    className="hit-folder-btn"
-                    title="フォルダを開く (Shift+Enter)"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void openFolder(hit.path);
-                    }}
-                  >
-                    📁
-                  </button>
-                </div>
-              </li>
-            ))
+                    <div className="hit-actions">
+                      <button
+                        type="button"
+                        className="hit-folder-btn"
+                        title="このフォルダ内で再検索"
+                        aria-label="このフォルダ内で再検索"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          rescopeToHitFolder(hit.path);
+                        }}
+                      >
+                        🔍
+                      </button>
+                      <button
+                        type="button"
+                        className="hit-folder-btn"
+                        title="フォルダを開く (Shift+Enter)"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void openFolder(hit.path);
+                        }}
+                      >
+                        📁
+                      </button>
+                    </div>
+                  </li>
+                );
+              });
+            })()
           )}
         </ul>
       )}
@@ -1040,6 +1082,13 @@ export default function Popup() {
             <span>Esc / 外クリック 閉じる</span>
           </>
         )}
+        <button
+          type="button"
+          className="popup-settings-btn"
+          onClick={() => void openSettings()}
+        >
+          設定
+        </button>
       </footer>
     </div>
   );
