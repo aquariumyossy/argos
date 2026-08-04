@@ -191,8 +191,7 @@ impl TantivyBackend {
         Ok(chunks.len())
     }
 
-    /// Kept for Tantivy tokenizer parity / debugging; prefer morph helpers for query tokens.
-    #[allow(dead_code)]
+    /// Kept for Tantivy tokenizer parity with the inverted index vocabulary.
     fn tokenize_ja(&self, text: &str) -> Result<Vec<String>, String> {
         let mut tokenizer = self
             .index
@@ -208,16 +207,85 @@ impl TantivyBackend {
     }
 
     /// Free OR terms: POS filter drops 助詞/助動詞 when enabled.
+    /// Surfaces are taken from the index tokenizer, then filtered by morph POS so
+    /// TermQuery values always exist in the inverted index.
     fn content_tokens(&self, query: &str, pos_filter: bool) -> Result<Vec<String>, String> {
-        self.morph.lock().content_surfaces(query, pos_filter)
+        let indexed = self.tokenize_ja(query)?;
+        if indexed.is_empty() {
+            return self.morph.lock().content_surfaces(query, pos_filter);
+        }
+        let morph = self.morph.lock().analyze(query)?;
+        let drop_surfaces: HashSet<String> = morph
+            .iter()
+            .filter(|t| {
+                if pos_filter {
+                    t.should_drop_for_content()
+                } else {
+                    super::morph::is_noise_highlight_term(&t.surface) || t.is_symbol()
+                }
+            })
+            .map(|t| t.surface.clone())
+            .collect();
+
+        let mut seen = HashSet::new();
+        let mut nouns = Vec::new();
+        let mut others = Vec::new();
+        // Align indexed tokens with morph drop decisions by surface.
+        for surface in indexed {
+            if surface.trim().is_empty() {
+                continue;
+            }
+            if drop_surfaces.contains(&surface) {
+                continue;
+            }
+            if !pos_filter && super::morph::is_noise_highlight_term(&surface) {
+                continue;
+            }
+            if pos_filter && is_index_symbol_token(&surface) {
+                continue;
+            }
+            if !seen.insert(surface.clone()) {
+                continue;
+            }
+            let is_noun = morph
+                .iter()
+                .any(|t| t.surface == surface && t.major_pos == "名詞");
+            if pos_filter && is_noun {
+                nouns.push(surface);
+            } else {
+                others.push(surface);
+            }
+        }
+        let mut content = Vec::new();
+        content.extend(nouns);
+        content.extend(others);
+        if content.is_empty() {
+            // Last resort: morph-only filter (may still help debugging).
+            return self.morph.lock().content_surfaces(query, pos_filter);
+        }
+        Ok(content)
     }
 
-    /// Phrase / user-dict terms: keep particles so index positions align.
+    /// Full token sequence for passage PhraseQuery (keep particles, drop symbols).
+    fn passage_tokens(&self, query: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .tokenize_ja(query)?
+            .into_iter()
+            .filter(|t| !is_index_symbol_token(t) && !t.trim().is_empty())
+            .collect())
+    }
+
+    /// Quoted / user-dict phrases: keep particles so index positions align.
     fn phrase_tokens(&self, query: &str) -> Result<Vec<String>, String> {
+        // Prefer index tokenizer surfaces; fall back to morph if empty.
+        let indexed = self.passage_tokens(query)?;
+        if !indexed.is_empty() {
+            return Ok(indexed);
+        }
         self.morph.lock().phrase_surfaces(query)
     }
 
-    fn term_in_title_or_body(&self, tok: &str) -> Box<dyn Query> {
+    fn term_in_title_or_body(&self, tok: &str) -> Vec<(Occur, Box<dyn Query>)> {
         let mut per_token: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for field in [self.fields.title, self.fields.body] {
             let term = Term::from_field_text(field, tok);
@@ -226,7 +294,7 @@ impl TantivyBackend {
                 Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
             ));
         }
-        Box::new(BooleanQuery::new(per_token))
+        per_token
     }
 
     fn phrase_in_title_or_body(&self, tokens: &[String]) -> Option<Box<dyn Query>> {
@@ -234,7 +302,7 @@ impl TantivyBackend {
             return None;
         }
         if tokens.len() == 1 {
-            return Some(self.term_in_title_or_body(&tokens[0]));
+            return Some(Box::new(BooleanQuery::new(self.term_in_title_or_body(&tokens[0]))));
         }
         let mut per_field: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for field in [self.fields.title, self.fields.body] {
@@ -256,8 +324,19 @@ impl TantivyBackend {
 
         for raw in &parsed.includes {
             let tokens = self.content_tokens(raw, pos_filter)?;
-            for tok in tokens {
-                clauses.push((Occur::Should, self.term_in_title_or_body(&tok)));
+            for tok in &tokens {
+                // Flatten title/body Should into the parent query.
+                clauses.extend(self.term_in_title_or_body(tok));
+            }
+            // Passage match: exact morph token sequence (including particles) finds
+            // the selected sentence even when OR-of-content-tokens is too weak alone.
+            if raw.chars().count() >= 4 {
+                let passage = self.passage_tokens(raw)?;
+                if passage.len() >= 2 {
+                    if let Some(q) = self.phrase_in_title_or_body(&passage) {
+                        clauses.push((Occur::Should, q));
+                    }
+                }
             }
         }
 
@@ -271,8 +350,10 @@ impl TantivyBackend {
 
         for raw in &parsed.excludes {
             let tokens = self.content_tokens(raw, pos_filter)?;
-            for tok in tokens {
-                clauses.push((Occur::MustNot, self.term_in_title_or_body(&tok)));
+            for tok in &tokens {
+                for (_, q) in self.term_in_title_or_body(tok) {
+                    clauses.push((Occur::MustNot, q));
+                }
             }
         }
 
@@ -423,6 +504,45 @@ fn is_query_delimiter(c: char) -> bool {
         c,
         ' ' | '\t' | '\n' | '\r' | '\u{3000}' | ',' | '\u{FF0C}' | '\u{3001}'
     )
+}
+
+fn is_index_symbol_token(t: &str) -> bool {
+    t.chars().all(|c| {
+        matches!(
+            c,
+            '(' | ')'
+                | '\u{300c}'
+                | '\u{300d}'
+                | '\u{3001}'
+                | '\u{3002}'
+                | '\u{30fb}'
+                | '"'
+                | '\''
+                | '\u{ff08}'
+                | '\u{ff09}'
+                | '、'
+                | '。'
+                | '，'
+                | ','
+                | '.'
+                | '!'
+                | '？'
+                | '?'
+                | '!'
+                | '：'
+                | ':'
+                | '；'
+                | ';'
+                | '・'
+                | '/'
+                | '\\'
+                | '…'
+                | '—'
+                | '-'
+                | '～'
+                | '~'
+        ) || c.is_whitespace()
+    })
 }
 
 /// Parse Google-like syntax: `"phrase"`, `-exclude`, `-"exclude phrase"`.
@@ -698,6 +818,16 @@ impl SearchBackend for TantivyBackend {
             "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} pos_filter={}",
             parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, pos_filter_enabled
         );
+        eprintln!(
+            "argos: highlight_terms={:?} content_for_includes={:?}",
+            highlight_terms,
+            parsed
+                .includes
+                .iter()
+                .map(|r| self.content_tokens(r, pos_filter_enabled))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_default()
+        );
 
         let searcher = self.reader.searcher();
         // Over-fetch more when scoping by path so post-filter can still fill `limit`.
@@ -709,6 +839,7 @@ impl SearchBackend for TantivyBackend {
         let top = searcher
             .search(&*tantivy_q, &TopDocs::with_limit(fetch_n))
             .map_err(|e| e.to_string())?;
+        eprintln!("argos: tantivy_raw_hits={}", top.len());
 
         // Phrase-only: require the phrase string; free tokens keep half-overlap rule.
         // With POS filtering, tokens are already contentful — requiring half of them
@@ -775,6 +906,11 @@ impl SearchBackend for TantivyBackend {
                 break;
             }
         }
+        eprintln!(
+            "argos: final_hits={} sample_terms={:?}",
+            hits.len(),
+            hits.first().map(|h| &h.highlight_terms)
+        );
         Ok(hits)
     }
 

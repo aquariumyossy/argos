@@ -83,10 +83,16 @@ export function collectPreviewHighlightTerms(
   query: string,
   highlightTerms?: string[],
 ): string[] {
-  const raw = [
-    ...(highlightTerms ?? []).filter((t) => t.trim().length > 0),
-    ...highlightTermsFromQuery(query),
-  ];
+  const fromHit = (highlightTerms ?? []).filter((t) => t.trim().length > 0);
+  const fromQuery =
+    fromHit.length > 0
+      ? []
+      : highlightTermsFromQuery(query).filter((t) => {
+          const hasDelim = /[\s\u3000,\uFF0C\u3001]/.test(t);
+          if (!hasDelim && Array.from(t).length >= 8) return false;
+          return true;
+        });
+  const raw = [...fromHit, ...fromQuery];
   const cleaned = Array.from(
     new Set(raw.map(stripMarkdownFromTerm).filter(isUsefulHighlightTerm)),
   );

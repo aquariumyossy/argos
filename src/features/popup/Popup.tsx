@@ -110,7 +110,18 @@ function highlightTermsFromQuery(query: string): string[] {
 
 function highlight(text: string, query: string, highlightTerms?: string[]) {
   const fromHit = (highlightTerms ?? []).filter((t) => t.trim().length > 0);
-  const fromQuery = highlightTermsFromQuery(query);
+  // When the backend already returns morph content terms (光景 / 見慣れ), do not also
+  // highlight the entire unspaced Japanese query as one giant term — that hides
+  // which content words actually matched.
+  const fromQuery =
+    fromHit.length > 0
+      ? []
+      : highlightTermsFromQuery(query).filter((t) => {
+          const hasDelim = /[\s\u3000,\uFF0C\u3001]/.test(t);
+          // Ignore a single long run of Japanese with no delimiters (selection paste).
+          if (!hasDelim && Array.from(t).length >= 8) return false;
+          return true;
+        });
   const terms = Array.from(new Set([...fromHit, ...fromQuery].filter(Boolean))).sort(
     (a, b) => b.length - a.length,
   );
