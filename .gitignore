@@ -15,6 +15,11 @@ release
 
 # Local icon script previews
 scripts/*-preview.png
+# e-Gov law JSON cache for extract-legal-terms.py
+scripts/.cache/
+
+# Local search-word / evaluation CSVs (do not publish)
+testdata/
 
 # Editor directories and files
 .vscode/*

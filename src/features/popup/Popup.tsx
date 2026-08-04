@@ -198,6 +198,8 @@ export default function Popup() {
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [index, setIndex] = useState(0);
   const [preview, setPreview] = useState<SearchHit | null>(null);
+  const [occurrences, setOccurrences] = useState<SearchHit[]>([]);
+  const [occIndex, setOccIndex] = useState(0);
   const [searching, setSearching] = useState(false);
   const [actionError, setActionError] = useState("");
   const [wordPickerOpen, setWordPickerOpen] = useState(false);
@@ -257,6 +259,8 @@ export default function Popup() {
       setHits(next);
       setIndex(0);
       setPreview(null);
+      setOccurrences([]);
+      setOccIndex(0);
     } catch (e) {
       console.error(e);
     } finally {
@@ -324,6 +328,8 @@ export default function Popup() {
       setHits(event.payload.hits);
       setIndex(0);
       setPreview(null);
+      setOccurrences([]);
+      setOccIndex(0);
       setActionError("");
       setSearching(false);
       setWordPickerOpen(false);
@@ -490,13 +496,45 @@ export default function Popup() {
     const hit = hits[index];
     if (!hit) return;
     setPreview(hit);
-  }, [hits, index]);
+    setOccurrences([hit]);
+    setOccIndex(0);
+    if (hit.source === "remote") return;
+    try {
+      const matches = await invoke<SearchHit[]>("search_path_matches", {
+        query: query.trim(),
+        path: hit.path,
+      });
+      if (!matches.length) return;
+      setOccurrences(matches);
+      const found = matches.findIndex((m) => m.id === hit.id);
+      setOccIndex(found >= 0 ? found : 0);
+      setPreview(matches[found >= 0 ? found : 0] ?? hit);
+    } catch (e) {
+      console.error(e);
+    }
+  }, [hits, index, query]);
+
+  const stepOccurrence = useCallback(
+    (delta: number) => {
+      if (occurrences.length <= 1) return;
+      setOccIndex((i) => {
+        const next = (i + delta + occurrences.length) % occurrences.length;
+        const hit = occurrences[next];
+        if (hit) setPreview(hit);
+        return next;
+      });
+    },
+    [occurrences],
+  );
 
   const hidePopup = useCallback(async () => {
     clearScope();
     setFolderPickerOpen(false);
     setWordPickerOpen(false);
     setHelpOpen(false);
+    setPreview(null);
+    setOccurrences([]);
+    setOccIndex(0);
     await invoke("hide_popup");
   }, [clearScope]);
 
@@ -524,12 +562,37 @@ export default function Popup() {
         }
         if (preview) {
           setPreview(null);
+          setOccurrences([]);
+          setOccIndex(0);
           return;
         }
         void hidePopup();
         return;
       }
       if (wordPickerOpen || helpOpen || folderPickerOpen) return;
+      if (preview) {
+        if (e.key === "ArrowLeft" || e.key === "[") {
+          e.preventDefault();
+          stepOccurrence(-1);
+          return;
+        }
+        if (e.key === "ArrowRight" || e.key === "]") {
+          e.preventDefault();
+          stepOccurrence(1);
+          return;
+        }
+        if (e.key === "Enter" && e.shiftKey) {
+          e.preventDefault();
+          void openFolder();
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          void openSelected();
+          return;
+        }
+        return;
+      }
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setIndex((i) => Math.min(i + 1, Math.max(hits.length - 1, 0)));
@@ -566,6 +629,7 @@ export default function Popup() {
     openSelected,
     preview,
     showPreview,
+    stepOccurrence,
     wordPickerOpen,
   ]);
 
@@ -848,8 +912,38 @@ export default function Popup() {
               🔍
             </button>
           </div>
+          {occurrences.length > 0 ? (
+            <div className="preview-occ-nav" aria-live="polite">
+              <button
+                type="button"
+                disabled={occurrences.length <= 1}
+                title="前の出現箇所 (←)"
+                aria-label="前の出現箇所"
+                onClick={() => stepOccurrence(-1)}
+              >
+                ←
+              </button>
+              <span className="preview-occ-label">
+                {occIndex + 1} / {occurrences.length}
+                {preview.page != null ? ` · p.${preview.page}` : ""}
+              </span>
+              <button
+                type="button"
+                disabled={occurrences.length <= 1}
+                title="次の出現箇所 (→)"
+                aria-label="次の出現箇所"
+                onClick={() => stepOccurrence(1)}
+              >
+                →
+              </button>
+            </div>
+          ) : null}
           <PreviewBody hit={preview} query={query} />
-          <div className="hint">Esc で一覧に戻る</div>
+          <div className="hint">
+            {occurrences.length > 1
+              ? "←→ 出現箇所 · Esc で一覧に戻る"
+              : "Esc で一覧に戻る"}
+          </div>
         </section>
       ) : (
         <ul className="hit-list" ref={listRef}>
@@ -931,11 +1025,21 @@ export default function Popup() {
       {actionError ? <div className="popup-error">{actionError}</div> : null}
 
       <footer className="popup-footer">
-        <span>↑↓ 移動</span>
-        <span>Enter 開く</span>
-        <span>Shift+Enter フォルダ</span>
-        <span>Ctrl+Enter プレビュー</span>
-        <span>Esc / 外クリック 閉じる</span>
+        {preview ? (
+          <>
+            <span>←→ 出現箇所</span>
+            <span>Enter 開く</span>
+            <span>Esc 一覧</span>
+          </>
+        ) : (
+          <>
+            <span>↑↓ 移動</span>
+            <span>Enter 開く</span>
+            <span>Shift+Enter フォルダ</span>
+            <span>Ctrl+Enter プレビュー</span>
+            <span>Esc / 外クリック 閉じる</span>
+          </>
+        )}
       </footer>
     </div>
   );

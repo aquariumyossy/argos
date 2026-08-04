@@ -535,6 +535,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn clear_search_words(&self) -> Result<u64, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute("DELETE FROM search_words", [])?;
+        Ok(n as u64)
+    }
+
     pub fn import_search_words(
         &self,
         entries: &[SearchWordImport],
