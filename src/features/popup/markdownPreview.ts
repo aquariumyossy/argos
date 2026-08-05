@@ -115,6 +115,22 @@ export function isMarkdownPath(path: string): boolean {
   return ext === "md" || ext === "markdown";
 }
 
+export function isHtmlPath(path: string): boolean {
+  const base = path.replace(/\\/g, "/").split("/").pop() ?? "";
+  const i = base.lastIndexOf(".");
+  if (i <= 0 || i === base.length - 1) return false;
+  const ext = base.slice(i + 1).toLowerCase();
+  return ext === "html" || ext === "htm";
+}
+
+/** Split extracted HTML body on blank lines for prose preview paragraphs. */
+export function splitProseParagraphs(text: string): string[] {
+  return text
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+}
+
 export function renderMarkdownHtml(text: string): string {
   const prepared = prepareMarkdownChunk(text);
   const html = marked.parse(prepared, { breaks: true, gfm: true, async: false }) as string;
