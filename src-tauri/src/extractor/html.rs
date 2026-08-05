@@ -255,34 +255,82 @@ fn extract_title(html: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TagBreak {
+    /// Block boundary → blank line for paragraph segmentation / readable preview.
+    Block,
+    /// Soft line break (`<br>`, `<hr>`).
+    Line,
+    /// Inline / unknown tags: no extra break (text nodes keep their own spaces).
+    None,
+}
+
+fn tag_break(name: &str) -> TagBreak {
+    match name {
+        "br" | "hr" => TagBreak::Line,
+        "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "aside"
+        | "nav" | "form" | "address" | "details" | "summary" | "figure" | "figcaption"
+        | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "tr" | "blockquote" | "pre"
+        | "table" | "ul" | "ol" | "dl" | "dt" | "dd" | "html" | "body" | "head" | "title" => {
+            TagBreak::Block
+        }
+        _ => TagBreak::None,
+    }
+}
+
+/// Strip markup, inserting newlines at block/`br` boundaries so structure survives.
 fn strip_tags(html: &str) -> String {
+    let chars: Vec<char> = html.chars().collect();
     let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let mut last_was_space = true;
-    for ch in html.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
+    let mut i = 0usize;
+    let len = chars.len();
+
+    while i < len {
+        if chars[i] != '<' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Parse a tag: optional `/`, name, then skip to `>`.
+        i += 1;
+        if i < len && chars[i] == '/' {
+            i += 1;
+        }
+        // Skip `!` / `?` declarations (DOCTYPE, XML) without emitting breaks.
+        if i < len && matches!(chars[i], '!' | '?') {
+            while i < len && chars[i] != '>' {
+                i += 1;
             }
-            '>' => {
-                in_tag = false;
-                if !last_was_space {
-                    out.push(' ');
-                    last_was_space = true;
-                }
+            if i < len {
+                i += 1;
             }
-            _ if !in_tag => {
-                if ch.is_whitespace() {
-                    if !last_was_space {
-                        out.push(' ');
-                        last_was_space = true;
-                    }
-                } else {
-                    out.push(ch);
-                    last_was_space = false;
-                }
-            }
-            _ => {}
+            continue;
+        }
+
+        let name_start = i;
+        while i < len && chars[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        let name: String = chars[name_start..i]
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+
+        while i < len && chars[i] != '>' {
+            i += 1;
+        }
+        if i < len {
+            i += 1;
+        }
+
+        if name.is_empty() {
+            continue;
+        }
+        match tag_break(&name) {
+            TagBreak::Block => out.push_str("\n\n"),
+            TagBreak::Line => out.push('\n'),
+            TagBreak::None => {}
         }
     }
     out
@@ -358,20 +406,47 @@ fn entity_to_char(name: &str) -> Option<char> {
     })
 }
 
+/// Collapse horizontal whitespace within lines; preserve newlines (max one blank line).
 fn collapse_whitespace(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut last_was_space = true;
+    let mut newline_run = 0usize;
+    let mut space_pending = false;
+    let mut at_line_start = true;
+
     for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !last_was_space {
-                out.push(' ');
-                last_was_space = true;
-            }
-        } else {
-            out.push(ch);
-            last_was_space = false;
+        if ch == '\r' {
+            continue;
         }
+        if ch == '\n' {
+            space_pending = false;
+            newline_run += 1;
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !at_line_start {
+                space_pending = true;
+            }
+            continue;
+        }
+
+        if newline_run > 0 {
+            if newline_run == 1 {
+                out.push('\n');
+            } else {
+                out.push_str("\n\n");
+            }
+            newline_run = 0;
+            space_pending = false;
+            at_line_start = true;
+        }
+        if space_pending && !at_line_start {
+            out.push(' ');
+        }
+        space_pending = false;
+        at_line_start = false;
+        out.push(ch);
     }
+
     out.trim().to_string()
 }
 
@@ -445,5 +520,39 @@ mod tests {
     fn numeric_entities() {
         let s = decode_entities("A&#65;B&#x41;C");
         assert_eq!(s, "AABAC");
+    }
+
+    #[test]
+    fn preserves_paragraph_breaks() {
+        let html = r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>段落</title></head>
+<body>
+<h1>見出し</h1>
+<p>第一段落です。</p>
+<p>第二段落です。</p>
+<p>改行<br>あり</p>
+</body></html>"#;
+        let (title, text) = html_to_text(html);
+        assert_eq!(title.as_deref(), Some("段落"));
+        assert!(text.contains("見出し"));
+        assert!(text.contains("第一段落です。"));
+        assert!(text.contains("第二段落です。"));
+        // Blank line between block elements for segmenter / prose preview.
+        assert!(
+            text.contains("第一段落です。\n\n第二段落です。"),
+            "expected blank line between paragraphs, got: {text:?}"
+        );
+        // Soft break from <br>.
+        assert!(
+            text.contains("改行\nあり"),
+            "expected soft newline from br, got: {text:?}"
+        );
+        assert!(!text.contains('<'), "tags should be stripped: {text:?}");
+    }
+
+    #[test]
+    fn collapse_keeps_newlines_collapses_spaces() {
+        let collapsed = collapse_whitespace("a   b\n\n\nc\t\td\n");
+        assert_eq!(collapsed, "a b\n\nc d");
     }
 }

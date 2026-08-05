@@ -794,6 +794,27 @@
   font-size: 14px;
 }
 
+.preview-body--prose {
+  white-space: normal;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+  line-height: 1.75;
+  font-size: 14px;
+}
+
+.preview-body--prose > :first-child {
+  margin-top: 0;
+}
+
+.preview-body--prose > :last-child {
+  margin-bottom: 0;
+}
+
+.preview-body--prose p {
+  margin: 0.55em 0;
+  white-space: pre-line;
+}
+
 ::highlight(argos-preview) {
   background-color: var(--highlight);
   color: inherit;

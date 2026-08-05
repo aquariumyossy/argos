@@ -6,8 +6,10 @@ import {
   applyPreviewHighlights,
   clearPreviewHighlights,
   collectPreviewHighlightTerms,
+  isHtmlPath,
   isMarkdownPath,
   renderMarkdownHtml,
+  splitProseParagraphs,
 } from "./markdownPreview";
 import "./popup.css";
 
@@ -178,10 +180,15 @@ function PreviewBody({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const isMarkdown = isMarkdownPath(hit.path);
+  const isHtml = isHtmlPath(hit.path);
   const markdownHtml = useMemo(() => {
     if (!isMarkdown) return "";
     return renderMarkdownHtml(hit.previewText);
   }, [hit.previewText, isMarkdown]);
+  const proseParagraphs = useMemo(() => {
+    if (!isHtml) return [];
+    return splitProseParagraphs(hit.previewText);
+  }, [hit.previewText, isHtml]);
   const highlightTerms = useMemo(
     () => collectPreviewHighlightTerms(query, hit.highlightTerms),
     [query, hit.highlightTerms],
@@ -202,6 +209,16 @@ function PreviewBody({
         className="preview-body preview-body--markdown"
         dangerouslySetInnerHTML={{ __html: markdownHtml }}
       />
+    );
+  }
+
+  if (isHtml) {
+    return (
+      <div className="preview-body preview-body--prose">
+        {proseParagraphs.map((para, i) => (
+          <p key={i}>{highlight(para, query, hit.highlightTerms)}</p>
+        ))}
+      </div>
     );
   }
 
