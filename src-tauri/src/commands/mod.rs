@@ -20,6 +20,9 @@ use crate::{hide_popup_window, show_main, show_popup};
 pub struct SearchPayload {
     pub query: String,
     pub hits: Vec<SearchHit>,
+    /// True while shortcut search is still running (popup shown early).
+    #[serde(default)]
+    pub searching: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -151,7 +154,23 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
 
-    eprintln!("argos: captured query len={} preview={:?}", query.chars().count(), query.chars().take(40).collect::<String>());
+    eprintln!(
+        "argos: captured query len={} preview={:?}",
+        query.chars().count(),
+        query.chars().take(40).collect::<String>()
+    );
+
+    // Show popup immediately with the query; search fills results after.
+    show_popup(app);
+    app.emit(
+        "search-results",
+        SearchPayload {
+            query: query.clone(),
+            hits: Vec::new(),
+            searching: true,
+        },
+    )
+    .map_err(|e| e.to_string())?;
 
     let settings = state.settings.read().clone();
     let backend = state.backend.clone();
@@ -163,9 +182,15 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
     .await
     .map_err(|e| e.to_string())??;
 
-    show_popup(app);
-    app.emit("search-results", SearchPayload { query, hits })
-        .map_err(|e| e.to_string())?;
+    app.emit(
+        "search-results",
+        SearchPayload {
+            query,
+            hits,
+            searching: false,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

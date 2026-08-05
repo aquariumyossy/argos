@@ -17,10 +17,22 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term, TantivyD
 use crate::pathutil;
 
 use super::morph::{is_noise_highlight_term, MorphAnalyzer};
-use super::{SearchBackend, SearchHit};
+use super::{ParagraphHit, SearchBackend, SearchHit};
 
-const CHUNK_SIZE: usize = 800;
-const CHUNK_OVERLAP: usize = 100;
+/// Bump when Tantivy on-disk schema changes. Triggers wipe + full reindex.
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION_FILE: &str = "argos_schema_version";
+
+/// Nested paragraphs shown under each file hit in the popup list.
+const NESTED_PARAGRAPH_LIMIT: usize = 3;
+/// Collapse near-duplicate units in the same file (shared label / body overlap).
+const DEDUPE_BODY_OVERLAP: f32 = 0.45;
+
+pub struct OpenIndexResult {
+    pub backend: TantivyBackend,
+    /// True when an older index was wiped; caller should run full reindex.
+    pub needs_full_reindex: bool,
+}
 
 pub struct TantivyBackend {
     index: Index,
@@ -41,11 +53,41 @@ struct Fields {
     page: Field,
     chunk_id: Field,
     doc_key: Field,
+    unit_id: Field,
+    unit_label: Field,
+    unit_kind: Field,
 }
 
 impl TantivyBackend {
-    pub fn open(index_dir: &Path) -> Result<Self, String> {
+    pub fn open(index_dir: &Path) -> Result<OpenIndexResult, String> {
         std::fs::create_dir_all(index_dir).map_err(|e| e.to_string())?;
+
+        let version_path = index_dir.join(SCHEMA_VERSION_FILE);
+        let existing_version = std::fs::read_to_string(&version_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let has_index = index_dir.join("meta.json").exists();
+        let needs_full_reindex = has_index && existing_version != Some(INDEX_SCHEMA_VERSION);
+
+        if needs_full_reindex {
+            eprintln!(
+                "argos: index schema {:?} -> {}; wiping index for rebuild",
+                existing_version, INDEX_SCHEMA_VERSION
+            );
+            // Remove Tantivy files but keep the directory.
+            for entry in std::fs::read_dir(index_dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path.file_name().and_then(|n| n.to_str()) == Some(SCHEMA_VERSION_FILE) {
+                    continue;
+                }
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
 
         let mut schema_builder = Schema::builder();
         let text_opts = TextOptions::default()
@@ -66,6 +108,9 @@ impl TantivyBackend {
         let page = schema_builder.add_text_field("page", STRING | STORED);
         let chunk_id = schema_builder.add_text_field("chunk_id", STRING | STORED);
         let doc_key = schema_builder.add_text_field("doc_key", STRING | STORED);
+        let unit_id = schema_builder.add_text_field("unit_id", STRING | STORED);
+        let unit_label = schema_builder.add_text_field("unit_label", STRING | STORED);
+        let unit_kind = schema_builder.add_text_field("unit_kind", STRING | STORED);
         let schema = schema_builder.build();
 
         let index = if index_dir.join("meta.json").exists() {
@@ -73,6 +118,9 @@ impl TantivyBackend {
         } else {
             Index::create_in_dir(index_dir, schema.clone()).map_err(|e| e.to_string())?
         };
+
+        std::fs::write(&version_path, INDEX_SCHEMA_VERSION.to_string())
+            .map_err(|e| e.to_string())?;
 
         // Decompose helps split compounds like 損害賠償 -> 損害 + 賠償
         let dictionary = load_dictionary("embedded://ipadic").map_err(|e| e.to_string())?;
@@ -89,23 +137,29 @@ impl TantivyBackend {
             .try_into()
             .map_err(|e| e.to_string())?;
 
-        Ok(Self {
-            index,
-            reader,
-            writer: Mutex::new(writer),
-            fields: Fields {
-                title,
-                body,
-                path,
-                mtime,
-                size,
-                ext,
-                folder,
-                page,
-                chunk_id,
-                doc_key,
+        Ok(OpenIndexResult {
+            backend: Self {
+                index,
+                reader,
+                writer: Mutex::new(writer),
+                fields: Fields {
+                    title,
+                    body,
+                    path,
+                    mtime,
+                    size,
+                    ext,
+                    folder,
+                    page,
+                    chunk_id,
+                    doc_key,
+                    unit_id,
+                    unit_label,
+                    unit_kind,
+                },
+                morph: Mutex::new(morph),
             },
-            morph: Mutex::new(morph),
+            needs_full_reindex,
         })
     }
 
@@ -166,29 +220,34 @@ impl TantivyBackend {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        let chunks = crate::extractor::chunk_pages(&extracted.pages, CHUNK_SIZE, CHUNK_OVERLAP);
+        let units = crate::extractor::segment_pages(&extracted.pages);
         let mut writer = self.writer.lock();
-        for chunk in &chunks {
-            let key = format!("{}#{}", path_str, chunk.chunk_id);
-            let page_str = chunk.page.map(|p| p.to_string()).unwrap_or_default();
+        for unit in &units {
+            let key = format!("{}#{}", path_str, unit.unit_id);
+            let page_str = unit.page.map(|p| p.to_string()).unwrap_or_default();
+            let unit_id_str = unit.unit_id.to_string();
             writer
                 .add_document(doc!(
                     self.fields.title => extracted.title.as_str(),
-                    self.fields.body => chunk.text.as_str(),
+                    self.fields.body => unit.text.as_str(),
                     self.fields.path => path_str.as_str(),
                     self.fields.mtime => mtime.to_string().as_str(),
                     self.fields.size => size.to_string().as_str(),
                     self.fields.ext => ext.as_str(),
                     self.fields.folder => folder,
                     self.fields.page => page_str.as_str(),
-                    self.fields.chunk_id => chunk.chunk_id.to_string().as_str(),
+                    // chunk_id kept as unit sequence for preview ordering compatibility
+                    self.fields.chunk_id => unit_id_str.as_str(),
                     self.fields.doc_key => key.as_str(),
+                    self.fields.unit_id => unit_id_str.as_str(),
+                    self.fields.unit_label => unit.label.as_str(),
+                    self.fields.unit_kind => unit.kind.as_str(),
                 ))
                 .map_err(|e| e.to_string())?;
         }
         writer.commit().map_err(|e| e.to_string())?;
         self.reader.reload().map_err(|e| e.to_string())?;
-        Ok(chunks.len())
+        Ok(units.len())
     }
 
     /// Kept for Tantivy tokenizer parity with the inverted index vocabulary.
@@ -476,6 +535,7 @@ impl TantivyBackend {
         let page = get(self.fields.page).parse().ok();
         let chunk_id = get(self.fields.chunk_id).parse().ok();
         let key = get(self.fields.doc_key);
+        let unit_label = get(self.fields.unit_label);
         let snippet = make_snippet(&body, query, highlight_terms, 100);
         // Only terms that actually appear in this hit
         let haystack = format!("{title} {body}");
@@ -497,6 +557,9 @@ impl TantivyBackend {
             source: "local".into(),
             preview_text: body,
             highlight_terms: terms,
+            match_count: 1,
+            paragraphs: Vec::new(),
+            unit_label,
         })
     }
 }
@@ -866,13 +929,14 @@ impl TantivyBackend {
         };
 
         let searcher = self.reader.searcher();
-        // Over-fetch more when scoping by path so post-filter can still fill `limit`.
+        // `limit` is the desired scored-unit count. Mild over-fetch absorbs post-filters.
+        // (Do not multiply by large factors here — callers already size the unit budget.)
         let fetch_n = if exact.is_some() {
-            limit.max(50)
+            limit.max(50).min(80)
         } else if scope.is_some() {
-            (limit * 40).max(200)
+            (limit * 5).max(80).min(400)
         } else {
-            (limit * 8).max(40)
+            (limit * 2).max(40).min(200)
         };
         let mut top = searcher
             .search(&*wrap_path(tantivy_q), &TopDocs::with_limit(fetch_n))
@@ -983,11 +1047,9 @@ impl TantivyBackend {
             ca.cmp(&cb)
                 .then_with(|| a.1.page.unwrap_or(0).cmp(&b.1.page.unwrap_or(0)))
         });
-        let hits: Vec<SearchHit> = scored
-            .into_iter()
-            .map(|(_, hit)| hit)
-            .take(limit)
-            .collect();
+        let hits: Vec<SearchHit> = scored.into_iter().map(|(_, hit)| hit).collect();
+        let hits = dedupe_path_units_doc_order(hits);
+        let hits: Vec<SearchHit> = hits.into_iter().take(limit).collect();
         eprintln!(
             "argos: path_matches={} path={}",
             hits.len(),
@@ -995,6 +1057,107 @@ impl TantivyBackend {
         );
         Ok(hits)
     }
+}
+
+/// Prefer higher-score units; drop near-duplicates in the same file.
+fn dedupe_path_units(mut units: Vec<SearchHit>) -> Vec<SearchHit> {
+    units.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut kept: Vec<SearchHit> = Vec::new();
+    for u in units {
+        if kept.iter().any(|k| units_are_near_duplicate(k, &u)) {
+            continue;
+        }
+        kept.push(u);
+    }
+    kept
+}
+
+/// Dedupe then restore document order (preview occurrence navigation).
+fn dedupe_path_units_doc_order(units: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut kept = dedupe_path_units(units);
+    kept.sort_by(|a, b| {
+        a.chunk_id
+            .unwrap_or(0)
+            .cmp(&b.chunk_id.unwrap_or(0))
+            .then_with(|| a.page.unwrap_or(0).cmp(&b.page.unwrap_or(0)))
+    });
+    kept
+}
+
+fn units_are_near_duplicate(a: &SearchHit, b: &SearchHit) -> bool {
+    let overlap = body_overlap_ratio(&a.preview_text, &b.preview_text);
+    if overlap >= DEDUPE_BODY_OVERLAP {
+        return true;
+    }
+    // Same label + identical snippet (typical UI-visible duplicate from tiny split overlap).
+    // Do not merge on label alone — long articles share a parent label across distinct chunks.
+    let la = a.unit_label.trim();
+    let lb = b.unit_label.trim();
+    if !la.is_empty() && la == lb {
+        let sa = normalize_unit_text(&a.snippet);
+        let sb = normalize_unit_text(&b.snippet);
+        if !sa.is_empty() && sa == sb {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_unit_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Overlap of two unit bodies in \[0, 1\] via containment or character-trigram Dice.
+fn body_overlap_ratio(a: &str, b: &str) -> f32 {
+    let na = normalize_unit_text(a);
+    let nb = normalize_unit_text(b);
+    if na.is_empty() || nb.is_empty() {
+        return 0.0;
+    }
+    if na == nb {
+        return 1.0;
+    }
+    let (shorter, longer) = if na.chars().count() <= nb.chars().count() {
+        (na.as_str(), nb.as_str())
+    } else {
+        (nb.as_str(), na.as_str())
+    };
+    if longer.contains(shorter) {
+        let s = shorter.chars().count().max(1) as f32;
+        let l = longer.chars().count().max(1) as f32;
+        return (s / l).clamp(0.0, 1.0);
+    }
+    let ta = char_trigrams(&na);
+    let tb = char_trigrams(&nb);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let mut inter = 0usize;
+    for t in &ta {
+        if tb.contains(t) {
+            inter += 1;
+        }
+    }
+    let dice = (2.0 * inter as f32) / (ta.len() + tb.len()) as f32;
+    dice.clamp(0.0, 1.0)
+}
+
+fn char_trigrams(s: &str) -> HashSet<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut set = HashSet::new();
+    if chars.len() < 3 {
+        if !chars.is_empty() {
+            set.insert(chars.iter().collect());
+        }
+        return set;
+    }
+    for i in 0..=chars.len() - 3 {
+        set.insert(chars[i..i + 3].iter().collect());
+    }
+    set
 }
 
 impl SearchBackend for TantivyBackend {
@@ -1005,14 +1168,55 @@ impl SearchBackend for TantivyBackend {
         path_prefix: Option<&str>,
         pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
-        let scored = self.search_scored(query, limit, path_prefix, pos_filter_enabled, None)?;
-        let mut hits: Vec<SearchHit> = Vec::new();
-        let mut seen_paths = HashSet::new();
+        // Unit budget ≈ pre-paragraph TopDocs size so nesting does not explode fetch_n.
+        // search_scored applies only a mild over-fetch on top of this.
+        let unit_limit = (limit * 8).max(40);
+        let scored =
+            self.search_scored(query, unit_limit, path_prefix, pos_filter_enabled, None)?;
+
+        // Group by path; scored is already best-score-first.
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<SearchHit>> =
+            std::collections::HashMap::new();
         for (_, hit) in scored {
-            if !seen_paths.insert(hit.path.clone()) {
+            let path = hit.path.clone();
+            if !groups.contains_key(&path) {
+                order.push(path.clone());
+            }
+            groups.entry(path).or_default().push(hit);
+        }
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for path in order {
+            let Some(mut units) = groups.remove(&path) else {
+                continue;
+            };
+            if units.is_empty() {
                 continue;
             }
-            hits.push(hit);
+            // units already score-sorted from global sort; keep that order within path.
+            units.sort_by(|a, b| b.score.total_cmp(&a.score));
+            let units = dedupe_path_units(units);
+            let match_count = units.len() as u32;
+            let paragraphs: Vec<ParagraphHit> = units
+                .iter()
+                .take(NESTED_PARAGRAPH_LIMIT)
+                .map(|u| ParagraphHit {
+                    id: u.id.clone(),
+                    label: if u.unit_label.is_empty() {
+                        u.snippet.chars().take(36).collect()
+                    } else {
+                        u.unit_label.clone()
+                    },
+                    snippet: u.snippet.clone(),
+                    score: u.score,
+                    page: u.page,
+                })
+                .collect();
+            let mut best = units.into_iter().next().expect("non-empty");
+            best.match_count = match_count;
+            best.paragraphs = paragraphs;
+            hits.push(best);
             if hits.len() >= limit {
                 break;
             }
@@ -1081,6 +1285,81 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_collapses_overlapping_same_label_units() {
+        let make = |id: &str, label: &str, body: &str, score: f32| SearchHit {
+            id: id.into(),
+            title: "t".into(),
+            snippet: body.chars().take(40).collect(),
+            path: r"C:\a.txt".into(),
+            page: Some(1),
+            chunk_id: Some(0),
+            score,
+            source: "local".into(),
+            preview_text: body.into(),
+            highlight_terms: vec![],
+            match_count: 1,
+            paragraphs: vec![],
+            unit_label: label.into(),
+        };
+        let shared = "損害賠償について定める。甲は乙に対し損害を賠償する義務を負う。".repeat(3);
+        let a = make("a#0", "第12条", &shared, 10.0);
+        let mut almost = shared.clone();
+        almost.push_str("なお特約がある。");
+        let b = make("a#1", "第12条", &almost, 8.0);
+        let other = make(
+            "a#2",
+            "第13条",
+            "秘密保持義務について別に定める。開示禁止と例外を列挙する。",
+            9.0,
+        );
+        let kept = dedupe_path_units(vec![a, b, other]);
+        assert_eq!(kept.len(), 2, "high body overlap merges; different label kept");
+        assert!(kept.iter().any(|h| h.id == "a#0"));
+        assert!(kept.iter().any(|h| h.id == "a#2"));
+        assert!(!kept.iter().any(|h| h.id == "a#1"));
+    }
+
+    #[test]
+    fn dedupe_keeps_same_label_distinct_bodies() {
+        let make = |id: &str, body: &str, score: f32| SearchHit {
+            id: id.into(),
+            title: "t".into(),
+            snippet: body.chars().take(20).collect(),
+            path: r"C:\a.txt".into(),
+            page: Some(1),
+            chunk_id: Some(0),
+            score,
+            source: "local".into(),
+            preview_text: body.into(),
+            highlight_terms: vec![],
+            match_count: 1,
+            paragraphs: vec![],
+            unit_label: "第12条（損害賠償）".into(),
+        };
+        let a = make(
+            "a#0",
+            "第12条（損害賠償）甲は故意または過失により損害を賠償する。前段の詳細。",
+            10.0,
+        );
+        let b = make(
+            "a#1",
+            "第12条（損害賠償）乙は前項の請求について異議を述べることができる。後段。",
+            9.0,
+        );
+        let kept = dedupe_path_units(vec![a, b]);
+        assert_eq!(kept.len(), 2, "shared parent label must not merge distinct chunks");
+    }
+
+    #[test]
+    fn body_overlap_detects_near_copies() {
+        let a = "あいうえおかきくけこさしすせそたちつてとなにぬねの";
+        let b = "あいうえおかきくけこさしすせそたちつてとなにぬねの。追加。";
+        assert!(body_overlap_ratio(a, b) >= DEDUPE_BODY_OVERLAP);
+        let c = "まったく別の文章で契約の解除と損害賠償について述べる。";
+        assert!(body_overlap_ratio(a, c) < DEDUPE_BODY_OVERLAP);
+    }
+
+    #[test]
     fn loose_fallback_keeps_content_substring_hits() {
         let dir = std::env::temp_dir().join(format!(
             "argos-tantivy-loose-{}",
@@ -1091,7 +1370,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let backend = TantivyBackend::open(&dir).expect("open index");
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
 
         // Junk doc: common debris tokens only (no content nouns from the query).
         let junk = "そうしたことはない。いてもよい。";
@@ -1167,7 +1446,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let backend = TantivyBackend::open(&dir).expect("open index");
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
         let body = "この光景は印象的だった。";
         let extracted = crate::extractor::ExtractedDoc {
             title: "only-noun".into(),
@@ -1208,7 +1487,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let backend = TantivyBackend::open(&dir).expect("open index");
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
         let sentence = "そうした光景を見慣れています";
         let indexed = backend.tokenize_ja(sentence).expect("tokenize");
         eprintln!("indexed tokens={indexed:?}");
@@ -1267,12 +1546,17 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let backend = TantivyBackend::open(&dir).expect("open index");
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
 
-        // Marker spaced so it lands in several 800-char chunks.
-        let filler = "あ".repeat(700);
+        // Distinct, varied fillers so long-split units are not near-duplicates.
+        let filler_a: String = (0..700)
+            .map(|i| char::from_u32(0x3042 + (i % 40) as u32).unwrap())
+            .collect();
+        let filler_b: String = (0..700)
+            .map(|i| char::from_u32(0x30a2 + (i % 40) as u32).unwrap())
+            .collect();
         let body = format!(
-            "損害賠償について。{filler}次に損害賠償を述べる。{filler}最後に損害賠償。"
+            "損害賠償について。{filler_a}次に損害賠償を述べる。{filler_b}最後に損害賠償。"
         );
         let path = dir.join("multi.txt");
         let path_str = path.to_str().unwrap().to_string();
@@ -1299,14 +1583,23 @@ mod tests {
             .expect("path matches");
         assert!(
             matches.len() >= 2,
-            "expected multiple chunks, got {}",
+            "expected multiple units, got {}",
             matches.len()
         );
         assert!(matches.iter().all(|h| h.path == path_str));
         let chunk_ids: Vec<_> = matches.iter().map(|h| h.chunk_id).collect();
         let mut sorted = chunk_ids.clone();
         sorted.sort();
-        assert_eq!(chunk_ids, sorted, "chunks ordered by chunk_id");
+        assert_eq!(chunk_ids, sorted, "units ordered by chunk_id");
+
+        assert!(
+            list[0].match_count >= 2,
+            "file hit should report multiple paragraph matches"
+        );
+        assert!(
+            !list[0].paragraphs.is_empty(),
+            "file hit should nest paragraph snippets"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

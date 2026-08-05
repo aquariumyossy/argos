@@ -574,6 +574,53 @@
   font-size: 13px;
 }
 
+.hit-paragraphs {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hit-paragraph-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.45);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.hit-paragraph-btn:hover {
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.hit-paragraph-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.hit-paragraph-snippet {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.hit-paragraph-more {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 2px 8px;
+}
+
 .hit-path {
   margin-top: 3px;
   font-size: 11px;
@@ -916,6 +963,14 @@
 .preview-body mark,
 .hit mark,
 .hit-snippet mark {
+  background: var(--highlight);
+  color: inherit;
+  font-weight: 700;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+.hit-paragraph-snippet mark {
   background: var(--highlight);
   color: inherit;
   font-weight: 700;

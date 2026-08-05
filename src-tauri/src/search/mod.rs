@@ -26,6 +26,26 @@ pub struct SearchHit {
     pub preview_text: String,
     /// Morphological / matched terms to highlight in UI.
     pub highlight_terms: Vec<String>,
+    /// Number of matching paragraph units in this file (list aggregation).
+    #[serde(default)]
+    pub match_count: u32,
+    /// Nested matching paragraphs (top N for list UI). Empty when unknown/compat.
+    #[serde(default)]
+    pub paragraphs: Vec<ParagraphHit>,
+    /// Best-effort unit label for the primary (best) paragraph.
+    #[serde(default)]
+    pub unit_label: String,
+}
+
+/// One matching paragraph nested under a file hit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphHit {
+    pub id: String,
+    pub label: String,
+    pub snippet: String,
+    pub score: f32,
+    pub page: Option<u32>,
 }
 
 pub trait SearchBackend: Send + Sync {

@@ -1,10 +1,13 @@
 mod html;
+pub mod segment;
 
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
 use zip::ZipArchive;
+
+pub use segment::{segment_pages, SearchUnit, UNIT_MAX_CHARS, UNIT_MIN_CHARS};
 
 #[derive(Debug, Clone)]
 pub struct ExtractedDoc {
@@ -132,11 +135,57 @@ fn extract_docx(path: &Path) -> Result<ExtractedDoc, String> {
             .map_err(|e| e.to_string())?;
         entry.read_to_string(&mut xml).map_err(|e| e.to_string())?;
     }
-    let text = strip_xml_text(&xml);
+    // Preserve `w:p` boundaries as blank-line separated blocks for segmentation.
+    let paragraphs = docx_paragraphs(&xml);
+    let text = if paragraphs.is_empty() {
+        strip_xml_text(&xml)
+    } else {
+        paragraphs.join("\n\n")
+    };
+    if !text.chars().any(|c| !c.is_whitespace()) {
+        return Err(SKIP_NO_TEXT.into());
+    }
     Ok(ExtractedDoc {
         title: file_title(path),
         pages: vec![text],
     })
+}
+
+/// Extract text per `w:p` element (empty paragraphs kept as blank separators).
+fn docx_paragraphs(xml: &str) -> Vec<String> {
+    let mut paras = Vec::new();
+    let mut rest = xml;
+    while let Some(rel) = rest.find("<w:p") {
+        let from = &rest[rel..];
+        // Reject lookalikes: w:pPr, w:pStyle, w:pict, …
+        let is_paragraph = from.starts_with("<w:p>")
+            || from.starts_with("<w:p ")
+            || from.starts_with("<w:p\t")
+            || from.starts_with("<w:p\n")
+            || from.starts_with("<w:p\r")
+            || from.starts_with("<w:p/");
+        if !is_paragraph {
+            rest = &from[1..]; // skip this `<` and keep searching
+            continue;
+        }
+        let Some(gt) = from.find('>') else {
+            break;
+        };
+        // Self-closing empty paragraph → blank separator
+        if from[..gt].ends_with('/') {
+            paras.push(String::new());
+            rest = &from[gt + 1..];
+            continue;
+        }
+        let after_open = &from[gt + 1..];
+        let Some(end_rel) = after_open.find("</w:p>") else {
+            break;
+        };
+        let inner = &after_open[..end_rel];
+        paras.push(strip_xml_text(inner));
+        rest = &after_open[end_rel + "</w:p>".len()..];
+    }
+    paras
 }
 
 fn extract_doc(path: &Path) -> Result<ExtractedDoc, String> {
@@ -295,5 +344,36 @@ mod tests {
     fn file_title_keeps_html_extension() {
         assert_eq!(file_title(Path::new("C:\\docs\\report.html")), "report.html");
         assert_eq!(file_title(Path::new("C:\\docs\\index.htm")), "index.htm");
+    }
+
+    #[test]
+    fn docx_paragraphs_split_on_wp() {
+        let xml = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>第一条（目的）</w:t></w:r></w:p>
+    <w:p><w:pPr/><w:r><w:t>この契約は甲乙間の取引条件を定めることを目的として締結されるものであり、十分な長さの本文を持つ。</w:t></w:r></w:p>
+    <w:p><w:r><w:t></w:t></w:r></w:p>
+    <w:p><w:r><w:t>第二条（定義）</w:t></w:r></w:p>
+    <w:p><w:r><w:t>本契約において用いる用語の定義は次のとおりとし、こちらも十分な長さの段落本文とするものである。</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let paras = docx_paragraphs(xml);
+        assert!(
+            paras.iter().any(|p| p.contains("第一条")),
+            "paras={paras:?}"
+        );
+        assert!(
+            paras.iter().any(|p| p.contains("第二条")),
+            "paras={paras:?}"
+        );
+        let joined = paras.join("\n\n");
+        let units = segment_pages(&[joined]);
+        assert!(
+            units.len() >= 2,
+            "expected blank-line units from w:p, got {}: {:?}",
+            units.len(),
+            units.iter().map(|u| &u.label).collect::<Vec<_>>()
+        );
     }
 }

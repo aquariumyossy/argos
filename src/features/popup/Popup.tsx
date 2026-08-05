@@ -21,6 +21,14 @@ type ResizeDirection =
   | "SouthWest"
   | "West";
 
+export type ParagraphHit = {
+  id: string;
+  label: string;
+  snippet: string;
+  score: number;
+  page?: number | null;
+};
+
 export type SearchHit = {
   id: string;
   title: string;
@@ -32,11 +40,15 @@ export type SearchHit = {
   source: string;
   previewText: string;
   highlightTerms?: string[];
+  matchCount?: number;
+  paragraphs?: ParagraphHit[];
+  unitLabel?: string;
 };
 
 type SearchPayload = {
   query: string;
   hits: SearchHit[];
+  searching?: boolean;
 };
 
 type SearchWordRow = { id: number; word: string; reading?: string; posLabel?: string };
@@ -48,7 +60,7 @@ type SearchScopesResult = {
   scopes: SearchScopeRow[];
 };
 
-const SEARCH_DEBOUNCE_MS = 220;
+const SEARCH_DEBOUNCE_MS = 450;
 
 /** Parent directory of a Windows / UNC file path. */
 function parentDir(path: string): string | null {
@@ -225,6 +237,7 @@ export default function Popup() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchSeq = useRef(0);
   const scopePathRef = useRef<string | null>(null);
+  const imeComposingRef = useRef(false);
 
   useEffect(() => {
     scopePathRef.current = scopePath;
@@ -279,6 +292,7 @@ export default function Popup() {
 
   const scheduleSearch = useCallback(
     (q: string, pathPrefix?: string | null) => {
+      if (imeComposingRef.current) return;
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(() => {
         void runSearch(q, pathPrefix);
@@ -338,7 +352,7 @@ export default function Popup() {
       setOccurrences([]);
       setOccIndex(0);
       setActionError("");
-      setSearching(false);
+      setSearching(Boolean(event.payload.searching));
       setWordPickerOpen(false);
       setFolderPickerOpen(false);
       setHelpOpen(false);
@@ -529,6 +543,48 @@ export default function Popup() {
     }
   }, [hits, index, query]);
 
+  const previewParagraph = useCallback(
+    async (paraId: string, fileHit: SearchHit) => {
+      setActionError("");
+      try {
+        if (fileHit.source === "remote") {
+          const hit = await invoke<SearchHit | null>("get_preview", {
+            id: paraId,
+          });
+          if (hit) {
+            setPreview(hit);
+            setOccurrences([hit]);
+            setOccIndex(0);
+          }
+          return;
+        }
+        const matches = await invoke<SearchHit[]>("search_path_matches", {
+          query: query.trim(),
+          path: fileHit.path,
+        });
+        if (!matches.length) {
+          const hit = await invoke<SearchHit | null>("get_preview", {
+            id: paraId,
+          });
+          if (hit) {
+            setPreview(hit);
+            setOccurrences([hit]);
+            setOccIndex(0);
+          }
+          return;
+        }
+        setOccurrences(matches);
+        const found = matches.findIndex((m) => m.id === paraId);
+        const idx = found >= 0 ? found : 0;
+        setOccIndex(idx);
+        setPreview(matches[idx] ?? fileHit);
+      } catch (e) {
+        setActionError(String(e));
+      }
+    },
+    [query],
+  );
+
   const stepOccurrence = useCallback(
     (delta: number) => {
       if (occurrences.length <= 1) return;
@@ -718,6 +774,19 @@ export default function Popup() {
             spellCheck={false}
             onChange={(e) => {
               const next = e.target.value;
+              setQuery(next);
+              scheduleSearch(next);
+            }}
+            onCompositionStart={() => {
+              imeComposingRef.current = true;
+              if (debounceRef.current) {
+                clearTimeout(debounceRef.current);
+                debounceRef.current = null;
+              }
+            }}
+            onCompositionEnd={(e) => {
+              imeComposingRef.current = false;
+              const next = e.currentTarget.value;
               setQuery(next);
               scheduleSearch(next);
             }}
@@ -964,9 +1033,11 @@ export default function Popup() {
         <ul className="hit-list" ref={listRef}>
           {hits.length === 0 ? (
             <li className="empty">
-              {query.trim()
-                ? "結果がありません。"
-                : "検索文字列を入力するか、文書上で選択してショートカットを押してください。"}
+              {searching
+                ? "検索中…"
+                : query.trim()
+                  ? "結果がありません。"
+                  : "検索文字列を入力するか、文書上で選択してショートカットを押してください。"}
             </li>
           ) : (
             (() => {
@@ -1015,10 +1086,49 @@ export default function Popup() {
                           ))}
                         </div>
                       </div>
-                      <div className="hit-snippet">
-                        {highlight(hit.snippet, query, hit.highlightTerms)}
-                      </div>
+                      {hit.paragraphs && hit.paragraphs.length > 0 ? (
+                        <ul className="hit-paragraphs">
+                          {hit.paragraphs.map((p) => (
+                            <li key={p.id} className="hit-paragraph">
+                              <button
+                                type="button"
+                                className="hit-paragraph-btn"
+                                title="この段落をプレビュー"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setIndex(i);
+                                  void previewParagraph(p.id, hit);
+                                }}
+                              >
+                                <span className="hit-paragraph-label">
+                                  {p.label || "段落"}
+                                </span>
+                                <span className="hit-paragraph-snippet">
+                                  {highlight(
+                                    p.snippet,
+                                    query,
+                                    hit.highlightTerms,
+                                  )}
+                                </span>
+                              </button>
+                            </li>
+                          ))}
+                          {(hit.matchCount ?? 0) > hit.paragraphs.length ? (
+                            <li className="hit-paragraph-more">
+                              他 {(hit.matchCount ?? 0) - hit.paragraphs.length}{" "}
+                              件
+                            </li>
+                          ) : null}
+                        </ul>
+                      ) : (
+                        <div className="hit-snippet">
+                          {highlight(hit.snippet, query, hit.highlightTerms)}
+                        </div>
+                      )}
                       <div className="hit-path" title={hit.path}>
+                        {hit.matchCount && hit.matchCount > 1
+                          ? `マッチ ${hit.matchCount} 段落 · `
+                          : null}
                         {hit.path}
                       </div>
                       {hit.highlightTerms && hit.highlightTerms.length > 0 ? (
