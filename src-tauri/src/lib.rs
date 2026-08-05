@@ -118,7 +118,7 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            let state = AppState::open().map_err(|e| {
+            let (state, needs_full_reindex) = AppState::open().map_err(|e| {
                 eprintln!("failed to open app state: {e}");
                 Box::<dyn std::error::Error>::from(e)
             })?;
@@ -167,7 +167,7 @@ pub fn run() {
                 });
             }
 
-            match watcher::start_watcher(folders, indexer, app.handle().clone()) {
+            match watcher::start_watcher(folders, indexer.clone(), app.handle().clone()) {
                 Ok(handle) => {
                     app.state::<Arc<AppState>>().set_watcher(handle);
                 }
@@ -178,6 +178,22 @@ pub fn run() {
             {
                 let state = app.state::<Arc<AppState>>();
                 state.sync_remote_server();
+            }
+
+            if needs_full_reindex {
+                eprintln!(
+                    "argos: schema migration — starting automatic full reindex (v1.3.x indexes are incompatible)"
+                );
+                tauri::async_runtime::spawn(async move {
+                    match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all()).await {
+                        Ok(Ok(stats)) => eprintln!(
+                            "argos: schema reindex done: indexed={} skipped={} errors={}",
+                            stats.indexed, stats.skipped, stats.errors
+                        ),
+                        Ok(Err(e)) => eprintln!("argos: schema reindex failed: {e}"),
+                        Err(e) => eprintln!("argos: schema reindex join failed: {e}"),
+                    }
+                });
             }
 
             Ok(())

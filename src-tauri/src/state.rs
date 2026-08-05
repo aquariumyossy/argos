@@ -24,7 +24,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn open() -> Result<Self, String> {
+    /// Returns `(state, needs_full_reindex)` when the on-disk index schema was wiped.
+    pub fn open() -> Result<(Self, bool), String> {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Argos");
@@ -35,21 +36,25 @@ impl AppState {
         let _ = db.save_settings(&settings);
 
         let index_dir = data_dir.join("index");
-        let backend = Arc::new(TantivyBackend::open(&index_dir)?);
+        let opened = TantivyBackend::open(&index_dir)?;
+        let backend = Arc::new(opened.backend);
         let indexer = Arc::new(Indexer::new(db.clone(), backend.clone()));
         let remote_server = RemoteServerHandle::new();
         let user_dict = Self::build_user_dict(&db);
 
-        Ok(Self {
-            db,
-            settings: RwLock::new(settings),
-            data_dir,
-            backend,
-            indexer,
-            remote_server,
-            watcher: RwLock::new(None),
-            user_dict: RwLock::new(user_dict),
-        })
+        Ok((
+            Self {
+                db,
+                settings: RwLock::new(settings),
+                data_dir,
+                backend,
+                indexer,
+                remote_server,
+                watcher: RwLock::new(None),
+                user_dict: RwLock::new(user_dict),
+            },
+            opened.needs_full_reindex,
+        ))
     }
 
     pub fn build_user_dict(db: &Db) -> UserDictMatcher {
