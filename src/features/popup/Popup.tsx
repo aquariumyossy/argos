@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -6,7 +6,10 @@ import {
   applyPreviewHighlights,
   clearPreviewHighlights,
   collectPreviewHighlightTerms,
+  findJsonHitOffset,
+  formatJsonForPreview,
   isHtmlPath,
+  isJsonPath,
   isMarkdownPath,
   renderMarkdownHtml,
   splitProseParagraphs,
@@ -179,8 +182,13 @@ function PreviewBody({
   query: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const preRef = useRef<HTMLPreElement>(null);
   const isMarkdown = isMarkdownPath(hit.path);
   const isHtml = isHtmlPath(hit.path);
+  const isJson = isJsonPath(hit.path);
+  const [jsonText, setJsonText] = useState<string | null>(null);
+  const [jsonLoading, setJsonLoading] = useState(false);
+
   const markdownHtml = useMemo(() => {
     if (!isMarkdown) return "";
     return renderMarkdownHtml(hit.previewText);
@@ -195,12 +203,99 @@ function PreviewBody({
   );
 
   useEffect(() => {
+    if (!isJson) {
+      setJsonText(null);
+      setJsonLoading(false);
+    }
+  }, [isJson]);
+
+  useEffect(() => {
+    if (!isJson || hit.source !== "remote") return;
+    setJsonText(formatJsonForPreview(hit.previewText));
+    setJsonLoading(false);
+  }, [hit.previewText, hit.source, isJson]);
+
+  useEffect(() => {
+    if (!isJson || hit.source === "remote") return;
+    let cancelled = false;
+    setJsonText(null);
+    setJsonLoading(true);
+    const fallback = hit.previewText;
+    void invoke<string>("read_text_file", { path: hit.path })
+      .then((raw) => {
+        if (cancelled) return;
+        setJsonText(formatJsonForPreview(raw));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setJsonText(formatJsonForPreview(fallback));
+      })
+      .finally(() => {
+        if (!cancelled) setJsonLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hit.path, hit.source, isJson]);
+
+  useEffect(() => {
     if (!isMarkdown) return;
     const el = containerRef.current;
     if (!el) return;
     applyPreviewHighlights(el, highlightTerms);
     return () => clearPreviewHighlights();
   }, [highlightTerms, isMarkdown, markdownHtml]);
+
+  useLayoutEffect(() => {
+    if (!isJson || jsonLoading || jsonText == null) return;
+    const pre = preRef.current;
+    if (!pre) return;
+
+    const offset = findJsonHitOffset(
+      jsonText,
+      hit.previewText ?? "",
+      hit.snippet ?? "",
+    );
+
+    const scrollToOffset = () => {
+      if (offset >= 0) {
+        const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+        let pos = 0;
+        let target: Element | null = null;
+        while (walker.nextNode()) {
+          const node = walker.currentNode as Text;
+          const len = node.data.length;
+          if (pos + len > offset) {
+            target =
+              node.parentElement?.closest("mark") ??
+              node.parentElement ??
+              pre;
+            break;
+          }
+          pos += len;
+        }
+        if (target) {
+          target.scrollIntoView({ block: "center", inline: "nearest" });
+          return;
+        }
+      }
+      const firstMark = pre.querySelector("mark");
+      if (firstMark) {
+        firstMark.scrollIntoView({ block: "center", inline: "nearest" });
+      }
+    };
+
+    // Wait for React to commit mark nodes before measuring.
+    const frame = requestAnimationFrame(scrollToOffset);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    hit.id,
+    hit.previewText,
+    hit.snippet,
+    isJson,
+    jsonLoading,
+    jsonText,
+  ]);
 
   if (isMarkdown) {
     return (
@@ -219,6 +314,18 @@ function PreviewBody({
           <p key={i}>{highlight(para, query, hit.highlightTerms)}</p>
         ))}
       </div>
+    );
+  }
+
+  if (isJson) {
+    if (jsonLoading && jsonText == null) {
+      return <pre className="preview-body">読み込み中…</pre>;
+    }
+    const text = jsonText ?? formatJsonForPreview(hit.previewText);
+    return (
+      <pre ref={preRef} className="preview-body">
+        {highlight(text, query, hit.highlightTerms)}
+      </pre>
     );
   }
 

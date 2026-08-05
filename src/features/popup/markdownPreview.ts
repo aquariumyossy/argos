@@ -123,6 +123,91 @@ export function isHtmlPath(path: string): boolean {
   return ext === "html" || ext === "htm";
 }
 
+export function isJsonPath(path: string): boolean {
+  const base = path.replace(/\\/g, "/").split("/").pop() ?? "";
+  const i = base.lastIndexOf(".");
+  if (i <= 0 || i === base.length - 1) return false;
+  const ext = base.slice(i + 1).toLowerCase();
+  return ext === "json";
+}
+
+/** Pretty-print JSON when valid; otherwise return the raw text unchanged. */
+export function formatJsonForPreview(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+/** Collapse whitespace for matching index chunks against pretty-printed JSON. */
+export function collapseWhitespace(s: string): string {
+  return s.replace(/\s+/g, "");
+}
+
+/** Strip snippet ellipsis (… / ...) added by the search backend. */
+export function stripSnippetEllipsis(s: string): string {
+  return s.replace(/\u2026/g, "").replace(/\.{2,}/g, "");
+}
+
+/**
+ * Find the character offset in `haystack` that corresponds to a needle from an
+ * index chunk (whitespace-tolerant). Returns -1 if not found.
+ */
+export function findCollapsedNeedleOffset(
+  haystack: string,
+  needle: string,
+): number {
+  const collapsedNeedle = collapseWhitespace(stripSnippetEllipsis(needle));
+  if (!collapsedNeedle) return -1;
+  // Prefer a stable prefix so oversized chunks still locate near the hit start.
+  const probeLen = Math.min(200, collapsedNeedle.length);
+  // Very short probes collide easily in JSON punctuation; require some substance.
+  if (probeLen < 8) return -1;
+  const probe = collapsedNeedle.slice(0, probeLen);
+
+  let collapsedPos = 0;
+  let matchStart = -1;
+  for (let i = 0; i < haystack.length; i += 1) {
+    const ch = haystack[i];
+    if (ch === undefined || /\s/.test(ch)) continue;
+    if (ch === probe[collapsedPos]) {
+      if (collapsedPos === 0) matchStart = i;
+      collapsedPos += 1;
+      if (collapsedPos === probe.length) return matchStart;
+    } else if (ch === probe[0]) {
+      matchStart = i;
+      collapsedPos = 1;
+    } else {
+      matchStart = -1;
+      collapsedPos = 0;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Locate a search hit inside pretty-printed JSON text.
+ * Prefer the indexed chunk body over the UI snippet (snippets include ellipsis).
+ */
+export function findJsonHitOffset(
+  displayText: string,
+  previewText: string,
+  snippet: string,
+): number {
+  const fromPreview = findCollapsedNeedleOffset(displayText, previewText);
+  if (fromPreview >= 0) {
+    // Refine to the snippet anchor within the chunk when possible.
+    const core = stripSnippetEllipsis(snippet).trim();
+    if (core.length >= 8) {
+      const refined = findCollapsedNeedleOffset(displayText, core);
+      if (refined >= fromPreview) return refined;
+    }
+    return fromPreview;
+  }
+  return findCollapsedNeedleOffset(displayText, snippet);
+}
+
 /** Split extracted HTML body on blank lines for prose preview paragraphs. */
 export function splitProseParagraphs(text: string): string[] {
   return text

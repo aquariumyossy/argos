@@ -222,6 +222,7 @@ pub fn run() {
             commands::open_hit,
             commands::open_containing_folder,
             commands::get_preview,
+            commands::read_text_file,
             commands::test_remote_connection,
             commands::get_lan_ip_hint,
             commands::show_settings_window,

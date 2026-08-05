@@ -20,7 +20,7 @@ use super::morph::{is_noise_highlight_term, MorphAnalyzer};
 use super::{ParagraphHit, SearchBackend, SearchHit};
 
 /// Bump when Tantivy on-disk schema changes. Triggers wipe + full reindex.
-pub const INDEX_SCHEMA_VERSION: u32 = 4;
+pub const INDEX_SCHEMA_VERSION: u32 = 5;
 const SCHEMA_VERSION_FILE: &str = "argos_schema_version";
 
 /// Nested paragraphs shown under each file hit in the popup list.
