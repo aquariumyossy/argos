@@ -620,6 +620,24 @@ pub fn get_preview(
     search::run_preview(&settings, state.backend.as_ref(), &hit_id)
 }
 
+/// Read a local `.json` file as UTF-8 text for full-file preview.
+#[tauri::command]
+pub fn read_text_file(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext != "json" {
+        return Err(format!("unsupported preview extension: {ext}"));
+    }
+    if !p.is_file() {
+        return Err("ファイルが見つかりません".into());
+    }
+    std::fs::read_to_string(p).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn test_remote_connection(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let settings = state.settings.read().clone();

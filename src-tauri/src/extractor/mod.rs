@@ -22,7 +22,7 @@ pub fn extract_file(path: &Path) -> Result<ExtractedDoc, String> {
         .unwrap_or("")
         .to_lowercase();
     match ext.as_str() {
-        "txt" | "md" | "markdown" => extract_text(path),
+        "txt" | "md" | "markdown" | "json" => extract_text(path),
         "html" | "htm" => extract_html(path),
         "pdf" => extract_pdf(path),
         "docx" => extract_docx(path),
@@ -40,8 +40,8 @@ pub fn is_supported(path: &Path) -> bool {
             .unwrap_or("")
             .to_lowercase()
             .as_str(),
-        "txt" | "md" | "markdown" | "html" | "htm" | "pdf" | "docx" | "doc" | "jtd" | "xls"
-            | "xlsx"
+        "txt" | "md" | "markdown" | "json" | "html" | "htm" | "pdf" | "docx" | "doc" | "jtd"
+            | "xls" | "xlsx"
     )
 }
 

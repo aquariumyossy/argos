@@ -9,7 +9,7 @@
 - **形態素解析による広いマッチ** — 日本語を単語に分解して検索するため、表記の揺れにも強い
 - **LAN リモート検索** — 別 PC の Argos 索引も、同じネットワークから検索可能
 
-対応形式: PDF / Word（DOCX・DOC） / 一太郎（JTD） / Excel（XLS・XLSX） / テキスト / Markdown / HTML
+対応形式: PDF / Word（DOCX・DOC） / 一太郎（JTD） / Excel（XLS・XLSX） / テキスト / Markdown / HTML / JSON
 
 ## ダウンロード
 
