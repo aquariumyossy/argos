@@ -266,18 +266,34 @@ fn file_title(path: &Path) -> String {
 fn strip_xml_text(xml: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
+    let mut tag_buf = String::new();
     let mut last_was_space = true;
     for ch in xml.chars() {
         match ch {
-            '<' => in_tag = true,
+            '<' => {
+                in_tag = true;
+                tag_buf.clear();
+            }
             '>' => {
                 in_tag = false;
-                if !last_was_space {
+                // Tag name is the first token; strip leading `/` (end tags) and trailing `/` (self-close).
+                let raw = tag_buf.trim();
+                let name = raw
+                    .trim_start_matches('/')
+                    .split(|c: char| c.is_whitespace() || c == '/')
+                    .next()
+                    .unwrap_or("");
+                if name == "w:br" || name == "w:cr" {
                     out.push('\n');
                     last_was_space = true;
+                } else if name == "w:tab" {
+                    out.push('\t');
+                    last_was_space = true;
                 }
+                // Other tags (w:t, w:r, …): concatenate adjacent runs with no break.
             }
-            _ if !in_tag => {
+            _ if in_tag => tag_buf.push(ch),
+            _ => {
                 if ch.is_whitespace() {
                     if !last_was_space {
                         out.push(' ');
@@ -288,7 +304,6 @@ fn strip_xml_text(xml: &str) -> String {
                     last_was_space = false;
                 }
             }
-            _ => {}
         }
     }
     out.trim().to_string()
@@ -375,5 +390,51 @@ mod tests {
             units.len(),
             units.iter().map(|u| &u.label).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn strip_xml_joins_adjacent_runs() {
+        let inner = r#"<w:r><w:t>１</w:t></w:r><w:r><w:t>ヵ月以内</w:t></w:r>"#;
+        assert_eq!(strip_xml_text(inner), "１ヵ月以内");
+    }
+
+    #[test]
+    fn strip_xml_joins_split_parentheses() {
+        let inner = concat!(
+            r#"<w:r><w:t>（</w:t></w:r>"#,
+            r#"<w:r><w:t>甲または甲の技術者の故意または過失による瑕疵</w:t></w:r>"#,
+            r#"<w:r><w:t>）</w:t></w:r>"#,
+        );
+        assert_eq!(
+            strip_xml_text(inner),
+            "（甲または甲の技術者の故意または過失による瑕疵）"
+        );
+    }
+
+    #[test]
+    fn strip_xml_preserves_soft_break_and_tab() {
+        let inner = r#"<w:r><w:t>前段</w:t><w:br/><w:t>後段</w:t><w:tab/><w:t>続き</w:t></w:r>"#;
+        assert_eq!(strip_xml_text(inner), "前段\n後段\t続き");
+    }
+
+    #[test]
+    fn docx_paragraph_with_split_runs_has_no_internal_newline() {
+        let xml = concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:p>"#,
+            r#"<w:r><w:t>１</w:t></w:r>"#,
+            r#"<w:r><w:t>ヵ月以内（個別契約において別途</w:t></w:r>"#,
+            r#"<w:r><w:t>期間</w:t></w:r>"#,
+            r#"<w:r><w:t>を定めた場合は個別契約の定めに従う。）</w:t></w:r>"#,
+            r#"</w:p></w:body></w:document>"#,
+        );
+        let paras = docx_paragraphs(xml);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(
+            paras[0],
+            "１ヵ月以内（個別契約において別途期間を定めた場合は個別契約の定めに従う。）"
+        );
+        assert!(!paras[0].contains('\n'));
     }
 }
