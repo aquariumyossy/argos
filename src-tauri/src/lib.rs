@@ -185,7 +185,8 @@ pub fn run() {
                     "argos: schema migration — starting automatic full reindex (v1.3.x indexes are incompatible)"
                 );
                 tauri::async_runtime::spawn(async move {
-                    match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all()).await {
+                    match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all(|_| {})).await
+                    {
                         Ok(Ok(stats)) => eprintln!(
                             "argos: schema reindex done: indexed={} skipped={} errors={}",
                             stats.indexed, stats.skipped, stats.errors
@@ -252,7 +253,9 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 let state = app.state::<Arc<AppState>>();
                 let indexer = state.indexer.clone();
                 tauri::async_runtime::spawn(async move {
-                    match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all()).await {
+                    match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all(|_| {}))
+                        .await
+                    {
                         Ok(Ok(stats)) => eprintln!(
                             "reindex done: indexed={} skipped={} errors={}",
                             stats.indexed, stats.skipped, stats.errors
