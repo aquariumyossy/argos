@@ -9,9 +9,8 @@ pub mod selection;
 pub mod state;
 pub mod watcher;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -23,73 +22,11 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 use crate::state::AppState;
 
-/// Ignore blur-to-hide briefly after show (focus settling).
-static POPUP_SHOW_MS: AtomicU64 = AtomicU64::new(0);
-/// Bumped when focus returns so deferred hide tasks can cancel.
-static POPUP_FOCUS_GEN: AtomicU64 = AtomicU64::new(0);
 /// True while the user is dragging the popup (set from the frontend).
 static POPUP_DRAGGING: AtomicBool = AtomicBool::new(false);
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-#[cfg(windows)]
-fn is_primary_mouse_down() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-    unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
-}
-
-#[cfg(not(windows))]
-fn is_primary_mouse_down() -> bool {
-    false
-}
-
-fn schedule_hide_on_blur(popup: WebviewWindow) {
-    let gen = POPUP_FOCUS_GEN.load(Ordering::SeqCst);
-    std::thread::spawn(move || {
-        // Wait out window drag / outside-click press
-        let wait_start = std::time::Instant::now();
-        loop {
-            if POPUP_FOCUS_GEN.load(Ordering::SeqCst) != gen {
-                return;
-            }
-            if popup.is_focused().unwrap_or(false) {
-                return;
-            }
-            let dragging = POPUP_DRAGGING.load(Ordering::SeqCst) || is_primary_mouse_down();
-            if !dragging {
-                break;
-            }
-            if wait_start.elapsed() > std::time::Duration::from_secs(30) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        if POPUP_FOCUS_GEN.load(Ordering::SeqCst) != gen {
-            return;
-        }
-        if POPUP_DRAGGING.load(Ordering::SeqCst) {
-            return;
-        }
-        if popup.is_focused().unwrap_or(false) {
-            return;
-        }
-        if popup.is_visible().unwrap_or(false) {
-            let _ = popup.hide();
-        }
-    });
-}
-
 pub fn set_popup_dragging(dragging: bool) {
     POPUP_DRAGGING.store(dragging, Ordering::SeqCst);
-    if !dragging {
-        POPUP_FOCUS_GEN.fetch_add(1, Ordering::SeqCst);
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -147,24 +84,7 @@ pub fn run() {
             }
             if let Some(popup) = app.get_webview_window("popup") {
                 let _ = popup.hide();
-                let popup_for_event = popup.clone();
-                popup.on_window_event(move |event| {
-                    match event {
-                        WindowEvent::Focused(true) => {
-                            POPUP_FOCUS_GEN.fetch_add(1, Ordering::SeqCst);
-                        }
-                        WindowEvent::Focused(false) => {
-                            let shown = POPUP_SHOW_MS.load(Ordering::SeqCst);
-                            if now_ms().saturating_sub(shown) < 350 {
-                                return;
-                            }
-                            if popup_for_event.is_visible().unwrap_or(false) {
-                                schedule_hide_on_blur(popup_for_event.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                });
+                attach_popup_window_handlers(&popup);
             }
 
             match watcher::start_watcher(folders, indexer.clone(), app.handle().clone()) {
@@ -297,6 +217,18 @@ fn attach_main_window_handlers(window: &WebviewWindow) {
     });
 }
 
+fn attach_popup_window_handlers(window: &WebviewWindow) {
+    let handle = window.clone();
+    window.clone().on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Err(e) = handle.hide() {
+                eprintln!("argos: hide popup window failed: {e}");
+            }
+        }
+    });
+}
+
 fn create_main_window(app: &AppHandle) -> Option<WebviewWindow> {
     let config = app
         .config()
@@ -348,7 +280,7 @@ pub fn show_popup(app: &AppHandle) -> Option<WebviewWindow> {
         apply_popup_initial_size(app, &w);
         apply_popup_initial_position(app, &w);
     }
-    POPUP_SHOW_MS.store(now_ms(), Ordering::SeqCst);
+    let _ = w.unminimize();
     let _ = w.show();
     let _ = w.set_focus();
     Some(w)

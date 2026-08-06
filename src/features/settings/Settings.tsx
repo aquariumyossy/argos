@@ -48,14 +48,14 @@ type IndexProgressPayload = {
 };
 
 function formatIndexProgress(p: IndexProgressPayload | null): string {
-  if (!p) return "処理中…";
+  if (!p) return "処琁E��…";
   if (p.phase === "counting") return "ファイル数を確認中…";
   return `${p.current.toLocaleString()} / ${p.total.toLocaleString()}`;
 }
 
 /** Left-hand-friendly shortcuts that avoid common Windows / IME reserved combos. */
 const SHORTCUT_OPTIONS = [
-  { value: "Ctrl+Alt+A", label: "Ctrl + Alt + A（推奨）" },
+  { value: "Ctrl+Alt+A", label: "Ctrl + Alt + A�E�推奨�E�E },
   { value: "Ctrl+Alt+Space", label: "Ctrl + Alt + Space" },
   { value: "Alt+Shift+Z", label: "Shift + Alt + Z" },
 ] as const;
@@ -68,20 +68,20 @@ const POPUP_POSITION_OPTIONS = [
 
 const SEARCH_MODE_OPTIONS = [
   { value: "local", label: "ローカルのみ" },
-  { value: "remote", label: "リモートのみ" },
-  { value: "hybrid", label: "ハイブリッド（ローカル＋リモート）" },
+  { value: "remote", label: "リモート�Eみ" },
+  { value: "hybrid", label: "ハイブリチE���E�ローカル�E�リモート！E },
 ] as const;
 
 const TABS: { id: TabId; label: string }[] = [
-  { id: "howto", label: "操作方法" },
+  { id: "howto", label: "操作方況E },
   { id: "folders", label: "検索対象フォルダ" },
   { id: "words", label: "検索ワード登録" },
-  { id: "options", label: "各種設定" },
-  { id: "remote", label: "リモート" },
-  { id: "credits", label: "クレジット" },
+  { id: "options", label: "吁E��設宁E },
+  { id: "remote", label: "リモーチE },
+  { id: "credits", label: "クレジチE��" },
 ];
 
-const APP_VERSION = "1.4.4";
+const APP_VERSION = "1.4.5";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -90,7 +90,7 @@ const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] =
   { name: "React / React DOM", license: "MIT" },
   { name: "Tantivy", license: "MIT" },
   { name: "Lindera / lindera-tantivy", license: "MIT", note: "形態素解析辞書 IPADIC を埋め込み" },
-  { name: "IPADIC（Lindera 経由）", license: "IPADIC 独自ライセンス" },
+  { name: "IPADIC�E�Eindera 経由�E�E, license: "IPADIC 独自ライセンス" },
   { name: "rusqlite / SQLite", license: "MIT / Public Domain" },
   { name: "axum / tower-http", license: "MIT" },
   { name: "tokio", license: "MIT" },
@@ -100,7 +100,7 @@ const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] =
   { name: "walkdir", license: "MIT OR Unlicense" },
   { name: "pdf-extract", license: "MIT" },
   { name: "calamine", license: "MIT" },
-  { name: "encoding_rs", license: "Apache-2.0 OR MIT", note: "HTML の文字コード判定・デコード" },
+  { name: "encoding_rs", license: "Apache-2.0 OR MIT", note: "HTML の斁E��コード判定�EチE��ーチE },
   { name: "quick-xml / zip", license: "MIT" },
   { name: "rwml", license: "MIT" },
   { name: "rjtd-core", license: "Apache-2.0" },
@@ -225,7 +225,7 @@ export default function Settings() {
     if (!settings) return;
     const saved = await invoke<SettingsData>("update_settings", { settings });
     setSettings(saved);
-    setMessage("設定を保存しました（ショートカット変更は再起動後に反映）");
+    setMessage("設定を保存しました�E�ショートカチE��変更は再起動後に反映�E�E);
   }
 
   async function addFolder() {
@@ -250,11 +250,11 @@ export default function Settings() {
         errors: number;
       }>("run_reindex_folder", { id: row.id });
       setMessage(
-        `フォルダを追加しました（このフォルダのみ索引: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}）。以降の変更は自動監視されます。`,
+        `フォルダを追加しました�E�このフォルダのみ索弁E 登録 ${stats.indexed} / スキチE�E ${stats.skipped} / エラー ${stats.errors}�E�。以降�E変更は自動監視されます。`,
       );
       await reload();
     } catch (e) {
-      setMessage(`失敗: ${String(e)}`);
+      setMessage(`失敁E ${String(e)}`);
       await reload().catch(() => undefined);
     } finally {
       setBusyFolderId(null);
@@ -267,7 +267,7 @@ export default function Settings() {
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: "検索対象フォルダを選択",
+      title: "検索対象フォルダを選抁E,
     });
     if (typeof selected === "string" && selected) {
       setFolderInput(selected);
@@ -278,7 +278,7 @@ export default function Settings() {
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: "除外フォルダを選択",
+      title: "除外フォルダを選抁E,
     });
     if (typeof selected === "string" && selected) {
       setExcludeInput(selected);
@@ -298,11 +298,11 @@ export default function Settings() {
         errors: number;
       }>("run_reindex_folder", { id });
       setMessage(
-        `公開パスを更新しました（このフォルダのみ再索引: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}）`,
+        `公開パスを更新しました�E�このフォルダのみ再索弁E 登録 ${stats.indexed} / スキチE�E ${stats.skipped} / エラー ${stats.errors}�E�`,
       );
       await reload();
     } catch (e) {
-      setMessage(`失敗: ${String(e)}`);
+      setMessage(`失敁E ${String(e)}`);
     } finally {
       setBusyFolderId(null);
       setIndexProgress(null);
@@ -326,11 +326,11 @@ export default function Settings() {
         errors: number;
       }>("run_reindex_folder", { id });
       setMessage(
-        `完了（このフォルダのみ）: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}`,
+        `完亁E��このフォルダのみ�E�E 登録 ${stats.indexed} / スキチE�E ${stats.skipped} / エラー ${stats.errors}`,
       );
       await reload();
     } catch (e) {
-      setMessage(`失敗: ${String(e)}`);
+      setMessage(`失敁E ${String(e)}`);
     } finally {
       setBusyFolderId(null);
       setIndexProgress(null);
@@ -360,7 +360,7 @@ export default function Settings() {
       setMessage("検索ワードを追加しました");
       await reload();
     } catch (e) {
-      setMessage(`追加失敗: ${String(e)}`);
+      setMessage(`追加失敁E ${String(e)}`);
     }
   }
 
@@ -374,7 +374,7 @@ export default function Settings() {
       setMessage("検索ワードを更新しました");
       await reload();
     } catch (e) {
-      setMessage(`更新失敗: ${String(e)}`);
+      setMessage(`更新失敁E ${String(e)}`);
     }
   }
 
@@ -390,17 +390,17 @@ export default function Settings() {
   async function clearAllSearchWords() {
     if (searchWords.length === 0) return;
     const ok = window.confirm(
-      `登録済みの検索ワード ${searchWords.length} 件をすべて削除しますか？\nこの操作は取り消せません。`,
+      `登録済みの検索ワーチE${searchWords.length} 件をすべて削除しますか�E�\nこ�E操作�E取り消せません。`,
     );
     if (!ok) return;
     try {
       const n = await invoke<number>("clear_search_words");
       setEditingWordId(null);
       setEditingWordDraft("");
-      setMessage(`検索ワードをすべて削除しました（${n} 件）`);
+      setMessage(`検索ワードをすべて削除しました�E�E{n} 件�E�`);
       await reload();
     } catch (e) {
-      setMessage(`一括削除失敗: ${String(e)}`);
+      setMessage(`一括削除失敁E ${String(e)}`);
     }
   }
 
@@ -474,11 +474,11 @@ export default function Settings() {
           skipped: number;
         }>("import_search_words", { entries });
         setMessage(
-          `CSV 取り込み: 追加 ${result.added} / 更新 ${result.updated} / スキップ ${result.skipped}`,
+          `CSV 取り込み: 追加 ${result.added} / 更新 ${result.updated} / スキチE�E ${result.skipped}`,
         );
         await reload();
       } catch (err) {
-        setMessage(`CSV 取り込み失敗: ${String(err)}`);
+        setMessage(`CSV 取り込み失敁E ${String(err)}`);
       }
     };
     input.click();
@@ -502,13 +502,13 @@ export default function Settings() {
     a.download = "argos-search-words.csv";
     a.click();
     URL.revokeObjectURL(url);
-    setMessage("CSV を書き出しました");
+    setMessage("CSV を書き�Eしました");
   }
 
   async function runReindex() {
     setIndexing(true);
     setIndexProgress(null);
-    setMessage("全フォルダを再構築中…");
+    setMessage("全フォルダを�E構築中…");
     try {
       const stats = await invoke<{
         indexed: number;
@@ -516,11 +516,11 @@ export default function Settings() {
         errors: number;
       }>("run_reindex");
       setMessage(
-        `完了（全フォルダ再構築）: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}`,
+        `完亁E���Eフォルダ再構築！E 登録 ${stats.indexed} / スキチE�E ${stats.skipped} / エラー ${stats.errors}`,
       );
       await reload();
     } catch (e) {
-      setMessage(`失敗: ${String(e)}`);
+      setMessage(`失敁E ${String(e)}`);
     } finally {
       setBusyFolderId(null);
       setIndexProgress(null);
@@ -539,7 +539,7 @@ export default function Settings() {
       const msg = await invoke<string>("test_remote_connection");
       setMessage(msg);
     } catch (e) {
-      setMessage(`接続テスト失敗: ${String(e)}`);
+      setMessage(`接続テスト失敁E ${String(e)}`);
     } finally {
       setTesting(false);
     }
@@ -549,7 +549,7 @@ export default function Settings() {
     lanIp && settings
       ? `http://${lanIp}:${settings.remoteServerPort}`
       : settings
-        ? `http://<このPCのLAN IP>:${settings.remoteServerPort}`
+        ? `http://<こ�EPCのLAN IP>:${settings.remoteServerPort}`
         : "";
 
   if (!settings) {
@@ -558,7 +558,7 @@ export default function Settings() {
 
   return (
     <div className="settings">
-      <nav className="settings-tabs" role="tablist" aria-label="設定グループ">
+      <nav className="settings-tabs" role="tablist" aria-label="設定グルーチE>
         {TABS.map((t) => (
           <button
             key={t.id}
@@ -590,22 +590,22 @@ export default function Settings() {
           <section>
             <h2>Argos とは</h2>
             <p className="muted">
-              任意のアプリで文字列を選択しショートカットを押すと、登録フォルダ内の PDF / DOCX / DOC /
-              JTD / XLS / XLSX / TXT / Markdown / HTML / JSON から全文検索し、結果をポップアップで表示します。
+              任意�Eアプリで斁E���Eを選択しショートカチE��を押すと、登録フォルダ冁E�E PDF / DOCX / DOC /
+              JTD / XLS / XLSX / TXT / Markdown / HTML / JSON から全斁E��索し、結果を�EチE�EアチE�Eで表示します、E
             </p>
           </section>
 
           <section>
-            <h2>便利な使い方</h2>
+            <h2>便利な使ぁE��</h2>
             <ul className="howto-tips">
               <li>
-                メールや文書の閲覧・編集中に、相手名・件名・キーワードを選択して検索し、関連資料をすぐ参照できます
+                メールめE��書の閲覧・編雁E��に、相手名・件名�Eキーワードを選択して検索し、E��連賁E��をすぐ参照できまぁE
               </li>
               <li>
-                ブラウザやチャットで気になった語句を選び、手元のフォルダから根拠や過去資料を探せます
+                ブラウザめE��ャチE��で気になった語句を選び、手允E�Eフォルダから根拠めE��去賁E��を探せまぁE
               </li>
               <li>
-                アプリを切り替えずポップアップで結果を確認し、必要ならそのままファイルを開けます
+                アプリを�Eり替えずポップアチE�Eで結果を確認し、忁E��ならそのままファイルを開けまぁE
               </li>
             </ul>
           </section>
@@ -614,22 +614,22 @@ export default function Settings() {
             <h2>はじめに</h2>
             <ol className="howto-steps">
               <li>
-                「検索対象フォルダ」タブで検索したいフォルダを追加します
+                「検索対象フォルダ」タブで検索したぁE��ォルダを追加しまぁE
               </li>
-              <li>「今すぐインデックス」を実行して全文検索用の索引を作成します</li>
+              <li>「今すぐインチE��クス」を実行して全斁E��索用の索引を作�EしまぁE/li>
               <li>
-                任意のアプリで文字列を選択し <kbd>{settings.shortcut}</kbd> を押します
+                任意�Eアプリで斁E���Eを選択し <kbd>{settings.shortcut}</kbd> を押しまぁE
               </li>
-              <li>ポップアップで結果を確認します</li>
+              <li>ポップアチE�Eで結果を確認しまぁE/li>
             </ol>
           </section>
 
           <section>
-            <h2>ポップアップの操作</h2>
+            <h2>ポップアチE�Eの操佁E/h2>
             <ul className="howto-keys">
               <li>
                 <kbd>Enter</kbd>
-                <span>選択中の結果を開く</span>
+                <span>選択中の結果を開ぁE/span>
               </li>
               <li>
                 <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
@@ -637,71 +637,71 @@ export default function Settings() {
               </li>
               <li>
                 <kbd>Shift</kbd>+<kbd>Enter</kbd>
-                <span>ファイルのフォルダを開く</span>
+                <span>ファイルのフォルダを開ぁE/span>
               </li>
               <li>
-                <kbd>↑</kbd> / <kbd>↓</kbd>
-                <span>結果を移動</span>
+                <kbd>ↁE/kbd> / <kbd>ↁE/kbd>
+                <span>結果を移勁E/span>
               </li>
               <li>
                 <kbd>Esc</kbd>
-                <span>ポップアップを閉じる</span>
+                <span>ポップアチE�Eを閉じる</span>
               </li>
             </ul>
           </section>
 
           <section>
-            <h2>インデックスの共有（LAN）</h2>
+            <h2>インチE��クスの共有！EAN�E�E/h2>
             <p className="muted">
-              同じ LAN 上の別 PC から、この PC の索引を検索できます。ファイル自体をコピーする必要はありません。
+              同じ LAN 上�E別 PC から、この PC の索引を検索できます。ファイル自体をコピ�Eする忁E���Eありません、E
             </p>
-            <h3 className="howto-subhead">索引がある PC（ホスト）</h3>
+            <h3 className="howto-subhead">索引がある PC�E��Eスト！E/h3>
             <ol className="howto-steps">
-              <li>「検索対象フォルダ」でフォルダを追加し、「今すぐインデックス」を実行します</li>
+              <li>「検索対象フォルダ」でフォルダを追加し、「今すぐインチE��クス」を実行しまぁE/li>
               <li>
-                クライアントからもファイルを開けるようにする場合は、フォルダの「公開パス（UNC）」に共有パス（例:{" "}
+                クライアントからもファイルを開けるようにする場合�E、フォルダの「�E開パス�E�ENC�E�」に共有パス�E�侁E{" "}
                 <code>\\192.168.0.8\共有名</code>
-                ）を設定してから再インデックスします。すでに UNC で登録している場合は空のままで構いません
+                �E�を設定してから再インチE��クスします。すでに UNC で登録してぁE��場合�E空のままで構いません
               </li>
-              <li>「リモート」タブで「リモート検索サーバを有効にする」をオンにします</li>
+              <li>「リモート」タブで「リモート検索サーバを有効にする」をオンにしまぁE/li>
               <li>
-                共有トークンを控えます（初回有効化時に乱数が自動生成されます。クライアントに同じ値を入れます）
+                共有トークンを控えます（�E回有効化時に乱数が�E動生成されます。クライアントに同じ値を�Eれます！E
               </li>
               <li>
-                Windows ファイアウォールでポート（既定 <code>17890</code>）の受信を許可します
+                Windows ファイアウォールでポ�Eト（既宁E<code>17890</code>�E��E受信を許可しまぁE
               </li>
             </ol>
-            <h3 className="howto-subhead">検索する側の PC（クライアント）</h3>
+            <h3 className="howto-subhead">検索する側の PC�E�クライアント！E/h3>
             <ol className="howto-steps">
               <li>
-                「リモート」タブで検索モードを「リモートのみ」または「ハイブリッド」にします
+                「リモート」タブで検索モードを「リモート�Eみ」また�E「ハイブリチE��」にしまぁE
               </li>
               <li>
-                リモート URL（例: <code>http://192.168.0.8:17890</code>
-                ）とホストと同じトークンを入力します
+                リモーチEURL�E�侁E <code>http://192.168.0.8:17890</code>
+                �E�とホストと同じト�Eクンを�E力しまぁE
               </li>
-              <li>「接続テスト」で確認してから設定を保存します</li>
+              <li>「接続テスト」で確認してから設定を保存しまぁE/li>
             </ol>
             <ul className="howto-tips">
               <li>
-                トークンは <code>%APPDATA%\Argos\argos.db</code>{" "}
-                に保存されます。漏洩が疑われる場合はホストで「トークンを再生成」し、全クライアントを更新してください
+                ト�Eクンは <code>%APPDATA%\Argos\argos.db</code>{" "}
+                に保存されます。漏洩が疑われる場合�Eホストで「トークンを�E生�E」し、�Eクライアントを更新してください
               </li>
               <li>
                 ホストが <code>C:\...</code>{" "}
-                などローカルパスだけを索引していると、クライアントではプレビューはできてもファイルを開けないことがあります
+                などローカルパスだけを索引してぁE��と、クライアントではプレビューはできてもファイルを開けなぁE��とがありまぁE
               </li>
-              <li>詳細な項目は「リモート」タブでも設定・確認できます</li>
+              <li>詳細な頁E��は「リモート」タブでも設定�E確認できまぁE/li>
             </ul>
           </section>
 
           <section>
-            <h2>ヒント</h2>
+            <h2>ヒンチE/h2>
             <ul className="howto-tips">
-              <li>登録フォルダ内のファイル変更は自動で監視され、索引に反映されます</li>
-              <li>ショートカットキーの変更はアプリ再起動後に反映されます</li>
+              <li>登録フォルダ冁E�Eファイル変更は自動で監視され、索引に反映されまぁE/li>
+              <li>ショートカチE��キーの変更はアプリ再起動後に反映されまぁE/li>
               <li>
-                データは <code>%APPDATA%\Argos\</code> に保存されます
+                チE�Eタは <code>%APPDATA%\Argos\</code> に保存されまぁE
               </li>
             </ul>
           </section>
@@ -718,17 +718,17 @@ export default function Settings() {
           <section>
             <h2>検索対象フォルダ</h2>
             <p className="muted">
-              ここに追加したフォルダ内の文書が検索対象になります。LAN
-              公開が必要な場合のみ、各フォルダの「UNC」から共有パスを設定できます。
+              ここに追加したフォルダ冁E�E斁E��が検索対象になります、EAN
+              公開が忁E��な場合�Eみ、各フォルダの「UNC」から�E有パスを設定できます、E
             </p>
             <div className="row">
               <input
-                placeholder="例: D:\事件 または \\他PC\共有"
+                placeholder="侁E D:\事件 また�E \\他PC\共朁E
                 value={folderInput}
                 onChange={(e) => setFolderInput(e.target.value)}
               />
               <button type="button" onClick={() => void browseFolder()}>
-                参照…
+                参�E…
               </button>
               <button
                 type="button"
@@ -740,7 +740,7 @@ export default function Settings() {
             </div>
             <ul className="folder-list">
               {folders.length === 0 ? (
-                <li className="empty">フォルダがまだ登録されていません</li>
+                <li className="empty">フォルダがまだ登録されてぁE��せん</li>
               ) : (
                 folders.map((f) => {
                   const publicOpen = publicPathOpenId === f.id;
@@ -765,12 +765,12 @@ export default function Settings() {
                         {isBusy ? (
                           <span
                             className="folder-busy"
-                            title="このフォルダの索引を処理中です"
+                            title="こ�Eフォルダの索引を処琁E��でぁE
                           >
                             {indexProgress &&
                             indexProgress.folderId === f.id
                               ? formatIndexProgress(indexProgress)
-                              : "処理中…"}
+                              : "処琁E��…"}
                           </span>
                         ) : (
                           <span className="folder-actions">
@@ -784,20 +784,20 @@ export default function Settings() {
                               aria-expanded={publicOpen}
                               title={
                                 hasPublicPath
-                                  ? `LAN公開用のUNCパスを表示・編集（設定済: ${publicDraft}）`
-                                  : "LAN公開用のUNCパスを表示・編集"
+                                  ? `LAN公開用のUNCパスを表示・編雁E��設定渁E ${publicDraft}�E�`
+                                  : "LAN公開用のUNCパスを表示・編雁E
                               }
                               onClick={() =>
                                 setPublicPathOpenId(publicOpen ? null : f.id)
                               }
                             >
                               UNC
-                              {hasPublicPath && !publicOpen ? " ✓" : ""}
+                              {hasPublicPath && !publicOpen ? " ✁E : ""}
                             </button>
                             <button
                               type="button"
                               disabled={indexing}
-                              title="このフォルダだけ索引を読み込み直す"
+                              title="こ�Eフォルダだけ索引を読み込み直ぁE
                               onClick={() => void runReindexFolder(f.id)}
                             >
                               読込
@@ -806,7 +806,7 @@ export default function Settings() {
                               type="button"
                               className="danger"
                               disabled={indexing}
-                              title="このフォルダを検索対象から削除する"
+                              title="こ�Eフォルダを検索対象から削除する"
                               onClick={() => void removeFolder(f.id)}
                             >
                               削除
@@ -817,11 +817,11 @@ export default function Settings() {
                       {publicOpen && !isBusy ? (
                         <label className="folder-public">
                           <span className="field-label">
-                            公開パス（UNC）— LAN 上の別 PC から開く場合に設定
+                            公開パス�E�ENC�E� ELAN 上�E別 PC から開く場合に設宁E
                           </span>
                           <span className="folder-public-row">
                             <input
-                              placeholder="例: \\このPC名\共有名（空なら上記パスをそのまま使用）"
+                              placeholder="侁E \\こ�EPC名\共有名�E�空なら上記パスをそのまま使用�E�E
                               value={publicDraft}
                               onChange={(e) =>
                                 setPublicPathDrafts((prev) => ({
@@ -833,10 +833,10 @@ export default function Settings() {
                             <button
                               type="button"
                               disabled={indexing}
-                              title="UNCパスを保存し、このフォルダだけ再索引する"
+                              title="UNCパスを保存し、このフォルダだけ�E索引すめE
                               onClick={() => void savePublicPath(f.id)}
                             >
-                              保存
+                              保孁E
                             </button>
                           </span>
                         </label>
@@ -847,14 +847,14 @@ export default function Settings() {
               )}
             </ul>
             <p className="field-hint">
-              フォルダ追加時はこのフォルダだけ自動で索引されます。UNC
-              は必要なときだけ「UNC」から設定してください。
+              フォルダ追加時�Eこ�Eフォルダだけ�E動で索引されます。UNC
+              は忁E��なときだけ「UNC」から設定してください、E
             </p>
           </section>
 
           <section>
             <h2>除外フォルダ</h2>
-            <p className="muted">検索・インデックスから除外するパスを指定します。</p>
+            <p className="muted">検索・インチE��クスから除外するパスを指定します、E/p>
             <div className="row">
               <input
                 placeholder="除外するフォルダパス"
@@ -862,7 +862,7 @@ export default function Settings() {
                 onChange={(e) => setExcludeInput(e.target.value)}
               />
               <button type="button" onClick={() => void browseExcludeFolder()}>
-                参照…
+                参�E…
               </button>
               <button type="button" onClick={() => void addExclude()}>
                 追加
@@ -889,10 +889,10 @@ export default function Settings() {
           </section>
 
           <section>
-            <h2>インデックス</h2>
+            <h2>インチE��クス</h2>
             <p className="muted">
-              登録フォルダ内の PDF / DOCX / DOC / JTD / XLS / XLSX / TXT / Markdown / HTML / JSON
-              を検索用に登録します。既存フォルダのファイル変更は自動監視されるため、通常はフォルダ追加時の自動索引だけで十分です。全フォルダ再構築は、索引の不整合を直すときだけ使ってください。
+              登録フォルダ冁E�E PDF / DOCX / DOC / JTD / XLS / XLSX / TXT / Markdown / HTML / JSON
+              を検索用に登録します。既存フォルダのファイル変更は自動監視されるため、E��常はフォルダ追加時�E自動索引だけで十�Eです。�Eフォルダ再構築�E、索引�E不整合を直すときだけ使ってください、E
             </p>
             <button
               type="button"
@@ -903,8 +903,8 @@ export default function Settings() {
               {indexing
                 ? indexProgress
                   ? formatIndexProgress(indexProgress)
-                  : "処理中…"
-                : "全フォルダを再構築"}
+                  : "処琁E��…"
+                : "全フォルダを�E構篁E}
             </button>
             {message ? <p className="msg">{message}</p> : null}
           </section>
@@ -921,12 +921,12 @@ export default function Settings() {
           <section>
             <h2>検索ワード登録</h2>
             <p className="muted">
-              法律用語などの複合語を登録すると、検索時に隣接フレーズとして扱われます（索引の分解は変えないため、部分語でもヒットします）。
-              各種設定の品詞フィルタと連携し、登録語内の助詞は除外されません。検索ポップアップの「＋」から挿入・その場登録もできます。
+              法律用語などの褁E��語を登録すると、検索時に隣接フレーズとして扱われます（索引�E刁E��は変えなぁE��め、E��刁E��でもヒチE��します）、E
+              吁E��設定�E品詞フィルタと連携し、登録語�Eの助詞�E除外されません。検索ポップアチE�Eの「＋」から挿入・そ�E場登録もできます、E
             </p>
             <div className="row">
               <input
-                placeholder="例: 弁済による代位 / 損害賠償"
+                placeholder="侁E 弁済による代佁E/ 損害賠儁E
                 value={wordInput}
                 onChange={(e) => setWordInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -949,7 +949,7 @@ export default function Settings() {
                 onClick={() => exportSearchWordsCsv()}
                 disabled={searchWords.length === 0}
               >
-                CSV 書き出し
+                CSV 書き�EぁE
               </button>
               <button
                 type="button"
@@ -961,11 +961,11 @@ export default function Settings() {
               </button>
             </div>
             <p className="field-hint">
-              CSV 形式: 1列（表層）または 表層,品詞,読み。法令から抽出した用語リストの一括登録向けです。
+              CSV 形弁E 1列（表層�E�また�E 表層,品詁E読み。法令から抽出した用語リスト�E一括登録向けです、E
             </p>
             <ul>
               {searchWords.length === 0 ? (
-                <li className="empty">検索ワードはまだ登録されていません</li>
+                <li className="empty">検索ワード�Eまだ登録されてぁE��せん</li>
               ) : (
                 searchWords.map((w) => (
                   <li key={w.id} className="search-word-item">
@@ -989,7 +989,7 @@ export default function Settings() {
                         />
                         <span className="search-word-actions">
                           <button type="button" onClick={() => void saveSearchWord(w.id)}>
-                            保存
+                            保孁E
                           </button>
                           <button
                             type="button"
@@ -1013,7 +1013,7 @@ export default function Settings() {
                               setEditingWordDraft(w.word);
                             }}
                           >
-                            編集
+                            編雁E
                           </button>
                           <button
                             type="button"
@@ -1042,9 +1042,9 @@ export default function Settings() {
           aria-labelledby="tab-options"
         >
           <section className="options-form">
-            <h2>各種設定</h2>
+            <h2>吁E��設宁E/h2>
             <label>
-              <span className="field-label">ショートカットキー</span>
+              <span className="field-label">ショートカチE��キー</span>
               <span className="field-leader" aria-hidden="true" />
               <select
                 value={settings.shortcut}
@@ -1059,7 +1059,7 @@ export default function Settings() {
             </label>
             <p className="field-hint">
               左手で押しやすい候補です。Shift + Alt + Z
-              は、OS の入力言語切替（Alt + Shift）と干渉することがあります。変更は再起動後に反映されます。
+              は、OS の入力言語�E替�E�Elt + Shift�E�と干渉することがあります。変更は再起動後に反映されます、E
             </p>
             <label>
               <span className="field-label">検索結果表示数</span>
@@ -1088,7 +1088,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              <span className="field-label">検索ポップアップの初期幅（px）</span>
+              <span className="field-label">検索ポップアチE�Eの初期幁E��Ex�E�E/span>
               <span className="field-leader" aria-hidden="true" />
               <input
                 type="number"
@@ -1104,7 +1104,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              <span className="field-label">検索ポップアップの初期高さ（px）</span>
+              <span className="field-label">検索ポップアチE�Eの初期高さ�E�Ex�E�E/span>
               <span className="field-leader" aria-hidden="true" />
               <input
                 type="number"
@@ -1120,7 +1120,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              <span className="field-label">検索ポップアップの出現位置</span>
+              <span className="field-label">検索ポップアチE�Eの出現位置</span>
               <span className="field-leader" aria-hidden="true" />
               <select
                 value={settings.popupPosition}
@@ -1139,10 +1139,10 @@ export default function Settings() {
               </select>
             </label>
             <p className="field-hint">
-              ポップアップを開き直すときにサイズ・位置が適用されます。表示中の手動移動・リサイズは、閉じるまで維持されます。
+              ポップアチE�Eを開き直すときにサイズ・位置が適用されます。表示中の手動移動�Eリサイズは、E��じるまで維持されます、E
             </p>
             <label>
-              <span className="field-label">インデックス更新間隔（秒）</span>
+              <span className="field-label">インチE��クス更新間隔�E�秒！E/span>
               <span className="field-leader" aria-hidden="true" />
               <input
                 type="number"
@@ -1164,7 +1164,7 @@ export default function Settings() {
                   setSettings({ ...settings, autostart: e.target.checked })
                 }
               />
-              Windows ログオン時に自動起動
+              Windows ログオン時に自動起勁E
             </label>
             <label className="row-check">
               <input
@@ -1174,13 +1174,13 @@ export default function Settings() {
                   setSettings({ ...settings, posFilterEnabled: e.target.checked })
                 }
               />
-              助詞・助動詞を検索から除外する（品詞フィルタ）
+              助詞�E助動詞を検索から除外する（品詞フィルタ�E�E
             </label>
             <p className="field-hint">
-              自然文クエリのノイズを減らします。ユーザ辞書や &quot;フレーズ&quot; 内の助詞は除外しません。
+              自然斁E��エリのノイズを減らします。ユーザ辞書めE&quot;フレーズ&quot; 冁E�E助詞�E除外しません、E
             </p>
             <button type="button" className="primary" onClick={() => void saveSettings()}>
-              設定を保存
+              設定を保孁E
             </button>
             {message ? <p className="msg">{message}</p> : null}
           </section>
@@ -1195,10 +1195,10 @@ export default function Settings() {
           aria-labelledby="tab-remote"
         >
           <section>
-            <h2>この PC を検索ホストにする</h2>
+            <h2>こ�E PC を検索ホストにする</h2>
             <p className="muted">
-              有効にすると、ローカル索引を LAN 上の他の Argos から検索できるようになります（既定ポート
-              17890）。Windows ファイアウォールで当該ポートの受信を許可してください。
+              有効にすると、ローカル索引を LAN 上�E他�E Argos から検索できるようになります（既定�EーチE
+              17890�E�。Windows ファイアウォールで当該ポ�Eト�E受信を許可してください、E
             </p>
             <label className="row-check">
               <input
@@ -1220,7 +1220,7 @@ export default function Settings() {
             </label>
             <div className="options-form">
               <label>
-                <span className="field-label">ポート</span>
+                <span className="field-label">ポ�EチE/span>
                 <span className="field-leader" aria-hidden="true" />
                 <input
                   type="number"
@@ -1254,28 +1254,28 @@ export default function Settings() {
                   setSettings({ ...settings, remoteServerToken: newToken() })
                 }
               >
-                トークンを再生成
+                ト�Eクンを�E生�E
               </button>
             </div>
             <p className="field-hint">
-              初回有効化時に UUID 乱数が自動生成されます。任意の文字列への変更や「トークンを再生成」も可能です。トークンは{" "}
+              初回有効化時に UUID 乱数が�E動生成されます。任意�E斁E���Eへの変更めE��トークンを�E生�E」も可能です。トークンは{" "}
               <code>%APPDATA%\Argos\argos.db</code>{" "}
-              に保存されます。漏洩時は再生成のうえ、全クライアントのリモートトークンを更新してください。
+              に保存されます。漏洩時�E再生成�EぁE��、�Eクライアント�Eリモートトークンを更新してください、E
             </p>
             <p className="field-hint">
-              クライアント用 URL の例: <code>{clientUrlHint}</code>
-              （トークンもクライアントに同じものを設定）
+              クライアント用 URL の侁E <code>{clientUrlHint}</code>
+              �E�トークンもクライアントに同じも�Eを設定！E
             </p>
           </section>
 
           <section>
-            <h2>他の Argos を検索する（クライアント）</h2>
+            <h2>他�E Argos を検索する�E�クライアント！E/h2>
             <p className="muted">
-              ホスト側でサーバを有効にしたあと、こちらで URL とトークンを設定します。
+              ホスト�Eでサーバを有効にしたあと、こちらで URL とト�Eクンを設定します、E
             </p>
             <div className="options-form">
               <label>
-                <span className="field-label">検索モード</span>
+                <span className="field-label">検索モーチE/span>
                 <span className="field-leader" aria-hidden="true" />
                 <select
                   value={settings.searchMode}
@@ -1294,7 +1294,7 @@ export default function Settings() {
                 </select>
               </label>
               <label>
-                <span className="field-label">リモート URL</span>
+                <span className="field-label">リモーチEURL</span>
                 <span className="field-leader" aria-hidden="true" />
                 <input
                   type="text"
@@ -1317,7 +1317,7 @@ export default function Settings() {
                 />
               </label>
               <label>
-                <span className="field-label">タイムアウト（ms）</span>
+                <span className="field-label">タイムアウト！Es�E�E/span>
                 <span className="field-leader" aria-hidden="true" />
                 <input
                   type="number"
@@ -1339,18 +1339,18 @@ export default function Settings() {
                 disabled={testing}
                 onClick={() => void testRemote()}
               >
-                {testing ? "テスト中…" : "接続テスト"}
+                {testing ? "チE��ト中…" : "接続テスチE}
               </button>
             </div>
             <p className="field-hint">
-              リモート結果のファイルパスがホストのローカルパス（例: C:\…）の場合、この
-              PC からは開けないことがあります。ホスト側でフォルダの「公開パス（UNC）」を設定し、再インデックスしてください。
+              リモート結果のファイルパスが�Eスト�Eローカルパス�E�侁E C:\…�E��E場合、この
+              PC からは開けなぁE��とがあります。�Eスト�Eでフォルダの「�E開パス�E�ENC�E�」を設定し、�EインチE��クスしてください、E
             </p>
           </section>
 
           <section>
             <button type="button" className="primary" onClick={() => void saveSettings()}>
-              設定を保存
+              設定を保孁E
             </button>
             {message ? <p className="msg">{message}</p> : null}
           </section>
@@ -1365,7 +1365,7 @@ export default function Settings() {
           aria-labelledby="tab-credits"
         >
           <section className="credits-block">
-            <h2>開発者</h2>
+            <h2>開発老E/h2>
             <p className="credits-org">半蔵門総合法律事務所</p>
             <p className="credits-person">弁護士　吉田秀平</p>
             <p className="muted credits-meta">Argos v{APP_VERSION}</p>
@@ -1374,21 +1374,21 @@ export default function Settings() {
           <section className="credits-block">
             <h2>利用条件</h2>
             <p className="muted">
-              本ソフトウェア（Argos）は、Apache License 2.0 又はこれと同等の条件に基づき提供されます。
-              ソースコード・バイナリの利用・複製・改変・再配布は、当該ライセンスの条件に従って行ってください。
+              本ソフトウェア�E�Ergos�E��E、Apache License 2.0 又�Eこれと同等�E条件に基づき提供されます、E
+              ソースコード�Eバイナリの利用・褁E��・改変�E再�E币E�E、当該ライセンスの条件に従って行ってください、E
             </p>
             <ul className="credits-terms">
               <li>著作権表示およびライセンス表示を保持すること</li>
-              <li>改変した場合はその旨を明示すること</li>
-              <li>本ソフトウェアは「現状有姿」で提供され、明示・黙示を問わず保証はありません</li>
-              <li>詳細は Apache License, Version 2.0（https://www.apache.org/licenses/LICENSE-2.0）を参照</li>
+              <li>改変した場合�Eそ�E旨を�E示すること</li>
+              <li>本ソフトウェアは「現状有姿」で提供され、�E示・黙示を問わず保証はありません</li>
+              <li>詳細は Apache License, Version 2.0�E�Ettps://www.apache.org/licenses/LICENSE-2.0�E�を参�E</li>
             </ul>
           </section>
 
           <section className="credits-block">
-            <h2>使用ライブラリ（クレジット）</h2>
+            <h2>使用ライブラリ�E�クレジチE���E�E/h2>
             <p className="muted">
-              本アプリは次のオープンソースライブラリ等を利用しています。各ライブラリの著作権はそれぞれの権利者に帰属し、記載のライセンス条件に従います。間接依存も含め、完全な一覧ではない場合があります。
+              本アプリは次のオープンソースライブラリ等を利用してぁE��す。各ライブラリの著作権はそれぞれの権利老E��帰属し、記載�Eライセンス条件に従います。間接依存も含め、完�Eな一覧ではなぁE��合があります、E
             </p>
             <ul className="credits-libs">
               {THIRD_PARTY_LICENSES.map((lib) => (

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -15,6 +23,107 @@ import {
   splitProseParagraphs,
 } from "./markdownPreview";
 import "./popup.css";
+
+function HitActionIcon({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      className="hit-action-icon"
+      viewBox="0 0 16 16"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconOpenFile() {
+  return (
+    <HitActionIcon>
+      <path d="M9 2.5h4.5V7" />
+      <path d="M13.5 2.5 7 9" />
+      <path d="M7.5 3.5H3.75A1.25 1.25 0 0 0 2.5 4.75v7.5A1.25 1.25 0 0 0 3.75 13.5h7.5a1.25 1.25 0 0 0 1.25-1.25V8.5" />
+    </HitActionIcon>
+  );
+}
+
+function IconPreview() {
+  return (
+    <HitActionIcon>
+      <path d="M1.75 8s2.25-4 6.25-4 6.25 4 6.25 4-2.25 4-6.25 4-6.25-4-6.25-4Z" />
+      <circle cx="8" cy="8" r="1.75" />
+    </HitActionIcon>
+  );
+}
+
+function IconRescope() {
+  return (
+    <HitActionIcon>
+      <circle cx="7" cy="7" r="4" />
+      <path d="m13 13-2.5-2.5" />
+    </HitActionIcon>
+  );
+}
+
+function IconFolder() {
+  return (
+    <HitActionIcon>
+      <path d="M2.5 5.25A1.25 1.25 0 0 1 3.75 4h2.3l1.2 1.5h5A1.25 1.25 0 0 1 13.5 6.75v4.5A1.25 1.25 0 0 1 12.25 12.5H3.75A1.25 1.25 0 0 1 2.5 11.25v-6Z" />
+    </HitActionIcon>
+  );
+}
+
+function IconList() {
+  return (
+    <HitActionIcon>
+      <path d="M5.5 4h8" />
+      <path d="M5.5 8h8" />
+      <path d="M5.5 12h8" />
+      <circle cx="3.25" cy="4" r="0.75" fill="currentColor" stroke="none" />
+      <circle cx="3.25" cy="8" r="0.75" fill="currentColor" stroke="none" />
+      <circle cx="3.25" cy="12" r="0.75" fill="currentColor" stroke="none" />
+    </HitActionIcon>
+  );
+}
+
+/** 16×16 paw-print pip for match score. */
+function IconScoreDog({ filled }: { filled: boolean }) {
+  return (
+    <svg
+      className={filled ? "hit-score-dog filled" : "hit-score-dog"}
+      viewBox="0 0 16 16"
+      width="16"
+      height="16"
+      aria-hidden="true"
+    >
+      {/* toe pads */}
+      <ellipse
+        cx="3.15"
+        cy="5.15"
+        rx="1.5"
+        ry="2"
+        transform="rotate(-30 3.15 5.15)"
+      />
+      <ellipse cx="6.1" cy="3.1" rx="1.4" ry="1.9" />
+      <ellipse cx="9.9" cy="3.1" rx="1.4" ry="1.9" />
+      <ellipse
+        cx="12.85"
+        cy="5.15"
+        rx="1.5"
+        ry="2"
+        transform="rotate(30 12.85 5.15)"
+      />
+      {/* main pad: rounded △, point toward toes, wide base below */}
+      <path d="M8 7.15c.85 0 2.1.75 3.25 2.05 1.9 1.7 2.3 3.95 1.55 5.15-.7.55-2.15.95-3.4.25-.4-.22-.7-.6-1.4-.6s-1 .38-1.4.6c-1.25.7-2.7.3-3.4-.25C2.45 13.15 2.85 10.9 4.75 9.2 5.9 7.9 7.15 7.15 8 7.15Z" />
+    </svg>
+  );
+}
 
 type ResizeDirection =
   | "East"
@@ -341,6 +450,7 @@ export default function Popup() {
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [index, setIndex] = useState(0);
   const [preview, setPreview] = useState<SearchHit | null>(null);
+  const [maximized, setMaximized] = useState(false);
   const [occurrences, setOccurrences] = useState<SearchHit[]>([]);
   const [occIndex, setOccIndex] = useState(0);
   const [searching, setSearching] = useState(false);
@@ -366,6 +476,22 @@ export default function Popup() {
   useEffect(() => {
     scopePathRef.current = scopePath;
   }, [scopePath]);
+
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    void win.isMaximized().then(setMaximized).catch(() => {});
+    void win
+      .onResized(() => {
+        void win.isMaximized().then(setMaximized).catch(() => {});
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -612,16 +738,19 @@ export default function Popup() {
     }
   }, [query, scheduleSearch]);
 
-  const openSelected = useCallback(async () => {
-    const hit = hits[index];
-    if (!hit) return;
-    setActionError("");
-    try {
-      await invoke("open_hit", { path: hit.path });
-    } catch (e) {
-      setActionError(String(e));
-    }
-  }, [hits, index]);
+  const openSelected = useCallback(
+    async (path?: string) => {
+      const target = path ?? hits[index]?.path;
+      if (!target) return;
+      setActionError("");
+      try {
+        await invoke("open_hit", { path: target });
+      } catch (e) {
+        setActionError(String(e));
+      }
+    },
+    [hits, index],
+  );
 
   const openFolder = useCallback(
     async (path?: string) => {
@@ -645,27 +774,30 @@ export default function Popup() {
     }
   }, []);
 
-  const showPreview = useCallback(async () => {
-    const hit = hits[index];
-    if (!hit) return;
-    setPreview(hit);
-    setOccurrences([hit]);
-    setOccIndex(0);
-    if (hit.source === "remote") return;
-    try {
-      const matches = await invoke<SearchHit[]>("search_path_matches", {
-        query: query.trim(),
-        path: hit.path,
-      });
-      if (!matches.length) return;
-      setOccurrences(matches);
-      const found = matches.findIndex((m) => m.id === hit.id);
-      setOccIndex(found >= 0 ? found : 0);
-      setPreview(matches[found >= 0 ? found : 0] ?? hit);
-    } catch (e) {
-      console.error(e);
-    }
-  }, [hits, index, query]);
+  const showPreview = useCallback(
+    async (target?: SearchHit) => {
+      const hit = target ?? hits[index];
+      if (!hit) return;
+      setPreview(hit);
+      setOccurrences([hit]);
+      setOccIndex(0);
+      if (hit.source === "remote") return;
+      try {
+        const matches = await invoke<SearchHit[]>("search_path_matches", {
+          query: query.trim(),
+          path: hit.path,
+        });
+        if (!matches.length) return;
+        setOccurrences(matches);
+        const found = matches.findIndex((m) => m.id === hit.id);
+        setOccIndex(found >= 0 ? found : 0);
+        setPreview(matches[found >= 0 ? found : 0] ?? hit);
+      } catch (e) {
+        console.error(e);
+      }
+    },
+    [hits, index, query],
+  );
 
   const previewParagraph = useCallback(
     async (paraId: string, fileHit: SearchHit) => {
@@ -722,6 +854,12 @@ export default function Popup() {
     [occurrences],
   );
 
+  const closePreview = useCallback(() => {
+    setPreview(null);
+    setOccurrences([]);
+    setOccIndex(0);
+  }, []);
+
   const hidePopup = useCallback(async () => {
     clearScope();
     setFolderPickerOpen(false);
@@ -756,9 +894,7 @@ export default function Popup() {
           return;
         }
         if (preview) {
-          setPreview(null);
-          setOccurrences([]);
-          setOccIndex(0);
+          closePreview();
           return;
         }
         void hidePopup();
@@ -816,6 +952,7 @@ export default function Popup() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
+    closePreview,
     folderPickerOpen,
     helpOpen,
     hidePopup,
@@ -827,6 +964,24 @@ export default function Popup() {
     stepOccurrence,
     wordPickerOpen,
   ]);
+
+  const minimizeWindow = useCallback(async () => {
+    try {
+      await getCurrentWindow().minimize();
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, []);
+
+  const toggleMaximizeWindow = useCallback(async () => {
+    try {
+      const win = getCurrentWindow();
+      await win.toggleMaximize();
+      setMaximized(await win.isMaximized());
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, []);
 
   const startWindowDrag = useCallback(async (e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -883,6 +1038,77 @@ export default function Popup() {
         />
       ))}
       <header className="popup-header" onMouseDown={(e) => void startWindowDrag(e)}>
+        <div
+          className="popup-titlebar"
+          onDoubleClick={(e) => {
+            if ((e.target as HTMLElement).closest("button")) return;
+            void toggleMaximizeWindow();
+          }}
+        >
+          <span className="popup-titlebar-label">Argos</span>
+          <div className="popup-window-controls">
+            <button
+              type="button"
+              className="popup-win-btn"
+              title="最小化"
+              aria-label="最小化"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => void minimizeWindow()}
+            >
+              <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+                <path d="M1 5h8" stroke="currentColor" strokeWidth="1.2" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="popup-win-btn"
+              title={maximized ? "元のサイズに戻す" : "最大化"}
+              aria-label={maximized ? "元のサイズに戻す" : "最大化"}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => void toggleMaximizeWindow()}
+            >
+              {maximized ? (
+                <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+                  <path
+                    d="M2.5 3h5v5h-5zm1.5-1.5h5V6.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.1"
+                  />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+                  <rect
+                    x="1.5"
+                    y="1.5"
+                    width="7"
+                    height="7"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.1"
+                  />
+                </svg>
+              )}
+            </button>
+            <button
+              type="button"
+              className="popup-win-btn popup-win-btn-close"
+              title="閉じる"
+              aria-label="閉じる"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => void hidePopup()}
+            >
+              <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
+                <path
+                  d="M2 2l6 6M8 2L2 8"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
         <div className="popup-kicker">
           検索
           <span className="drag-hint">
@@ -935,17 +1161,6 @@ export default function Popup() {
           </button>
           <button
             type="button"
-            className="popup-help-btn"
-            title="検索構文のヒント"
-            aria-label="検索構文のヒント"
-            aria-expanded={helpOpen}
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => toggleHelp()}
-          >
-            ？
-          </button>
-          <button
-            type="button"
             className="popup-word-add-btn"
             title="登録済み検索ワードを追加"
             aria-label="登録済み検索ワードを追加"
@@ -960,6 +1175,17 @@ export default function Popup() {
             }}
           >
             ＋
+          </button>
+          <button
+            type="button"
+            className="popup-help-btn"
+            title="検索構文のヒント"
+            aria-label="検索構文のヒント"
+            aria-expanded={helpOpen}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => toggleHelp()}
+          >
+            ？
           </button>
           {helpOpen ? (
             <div className="popup-syntax-help" role="dialog" aria-label="検索構文のヒント">
@@ -1104,20 +1330,41 @@ export default function Popup() {
           <div className="preview-title">{preview.title}</div>
           <div className="preview-path">{preview.path}</div>
           <div className="preview-actions">
-            <button type="button" onClick={() => void openSelected()}>
-              ファイルを開く
-            </button>
-            <button type="button" onClick={() => void openFolder(preview.path)}>
-              フォルダを開く
+            <button
+              type="button"
+              className="hit-action-btn"
+              title="一覧に戻る (Esc)"
+              aria-label="一覧に戻る"
+              onClick={closePreview}
+            >
+              <IconList />
             </button>
             <button
               type="button"
-              className="preview-rescope-btn"
+              className="hit-action-btn"
+              title="ファイルを開く (Enter)"
+              aria-label="ファイルを開く"
+              onClick={() => void openSelected()}
+            >
+              <IconOpenFile />
+            </button>
+            <button
+              type="button"
+              className="hit-action-btn"
+              title="フォルダを開く (Shift+Enter)"
+              aria-label="フォルダを開く"
+              onClick={() => void openFolder(preview.path)}
+            >
+              <IconFolder />
+            </button>
+            <button
+              type="button"
+              className="hit-action-btn"
               title="このフォルダ内で再検索"
               aria-label="このフォルダ内で再検索"
               onClick={() => rescopeToHitFolder(preview.path)}
             >
-              🔍
+              <IconRescope />
             </button>
           </div>
           {occurrences.length > 0 ? (
@@ -1199,14 +1446,7 @@ export default function Popup() {
                           title={`マッチ度 ${level}/5`}
                         >
                           {[1, 2, 3, 4, 5].map((n) => (
-                            <span
-                              key={n}
-                              className={
-                                n <= level
-                                  ? "hit-score-dot filled"
-                                  : "hit-score-dot"
-                              }
-                            />
+                            <IconScoreDog key={n} filled={n <= level} />
                           ))}
                         </div>
                       </div>
@@ -1268,7 +1508,32 @@ export default function Popup() {
                     <div className="hit-actions">
                       <button
                         type="button"
-                        className="hit-folder-btn"
+                        className="hit-action-btn"
+                        title="ファイルを開く (Enter)"
+                        aria-label="ファイルを開く"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void openSelected(hit.path);
+                        }}
+                      >
+                        <IconOpenFile />
+                      </button>
+                      <button
+                        type="button"
+                        className="hit-action-btn"
+                        title="プレビュー (Ctrl+Enter)"
+                        aria-label="プレビュー"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setIndex(i);
+                          void showPreview(hit);
+                        }}
+                      >
+                        <IconPreview />
+                      </button>
+                      <button
+                        type="button"
+                        className="hit-action-btn"
                         title="このフォルダ内で再検索"
                         aria-label="このフォルダ内で再検索"
                         onClick={(e) => {
@@ -1276,18 +1541,19 @@ export default function Popup() {
                           rescopeToHitFolder(hit.path);
                         }}
                       >
-                        🔍
+                        <IconRescope />
                       </button>
                       <button
                         type="button"
-                        className="hit-folder-btn"
+                        className="hit-action-btn"
                         title="フォルダを開く (Shift+Enter)"
+                        aria-label="フォルダを開く"
                         onClick={(e) => {
                           e.stopPropagation();
                           void openFolder(hit.path);
                         }}
                       >
-                        📁
+                        <IconFolder />
                       </button>
                     </div>
                   </li>
@@ -1304,16 +1570,58 @@ export default function Popup() {
         {preview ? (
           <>
             <span>←→ 出現箇所</span>
-            <span>Enter 開く</span>
-            <span>Esc 一覧</span>
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="ファイルを開く (Enter)"
+              onClick={() => void openSelected()}
+            >
+              Enter 開く
+            </button>
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="一覧に戻る (Esc)"
+              onClick={closePreview}
+            >
+              Esc 一覧
+            </button>
           </>
         ) : (
           <>
             <span>↑↓ 移動</span>
-            <span>Enter 開く</span>
-            <span>Shift+Enter フォルダ</span>
-            <span>Ctrl+Enter プレビュー</span>
-            <span>Esc / 外クリック 閉じる</span>
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="ファイルを開く (Enter)"
+              onClick={() => void openSelected()}
+            >
+              Enter 開く
+            </button>
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="フォルダを開く (Shift+Enter)"
+              onClick={() => void openFolder()}
+            >
+              Shift+Enter フォルダ
+            </button>
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="プレビュー (Ctrl+Enter)"
+              onClick={() => void showPreview()}
+            >
+              Ctrl+Enter プレビュー
+            </button>
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="閉じる (Esc)"
+              onClick={() => void hidePopup()}
+            >
+              Esc 閉じる
+            </button>
           </>
         )}
         <button
