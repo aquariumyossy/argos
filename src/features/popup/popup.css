@@ -74,7 +74,7 @@
 }
 
 .popup-header {
-  padding: 16px 18px 12px;
+  padding: 0 0 12px;
   border-bottom: 1px solid var(--line);
   cursor: grab;
   user-select: none;
@@ -82,6 +82,55 @@
 
 .popup-header:active {
   cursor: grabbing;
+}
+
+.popup-titlebar {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  min-height: 32px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 253, 248, 0.55);
+}
+
+.popup-titlebar-label {
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.popup-window-controls {
+  display: flex;
+  align-items: stretch;
+  margin-left: auto;
+}
+
+.popup-win-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.popup-win-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+  opacity: 1;
+}
+
+.popup-win-btn-close:hover {
+  background: #e81123;
+  color: #fff;
+  opacity: 1;
 }
 
 .popup-kicker {
@@ -93,6 +142,7 @@
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
+  padding: 0 18px;
 }
 
 .drag-hint {
@@ -115,6 +165,7 @@
   gap: 6px;
   min-width: 0;
   position: relative;
+  padding: 0 18px;
 }
 
 .popup-query-input {
@@ -424,6 +475,7 @@
   flex-wrap: wrap;
   gap: 6px;
   margin-top: 8px;
+  padding: 0 18px;
 }
 
 .popup-scope-chip {
@@ -466,9 +518,10 @@
 
 .hit-actions {
   display: flex;
+  flex-direction: column;
   flex-shrink: 0;
-  gap: 4px;
-  align-items: flex-start;
+  gap: 3px;
+  align-items: stretch;
 }
 
 .hit-list {
@@ -513,23 +566,26 @@
 .hit-score {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 1px;
   flex-shrink: 0;
-  padding-top: 4px;
+  padding-top: 0;
 }
 
-.hit-score-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: transparent;
-  box-sizing: border-box;
+.hit-score-dog {
+  display: block;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.15;
+  color: var(--muted);
+  opacity: 0.5;
 }
 
-.hit-score-dot.filled {
-  border-color: var(--accent);
-  background: var(--accent);
+.hit-score-dog.filled {
+  fill: currentColor;
+  stroke: none;
+  color: var(--accent);
+  opacity: 1;
 }
 
 .hit-source {
@@ -647,19 +703,31 @@
   border-radius: 3px;
 }
 
-.hit-folder-btn {
+.hit-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 26px;
+  height: 26px;
+  padding: 0;
   flex-shrink: 0;
   border: 1px solid var(--line);
   background: var(--bg-elevated);
-  border-radius: 4px;
-  padding: 4px 8px;
-  line-height: 1.2;
-  opacity: 0.85;
+  border-radius: 5px;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 0;
 }
 
-.hit-folder-btn:hover {
-  opacity: 1;
+.hit-action-btn:hover {
+  color: var(--accent);
   border-color: var(--accent);
+}
+
+.hit-action-icon {
+  display: block;
+  flex-shrink: 0;
 }
 
 .empty {
@@ -677,6 +745,25 @@
   color: var(--muted);
   font-size: 11px;
   background: rgba(255, 253, 248, 0.7);
+}
+
+.popup-footer-action {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: transparent;
+}
+
+.popup-footer-action:hover {
+  color: var(--ink);
+  text-decoration-color: currentColor;
 }
 
 .popup-settings-btn {
@@ -720,7 +807,7 @@
 
 .preview-actions {
   display: flex;
-  gap: 8px;
+  gap: 3px;
   margin-bottom: 12px;
 }
 
@@ -756,27 +843,6 @@
   min-width: 5em;
   text-align: center;
   font-variant-numeric: tabular-nums;
-}
-
-.preview-actions button {
-  border: 1px solid var(--line);
-  background: var(--bg-elevated);
-  padding: 6px 10px;
-  border-radius: 4px;
-}
-
-.preview-rescope-btn {
-  width: 32px;
-  min-width: 32px;
-  padding: 6px 0 !important;
-  line-height: 1.2;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.preview-rescope-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
 }
 
 .preview-body {
