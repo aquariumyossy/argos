@@ -40,6 +40,19 @@ type SearchWordRow = {
 
 type TabId = "howto" | "folders" | "words" | "options" | "remote" | "credits";
 
+type IndexProgressPayload = {
+  folderId: number;
+  current: number;
+  total: number;
+  phase: "counting" | "indexing";
+};
+
+function formatIndexProgress(p: IndexProgressPayload | null): string {
+  if (!p) return "処理中…";
+  if (p.phase === "counting") return "ファイル数を確認中…";
+  return `${p.current.toLocaleString()} / ${p.total.toLocaleString()}`;
+}
+
 /** Left-hand-friendly shortcuts that avoid common Windows / IME reserved combos. */
 const SHORTCUT_OPTIONS = [
   { value: "Ctrl+Alt+A", label: "Ctrl + Alt + A（推奨）" },
@@ -68,7 +81,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.4.3";
+const APP_VERSION = "1.4.4";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -117,6 +130,9 @@ export default function Settings() {
   const [message, setMessage] = useState("");
   const [indexing, setIndexing] = useState(false);
   const [busyFolderId, setBusyFolderId] = useState<number | null>(null);
+  const [indexProgress, setIndexProgress] = useState<IndexProgressPayload | null>(
+    null,
+  );
   const [tab, setTab] = useState<TabId>("howto");
   const [lanIp, setLanIp] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
@@ -183,6 +199,20 @@ export default function Settings() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<IndexProgressPayload>("index-progress", (event) => {
+      const p = event.payload;
+      setIndexProgress(p);
+      setBusyFolderId(p.folderId);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   // Settings window stays mounted; refresh when opening this tab.
   useEffect(() => {
     if (tab !== "words") return;
@@ -213,6 +243,7 @@ export default function Settings() {
         [row.id]: row.publicPath ?? "",
       }));
       setBusyFolderId(row.id);
+      setIndexProgress(null);
       const stats = await invoke<{
         indexed: number;
         skipped: number;
@@ -227,6 +258,7 @@ export default function Settings() {
       await reload().catch(() => undefined);
     } finally {
       setBusyFolderId(null);
+      setIndexProgress(null);
       setIndexing(false);
     }
   }
@@ -257,6 +289,7 @@ export default function Settings() {
     const publicPath = (publicPathDrafts[id] ?? "").trim();
     setIndexing(true);
     setBusyFolderId(id);
+    setIndexProgress(null);
     try {
       await invoke("update_folder_public_path", { id, publicPath });
       const stats = await invoke<{
@@ -272,6 +305,7 @@ export default function Settings() {
       setMessage(`失敗: ${String(e)}`);
     } finally {
       setBusyFolderId(null);
+      setIndexProgress(null);
       setIndexing(false);
     }
   }
@@ -284,6 +318,7 @@ export default function Settings() {
   async function runReindexFolder(id: number) {
     setIndexing(true);
     setBusyFolderId(id);
+    setIndexProgress(null);
     try {
       const stats = await invoke<{
         indexed: number;
@@ -298,6 +333,7 @@ export default function Settings() {
       setMessage(`失敗: ${String(e)}`);
     } finally {
       setBusyFolderId(null);
+      setIndexProgress(null);
       setIndexing(false);
     }
   }
@@ -471,6 +507,7 @@ export default function Settings() {
 
   async function runReindex() {
     setIndexing(true);
+    setIndexProgress(null);
     setMessage("全フォルダを再構築中…");
     try {
       const stats = await invoke<{
@@ -485,6 +522,8 @@ export default function Settings() {
     } catch (e) {
       setMessage(`失敗: ${String(e)}`);
     } finally {
+      setBusyFolderId(null);
+      setIndexProgress(null);
       setIndexing(false);
     }
   }
@@ -728,7 +767,10 @@ export default function Settings() {
                             className="folder-busy"
                             title="このフォルダの索引を処理中です"
                           >
-                            処理中…
+                            {indexProgress &&
+                            indexProgress.folderId === f.id
+                              ? formatIndexProgress(indexProgress)
+                              : "処理中…"}
                           </span>
                         ) : (
                           <span className="folder-actions">
@@ -858,7 +900,11 @@ export default function Settings() {
               disabled={indexing}
               onClick={() => void runReindex()}
             >
-              {indexing ? "処理中…" : "全フォルダを再構築"}
+              {indexing
+                ? indexProgress
+                  ? formatIndexProgress(indexProgress)
+                  : "処理中…"
+                : "全フォルダを再構築"}
             </button>
             {message ? <p className="msg">{message}</p> : null}
           </section>

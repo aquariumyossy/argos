@@ -7,7 +7,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::db::{
     ExcludePathRow, FolderRow, SearchWordImport, SearchWordImportResult, SearchWordRow, Settings,
 };
-use crate::indexer::IndexStats;
+use crate::indexer::{IndexProgress, IndexStats};
 use crate::pathutil;
 use crate::remote_server;
 use crate::search::{self, SearchHit};
@@ -665,20 +665,32 @@ pub fn set_popup_dragging(app: AppHandle, dragging: bool) {
 }
 
 #[tauri::command]
-pub async fn run_reindex(state: State<'_, Arc<AppState>>) -> Result<IndexStats, String> {
+pub async fn run_reindex(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<IndexStats, String> {
     let indexer = state.indexer.clone();
-    tauri::async_runtime::spawn_blocking(move || indexer.reindex_all())
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        indexer.reindex_all(|p: IndexProgress| {
+            let _ = app.emit("index-progress", &p);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn run_reindex_folder(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     id: i64,
 ) -> Result<IndexStats, String> {
     let indexer = state.indexer.clone();
-    tauri::async_runtime::spawn_blocking(move || indexer.reindex_folder(id))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        indexer.reindex_folder(id, |p: IndexProgress| {
+            let _ = app.emit("index-progress", &p);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

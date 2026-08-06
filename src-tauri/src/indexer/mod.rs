@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use walkdir::WalkDir;
 
@@ -9,6 +9,9 @@ use crate::db::{Db, FolderRow};
 use crate::extractor::{self, content_hash};
 use crate::pathutil;
 use crate::search::tantivy_backend::TantivyBackend;
+
+/// Minimum interval between intermediate `indexing` progress emits (~10 Hz).
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct Indexer {
     db: Arc<Db>,
@@ -20,7 +23,10 @@ impl Indexer {
         Self { db, backend }
     }
 
-    pub fn reindex_all(&self) -> Result<IndexStats, String> {
+    pub fn reindex_all<F>(&self, mut on_progress: F) -> Result<IndexStats, String>
+    where
+        F: FnMut(IndexProgress),
+    {
         // Full rebuild so removed folders / orphaned chunks disappear
         self.backend.clear_all()?;
         self.db.clear_all_files().map_err(|e| e.to_string())?;
@@ -30,13 +36,20 @@ impl Indexer {
 
         let mut stats = IndexStats::default();
         for folder in folders.into_iter().filter(|f| f.enabled) {
-            stats.merge(self.crawl_folder(&folder, &excludes));
+            stats.merge(self.crawl_folder(&folder, &excludes, &mut on_progress));
         }
         Ok(stats)
     }
 
     /// Rebuild index for a single folder without touching other folders.
-    pub fn reindex_folder(&self, folder_id: i64) -> Result<IndexStats, String> {
+    pub fn reindex_folder<F>(
+        &self,
+        folder_id: i64,
+        mut on_progress: F,
+    ) -> Result<IndexStats, String>
+    where
+        F: FnMut(IndexProgress),
+    {
         let folder = self
             .db
             .get_folder(folder_id)
@@ -59,7 +72,7 @@ impl Indexer {
             .map_err(|e| e.to_string())?;
 
         let excludes = self.load_excludes()?;
-        Ok(self.crawl_folder(&folder, &excludes))
+        Ok(self.crawl_folder(&folder, &excludes, &mut on_progress))
     }
 
     fn load_excludes(&self) -> Result<Vec<String>, String> {
@@ -72,19 +85,46 @@ impl Indexer {
             .collect())
     }
 
-    fn crawl_folder(&self, folder: &FolderRow, excludes: &[String]) -> IndexStats {
+    fn crawl_folder<F>(
+        &self,
+        folder: &FolderRow,
+        excludes: &[String],
+        on_progress: &mut F,
+    ) -> IndexStats
+    where
+        F: FnMut(IndexProgress),
+    {
         let mut stats = IndexStats::default();
         let root = PathBuf::from(&folder.path);
         if !root.exists() {
             stats.errors += 1;
             return stats;
         }
+
+        on_progress(IndexProgress {
+            folder_id: folder.id,
+            current: 0,
+            total: 0,
+            phase: IndexPhase::Counting,
+        });
+
+        let total = count_indexable(&root, excludes);
+
+        on_progress(IndexProgress {
+            folder_id: folder.id,
+            current: 0,
+            total,
+            phase: IndexPhase::Indexing,
+        });
+
+        let mut current: u32 = 0;
+        let mut last_emit = Instant::now()
+            .checked_sub(PROGRESS_EMIT_INTERVAL)
+            .unwrap_or_else(Instant::now);
+
         for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if !path.is_file() || !extractor::is_supported(path) {
-                continue;
-            }
-            if is_excluded(path, excludes) {
+            if !is_indexable(path, excludes) {
                 continue;
             }
             match self.index_one(&folder.path, &folder.public_path, path) {
@@ -95,7 +135,31 @@ impl Indexer {
                     stats.errors += 1;
                 }
             }
+            current += 1;
+            let is_done = current >= total;
+            let due = last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL;
+            if is_done || due {
+                on_progress(IndexProgress {
+                    folder_id: folder.id,
+                    current,
+                    total,
+                    phase: IndexPhase::Indexing,
+                });
+                last_emit = Instant::now();
+            }
         }
+
+        // Ensure final n/N even when the last intermediate emit was throttled away
+        // and total was 0 (empty folder): still report 0/0 once above.
+        if total > 0 && current > 0 {
+            on_progress(IndexProgress {
+                folder_id: folder.id,
+                current,
+                total,
+                phase: IndexPhase::Indexing,
+            });
+        }
+
         stats
     }
 
@@ -201,11 +265,41 @@ impl Indexer {
     }
 }
 
+fn count_indexable(root: &Path, excludes: &[String]) -> u32 {
+    let mut total = 0u32;
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if is_indexable(entry.path(), excludes) {
+            total = total.saturating_add(1);
+        }
+    }
+    total
+}
+
+fn is_indexable(path: &Path, excludes: &[String]) -> bool {
+    path.is_file() && extractor::is_supported(path) && !is_excluded(path, excludes)
+}
+
 fn is_excluded(path: &Path, excludes: &[String]) -> bool {
     let s = pathutil::simplify_windows_path(&path.to_string_lossy());
     excludes.iter().any(|ex| {
         pathutil::path_starts_with(&s, &pathutil::simplify_windows_path(ex))
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexPhase {
+    Counting,
+    Indexing,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexProgress {
+    pub folder_id: i64,
+    pub current: u32,
+    pub total: u32,
+    pub phase: IndexPhase,
 }
 
 #[derive(Default, Clone, serde::Serialize)]
