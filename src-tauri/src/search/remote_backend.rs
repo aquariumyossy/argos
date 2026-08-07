@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Settings;
 
-use super::{filter_hits_by_path_prefix, SearchBackend, SearchHit};
+use super::{filter_hits_by_exts, filter_hits_by_path_prefix, SearchBackend, SearchHit};
 
 #[derive(Serialize)]
 struct SearchRequest<'a> {
@@ -13,6 +13,8 @@ struct SearchRequest<'a> {
     limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     path_prefix: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exts: Option<&'a [String]>,
 }
 
 #[derive(Deserialize)]
@@ -99,14 +101,14 @@ impl SearchBackend for RemoteArgosBackend {
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        exts: Option<&[String]>,
         _pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
         let url = format!("{}/search", self.base_url);
-        let scope = path_prefix
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        // Ask remote for more when scoping; older servers ignore path_prefix so we post-filter.
-        let request_limit = if scope.is_some() {
+        let scope = path_prefix.map(str::trim).filter(|s| !s.is_empty());
+        let ext_list = exts.filter(|e| !e.is_empty());
+        // Ask remote for more when scoping; older servers ignore filters so we post-filter.
+        let request_limit = if scope.is_some() || ext_list.is_some() {
             (limit * 4).max(limit)
         } else {
             limit
@@ -119,6 +121,7 @@ impl SearchBackend for RemoteArgosBackend {
                 query,
                 limit: request_limit,
                 path_prefix: scope,
+                exts: ext_list,
             })
             .send()
             .map_err(|e| format!("リモート検索に失敗: {e}"))?;
@@ -135,8 +138,9 @@ impl SearchBackend for RemoteArgosBackend {
         for hit in &mut hits {
             hit.source = "remote".into();
         }
-        // Always post-filter: covers old remotes that ignore path_prefix.
+        // Always post-filter: covers old remotes that ignore path_prefix / exts.
         let mut hits = filter_hits_by_path_prefix(hits, scope);
+        hits = filter_hits_by_exts(hits, ext_list);
         hits.truncate(limit);
         Ok(hits)
     }
@@ -174,13 +178,14 @@ pub fn hybrid_search(
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
+    exts: Option<&[String]>,
     pos_filter_enabled: bool,
 ) -> Result<Vec<SearchHit>, String> {
     let (local_res, remote_res) = std::thread::scope(|scope| {
         let local_handle =
-            scope.spawn(|| local.search(query, limit, path_prefix, pos_filter_enabled));
+            scope.spawn(|| local.search(query, limit, path_prefix, exts, pos_filter_enabled));
         let remote_handle =
-            scope.spawn(|| remote.search(query, limit, path_prefix, pos_filter_enabled));
+            scope.spawn(|| remote.search(query, limit, path_prefix, exts, pos_filter_enabled));
         (local_handle.join(), remote_handle.join())
     });
 

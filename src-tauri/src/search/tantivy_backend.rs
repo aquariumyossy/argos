@@ -250,6 +250,14 @@ impl TantivyBackend {
         Ok(units.len())
     }
 
+    pub fn morph_content_surfaces(
+        &self,
+        text: &str,
+        pos_filter: bool,
+    ) -> Result<Vec<String>, String> {
+        self.morph.lock().content_surfaces(text, pos_filter)
+    }
+
     /// Kept for Tantivy tokenizer parity with the inverted index vocabulary.
     fn tokenize_ja(&self, text: &str) -> Result<Vec<String>, String> {
         let mut tokenizer = self
@@ -565,11 +573,11 @@ impl TantivyBackend {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct ParsedQuery {
-    includes: Vec<String>,
-    phrases: Vec<String>,
-    excludes: Vec<String>,
-    exclude_phrases: Vec<String>,
+pub struct ParsedQuery {
+    pub includes: Vec<String>,
+    pub phrases: Vec<String>,
+    pub excludes: Vec<String>,
+    pub exclude_phrases: Vec<String>,
 }
 
 /// Short function-word surfaces to skip when guessing snippet anchors.
@@ -625,7 +633,7 @@ fn is_index_symbol_token(t: &str) -> bool {
 
 /// Parse Google-like syntax: `"phrase"`, `-exclude`, `-"exclude phrase"`.
 /// Delimiters: half/full-width space and comma (including `、`).
-fn parse_query_syntax(raw: &str) -> ParsedQuery {
+pub fn parse_query_syntax(raw: &str) -> ParsedQuery {
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0usize;
     let mut out = ParsedQuery::default();
@@ -867,11 +875,13 @@ fn make_snippet(body: &str, query: &str, highlight_terms: &[String], radius: usi
 impl TantivyBackend {
     /// Score-ranked chunk hits, optionally scoped by path prefix. Does not dedupe by path.
     /// When `exact_path` is set, AND a path TermQuery so all chunks of that file are retrieved.
+    /// When `exts` is set, AND an extension TermQuery (OR across the list).
     fn search_scored(
         &self,
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        exts: Option<&[String]>,
         pos_filter_enabled: bool,
         exact_path: Option<&str>,
     ) -> Result<Vec<(f32, SearchHit)>, String> {
@@ -895,14 +905,17 @@ impl TantivyBackend {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let ext_filter: Option<Vec<String>> = exts
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_vec());
         // Use path as stored in the index (hit.path), not simplified — STRING TermQuery is exact.
         let exact = exact_path
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         eprintln!(
-            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exact_path={:?} pos_filter={}",
-            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, exact, pos_filter_enabled
+            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exts={:?} exact_path={:?} pos_filter={}",
+            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, ext_filter, exact, pos_filter_enabled
         );
         eprintln!(
             "argos: highlight_terms={:?} content_for_includes={:?}",
@@ -915,16 +928,39 @@ impl TantivyBackend {
                 .unwrap_or_default()
         );
 
-        let wrap_path = |inner: Box<dyn Query>| -> Box<dyn Query> {
+        let wrap_filters = |inner: Box<dyn Query>| -> Box<dyn Query> {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, inner)];
             if let Some(ref p) = exact {
                 let path_term = Term::from_field_text(self.fields.path, p);
                 let path_q = TermQuery::new(path_term, IndexRecordOption::Basic);
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, inner),
-                    (Occur::Must, Box::new(path_q)),
-                ]))
+                clauses.push((Occur::Must, Box::new(path_q)));
+            }
+            if let Some(ref list) = ext_filter {
+                if list.len() == 1 {
+                    let term = Term::from_field_text(self.fields.ext, &list[0]);
+                    clauses.push((
+                        Occur::Must,
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                    ));
+                } else {
+                    let shoulds: Vec<(Occur, Box<dyn Query>)> = list
+                        .iter()
+                        .map(|e| {
+                            let term = Term::from_field_text(self.fields.ext, e);
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                    as Box<dyn Query>,
+                            )
+                        })
+                        .collect();
+                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(shoulds))));
+                }
+            }
+            if clauses.len() == 1 {
+                clauses.remove(0).1
             } else {
-                inner
+                Box::new(BooleanQuery::new(clauses))
             }
         };
 
@@ -933,13 +969,13 @@ impl TantivyBackend {
         // (Do not multiply by large factors here — callers already size the unit budget.)
         let fetch_n = if exact.is_some() {
             limit.max(50).min(80)
-        } else if scope.is_some() {
+        } else if scope.is_some() || ext_filter.is_some() {
             (limit * 5).max(80).min(400)
         } else {
             (limit * 2).max(40).min(200)
         };
         let mut top = searcher
-            .search(&*wrap_path(tantivy_q), &TopDocs::with_limit(fetch_n))
+            .search(&*wrap_filters(tantivy_q), &TopDocs::with_limit(fetch_n))
             .map_err(|e| e.to_string())?;
         eprintln!("argos: tantivy_raw_hits={}", top.len());
 
@@ -951,7 +987,7 @@ impl TantivyBackend {
         if top.is_empty() && pos_filter_enabled && !proximity_tokens.is_empty() {
             if let Some(loose_q) = self.build_parsed_query(&parsed, false)? {
                 top = searcher
-                    .search(&*wrap_path(loose_q), &TopDocs::with_limit(fetch_n))
+                    .search(&*wrap_filters(loose_q), &TopDocs::with_limit(fetch_n))
                     .map_err(|e| e.to_string())?;
                 used_loose_retrieval = true;
                 eprintln!(
@@ -983,6 +1019,12 @@ impl TantivyBackend {
             };
             if let Some(ref prefix) = scope {
                 if !pathutil::path_starts_with(&hit.path, prefix) {
+                    continue;
+                }
+            }
+            if let Some(ref list) = ext_filter {
+                let hit_ext = super::path_extension(&hit.path);
+                if !list.iter().any(|e| e == &hit_ext) {
                     continue;
                 }
             }
@@ -1032,10 +1074,10 @@ impl TantivyBackend {
             return Ok(vec![]);
         }
         let mut scored =
-            self.search_scored(query, limit, None, pos_filter_enabled, Some(path))?;
+            self.search_scored(query, limit, None, None, pos_filter_enabled, Some(path))?;
         // Fallback if TermQuery missed due to path normalization drift: prefix scope.
         if scored.is_empty() {
-            scored = self.search_scored(query, limit, Some(path), pos_filter_enabled, None)?;
+            scored = self.search_scored(query, limit, Some(path), None, pos_filter_enabled, None)?;
             scored.retain(|(_, hit)| {
                 pathutil::simplify_windows_path(&hit.path)
                     .eq_ignore_ascii_case(&pathutil::simplify_windows_path(path))
@@ -1166,13 +1208,14 @@ impl SearchBackend for TantivyBackend {
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        exts: Option<&[String]>,
         pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
         // Unit budget ≈ pre-paragraph TopDocs size so nesting does not explode fetch_n.
         // search_scored applies only a mild over-fetch on top of this.
         let unit_limit = (limit * 8).max(40);
         let scored =
-            self.search_scored(query, unit_limit, path_prefix, pos_filter_enabled, None)?;
+            self.search_scored(query, unit_limit, path_prefix, exts, pos_filter_enabled, None)?;
 
         // Group by path; scored is already best-score-first.
         let mut order: Vec<String> = Vec::new();
@@ -1226,7 +1269,7 @@ impl SearchBackend for TantivyBackend {
             hits.len(),
             hits.first().map(|h| &h.highlight_terms)
         );
-        Ok(hits)
+        Ok(super::filter_hits_by_exts(hits, exts))
     }
 
     fn preview(&self, hit_id: &str) -> Result<Option<SearchHit>, String> {
@@ -1411,7 +1454,7 @@ mod tests {
             .expect("index good");
 
         let hits = backend
-            .search(good, 10, None, true)
+            .search(good, 10, None, None, true)
             .expect("search");
         assert!(
             !hits.is_empty(),
@@ -1466,7 +1509,7 @@ mod tests {
             .expect("index");
 
         let hits = backend
-            .search("そうした光景を見慣れています", 10, None, true)
+            .search("そうした光景を見慣れています", 10, None, None, true)
             .expect("search");
         assert!(
             !hits.is_empty(),
@@ -1516,7 +1559,7 @@ mod tests {
         }
 
         let hits = backend
-            .search(sentence, 10, None, true)
+            .search(sentence, 10, None, None, true)
             .expect("search sentence");
         eprintln!(
             "sentence hits={} terms={:?}",
@@ -1575,7 +1618,7 @@ mod tests {
             )
             .expect("index");
 
-        let list = backend.search("損害賠償", 10, None, false).expect("search");
+        let list = backend.search("損害賠償", 10, None, None, false).expect("search");
         assert_eq!(list.len(), 1, "list stays one hit per file");
 
         let matches = backend

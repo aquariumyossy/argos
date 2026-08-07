@@ -8,7 +8,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::search::{filter_hits_by_path_prefix, SearchBackend, SearchHit, TantivyBackend};
+use crate::search::{
+    filter_hits_by_exts, filter_hits_by_path_prefix, SearchBackend, SearchHit, TantivyBackend,
+};
 
 #[derive(Clone)]
 struct ServerState {
@@ -29,6 +31,8 @@ struct SearchRequest {
     limit: Option<usize>,
     #[serde(default)]
     path_prefix: Option<String>,
+    #[serde(default)]
+    exts: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -88,24 +92,33 @@ async fn search(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let exts = crate::search::normalize_exts(body.exts);
     // Over-fetch when scoped so post-filter can still fill limit.
-    let fetch_limit = if path_prefix.is_some() {
+    let fetch_limit = if path_prefix.is_some() || exts.is_some() {
         (limit * 4).clamp(1, 50)
     } else {
         limit
     };
     let prefix_for_filter = path_prefix.clone();
+    let exts_for_filter = exts.clone();
     let pos_filter = state
         .pos_filter_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
     let mut hits = tauri::async_runtime::spawn_blocking(move || {
-        backend.search(&query, fetch_limit, path_prefix.as_deref(), pos_filter)
+        backend.search(
+            &query,
+            fetch_limit,
+            path_prefix.as_deref(),
+            exts.as_deref(),
+            pos_filter,
+        )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     // Safety net if backend ignored scope (should not happen for local Tantivy).
     hits = filter_hits_by_path_prefix(hits, prefix_for_filter.as_deref());
+    hits = filter_hits_by_exts(hits, exts_for_filter.as_deref());
     hits.truncate(limit);
     for hit in &mut hits {
         hit.source = "remote".into();
