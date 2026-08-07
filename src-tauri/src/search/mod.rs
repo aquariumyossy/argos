@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+pub mod history;
 pub mod morph;
 pub mod remote_backend;
 pub mod tantivy_backend;
 
+pub use history::{extract_search_terms, suggest_from_history, SearchTermSuggestion};
 pub use morph::{apply_user_dictionary, is_noise_highlight_term, MorphAnalyzer, UserDictMatcher};
 pub use remote_backend::{hybrid_search, RemoteArgosBackend};
-pub use tantivy_backend::TantivyBackend;
+pub use tantivy_backend::{parse_query_syntax, TantivyBackend};
 
 use crate::db::Settings;
 use crate::pathutil;
@@ -54,6 +56,7 @@ pub trait SearchBackend: Send + Sync {
         query: &str,
         limit: usize,
         path_prefix: Option<&str>,
+        exts: Option<&[String]>,
         pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String>;
     fn preview(&self, hit_id: &str) -> Result<Option<SearchHit>, String>;
@@ -72,6 +75,51 @@ pub fn filter_hits_by_path_prefix(
         .collect()
 }
 
+/// Extension from a file path (lowercase, no leading dot). Empty if none.
+pub fn path_extension(path: &str) -> String {
+    let base = path.replace('\\', "/");
+    let file = base.rsplit('/').next().unwrap_or("");
+    let Some(i) = file.rfind('.') else {
+        return String::new();
+    };
+    if i == 0 || i + 1 >= file.len() {
+        return String::new();
+    }
+    file[i + 1..].to_lowercase()
+}
+
+/// Keep hits whose path extension is in `exts` (lowercase). Empty/None = no filter.
+pub fn filter_hits_by_exts(hits: Vec<SearchHit>, exts: Option<&[String]>) -> Vec<SearchHit> {
+    let Some(list) = exts.filter(|e| !e.is_empty()) else {
+        return hits;
+    };
+    hits.into_iter()
+        .filter(|h| {
+            let ext = path_extension(&h.path);
+            list.iter().any(|e| e == &ext)
+        })
+        .collect()
+}
+
+/// Trim, strip leading dots, lowercase, drop empties. None if nothing left.
+pub fn normalize_exts(exts: Option<Vec<String>>) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in exts.unwrap_or_default() {
+        let e = raw.trim().trim_start_matches('.').to_lowercase();
+        if e.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|x| x == &e) {
+            out.push(e);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// Apply client user-dictionary quoting, then route by `search_mode`.
 ///
 /// Dictionary rewrite runs on the client so remote hosts receive `"phrase"` syntax
@@ -83,6 +131,7 @@ pub fn run_search(
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
+    exts: Option<&[String]>,
     user_dict: &UserDictMatcher,
 ) -> Result<Vec<SearchHit>, String> {
     let rewritten = apply_user_dictionary(query, user_dict);
@@ -90,7 +139,7 @@ pub fn run_search(
     match settings.search_mode.as_str() {
         "remote" => {
             let remote = RemoteArgosBackend::from_settings(settings)?;
-            remote.search(&rewritten, limit, path_prefix, pos_filter)
+            remote.search(&rewritten, limit, path_prefix, exts, pos_filter)
         }
         "hybrid" => {
             let remote = RemoteArgosBackend::from_settings(settings)?;
@@ -100,10 +149,11 @@ pub fn run_search(
                 &rewritten,
                 limit,
                 path_prefix,
+                exts,
                 pos_filter,
             )
         }
-        _ => local.search(&rewritten, limit, path_prefix, pos_filter),
+        _ => local.search(&rewritten, limit, path_prefix, exts, pos_filter),
     }
 }
 

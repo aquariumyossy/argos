@@ -92,6 +92,18 @@ function IconList() {
   );
 }
 
+/** Document with folded corner — file-type filter toolbar button. */
+function IconFileType() {
+  return (
+    <HitActionIcon>
+      <path d="M4.25 2.5h5.25L12.5 5.5v7.25A1.25 1.25 0 0 1 11.25 14h-7A1.25 1.25 0 0 1 3 12.75v-9A1.25 1.25 0 0 1 4.25 2.5Z" />
+      <path d="M9.5 2.5V5h2.75" />
+      <path d="M5.5 8h5" />
+      <path d="M5.5 10.5h5" />
+    </HitActionIcon>
+  );
+}
+
 /** 16×16 paw-print pip for match score. */
 function IconScoreDog({ filled }: { filled: boolean }) {
   return (
@@ -167,12 +179,55 @@ type SearchPayload = {
 
 type SearchWordRow = { id: number; word: string; reading?: string; posLabel?: string };
 
+type SearchHistoryTermRow = { term: string; count: number; last: number };
+
+type SearchTermSuggestion = {
+  term: string;
+  displayPrefix: string;
+  displayRest: string;
+  kind: string;
+  score: number;
+  fromHistory?: boolean;
+  fromRegistered?: boolean;
+};
+
 type SearchScopeRow = { path: string; label: string; isRoot: boolean };
 
-type SearchScopesResult = {
-  recent: SearchScopeRow[];
-  scopes: SearchScopeRow[];
-};
+type SearchScopesResult = { recent: SearchScopeRow[]; scopes: SearchScopeRow[] };
+
+type FileTypeOption = { id: string; label: string; exts: string[] };
+
+const FILE_TYPE_OPTIONS: FileTypeOption[] = [
+  { id: "pdf", label: "PDF", exts: ["pdf"] },
+  { id: "docx", label: "Word (docx)", exts: ["docx"] },
+  { id: "doc", label: "Word (doc)", exts: ["doc"] },
+  { id: "xlsx", label: "Excel (xlsx)", exts: ["xlsx"] },
+  { id: "xls", label: "Excel (xls)", exts: ["xls"] },
+  { id: "txt", label: "テキスト", exts: ["txt"] },
+  { id: "md", label: "Markdown", exts: ["md", "markdown"] },
+  { id: "html", label: "HTML", exts: ["html", "htm"] },
+  { id: "json", label: "JSON", exts: ["json"] },
+  { id: "jtd", label: "JTD", exts: ["jtd"] },
+];
+
+function extsFromFilterKeys(keys: string[]): string[] | null {
+  const out: string[] = [];
+  for (const key of keys) {
+    const opt = FILE_TYPE_OPTIONS.find((o) => o.id === key);
+    if (!opt) continue;
+    for (const e of opt.exts) {
+      if (!out.includes(e)) out.push(e);
+    }
+  }
+  return out.length ? out : null;
+}
+
+function extFilterChipLabel(keys: string[]): string {
+  return keys
+    .map((id) => FILE_TYPE_OPTIONS.find((o) => o.id === id)?.label)
+    .filter(Boolean)
+    .join(" · ");
+}
 
 const SEARCH_DEBOUNCE_MS = 450;
 
@@ -456,14 +511,23 @@ export default function Popup() {
   const [searching, setSearching] = useState(false);
   const [actionError, setActionError] = useState("");
   const [wordPickerOpen, setWordPickerOpen] = useState(false);
+  const [wordPickerFilter, setWordPickerFilter] = useState<
+    "all" | "history" | "registered"
+  >("all");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  const [extPickerOpen, setExtPickerOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [searchWords, setSearchWords] = useState<SearchWordRow[]>([]);
+  const [historyTerms, setHistoryTerms] = useState<SearchHistoryTermRow[]>([]);
+  const [suggestions, setSuggestions] = useState<SearchTermSuggestion[]>([]);
+  const [suggestIndex, setSuggestIndex] = useState(0);
+  const [suggestOpen, setSuggestOpen] = useState(false);
   const [searchScopes, setSearchScopes] = useState<SearchScopeRow[]>([]);
   const [recentScopes, setRecentScopes] = useState<SearchScopeRow[]>([]);
   const [scopeFilter, setScopeFilter] = useState("");
   const [scopePath, setScopePath] = useState<string | null>(null);
   const [scopeLabel, setScopeLabel] = useState<string | null>(null);
+  const [extFilterKeys, setExtFilterKeys] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const scopeFilterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
@@ -471,11 +535,16 @@ export default function Popup() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchSeq = useRef(0);
   const scopePathRef = useRef<string | null>(null);
+  const extFilterRef = useRef<string[]>([]);
   const imeComposingRef = useRef(false);
 
   useEffect(() => {
     scopePathRef.current = scopePath;
   }, [scopePath]);
+
+  useEffect(() => {
+    extFilterRef.current = extFilterKeys;
+  }, [extFilterKeys]);
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -507,38 +576,45 @@ export default function Popup() {
     };
   }, []);
 
-  const runSearch = useCallback(async (q: string, pathPrefix?: string | null) => {
-    const seq = ++searchSeq.current;
-    const trimmed = q.trim();
-    if (!trimmed) {
-      if (seq === searchSeq.current) {
-        setHits([]);
+  const runSearch = useCallback(
+    async (q: string, pathPrefix?: string | null, exts?: string[] | null) => {
+      const seq = ++searchSeq.current;
+      const trimmed = q.trim();
+      if (!trimmed) {
+        if (seq === searchSeq.current) {
+          setHits([]);
+          setIndex(0);
+          setSearching(false);
+        }
+        return;
+      }
+      setSearching(true);
+      const prefix = pathPrefix !== undefined ? pathPrefix : scopePathRef.current;
+      const extList =
+        exts !== undefined ? exts : extsFromFilterKeys(extFilterRef.current);
+      try {
+        const next = await invoke<SearchHit[]>("search_query", {
+          query: trimmed,
+          pathPrefix: prefix && prefix.trim() ? prefix.trim() : null,
+          exts: extList && extList.length ? extList : null,
+        });
+        if (seq !== searchSeq.current) return;
+        setHits(next);
         setIndex(0);
-        setSearching(false);
+        setPreview(null);
+        setOccurrences([]);
+        setOccIndex(0);
+        void invoke("record_search_query", { query: trimmed }).catch(console.error);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        if (seq === searchSeq.current) {
+          setSearching(false);
+        }
       }
-      return;
-    }
-    setSearching(true);
-    const prefix = pathPrefix !== undefined ? pathPrefix : scopePathRef.current;
-    try {
-      const next = await invoke<SearchHit[]>("search_query", {
-        query: trimmed,
-        pathPrefix: prefix && prefix.trim() ? prefix.trim() : null,
-      });
-      if (seq !== searchSeq.current) return;
-      setHits(next);
-      setIndex(0);
-      setPreview(null);
-      setOccurrences([]);
-      setOccIndex(0);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      if (seq === searchSeq.current) {
-        setSearching(false);
-      }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const scheduleSearch = useCallback(
     (q: string, pathPrefix?: string | null) => {
@@ -556,6 +632,34 @@ export default function Popup() {
     setScopeLabel(null);
     scopePathRef.current = null;
   }, []);
+
+  const clearExtFilter = useCallback(() => {
+    setExtFilterKeys([]);
+    extFilterRef.current = [];
+  }, []);
+
+  const applyExtFilter = useCallback(
+    (keys: string[]) => {
+      setExtFilterKeys(keys);
+      extFilterRef.current = keys;
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      void runSearch(query, undefined, extsFromFilterKeys(keys));
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+      });
+    },
+    [query, runSearch],
+  );
+
+  const toggleExtFilterKey = useCallback(
+    (id: string) => {
+      const next = extFilterRef.current.includes(id)
+        ? extFilterRef.current.filter((k) => k !== id)
+        : [...extFilterRef.current, id];
+      applyExtFilter(next);
+    },
+    [applyExtFilter],
+  );
 
   const applyScope = useCallback(
     (path: string | null, label: string | null) => {
@@ -595,6 +699,7 @@ export default function Popup() {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       searchSeq.current += 1;
       clearScope();
+      clearExtFilter();
       setQuery(event.payload.query);
       setHits(event.payload.hits);
       setIndex(0);
@@ -605,7 +710,9 @@ export default function Popup() {
       setSearching(Boolean(event.payload.searching));
       setWordPickerOpen(false);
       setFolderPickerOpen(false);
+      setExtPickerOpen(false);
       setHelpOpen(false);
+      setSuggestOpen(false);
       // Allow edit immediately after shortcut search
       requestAnimationFrame(() => {
         inputRef.current?.focus();
@@ -618,32 +725,132 @@ export default function Popup() {
       unlisten?.();
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [clearScope]);
+  }, [clearScope, clearExtFilter]);
 
   useEffect(() => {
-    if (!wordPickerOpen && !helpOpen && !folderPickerOpen) return;
+    if (
+      !wordPickerOpen &&
+      !helpOpen &&
+      !folderPickerOpen &&
+      !extPickerOpen &&
+      !suggestOpen
+    ) {
+      return;
+    }
     const onPointerDown = (e: MouseEvent) => {
       if (wordPickerRef.current?.contains(e.target as Node)) return;
       setWordPickerOpen(false);
       setFolderPickerOpen(false);
+      setExtPickerOpen(false);
       setHelpOpen(false);
+      setSuggestOpen(false);
     };
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [wordPickerOpen, helpOpen, folderPickerOpen]);
+  }, [wordPickerOpen, helpOpen, folderPickerOpen, extPickerOpen, suggestOpen]);
 
   const openWordPicker = useCallback(async () => {
     try {
-      const words = await invoke<SearchWordRow[]>("list_search_words");
+      const [words, history] = await Promise.all([
+        invoke<SearchWordRow[]>("list_search_words"),
+        invoke<SearchHistoryTermRow[]>("list_search_history_terms"),
+      ]);
       setSearchWords(words);
+      setHistoryTerms(history);
       setHelpOpen(false);
       setFolderPickerOpen(false);
+      setExtPickerOpen(false);
+      setSuggestOpen(false);
       setWordPickerOpen(true);
     } catch (e) {
       console.error(e);
       setActionError(String(e));
     }
   }, []);
+
+  const clearHistoryTerms = useCallback(async () => {
+    try {
+      await invoke("clear_search_term_history");
+      setHistoryTerms([]);
+    } catch (e) {
+      console.error(e);
+      setActionError(String(e));
+    }
+  }, []);
+
+  const refreshSuggestions = useCallback(async (q: string) => {
+    if (imeComposingRef.current) {
+      setSuggestOpen(false);
+      setSuggestions([]);
+      return;
+    }
+    try {
+      const next = await invoke<SearchTermSuggestion[]>("suggest_search_terms", {
+        query: q,
+      });
+      setSuggestions(next);
+      setSuggestIndex(0);
+      setSuggestOpen(next.length > 0);
+    } catch (e) {
+      console.error(e);
+      setSuggestions([]);
+      setSuggestOpen(false);
+    }
+  }, []);
+
+  const applySuggestion = useCallback(
+    (sug: SearchTermSuggestion) => {
+      const q = query;
+      const delimRe = /[\s\u3000,\uFF0C\u3001]/;
+      let next: string;
+      if (sug.kind === "prefix") {
+        const chars = Array.from(q);
+        let end = chars.length;
+        while (end > 0 && delimRe.test(chars[end - 1]!)) end -= 1;
+        let start = end;
+        while (
+          start > 0 &&
+          !delimRe.test(chars[start - 1]!) &&
+          chars[start - 1] !== '"'
+        ) {
+          start -= 1;
+        }
+        const tokenRaw = chars.slice(start, end).join("");
+        const exclude = tokenRaw.startsWith("-");
+        const applied = exclude ? `-${sug.term}` : sug.term;
+        next = `${chars.slice(0, start).join("")}${applied}`;
+      } else {
+        const trimmed = q.trimEnd();
+        // If last token is a prefix of the suggestion term, replace it.
+        const chars = Array.from(trimmed);
+        let end = chars.length;
+        let start = end;
+        while (
+          start > 0 &&
+          !delimRe.test(chars[start - 1]!) &&
+          chars[start - 1] !== '"'
+        ) {
+          start -= 1;
+        }
+        const tokenRaw = chars.slice(start, end).join("").replace(/^-/, "");
+        if (tokenRaw && sug.term.startsWith(tokenRaw) && sug.term !== tokenRaw) {
+          const exclude = chars.slice(start, end).join("").startsWith("-");
+          const applied = exclude ? `-${sug.term}` : sug.term;
+          next = `${chars.slice(0, start).join("")}${applied}`;
+        } else {
+          next = trimmed ? `${trimmed} ${sug.term}` : sug.term;
+        }
+      }
+      setQuery(next);
+      setSuggestOpen(false);
+      setSuggestions([]);
+      scheduleSearch(next);
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+      });
+    },
+    [query, scheduleSearch],
+  );
 
   const openFolderPicker = useCallback(async () => {
     try {
@@ -655,6 +862,8 @@ export default function Popup() {
       setSearchScopes(result.scopes ?? []);
       setHelpOpen(false);
       setWordPickerOpen(false);
+      setExtPickerOpen(false);
+      setSuggestOpen(false);
       setScopeFilter("");
       setFolderPickerOpen(true);
       requestAnimationFrame(() => {
@@ -666,9 +875,19 @@ export default function Popup() {
     }
   }, [query]);
 
+  const openExtPicker = useCallback(() => {
+    setHelpOpen(false);
+    setWordPickerOpen(false);
+    setFolderPickerOpen(false);
+    setSuggestOpen(false);
+    setExtPickerOpen(true);
+  }, []);
+
   const toggleHelp = useCallback(() => {
     setWordPickerOpen(false);
     setFolderPickerOpen(false);
+    setExtPickerOpen(false);
+    setSuggestOpen(false);
     setHelpOpen((v) => !v);
   }, []);
 
@@ -697,6 +916,7 @@ export default function Popup() {
       const next = query.trim() ? `${query.trim()} ${trimmed}` : trimmed;
       setQuery(next);
       setWordPickerOpen(false);
+      setSuggestOpen(false);
       scheduleSearch(next);
       requestAnimationFrame(() => {
         inputRef.current?.focus();
@@ -805,7 +1025,7 @@ export default function Popup() {
       try {
         if (fileHit.source === "remote") {
           const hit = await invoke<SearchHit | null>("get_preview", {
-            id: paraId,
+            hitId: paraId,
           });
           if (hit) {
             setPreview(hit);
@@ -820,7 +1040,7 @@ export default function Popup() {
         });
         if (!matches.length) {
           const hit = await invoke<SearchHit | null>("get_preview", {
-            id: paraId,
+            hitId: paraId,
           });
           if (hit) {
             setPreview(hit);
@@ -864,7 +1084,9 @@ export default function Popup() {
     clearScope();
     setFolderPickerOpen(false);
     setWordPickerOpen(false);
+    setExtPickerOpen(false);
     setHelpOpen(false);
+    setSuggestOpen(false);
     setPreview(null);
     setOccurrences([]);
     setOccIndex(0);
@@ -885,12 +1107,20 @@ export default function Popup() {
           setFolderPickerOpen(false);
           return;
         }
+        if (extPickerOpen) {
+          setExtPickerOpen(false);
+          return;
+        }
         if (wordPickerOpen) {
           setWordPickerOpen(false);
           return;
         }
         if (helpOpen) {
           setHelpOpen(false);
+          return;
+        }
+        if (suggestOpen) {
+          setSuggestOpen(false);
           return;
         }
         if (preview) {
@@ -900,7 +1130,34 @@ export default function Popup() {
         void hidePopup();
         return;
       }
-      if (wordPickerOpen || helpOpen || folderPickerOpen) return;
+      if (wordPickerOpen || helpOpen || folderPickerOpen || extPickerOpen) return;
+
+      if (
+        suggestOpen &&
+        suggestions.length > 0 &&
+        !preview &&
+        !imeComposingRef.current
+      ) {
+        if (e.key === "Tab") {
+          e.preventDefault();
+          const sug = suggestions[suggestIndex] ?? suggestions[0];
+          if (sug) applySuggestion(sug);
+          return;
+        }
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setSuggestIndex((i) => (i + 1) % suggestions.length);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setSuggestIndex(
+            (i) => (i - 1 + suggestions.length) % suggestions.length,
+          );
+          return;
+        }
+      }
+
       if (preview) {
         if (e.key === "ArrowLeft" || e.key === "[") {
           e.preventDefault();
@@ -952,7 +1209,9 @@ export default function Popup() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
+    applySuggestion,
     closePreview,
+    extPickerOpen,
     folderPickerOpen,
     helpOpen,
     hidePopup,
@@ -962,6 +1221,9 @@ export default function Popup() {
     preview,
     showPreview,
     stepOccurrence,
+    suggestIndex,
+    suggestOpen,
+    suggestions,
     wordPickerOpen,
   ]);
 
@@ -1045,7 +1307,17 @@ export default function Popup() {
             void toggleMaximizeWindow();
           }}
         >
-          <span className="popup-titlebar-label">Argos</span>
+          <span className="popup-titlebar-label">
+            <img
+              className="popup-titlebar-icon"
+              src="/argos-icon.png"
+              alt=""
+              width={16}
+              height={16}
+              draggable={false}
+            />
+            Argos
+          </span>
           <div className="popup-window-controls">
             <button
               type="button"
@@ -1126,9 +1398,20 @@ export default function Popup() {
               const next = e.target.value;
               setQuery(next);
               scheduleSearch(next);
+              if (
+                !wordPickerOpen &&
+                !folderPickerOpen &&
+                !extPickerOpen &&
+                !helpOpen
+              ) {
+                void refreshSuggestions(next);
+              } else {
+                setSuggestOpen(false);
+              }
             }}
             onCompositionStart={() => {
               imeComposingRef.current = true;
+              setSuggestOpen(false);
               if (debounceRef.current) {
                 clearTimeout(debounceRef.current);
                 debounceRef.current = null;
@@ -1139,6 +1422,14 @@ export default function Popup() {
               const next = e.currentTarget.value;
               setQuery(next);
               scheduleSearch(next);
+              if (
+                !wordPickerOpen &&
+                !folderPickerOpen &&
+                !extPickerOpen &&
+                !helpOpen
+              ) {
+                void refreshSuggestions(next);
+              }
             }}
             onMouseDown={(e) => e.stopPropagation()}
           />
@@ -1161,9 +1452,26 @@ export default function Popup() {
           </button>
           <button
             type="button"
+            className={`popup-ext-btn${extFilterKeys.length ? " is-active" : ""}`}
+            title="ファイル種別で絞る"
+            aria-label="ファイル種別で絞る"
+            aria-expanded={extPickerOpen}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => {
+              if (extPickerOpen) {
+                setExtPickerOpen(false);
+              } else {
+                openExtPicker();
+              }
+            }}
+          >
+            <IconFileType />
+          </button>
+          <button
+            type="button"
             className="popup-word-add-btn"
-            title="登録済み検索ワードを追加"
-            aria-label="登録済み検索ワードを追加"
+            title="履歴・登録ワード"
+            aria-label="履歴・登録ワード"
             aria-expanded={wordPickerOpen}
             onMouseDown={(e) => e.stopPropagation()}
             onClick={() => {
@@ -1174,7 +1482,7 @@ export default function Popup() {
               }
             }}
           >
-            ＋
+            <IconList />
           </button>
           <button
             type="button"
@@ -1210,36 +1518,159 @@ export default function Popup() {
             </div>
           ) : null}
           {wordPickerOpen ? (
-            <div className="popup-word-picker" role="listbox" aria-label="登録済み検索ワード">
-              <div className="popup-word-picker-actions">
+            <div className="popup-word-picker" role="listbox" aria-label="検索ワード">
+              <div className="popup-word-picker-toolbar">
                 <button
                   type="button"
                   className="popup-word-register-btn"
+                  title="入力中の語を辞書登録"
+                  aria-label="入力中の語を辞書登録"
                   onClick={() => void registerCurrentQueryWord()}
                   disabled={!query.trim()}
                 >
-                  入力中の語を辞書登録
+                  辞書登録
                 </button>
-              </div>
-              {searchWords.length === 0 ? (
-                <div className="popup-word-empty">
-                  登録済みの検索ワードはありません。上のボタンまたは設定の「検索ワード登録」から追加できます。
-                </div>
-              ) : (
-                <ul>
-                  {searchWords.map((w) => (
-                    <li key={w.id}>
-                      <button
-                        type="button"
-                        role="option"
-                        onClick={() => appendSearchWord(w.word)}
-                      >
-                        {w.word}
-                      </button>
-                    </li>
+                <div
+                  className="popup-word-filter"
+                  role="tablist"
+                  aria-label="表示切り替え"
+                >
+                  {(
+                    [
+                      ["all", "すべて"],
+                      ["history", "履歴"],
+                      ["registered", "登録"],
+                    ] as const
+                  ).map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      role="tab"
+                      aria-selected={wordPickerFilter === id}
+                      className={
+                        wordPickerFilter === id
+                          ? "popup-word-filter-btn is-active"
+                          : "popup-word-filter-btn"
+                      }
+                      onClick={() => setWordPickerFilter(id)}
+                    >
+                      {label}
+                    </button>
                   ))}
-                </ul>
-              )}
+                </div>
+              </div>
+              {(() => {
+                const showHistory =
+                  wordPickerFilter === "all" || wordPickerFilter === "history";
+                const showRegistered =
+                  wordPickerFilter === "all" ||
+                  wordPickerFilter === "registered";
+                const hist = showHistory ? historyTerms : [];
+                const words = showRegistered ? searchWords : [];
+                if (hist.length === 0 && words.length === 0) {
+                  return (
+                    <div className="popup-word-empty">
+                      {wordPickerFilter === "history"
+                        ? "履歴はまだありません。検索するとここに残ります。"
+                        : wordPickerFilter === "registered"
+                          ? "登録ワードはありません。上のボタンまたは設定から追加できます。"
+                          : "履歴・登録ワードはまだありません。検索すると履歴に残り、設定の「検索ワード登録」からも追加できます。"}
+                    </div>
+                  );
+                }
+                return (
+                  <ul>
+                    {hist.map((h) => (
+                      <li key={`hist:${h.term}`}>
+                        <button
+                          type="button"
+                          role="option"
+                          onClick={() => appendSearchWord(h.term)}
+                        >
+                          <span className="word-kind history">履歴</span>
+                          <span className="word-label">{h.term}</span>
+                        </button>
+                      </li>
+                    ))}
+                    {hist.length > 0 && words.length > 0 ? (
+                      <li className="scope-sep" aria-hidden="true" />
+                    ) : null}
+                    {words.map((w) => (
+                      <li key={w.id}>
+                        <button
+                          type="button"
+                          role="option"
+                          onClick={() => appendSearchWord(w.word)}
+                        >
+                          <span className="word-kind registered">登録</span>
+                          <span className="word-label">{w.word}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                );
+              })()}
+              {historyTerms.length > 0 &&
+              (wordPickerFilter === "all" ||
+                wordPickerFilter === "history") ? (
+                <div className="popup-word-picker-actions popup-word-picker-footer">
+                  <button
+                    type="button"
+                    className="popup-ext-clear-btn"
+                    onClick={() => void clearHistoryTerms()}
+                  >
+                    履歴をクリア
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {suggestOpen &&
+          suggestions.length > 0 &&
+          !wordPickerOpen &&
+          !folderPickerOpen &&
+          !extPickerOpen &&
+          !helpOpen ? (
+            <div
+              className="popup-suggest"
+              role="listbox"
+              aria-label="検索候補"
+            >
+              <ul>
+                {suggestions.map((s, i) => (
+                  <li key={`${s.kind}:${s.term}`}>
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={i === suggestIndex}
+                      className={i === suggestIndex ? "is-active" : undefined}
+                      onMouseEnter={() => setSuggestIndex(i)}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => applySuggestion(s)}
+                    >
+                      {s.kind === "prefix" && s.displayPrefix ? (
+                        <span className="suggest-term">
+                          <span className="suggest-prefix">{s.displayPrefix}</span>
+                          <span className="suggest-rest">{s.displayRest}</span>
+                        </span>
+                      ) : (
+                        <span className="suggest-term">{s.term}</span>
+                      )}
+                      <span className="suggest-badges">
+                        {s.fromHistory ? (
+                          <span className="word-kind history">履歴</span>
+                        ) : null}
+                        {s.fromRegistered ? (
+                          <span className="word-kind registered">登録</span>
+                        ) : null}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="popup-suggest-hint">
+                ↑↓ で選択 · Tab で確定 · Esc で閉じる
+              </div>
             </div>
           ) : null}
           {folderPickerOpen ? (
@@ -1304,23 +1735,85 @@ export default function Popup() {
               )}
             </div>
           ) : null}
+          {extPickerOpen ? (
+            <div
+              className="popup-ext-picker"
+              role="listbox"
+              aria-label="ファイル種別"
+              aria-multiselectable="true"
+            >
+              <ul>
+                {FILE_TYPE_OPTIONS.map((opt) => {
+                  const selected = extFilterKeys.includes(opt.id);
+                  return (
+                    <li key={opt.id}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={selected}
+                        className={selected ? "is-selected" : undefined}
+                        onClick={() => toggleExtFilterKey(opt.id)}
+                      >
+                        <span className="ext-check" aria-hidden="true">
+                          {selected ? "✓" : ""}
+                        </span>
+                        <span className="ext-label">{opt.label}</span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              {extFilterKeys.length > 0 ? (
+                <div className="popup-ext-picker-actions">
+                  <button
+                    type="button"
+                    className="popup-ext-clear-btn"
+                    onClick={() => applyExtFilter([])}
+                  >
+                    種別フィルタを解除
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-        {scopePath ? (
+        {scopePath || extFilterKeys.length > 0 ? (
           <div className="popup-scope-chip-row">
-            <span className="popup-scope-chip" title={scopePath}>
-              <span className="popup-scope-chip-at">@</span>
-              {scopeChipLabel(scopePath, scopeLabel)}
-              <button
-                type="button"
-                className="popup-scope-chip-clear"
-                title="フォルダ絞り込みを解除"
-                aria-label="フォルダ絞り込みを解除"
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={() => applyScope(null, null)}
+            {scopePath ? (
+              <span className="popup-scope-chip" title={scopePath}>
+                <span className="popup-scope-chip-at">@</span>
+                {scopeChipLabel(scopePath, scopeLabel)}
+                <button
+                  type="button"
+                  className="popup-scope-chip-clear"
+                  title="フォルダ絞り込みを解除"
+                  aria-label="フォルダ絞り込みを解除"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={() => applyScope(null, null)}
+                >
+                  ×
+                </button>
+              </span>
+            ) : null}
+            {extFilterKeys.length > 0 ? (
+              <span
+                className="popup-scope-chip popup-ext-chip"
+                title={extFilterChipLabel(extFilterKeys)}
               >
-                ×
-              </button>
-            </span>
+                <span className="popup-scope-chip-at">種別</span>
+                {extFilterChipLabel(extFilterKeys)}
+                <button
+                  type="button"
+                  className="popup-scope-chip-clear"
+                  title="種別絞り込みを解除"
+                  aria-label="種別絞り込みを解除"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={() => applyExtFilter([])}
+                >
+                  ×
+                </button>
+              </span>
+            ) : null}
           </div>
         ) : null}
       </header>
@@ -1438,7 +1931,7 @@ export default function Popup() {
                               </span>
                             ) : null;
                           })()}
-                          📄 {highlight(hit.title, query, hit.highlightTerms)}
+                          {highlight(hit.title, query, hit.highlightTerms)}
                         </div>
                         <div
                           className="hit-score"

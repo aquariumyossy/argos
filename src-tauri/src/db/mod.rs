@@ -107,6 +107,44 @@ pub struct RecentSearchScope {
 pub const MAX_RECENT_SEARCH_SCOPES: usize = 3;
 const RECENT_SEARCH_SCOPES_KEY: &str = "recent_search_scopes";
 
+/// Cap on remembered search events (co-occurrence source).
+pub const MAX_SEARCH_TERM_EVENTS: usize = 30;
+/// Cap on distinct terms kept in stats.
+pub const MAX_SEARCH_TERM_STATS: usize = 100;
+const SEARCH_TERM_HISTORY_KEY: &str = "search_term_history";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTermStat {
+    pub count: u32,
+    pub last: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTermEvent {
+    pub terms: Vec<String>,
+    pub t: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchTermHistory {
+    #[serde(default)]
+    pub events: Vec<SearchTermEvent>,
+    #[serde(default)]
+    pub stats: std::collections::HashMap<String, SearchTermStat>,
+}
+
+/// Row for the + picker history section (MRU by last used).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHistoryTermRow {
+    pub term: String,
+    pub count: u32,
+    pub last: i64,
+}
+
 pub struct Db {
     conn: parking_lot::Mutex<rusqlite::Connection>,
 }
@@ -636,6 +674,120 @@ impl Db {
             rusqlite::params![RECENT_SEARCH_SCOPES_KEY, raw],
         )?;
         Ok(next)
+    }
+
+    fn load_search_term_history_locked(
+        conn: &rusqlite::Connection,
+    ) -> SearchTermHistory {
+        let value: Result<String, _> = conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [SEARCH_TERM_HISTORY_KEY],
+            |r| r.get(0),
+        );
+        let Ok(raw) = value else {
+            return SearchTermHistory::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save_search_term_history_locked(
+        conn: &rusqlite::Connection,
+        history: &SearchTermHistory,
+    ) -> Result<(), rusqlite::Error> {
+        let raw = serde_json::to_string(history).unwrap_or_else(|_| {
+            serde_json::to_string(&SearchTermHistory::default()).unwrap_or_else(|_| "{}".into())
+        });
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![SEARCH_TERM_HISTORY_KEY, raw],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_search_term_history(&self) -> SearchTermHistory {
+        let conn = self.conn.lock();
+        Self::load_search_term_history_locked(&conn)
+    }
+
+    /// MRU terms for the + picker (newest `last` first).
+    pub fn list_search_history_terms(&self) -> Vec<SearchHistoryTermRow> {
+        let history = self.get_search_term_history();
+        let mut rows: Vec<SearchHistoryTermRow> = history
+            .stats
+            .into_iter()
+            .filter(|(term, _)| !term.trim().is_empty())
+            .map(|(term, st)| SearchHistoryTermRow {
+                term,
+                count: st.count,
+                last: st.last,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.last.cmp(&a.last).then_with(|| b.count.cmp(&a.count)));
+        rows
+    }
+
+    pub fn record_search_terms(&self, terms: &[String]) -> Result<(), rusqlite::Error> {
+        let mut cleaned: Vec<String> = Vec::new();
+        for t in terms {
+            let term = t.trim();
+            if term.is_empty() {
+                continue;
+            }
+            if cleaned.iter().any(|x| x == term) {
+                continue;
+            }
+            cleaned.push(term.to_string());
+        }
+        if cleaned.is_empty() {
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let conn = self.conn.lock();
+        let mut history = Self::load_search_term_history_locked(&conn);
+
+        history.events.insert(
+            0,
+            SearchTermEvent {
+                terms: cleaned.clone(),
+                t: now,
+            },
+        );
+        history.events.truncate(MAX_SEARCH_TERM_EVENTS);
+
+        for term in &cleaned {
+            let entry = history.stats.entry(term.clone()).or_insert(SearchTermStat {
+                count: 0,
+                last: 0,
+            });
+            entry.count = entry.count.saturating_add(1);
+            entry.last = now;
+        }
+
+        if history.stats.len() > MAX_SEARCH_TERM_STATS {
+            let mut by_last: Vec<(String, i64, u32)> = history
+                .stats
+                .iter()
+                .map(|(k, v)| (k.clone(), v.last, v.count))
+                .collect();
+            by_last.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+            by_last.truncate(MAX_SEARCH_TERM_STATS);
+            let keep: std::collections::HashSet<String> =
+                by_last.into_iter().map(|(k, _, _)| k).collect();
+            history.stats.retain(|k, _| keep.contains(k));
+        }
+
+        Self::save_search_term_history_locked(&conn, &history)
+    }
+
+    pub fn clear_search_term_history(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        Self::save_search_term_history_locked(&conn, &SearchTermHistory::default())
     }
 
     pub fn folder_id_by_path(&self, path: &str) -> Result<Option<i64>, rusqlite::Error> {

@@ -5,7 +5,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{
-    ExcludePathRow, FolderRow, SearchWordImport, SearchWordImportResult, SearchWordRow, Settings,
+    ExcludePathRow, FolderRow, SearchHistoryTermRow, SearchWordImport, SearchWordImportResult,
+    SearchWordRow, Settings,
 };
 use crate::indexer::{IndexProgress, IndexStats};
 use crate::pathutil;
@@ -176,11 +177,23 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
     let backend = state.backend.clone();
     let user_dict = state.user_dict.read().clone();
     let q = query.clone();
+    let pos_filter = settings.pos_filter_enabled;
     let hits = tauri::async_runtime::spawn_blocking(move || {
-        search::run_search(&settings, backend.as_ref(), &q, limit, None, &user_dict)
+        let result =
+            search::run_search(&settings, backend.as_ref(), &q, limit, None, None, &user_dict);
+        let terms = search::extract_search_terms(&q, |text| {
+            backend.morph_content_surfaces(text, pos_filter)
+        })
+        .unwrap_or_default();
+        (result, terms)
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())?;
+    let (hits, terms) = hits;
+    let hits = hits?;
+    if !terms.is_empty() {
+        let _ = state.db.record_search_terms(&terms);
+    }
 
     app.emit(
         "search-results",
@@ -421,6 +434,7 @@ pub fn search_query(
     state: State<'_, Arc<AppState>>,
     query: String,
     path_prefix: Option<String>,
+    exts: Option<Vec<String>>,
 ) -> Result<Vec<SearchHit>, String> {
     let settings = state.settings.read().clone();
     let limit = settings.max_results;
@@ -428,6 +442,7 @@ pub fn search_query(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let exts = search::normalize_exts(exts);
     let user_dict = state.user_dict.read().clone();
     search::run_search(
         &settings,
@@ -435,6 +450,7 @@ pub fn search_query(
         &query,
         limit,
         prefix,
+        exts.as_deref(),
         &user_dict,
     )
 }
@@ -494,6 +510,7 @@ pub fn list_search_scopes(
                 q,
                 SCOPE_QUERY_HIT_LIMIT,
                 None,
+                None,
                 &user_dict,
             )?;
             if hits.is_empty() {
@@ -540,6 +557,57 @@ pub fn push_recent_search_scope(
             is_root: false,
         })
         .collect())
+}
+
+#[tauri::command]
+pub fn list_search_history_terms(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<SearchHistoryTermRow>, String> {
+    Ok(state.db.list_search_history_terms())
+}
+
+#[tauri::command]
+pub fn record_search_query(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+) -> Result<(), String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(());
+    }
+    let pos_filter = state.settings.read().pos_filter_enabled;
+    let backend = state.backend.clone();
+    let terms = search::extract_search_terms(q, |text| {
+        backend.morph_content_surfaces(text, pos_filter)
+    })?;
+    state
+        .db
+        .record_search_terms(&terms)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_search_term_history(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state
+        .db
+        .clear_search_term_history()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn suggest_search_terms(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+) -> Result<Vec<search::SearchTermSuggestion>, String> {
+    let history = state.db.get_search_term_history();
+    let registered: Vec<String> = state
+        .db
+        .list_search_words()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|w| w.word)
+        .collect();
+    Ok(search::suggest_from_history(&history, &registered, &query))
 }
 
 #[tauri::command]
