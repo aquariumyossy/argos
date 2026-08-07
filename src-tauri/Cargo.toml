@@ -1,4 +1,4 @@
-package]
+[package]
 name = "argos"
 version = "1.5.0"
 description = "Argos  Elocal desktop instant search"
