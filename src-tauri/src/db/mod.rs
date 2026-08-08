@@ -23,6 +23,18 @@ pub struct Settings {
     pub remote_timeout_ms: u32,
     /// Drop 助詞/助動詞 from free query tokens (default true).
     pub pos_filter_enabled: bool,
+    /// Index Outlook Classic mail via COM.
+    pub mail_enabled: bool,
+    /// How far back to sync (days).
+    pub mail_days_back: u32,
+    /// Periodic mail sync interval (seconds). 0 = manual only.
+    pub mail_sync_interval_secs: u64,
+    /// If true, only the newest message per ConversationID is kept in the index.
+    pub mail_latest_only: bool,
+    /// If true, search results collapse hits that share a conversation id.
+    pub mail_thread_collapse: bool,
+    /// Last successful mail sync (RFC3339), empty if never.
+    pub mail_last_sync_at: String,
 }
 
 impl Default for Settings {
@@ -44,8 +56,54 @@ impl Default for Settings {
             remote_token: String::new(),
             remote_timeout_ms: 3000,
             pos_filter_enabled: true,
+            mail_enabled: false,
+            mail_days_back: 730,
+            mail_sync_interval_secs: 3600,
+            mail_latest_only: false,
+            mail_thread_collapse: true,
+            mail_last_sync_at: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailFolderRow {
+    pub id: i64,
+    pub store_id: String,
+    pub entry_id: String,
+    pub name: String,
+    pub path_label: String,
+    pub selected: bool,
+    /// Outlook Items.Count at last catalog refresh (approximate).
+    #[serde(default)]
+    pub item_count: i32,
+    /// Messages with status=indexed for this folder (searchable in Argos).
+    #[serde(default)]
+    pub indexed_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailMessageRow {
+    pub path: String,
+    pub store_id: String,
+    pub entry_id: String,
+    pub conversation_id: String,
+    pub folder_name: String,
+    pub from_addr: String,
+    pub subject: String,
+    pub date_unix: i64,
+    pub content_hash: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailThreadWinner {
+    pub conversation_id: String,
+    pub path: String,
+    pub date_unix: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +251,34 @@ impl Db {
               pos_label TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS email_folders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              store_id TEXT NOT NULL,
+              entry_id TEXT NOT NULL,
+              name TEXT NOT NULL DEFAULT '',
+              path_label TEXT NOT NULL DEFAULT '',
+              selected INTEGER NOT NULL DEFAULT 0,
+              item_count INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(store_id, entry_id)
+            );
+            CREATE TABLE IF NOT EXISTS email_messages (
+              path TEXT PRIMARY KEY,
+              store_id TEXT NOT NULL,
+              entry_id TEXT NOT NULL,
+              conversation_id TEXT NOT NULL DEFAULT '',
+              folder_name TEXT NOT NULL DEFAULT '',
+              from_addr TEXT NOT NULL DEFAULT '',
+              subject TEXT NOT NULL DEFAULT '',
+              date_unix INTEGER NOT NULL DEFAULT 0,
+              content_hash TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'pending',
+              indexed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS email_threads (
+              conversation_id TEXT PRIMARY KEY,
+              path TEXT NOT NULL,
+              date_unix INTEGER NOT NULL DEFAULT 0
+            );
             "#,
         )?;
         // Migrate older DBs that lack public_path
@@ -207,6 +293,10 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE search_words ADD COLUMN pos_label TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE email_folders ADD COLUMN item_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
         // Ensure FK is on for this connection (WAL batch may not stick across all cases)
@@ -263,6 +353,18 @@ impl Db {
                     "pos_filter_enabled" => {
                         s.pos_filter_enabled = row.1 == "1" || row.1 == "true"
                     }
+                    "mail_enabled" => s.mail_enabled = row.1 == "1" || row.1 == "true",
+                    "mail_days_back" => s.mail_days_back = row.1.parse().unwrap_or(730),
+                    "mail_sync_interval_secs" => {
+                        s.mail_sync_interval_secs = row.1.parse().unwrap_or(3600)
+                    }
+                    "mail_latest_only" => {
+                        s.mail_latest_only = row.1 == "1" || row.1 == "true"
+                    }
+                    "mail_thread_collapse" => {
+                        s.mail_thread_collapse = !(row.1 == "0" || row.1 == "false")
+                    }
+                    "mail_last_sync_at" => s.mail_last_sync_at = row.1,
                     _ => {}
                 }
             }
@@ -295,6 +397,24 @@ impl Db {
                 "pos_filter_enabled",
                 if s.pos_filter_enabled { "1" } else { "0" }.to_string(),
             ),
+            (
+                "mail_enabled",
+                if s.mail_enabled { "1" } else { "0" }.to_string(),
+            ),
+            ("mail_days_back", s.mail_days_back.to_string()),
+            (
+                "mail_sync_interval_secs",
+                s.mail_sync_interval_secs.to_string(),
+            ),
+            (
+                "mail_latest_only",
+                if s.mail_latest_only { "1" } else { "0" }.to_string(),
+            ),
+            (
+                "mail_thread_collapse",
+                if s.mail_thread_collapse { "1" } else { "0" }.to_string(),
+            ),
+            ("mail_last_sync_at", s.mail_last_sync_at.clone()),
         ];
         for (k, v) in pairs {
             conn.execute(
@@ -861,6 +981,263 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM files WHERE folder_id=?1", [folder_id])?;
         Ok(())
+    }
+
+    // --- Outlook mail metadata (not tied to FS folders) ---
+
+    pub fn replace_email_folder_catalog(
+        &self,
+        folders: &[EmailFolderRow],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let selected: std::collections::HashSet<(String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT store_id, entry_id FROM email_folders WHERE selected=1",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.flatten().collect()
+        };
+        conn.execute("DELETE FROM email_folders", [])?;
+        for f in folders {
+            let is_selected = selected.contains(&(f.store_id.clone(), f.entry_id.clone()));
+            conn.execute(
+                "INSERT INTO email_folders(store_id, entry_id, name, path_label, selected, item_count)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    f.store_id,
+                    f.entry_id,
+                    f.name,
+                    f.path_label,
+                    if is_selected { 1 } else { 0 },
+                    f.item_count
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_email_folders(&self) -> Result<Vec<EmailFolderRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.store_id, f.entry_id, f.name, f.path_label, f.selected, f.item_count,
+                    (SELECT COUNT(*) FROM email_messages m
+                     WHERE m.status='indexed'
+                       AND m.store_id = f.store_id
+                       AND (m.folder_name = f.path_label OR m.folder_name = f.name)) AS indexed_count
+             FROM email_folders f
+             ORDER BY f.path_label COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EmailFolderRow {
+                id: row.get(0)?,
+                store_id: row.get(1)?,
+                entry_id: row.get(2)?,
+                name: row.get(3)?,
+                path_label: row.get(4)?,
+                selected: row.get::<_, i64>(5)? != 0,
+                item_count: row.get(6)?,
+                indexed_count: row.get::<_, i64>(7)? as u32,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn list_selected_email_folders(&self) -> Result<Vec<EmailFolderRow>, rusqlite::Error> {
+        Ok(self
+            .list_email_folders()?
+            .into_iter()
+            .filter(|f| f.selected)
+            .collect())
+    }
+
+    pub fn set_email_folders_selected(
+        &self,
+        keys: &[(String, String)],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE email_folders SET selected=0", [])?;
+        for (store_id, entry_id) in keys {
+            conn.execute(
+                "UPDATE email_folders SET selected=1 WHERE store_id=?1 AND entry_id=?2",
+                rusqlite::params![store_id, entry_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_email_message_by_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<EmailMessageRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path, store_id, entry_id, conversation_id, folder_name, from_addr,
+                    subject, date_unix, content_hash, status
+             FROM email_messages WHERE path=?1",
+        )?;
+        let mut rows = stmt.query_map([path], |row| {
+            Ok(EmailMessageRow {
+                path: row.get(0)?,
+                store_id: row.get(1)?,
+                entry_id: row.get(2)?,
+                conversation_id: row.get(3)?,
+                folder_name: row.get(4)?,
+                from_addr: row.get(5)?,
+                subject: row.get(6)?,
+                date_unix: row.get(7)?,
+                content_hash: row.get(8)?,
+                status: row.get(9)?,
+            })
+        })?;
+        if let Some(Ok(m)) = rows.next() {
+            return Ok(Some(m));
+        }
+        Ok(None)
+    }
+
+    pub fn upsert_email_message(
+        &self,
+        path: &str,
+        store_id: &str,
+        entry_id: &str,
+        conversation_id: &str,
+        folder_name: &str,
+        from_addr: &str,
+        subject: &str,
+        date_unix: i64,
+        content_hash: &str,
+        status: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO email_messages(
+                path, store_id, entry_id, conversation_id, folder_name, from_addr,
+                subject, date_unix, content_hash, status, indexed_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             ON CONFLICT(path) DO UPDATE SET
+                store_id=excluded.store_id,
+                entry_id=excluded.entry_id,
+                conversation_id=excluded.conversation_id,
+                folder_name=excluded.folder_name,
+                from_addr=excluded.from_addr,
+                subject=excluded.subject,
+                date_unix=excluded.date_unix,
+                content_hash=excluded.content_hash,
+                status=excluded.status,
+                indexed_at=excluded.indexed_at",
+            rusqlite::params![
+                path,
+                store_id,
+                entry_id,
+                conversation_id,
+                folder_name,
+                from_addr,
+                subject,
+                date_unix,
+                content_hash,
+                status,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_email_message_status(
+        &self,
+        path: &str,
+        status: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE email_messages SET status=?1 WHERE path=?2",
+            rusqlite::params![status, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_email_thread(
+        &self,
+        conversation_id: &str,
+        path: &str,
+        date_unix: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let existing: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT path, date_unix FROM email_threads WHERE conversation_id=?1",
+                [conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((_, old_date)) = existing {
+            if date_unix < old_date {
+                return Ok(());
+            }
+        }
+        conn.execute(
+            "INSERT INTO email_threads(conversation_id, path, date_unix) VALUES(?1,?2,?3)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+               path=excluded.path,
+               date_unix=excluded.date_unix",
+            rusqlite::params![conversation_id, path, date_unix],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_email_thread_winner(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<EmailThreadWinner>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, path, date_unix FROM email_threads WHERE conversation_id=?1",
+        )?;
+        let mut rows = stmt.query_map([conversation_id], |row| {
+            Ok(EmailThreadWinner {
+                conversation_id: row.get(0)?,
+                path: row.get(1)?,
+                date_unix: row.get(2)?,
+            })
+        })?;
+        if let Some(Ok(w)) = rows.next() {
+            return Ok(Some(w));
+        }
+        Ok(None)
+    }
+
+    pub fn list_indexed_email_folder_names(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT folder_name FROM email_messages
+             WHERE status='indexed' AND folder_name != ''
+             ORDER BY folder_name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn clear_all_email_messages(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM email_messages", [])?;
+        conn.execute("DELETE FROM email_threads", [])?;
+        Ok(())
+    }
+
+    pub fn set_mail_last_sync_now(&self) -> Result<(), rusqlite::Error> {
+        let mut s = self.load_settings();
+        s.mail_last_sync_at = chrono::Utc::now().to_rfc3339();
+        self.save_settings(&s)
+    }
+
+    pub fn count_indexed_emails(&self) -> Result<u32, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM email_messages WHERE status='indexed'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
     }
 }
 

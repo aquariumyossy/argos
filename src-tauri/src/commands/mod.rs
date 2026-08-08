@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{
-    ExcludePathRow, FolderRow, SearchHistoryTermRow, SearchWordImport, SearchWordImportResult,
-    SearchWordRow, Settings,
+    EmailFolderRow, ExcludePathRow, FolderRow, SearchHistoryTermRow, SearchWordImport,
+    SearchWordImportResult, SearchWordRow, Settings,
 };
 use crate::indexer::{IndexProgress, IndexStats};
+use crate::mail::{self, MailSyncProgress, MailSyncStats, OutlookFolderInfo};
 use crate::pathutil;
 use crate::remote_server;
 use crate::search::{self, SearchHit};
@@ -175,12 +176,21 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
 
     let settings = state.settings.read().clone();
     let backend = state.backend.clone();
+    let mail_backend = state.mail_backend.clone();
     let user_dict = state.user_dict.read().clone();
     let q = query.clone();
     let pos_filter = settings.pos_filter_enabled;
     let hits = tauri::async_runtime::spawn_blocking(move || {
-        let result =
-            search::run_search(&settings, backend.as_ref(), &q, limit, None, None, &user_dict);
+        let result = search::run_search(
+            &settings,
+            backend.as_ref(),
+            Some(mail_backend.as_ref()),
+            &q,
+            limit,
+            None,
+            None,
+            &user_dict,
+        );
         let terms = search::extract_search_terms(&q, |text| {
             backend.morph_content_surfaces(text, pos_filter)
         })
@@ -226,6 +236,8 @@ pub fn update_settings(
     settings.search_mode = search::normalize_search_mode(&settings.search_mode);
     settings.remote_server_port = settings.remote_server_port.clamp(1, 65535);
     settings.remote_timeout_ms = settings.remote_timeout_ms.clamp(500, 60_000);
+    settings.mail_days_back = settings.mail_days_back.clamp(1, 3650);
+    settings.mail_sync_interval_secs = settings.mail_sync_interval_secs.min(7 * 24 * 3600);
     search::ensure_server_token(&mut settings);
 
     state.db.save_settings(&settings).map_err(|e| e.to_string())?;
@@ -444,9 +456,10 @@ pub fn search_query(
         .filter(|s| !s.is_empty());
     let exts = search::normalize_exts(exts);
     let user_dict = state.user_dict.read().clone();
-    search::run_search(
+    search::run_search_with_mail_options(
         &settings,
         state.backend.as_ref(),
+        Some(state.mail_backend.as_ref()),
         &query,
         limit,
         prefix,
@@ -466,6 +479,7 @@ pub fn search_path_matches(
     search::run_path_matches(
         &settings,
         state.backend.as_ref(),
+        Some(state.mail_backend.as_ref()),
         &query,
         &path,
         &user_dict,
@@ -507,6 +521,7 @@ pub fn list_search_scopes(
             let hits = search::run_search(
                 &settings,
                 state.backend.as_ref(),
+                Some(state.mail_backend.as_ref()),
                 q,
                 SCOPE_QUERY_HIT_LIMIT,
                 None,
@@ -617,6 +632,14 @@ pub fn hide_popup(app: AppHandle) {
 
 #[tauri::command]
 pub fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
+    if mail::is_outlook_path(&path) {
+        let (store_id, entry_id) = mail::parse_outlook_path(&path)
+            .ok_or_else(|| "Outlook メールのパスが不正です".to_string())?;
+        let state = app.state::<Arc<AppState>>();
+        let mail_h = state.mail.clone();
+        mail_h.open_item(&store_id, &entry_id)?;
+        return Ok(());
+    }
     let p = std::path::Path::new(&path);
     if !p.exists() {
         return Err(
@@ -631,13 +654,16 @@ pub fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
                 "ファイルを開けません（{e}）。リモート上のパスの場合はホスト PC で開くか、共有パスで再インデックスしてください。"
             )
         })?;
-    hide_popup_window(&app);
     Ok(())
 }
 
 /// Open the folder that contains the file (on Windows, select the file in Explorer).
 #[tauri::command]
 pub fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
+    if mail::is_outlook_path(&path) {
+        // Opening the message in Outlook is the closest equivalent.
+        return open_hit(app, path);
+    }
     let p = std::path::Path::new(&path);
     if !p.exists() {
         return Err(
@@ -674,8 +700,6 @@ pub fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String
             .map_err(|e| e.to_string())?;
     }
 
-    let _ = &app;
-    hide_popup_window(&app);
     Ok(())
 }
 
@@ -685,7 +709,12 @@ pub fn get_preview(
     hit_id: String,
 ) -> Result<Option<SearchHit>, String> {
     let settings = state.settings.read().clone();
-    search::run_preview(&settings, state.backend.as_ref(), &hit_id)
+    search::run_preview(
+        &settings,
+        state.backend.as_ref(),
+        Some(state.mail_backend.as_ref()),
+        &hit_id,
+    )
 }
 
 /// Read a local `.json` file as UTF-8 text for full-file preview.
@@ -738,13 +767,16 @@ pub async fn run_reindex(
     state: State<'_, Arc<AppState>>,
 ) -> Result<IndexStats, String> {
     let indexer = state.indexer.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let app_progress = app.clone();
+    let stats = tauri::async_runtime::spawn_blocking(move || {
         indexer.reindex_all(|p: IndexProgress| {
-            let _ = app.emit("index-progress", &p);
+            let _ = app_progress.emit("index-progress", &p);
         })
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    Ok(stats)
 }
 
 #[tauri::command]
@@ -761,4 +793,97 @@ pub async fn run_reindex_folder(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailFolderKey {
+    pub store_id: String,
+    pub entry_id: String,
+}
+
+#[tauri::command]
+pub fn mail_detect_outlook(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    state.mail.detect()
+}
+
+#[tauri::command]
+pub fn mail_list_folders(state: State<'_, Arc<AppState>>) -> Result<Vec<EmailFolderRow>, String> {
+    state.db.list_email_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn mail_refresh_folder_catalog(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<EmailFolderRow>, String> {
+    let listed = state.mail.list_folders()?;
+    let rows: Vec<EmailFolderRow> = listed
+        .into_iter()
+        .map(|f: OutlookFolderInfo| EmailFolderRow {
+            id: 0,
+            store_id: f.store_id,
+            entry_id: f.entry_id,
+            name: f.name,
+            path_label: f.path_label,
+            selected: false,
+            item_count: f.item_count,
+            indexed_count: 0,
+        })
+        .collect();
+    state
+        .db
+        .replace_email_folder_catalog(&rows)
+        .map_err(|e| e.to_string())?;
+    state.db.list_email_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn mail_set_selected_folders(
+    state: State<'_, Arc<AppState>>,
+    folders: Vec<MailFolderKey>,
+) -> Result<(), String> {
+    let keys: Vec<(String, String)> = folders
+        .into_iter()
+        .map(|f| (f.store_id, f.entry_id))
+        .collect();
+    state
+        .db
+        .set_email_folders_selected(&keys)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn mail_list_selected_folder_names(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>, String> {
+    state
+        .db
+        .list_indexed_email_folder_names()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn mail_run_sync(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<MailSyncStats, String> {
+    if !state.settings.read().mail_enabled {
+        return Err("Outlook メール索引が無効です。設定で有効にしてください。".into());
+    }
+    let mail = state.mail.clone();
+    let app2 = app.clone();
+    let stats = tauri::async_runtime::spawn_blocking(move || {
+        mail.sync_all(move |p: MailSyncProgress| {
+            let _ = app2.emit("mail-sync-progress", &p);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    *state.settings.write() = state.db.load_settings();
+    Ok(stats)
+}
+
+#[tauri::command]
+pub fn mail_indexed_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    state.db.count_indexed_emails().map_err(|e| e.to_string())
 }

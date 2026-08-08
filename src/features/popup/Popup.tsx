@@ -169,6 +169,11 @@ export type SearchHit = {
   matchCount?: number;
   paragraphs?: ParagraphHit[];
   unitLabel?: string;
+  mailFrom?: string;
+  mailDate?: string;
+  mailConversationId?: string;
+  mailFolder?: string;
+  docKind?: string;
 };
 
 type SearchPayload = {
@@ -231,8 +236,11 @@ function extFilterChipLabel(keys: string[]): string {
 
 const SEARCH_DEBOUNCE_MS = 450;
 
-/** Parent directory of a Windows / UNC file path. */
+/** Parent directory of a Windows / UNC file path. Not for outlook: virtual paths. */
 function parentDir(path: string): string | null {
+  if (path.startsWith("outlook:") || path.startsWith("mailfolder:")) {
+    return null;
+  }
   const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
   const i = normalized.lastIndexOf("\\");
   if (i <= 0) return null;
@@ -242,11 +250,82 @@ function parentDir(path: string): string | null {
   return parent;
 }
 
+const SCOPE_CHIP_LABEL_MAX = 36;
+
+/** Shorten long chip labels for display; full value stays in title/tooltip. */
+function truncateChipLabel(label: string, max = SCOPE_CHIP_LABEL_MAX): string {
+  const chars = Array.from(label);
+  if (chars.length <= max) return label;
+  if (max <= 1) return "…";
+  const head = Math.ceil((max - 1) * 0.55);
+  const tail = Math.max(1, max - 1 - head);
+  return `${chars.slice(0, head).join("")}…${chars.slice(-tail).join("")}`;
+}
+
+/** Split Outlook `Store / Folder / …` and drop leading repeats of the store name. */
+function splitMailPathLabel(pathLabel: string): { store: string; folderParts: string[] } {
+  const parts = pathLabel
+    .split("/")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return { store: "", folderParts: [] };
+  const store = parts[0];
+  let i = 1;
+  while (
+    i < parts.length &&
+    parts[i].localeCompare(store, undefined, { sensitivity: "accent" }) === 0
+  ) {
+    i += 1;
+  }
+  return { store, folderParts: parts.slice(i) };
+}
+
+/** Chip text: `メール：Folder／Sub（Store）` — store shown once. */
+function formatMailScopeLabel(pathLabel: string): string {
+  const { store, folderParts } = splitMailPathLabel(pathLabel);
+  if (!store) return "メール";
+  if (folderParts.length === 0) return `メール：${store}`;
+  return `メール：${folderParts.join("／")}（${store}）`;
+}
+
+/** Compact folder meta for hit rows (no メール： prefix). */
+function formatMailFolderMeta(pathLabel: string): string {
+  const { store, folderParts } = splitMailPathLabel(pathLabel);
+  if (!store) return pathLabel.trim();
+  if (folderParts.length === 0) return store;
+  return `${folderParts.join("／")}（${store}）`;
+}
+
 function scopeChipLabel(path: string, label?: string | null): string {
   if (label && label.trim()) return label.trim();
+  if (path.startsWith("mailfolder:")) {
+    return formatMailScopeLabel(path.slice("mailfolder:".length));
+  }
+  if (path.startsWith("outlook:")) {
+    return "Outlook メール";
+  }
   const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
   const base = normalized.split("\\").filter(Boolean).pop();
   return base || path;
+}
+
+function isOutlookHit(hit: SearchHit): boolean {
+  return (
+    hit.source === "outlook" ||
+    hit.docKind === "email" ||
+    hit.path.startsWith("outlook:")
+  );
+}
+
+function formatMailDate(unixStr?: string): string {
+  if (!unixStr) return "";
+  const n = Number(unixStr);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  try {
+    return new Date(n * 1000).toLocaleString();
+  } catch {
+    return "";
+  }
 }
 
 /** Split query for highlight using the same delimiters as the Rust parser (outside quotes). */
@@ -685,8 +764,19 @@ export default function Popup() {
   );
 
   const rescopeToHitFolder = useCallback(
-    (filePath: string) => {
-      const dir = parentDir(filePath);
+    (hit: SearchHit) => {
+      if (isOutlookHit(hit)) {
+        const folder = (hit.mailFolder ?? "").trim();
+        if (!folder) {
+          setActionError(
+            "このメールの Outlook フォルダ名が不明なため、フォルダ内検索できません。",
+          );
+          return;
+        }
+        applyScope(`mailfolder:${folder}`, formatMailScopeLabel(folder));
+        return;
+      }
+      const dir = parentDir(hit.path);
       if (!dir) return;
       applyScope(dir, scopeChipLabel(dir));
     },
@@ -858,8 +948,38 @@ export default function Popup() {
       const result = await invoke<SearchScopesResult>("list_search_scopes", {
         query: trimmed || null,
       });
+      let scopes = result.scopes ?? [];
+      try {
+        if (trimmed) {
+          // With a query: only mail folders that appear in current hits.
+          const fromHits = new Set<string>();
+          for (const hit of hits) {
+            const folder = (hit.mailFolder ?? "").trim();
+            if (folder) fromHits.add(folder);
+          }
+          const mailScopes: SearchScopeRow[] = [...fromHits]
+            .sort((a, b) => a.localeCompare(b, "ja"))
+            .map((name) => ({
+              path: `mailfolder:${name}`,
+              label: formatMailScopeLabel(name),
+              isRoot: true,
+            }));
+          scopes = [...scopes, ...mailScopes];
+        } else {
+          // No query: append selected mail folders after file scopes.
+          const mailNames = await invoke<string[]>("mail_list_selected_folder_names");
+          const mailScopes: SearchScopeRow[] = (mailNames ?? []).map((name) => ({
+            path: `mailfolder:${name}`,
+            label: formatMailScopeLabel(name),
+            isRoot: true,
+          }));
+          scopes = [...scopes, ...mailScopes];
+        }
+      } catch {
+        // Outlook mail not configured — ignore
+      }
       setRecentScopes(result.recent ?? []);
-      setSearchScopes(result.scopes ?? []);
+      setSearchScopes(scopes);
       setHelpOpen(false);
       setWordPickerOpen(false);
       setExtPickerOpen(false);
@@ -873,7 +993,7 @@ export default function Popup() {
       console.error(e);
       setActionError(String(e));
     }
-  }, [query]);
+  }, [query, hits]);
 
   const openExtPicker = useCallback(() => {
     setHelpOpen(false);
@@ -1780,9 +1900,14 @@ export default function Popup() {
         {scopePath || extFilterKeys.length > 0 ? (
           <div className="popup-scope-chip-row">
             {scopePath ? (
-              <span className="popup-scope-chip" title={scopePath}>
+              <span
+                className="popup-scope-chip"
+                title={scopeChipLabel(scopePath, scopeLabel)}
+              >
                 <span className="popup-scope-chip-at">@</span>
-                {scopeChipLabel(scopePath, scopeLabel)}
+                <span className="popup-scope-chip-text">
+                  {truncateChipLabel(scopeChipLabel(scopePath, scopeLabel))}
+                </span>
                 <button
                   type="button"
                   className="popup-scope-chip-clear"
@@ -1801,7 +1926,9 @@ export default function Popup() {
                 title={extFilterChipLabel(extFilterKeys)}
               >
                 <span className="popup-scope-chip-at">種別</span>
-                {extFilterChipLabel(extFilterKeys)}
+                <span className="popup-scope-chip-text">
+                  {truncateChipLabel(extFilterChipLabel(extFilterKeys))}
+                </span>
                 <button
                   type="button"
                   className="popup-scope-chip-clear"
@@ -1821,7 +1948,22 @@ export default function Popup() {
       {preview ? (
         <section className="preview">
           <div className="preview-title">{preview.title}</div>
-          <div className="preview-path">{preview.path}</div>
+          <div
+            className="preview-path"
+            title={preview.path}
+          >
+            {isOutlookHit(preview)
+              ? [
+                  preview.mailFolder
+                    ? formatMailFolderMeta(preview.mailFolder)
+                    : "",
+                  preview.mailFrom,
+                  formatMailDate(preview.mailDate),
+                ]
+                  .filter(Boolean)
+                  .join(" · ") || "Outlook メール"
+              : preview.path}
+          </div>
           <div className="preview-actions">
             <button
               type="button"
@@ -1855,7 +1997,7 @@ export default function Popup() {
               className="hit-action-btn"
               title="このフォルダ内で再検索"
               aria-label="このフォルダ内で再検索"
-              onClick={() => rescopeToHitFolder(preview.path)}
+              onClick={() => rescopeToHitFolder(preview)}
             >
               <IconRescope />
             </button>
@@ -1923,7 +2065,13 @@ export default function Popup() {
                               リモート
                             </span>
                           ) : null}
+                          {isOutlookHit(hit) ? (
+                            <span className="hit-source" title="Outlook メール">
+                              メール
+                            </span>
+                          ) : null}
                           {(() => {
+                            if (isOutlookHit(hit)) return null;
                             const ext = extFromPath(hit.path);
                             return ext ? (
                               <span className="hit-ext" title={hit.path}>
@@ -1943,6 +2091,22 @@ export default function Popup() {
                           ))}
                         </div>
                       </div>
+                      {isOutlookHit(hit) ? (
+                        <div className="hit-mail-meta muted">
+                          {[
+                            hit.mailFrom,
+                            formatMailDate(hit.mailDate),
+                            hit.mailFolder
+                              ? formatMailFolderMeta(hit.mailFolder)
+                              : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                          {(hit.matchCount ?? 0) > 1
+                            ? ` · スレッド ${hit.matchCount} 通`
+                            : ""}
+                        </div>
+                      ) : null}
                       {hit.paragraphs && hit.paragraphs.length > 0 ? (
                         <ul className="hit-paragraphs">
                           {hit.paragraphs.map((p) => (
@@ -2031,7 +2195,7 @@ export default function Popup() {
                         aria-label="このフォルダ内で再検索"
                         onClick={(e) => {
                           e.stopPropagation();
-                          rescopeToHitFolder(hit.path);
+                          rescopeToHitFolder(hit);
                         }}
                       >
                         <IconRescope />

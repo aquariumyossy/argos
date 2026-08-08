@@ -119,6 +119,7 @@ async fn search(
     // Safety net if backend ignored scope (should not happen for local Tantivy).
     hits = filter_hits_by_path_prefix(hits, prefix_for_filter.as_deref());
     hits = filter_hits_by_exts(hits, exts_for_filter.as_deref());
+    hits = crate::search::filter_out_email_hits(hits);
     hits.truncate(limit);
     for hit in &mut hits {
         hit.source = "remote".into();
@@ -139,6 +140,9 @@ async fn preview(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if let Some(ref mut h) = hit {
+        if h.doc_kind == "email" || crate::mail::is_outlook_path(&h.path) {
+            return Ok(Json(PreviewResponse { hit: None }));
+        }
         h.source = "remote".into();
     }
     Ok(Json(PreviewResponse { hit }))
