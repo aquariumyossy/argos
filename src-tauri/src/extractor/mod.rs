@@ -7,6 +7,7 @@ use std::path::Path;
 
 use zip::ZipArchive;
 
+pub use html::{html_to_text, decode_html_bytes};
 pub use segment::{segment_pages, SearchUnit, UNIT_MAX_CHARS, UNIT_MIN_CHARS};
 
 #[derive(Debug, Clone)]

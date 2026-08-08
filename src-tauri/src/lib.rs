@@ -2,6 +2,7 @@ pub mod commands;
 pub mod db;
 pub mod extractor;
 pub mod indexer;
+pub mod mail;
 pub mod pathutil;
 pub mod remote_server;
 pub mod search;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WebviewWindowBuilder,
     WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -102,8 +103,9 @@ pub fn run() {
 
             if needs_full_reindex {
                 eprintln!(
-                    "argos: schema migration — starting automatic full reindex (v1.3.x indexes are incompatible)"
+                    "argos: schema migration — starting automatic full reindex (indexes are incompatible)"
                 );
+                let indexer = indexer.clone();
                 tauri::async_runtime::spawn(async move {
                     match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all(|_| {})).await
                     {
@@ -113,6 +115,49 @@ pub fn run() {
                         ),
                         Ok(Err(e)) => eprintln!("argos: schema reindex failed: {e}"),
                         Err(e) => eprintln!("argos: schema reindex join failed: {e}"),
+                    }
+                });
+            }
+
+            // Periodic Outlook mail sync (dedicated interval; 0 = manual only).
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        let state = app_handle.state::<Arc<AppState>>();
+                        let (enabled, interval) = {
+                            let s = state.settings.read();
+                            (s.mail_enabled, s.mail_sync_interval_secs)
+                        };
+                        if !enabled || interval == 0 {
+                            continue;
+                        }
+                        let due = {
+                            let last = state.settings.read().mail_last_sync_at.clone();
+                            if last.is_empty() {
+                                true
+                            } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&last) {
+                                let elapsed = chrono::Utc::now().timestamp() - dt.timestamp();
+                                elapsed >= interval as i64
+                            } else {
+                                true
+                            }
+                        };
+                        if !due {
+                            continue;
+                        }
+                        let mail = state.mail.clone();
+                        let app2 = app_handle.clone();
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            mail.sync_all(move |p| {
+                                let _ = app2.emit("mail-sync-progress", &p);
+                            })
+                        })
+                        .await;
+                        // Refresh cached settings (last sync timestamp).
+                        let state = app_handle.state::<Arc<AppState>>();
+                        *state.settings.write() = state.db.load_settings();
                     }
                 });
             }
@@ -154,6 +199,13 @@ pub fn run() {
             commands::run_reindex,
             commands::run_reindex_folder,
             commands::set_popup_dragging,
+            commands::mail_detect_outlook,
+            commands::mail_list_folders,
+            commands::mail_refresh_folder_catalog,
+            commands::mail_set_selected_folders,
+            commands::mail_list_selected_folder_names,
+            commands::mail_run_sync,
+            commands::mail_indexed_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Argos");

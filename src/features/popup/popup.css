@@ -776,7 +776,8 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  max-width: 100%;
+  max-width: min(100%, 420px);
+  min-width: 0;
   padding: 3px 6px 3px 8px;
   border: 1px solid var(--accent);
   border-radius: 4px;
@@ -788,7 +789,15 @@
 }
 
 .popup-scope-chip-at {
+  flex-shrink: 0;
   color: var(--accent);
+}
+
+.popup-scope-chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .popup-scope-chip-clear {
@@ -907,6 +916,13 @@
   border: 1px solid var(--line);
   border-radius: 3px;
   vertical-align: 1px;
+}
+
+.hit-mail-meta {
+  font-size: 12px;
+  margin: 2px 0 6px;
+  line-height: 1.35;
+  color: var(--muted);
 }
 
 .popup-error {

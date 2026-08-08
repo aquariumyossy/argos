@@ -1,7 +1,11 @@
 //! Windows path normalization and UNC / public-path rewriting.
 
 /// Strip `\\?\` / `\\?\UNC\` prefixes and normalize separators to `\`.
+/// Leaves virtual document keys (e.g. `outlook:…`) unchanged.
 pub fn simplify_windows_path(s: &str) -> String {
+    if crate::mail::is_outlook_path(s) {
+        return s.to_string();
+    }
     let mut out = s.replace('/', "\\");
     if let Some(rest) = out.strip_prefix(r"\\?\UNC\") {
         out = format!(r"\\{rest}");
@@ -31,7 +35,11 @@ fn trim_trailing_slash(s: &str) -> String {
 }
 
 /// Case-insensitive path prefix check (Windows).
+/// Virtual schemes such as `outlook:` are never treated as filesystem paths.
 pub fn path_starts_with(path: &str, prefix: &str) -> bool {
+    if crate::mail::is_outlook_path(path) || crate::mail::is_outlook_path(prefix) {
+        return path.eq_ignore_ascii_case(prefix);
+    }
     let path = simplify_windows_path(path);
     let prefix = simplify_windows_path(prefix);
     if prefix.is_empty() {

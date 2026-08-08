@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 
 use crate::db::{Db, Settings};
 use crate::indexer::Indexer;
+use crate::mail::MailStaHandle;
 use crate::remote_server::RemoteServerHandle;
 use crate::search::tantivy_backend::TantivyBackend;
 use crate::search::UserDictMatcher;
@@ -15,16 +16,20 @@ pub struct AppState {
     pub settings: RwLock<Settings>,
     pub data_dir: PathBuf,
     pub backend: Arc<TantivyBackend>,
+    /// Dedicated Outlook mail index (`index-mail/`). Independent of file reindex.
+    pub mail_backend: Arc<TantivyBackend>,
     pub indexer: Arc<Indexer>,
     pub remote_server: RemoteServerHandle,
     /// Set during app setup after the FS watcher thread starts.
     pub watcher: RwLock<Option<WatcherHandle>>,
     /// Client-side user dictionary for query phrase forcing.
     pub user_dict: RwLock<UserDictMatcher>,
+    /// Outlook Classic COM worker (STA). Always present; errors if Outlook missing.
+    pub mail: MailStaHandle,
 }
 
 impl AppState {
-    /// Returns `(state, needs_full_reindex)` when the on-disk index schema was wiped.
+    /// Returns `(state, needs_full_reindex)` when the on-disk *file* index schema was wiped.
     pub fn open() -> Result<(Self, bool), String> {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -38,9 +43,29 @@ impl AppState {
         let index_dir = data_dir.join("index");
         let opened = TantivyBackend::open(&index_dir)?;
         let backend = Arc::new(opened.backend);
+
+        let mail_index_dir = data_dir.join("index-mail");
+        let mail_opened = TantivyBackend::open_mail(&mail_index_dir)?;
+        let mail_backend = Arc::new(mail_opened.backend);
+        // Schema wipe, or migration to a fresh empty index-mail while SQLite still
+        // thinks messages are indexed (would cause sync to skip everything).
+        let mail_db_indexed = db.count_indexed_emails().unwrap_or(0);
+        let mail_needs_resync = mail_opened.needs_full_reindex
+            || (mail_db_indexed > 0 && mail_backend.num_docs() == 0);
+        if mail_needs_resync {
+            eprintln!(
+                "argos: mail index needs rebuild (schema_wipe={}, sqlite_indexed={}, tantivy_docs={}); clearing mail sqlite",
+                mail_opened.needs_full_reindex,
+                mail_db_indexed,
+                mail_backend.num_docs()
+            );
+            let _ = db.clear_all_email_messages();
+        }
+
         let indexer = Arc::new(Indexer::new(db.clone(), backend.clone()));
         let remote_server = RemoteServerHandle::new();
         let user_dict = Self::build_user_dict(&db);
+        let mail = MailStaHandle::start(db.clone(), mail_backend.clone());
 
         Ok((
             Self {
@@ -48,10 +73,12 @@ impl AppState {
                 settings: RwLock::new(settings),
                 data_dir,
                 backend,
+                mail_backend,
                 indexer,
                 remote_server,
                 watcher: RwLock::new(None),
                 user_dict: RwLock::new(user_dict),
+                mail,
             },
             opened.needs_full_reindex,
         ))

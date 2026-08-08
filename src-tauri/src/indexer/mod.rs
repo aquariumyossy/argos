@@ -36,12 +36,13 @@ impl Indexer {
 
         let mut stats = IndexStats::default();
         for folder in folders.into_iter().filter(|f| f.enabled) {
-            stats.merge(self.crawl_folder(&folder, &excludes, &mut on_progress));
+            stats.merge(self.crawl_folder(&folder, &excludes, false, &mut on_progress));
         }
         Ok(stats)
     }
 
-    /// Rebuild index for a single folder without touching other folders.
+    /// Resume-friendly reindex for one folder: keep existing docs, skip unchanged
+    /// files, then drop paths that no longer exist (or are newly excluded).
     pub fn reindex_folder<F>(
         &self,
         folder_id: i64,
@@ -60,19 +61,8 @@ impl Indexer {
             return Err("フォルダが無効です".into());
         }
 
-        // Purge only this folder's entries, then crawl
-        let file_paths = self
-            .db
-            .list_file_paths_by_folder(folder_id)
-            .map_err(|e| e.to_string())?;
-        self.backend.delete_by_folder(&folder.path)?;
-        self.backend.delete_paths(&file_paths)?;
-        self.db
-            .clear_files_by_folder(folder_id)
-            .map_err(|e| e.to_string())?;
-
         let excludes = self.load_excludes()?;
-        Ok(self.crawl_folder(&folder, &excludes, &mut on_progress))
+        Ok(self.crawl_folder(&folder, &excludes, true, &mut on_progress))
     }
 
     fn load_excludes(&self) -> Result<Vec<String>, String> {
@@ -89,6 +79,7 @@ impl Indexer {
         &self,
         folder: &FolderRow,
         excludes: &[String],
+        purge_orphans: bool,
         on_progress: &mut F,
     ) -> IndexStats
     where
@@ -121,12 +112,16 @@ impl Indexer {
         let mut last_emit = Instant::now()
             .checked_sub(PROGRESS_EMIT_INTERVAL)
             .unwrap_or_else(Instant::now);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if !is_indexable(path, excludes) {
                 continue;
             }
+            let store_path =
+                pathutil::to_indexed_path(&path.to_string_lossy(), &folder.path, &folder.public_path);
+            seen.insert(store_path);
             match self.index_one(&folder.path, &folder.public_path, path) {
                 Ok(IndexAction::Indexed) => stats.indexed += 1,
                 Ok(IndexAction::Skipped) => stats.skipped += 1,
@@ -160,7 +155,40 @@ impl Indexer {
             });
         }
 
+        if purge_orphans {
+            if let Err(e) = self.purge_folder_orphans(folder.id, &seen) {
+                eprintln!("argos: purge orphans for folder {}: {e}", folder.id);
+                stats.errors += 1;
+            }
+        }
+
         stats
+    }
+
+    /// Remove indexed paths for this folder that were not seen in the latest crawl.
+    fn purge_folder_orphans(
+        &self,
+        folder_id: i64,
+        seen: &std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        let existing = self
+            .db
+            .list_file_paths_by_folder(folder_id)
+            .map_err(|e| e.to_string())?;
+        let orphans: Vec<String> = existing
+            .into_iter()
+            .filter(|p| !seen.contains(p))
+            .collect();
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        self.backend.delete_paths(&orphans)?;
+        for path in &orphans {
+            self.db
+                .mark_file_deleted(path)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn index_path(&self, folder: &str, path: &Path) -> Result<IndexAction, String> {

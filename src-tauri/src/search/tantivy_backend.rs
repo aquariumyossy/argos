@@ -23,10 +23,30 @@ use super::{ParagraphHit, SearchBackend, SearchHit};
 pub const INDEX_SCHEMA_VERSION: u32 = 5;
 const SCHEMA_VERSION_FILE: &str = "argos_schema_version";
 
+/// Mail index schema (separate directory: `index-mail/`).
+pub const MAIL_INDEX_SCHEMA_VERSION: u32 = 1;
+const MAIL_SCHEMA_VERSION_FILE: &str = "argos_mail_schema_version";
+
 /// Nested paragraphs shown under each file hit in the popup list.
 const NESTED_PARAGRAPH_LIMIT: usize = 3;
 /// Collapse near-duplicate units in the same file (shared label / body overlap).
 const DEDUPE_BODY_OVERLAP: f32 = 0.45;
+
+/// Which on-disk index this backend owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    File,
+    Mail,
+}
+
+/// Metadata for Outlook email documents (mail index only).
+#[derive(Debug, Clone, Default)]
+pub struct EmailDocMeta {
+    pub from: String,
+    pub date_unix: i64,
+    pub conversation_id: String,
+    pub folder: String,
+}
 
 pub struct OpenIndexResult {
     pub backend: TantivyBackend,
@@ -35,6 +55,7 @@ pub struct OpenIndexResult {
 }
 
 pub struct TantivyBackend {
+    kind: IndexKind,
     index: Index,
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
@@ -56,29 +77,49 @@ struct Fields {
     unit_id: Field,
     unit_label: Field,
     unit_kind: Field,
+    /// Present only for [`IndexKind::Mail`].
+    mail_from: Option<Field>,
+    mail_date: Option<Field>,
+    mail_conversation_id: Option<Field>,
+    mail_folder: Option<Field>,
 }
 
 impl TantivyBackend {
     pub fn open(index_dir: &Path) -> Result<OpenIndexResult, String> {
+        Self::open_kind(index_dir, IndexKind::File)
+    }
+
+    pub fn open_mail(index_dir: &Path) -> Result<OpenIndexResult, String> {
+        Self::open_kind(index_dir, IndexKind::Mail)
+    }
+
+    pub fn kind(&self) -> IndexKind {
+        self.kind
+    }
+
+    fn open_kind(index_dir: &Path, kind: IndexKind) -> Result<OpenIndexResult, String> {
         std::fs::create_dir_all(index_dir).map_err(|e| e.to_string())?;
 
-        let version_path = index_dir.join(SCHEMA_VERSION_FILE);
+        let (schema_version, version_file) = match kind {
+            IndexKind::File => (INDEX_SCHEMA_VERSION, SCHEMA_VERSION_FILE),
+            IndexKind::Mail => (MAIL_INDEX_SCHEMA_VERSION, MAIL_SCHEMA_VERSION_FILE),
+        };
+        let version_path = index_dir.join(version_file);
         let existing_version = std::fs::read_to_string(&version_path)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         let has_index = index_dir.join("meta.json").exists();
-        let needs_full_reindex = has_index && existing_version != Some(INDEX_SCHEMA_VERSION);
+        let needs_full_reindex = has_index && existing_version != Some(schema_version);
 
         if needs_full_reindex {
             eprintln!(
-                "argos: index schema {:?} -> {}; wiping index for rebuild",
-                existing_version, INDEX_SCHEMA_VERSION
+                "argos: {:?} index schema {:?} -> {}; wiping index for rebuild",
+                kind, existing_version, schema_version
             );
-            // Remove Tantivy files but keep the directory.
             for entry in std::fs::read_dir(index_dir).map_err(|e| e.to_string())? {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
-                if path.file_name().and_then(|n| n.to_str()) == Some(SCHEMA_VERSION_FILE) {
+                if path.file_name().and_then(|n| n.to_str()) == Some(version_file) {
                     continue;
                 }
                 if path.is_dir() {
@@ -111,6 +152,16 @@ impl TantivyBackend {
         let unit_id = schema_builder.add_text_field("unit_id", STRING | STORED);
         let unit_label = schema_builder.add_text_field("unit_label", STRING | STORED);
         let unit_kind = schema_builder.add_text_field("unit_kind", STRING | STORED);
+        let (mail_from, mail_date, mail_conversation_id, mail_folder) = if kind == IndexKind::Mail {
+            (
+                Some(schema_builder.add_text_field("mail_from", STRING | STORED)),
+                Some(schema_builder.add_text_field("mail_date", STRING | STORED)),
+                Some(schema_builder.add_text_field("mail_conversation_id", STRING | STORED)),
+                Some(schema_builder.add_text_field("mail_folder", STRING | STORED)),
+            )
+        } else {
+            (None, None, None, None)
+        };
         let schema = schema_builder.build();
 
         let index = if index_dir.join("meta.json").exists() {
@@ -119,10 +170,8 @@ impl TantivyBackend {
             Index::create_in_dir(index_dir, schema.clone()).map_err(|e| e.to_string())?
         };
 
-        std::fs::write(&version_path, INDEX_SCHEMA_VERSION.to_string())
-            .map_err(|e| e.to_string())?;
+        std::fs::write(&version_path, schema_version.to_string()).map_err(|e| e.to_string())?;
 
-        // Decompose helps split compounds like 損害賠償 -> 損害 + 賠償
         let dictionary = load_dictionary("embedded://ipadic").map_err(|e| e.to_string())?;
         let segmenter = Segmenter::new(Mode::Decompose(Penalty::default()), dictionary, None);
         let tokenizer = LinderaTokenizer::from_segmenter(segmenter);
@@ -139,6 +188,7 @@ impl TantivyBackend {
 
         Ok(OpenIndexResult {
             backend: Self {
+                kind,
                 index,
                 reader,
                 writer: Mutex::new(writer),
@@ -156,6 +206,10 @@ impl TantivyBackend {
                     unit_id,
                     unit_label,
                     unit_kind,
+                    mail_from,
+                    mail_date,
+                    mail_conversation_id,
+                    mail_folder,
                 },
                 morph: Mutex::new(morph),
             },
@@ -170,6 +224,21 @@ impl TantivyBackend {
         writer.commit().map_err(|e| e.to_string())?;
         self.reader.reload().map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// True when at least one document with this `path` field exists.
+    pub fn has_path(&self, path: &str) -> Result<bool, String> {
+        let searcher = self.reader.searcher();
+        let term = Term::from_field_text(self.fields.path, path);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top = searcher
+            .search(&query, &TopDocs::with_limit(1))
+            .map_err(|e| e.to_string())?;
+        Ok(!top.is_empty())
+    }
+
+    pub fn num_docs(&self) -> u64 {
+        self.reader.searcher().num_docs()
     }
 
     pub fn delete_by_folder(&self, folder: &str) -> Result<u64, String> {
@@ -242,6 +311,63 @@ impl TantivyBackend {
                     self.fields.unit_id => unit_id_str.as_str(),
                     self.fields.unit_label => unit.label.as_str(),
                     self.fields.unit_kind => unit.kind.as_str(),
+                ))
+                .map_err(|e| e.to_string())?;
+        }
+        writer.commit().map_err(|e| e.to_string())?;
+        self.reader.reload().map_err(|e| e.to_string())?;
+        Ok(units.len())
+    }
+
+    /// Index an Outlook email into the mail index only.
+    pub fn index_email(
+        &self,
+        store_path: &str,
+        title: &str,
+        mtime: u64,
+        size: u64,
+        units: &[crate::extractor::SearchUnit],
+        meta: &EmailDocMeta,
+    ) -> Result<usize, String> {
+        if self.kind != IndexKind::Mail {
+            return Err("index_email requires the mail Tantivy backend".into());
+        }
+        let mail_from = self.fields.mail_from.ok_or("mail_from field missing")?;
+        let mail_date = self.fields.mail_date.ok_or("mail_date field missing")?;
+        let mail_conversation_id = self
+            .fields
+            .mail_conversation_id
+            .ok_or("mail_conversation_id field missing")?;
+        let mail_folder = self.fields.mail_folder.ok_or("mail_folder field missing")?;
+
+        let path_str = store_path.to_string();
+        self.delete_by_path(&path_str)?;
+
+        let date_str = meta.date_unix.to_string();
+        let mut writer = self.writer.lock();
+        for unit in units {
+            let key = format!("{}#{}", path_str, unit.unit_id);
+            let page_str = unit.page.map(|p| p.to_string()).unwrap_or_default();
+            let unit_id_str = unit.unit_id.to_string();
+            writer
+                .add_document(doc!(
+                    self.fields.title => title,
+                    self.fields.body => unit.text.as_str(),
+                    self.fields.path => path_str.as_str(),
+                    self.fields.mtime => mtime.to_string().as_str(),
+                    self.fields.size => size.to_string().as_str(),
+                    self.fields.ext => "msg",
+                    self.fields.folder => meta.folder.as_str(),
+                    self.fields.page => page_str.as_str(),
+                    self.fields.chunk_id => unit_id_str.as_str(),
+                    self.fields.doc_key => key.as_str(),
+                    self.fields.unit_id => unit_id_str.as_str(),
+                    self.fields.unit_label => unit.label.as_str(),
+                    self.fields.unit_kind => unit.kind.as_str(),
+                    mail_from => meta.from.as_str(),
+                    mail_date => date_str.as_str(),
+                    mail_conversation_id => meta.conversation_id.as_str(),
+                    mail_folder => meta.folder.as_str(),
                 ))
                 .map_err(|e| e.to_string())?;
         }
@@ -544,9 +670,28 @@ impl TantivyBackend {
         let chunk_id = get(self.fields.chunk_id).parse().ok();
         let key = get(self.fields.doc_key);
         let unit_label = get(self.fields.unit_label);
+        let mail_from = self
+            .fields
+            .mail_from
+            .map(|f| get(f))
+            .unwrap_or_default();
+        let mail_date = self
+            .fields
+            .mail_date
+            .map(|f| get(f))
+            .unwrap_or_default();
+        let mail_conversation_id = self
+            .fields
+            .mail_conversation_id
+            .map(|f| get(f))
+            .unwrap_or_default();
+        let mail_folder = self
+            .fields
+            .mail_folder
+            .map(|f| get(f))
+            .unwrap_or_default();
         let snippet = make_snippet(&body, query, highlight_terms, 100);
-        // Only terms that actually appear in this hit
-        let haystack = format!("{title} {body}");
+        let haystack = format!("{title} {body} {mail_from}");
         let mut terms: Vec<String> = Vec::new();
         for t in highlight_terms {
             if !t.is_empty() && haystack.contains(t) {
@@ -554,6 +699,11 @@ impl TantivyBackend {
             }
         }
         terms.sort_by_key(|t| std::cmp::Reverse(t.chars().count()));
+        let (source, doc_kind) = if self.kind == IndexKind::Mail {
+            ("outlook".to_string(), "email".to_string())
+        } else {
+            ("local".to_string(), "file".to_string())
+        };
         Some(SearchHit {
             id: key,
             title,
@@ -562,12 +712,17 @@ impl TantivyBackend {
             page,
             chunk_id,
             score,
-            source: "local".into(),
+            source,
             preview_text: body,
             highlight_terms: terms,
             match_count: 1,
             paragraphs: Vec::new(),
             unit_label,
+            mail_from,
+            mail_date,
+            mail_conversation_id,
+            mail_folder,
+            doc_kind,
         })
     }
 }
@@ -1018,7 +1173,17 @@ impl TantivyBackend {
                 continue;
             };
             if let Some(ref prefix) = scope {
-                if !pathutil::path_starts_with(&hit.path, prefix) {
+                if let Some(folder) = prefix.strip_prefix("mailfolder:") {
+                    if self.kind != IndexKind::Mail {
+                        continue;
+                    }
+                    let folder = folder.trim();
+                    if !hit.mail_folder.eq_ignore_ascii_case(folder) {
+                        continue;
+                    }
+                } else if crate::mail::is_outlook_path(&hit.path) {
+                    continue;
+                } else if !pathutil::path_starts_with(&hit.path, prefix) {
                     continue;
                 }
             }
@@ -1343,6 +1508,11 @@ mod tests {
             match_count: 1,
             paragraphs: vec![],
             unit_label: label.into(),
+            mail_from: String::new(),
+            mail_date: String::new(),
+            mail_conversation_id: String::new(),
+            mail_folder: String::new(),
+            doc_kind: String::new(),
         };
         let shared = "損害賠償について定める。甲は乙に対し損害を賠償する義務を負う。".repeat(3);
         let a = make("a#0", "第12条", &shared, 10.0);
@@ -1378,6 +1548,11 @@ mod tests {
             match_count: 1,
             paragraphs: vec![],
             unit_label: "第12条（損害賠償）".into(),
+            mail_from: String::new(),
+            mail_date: String::new(),
+            mail_conversation_id: String::new(),
+            mail_folder: String::new(),
+            doc_kind: String::new(),
         };
         let a = make(
             "a#0",

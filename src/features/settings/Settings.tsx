@@ -21,6 +21,12 @@ type SettingsData = {
   remoteToken: string;
   remoteTimeoutMs: number;
   posFilterEnabled: boolean;
+  mailEnabled: boolean;
+  mailDaysBack: number;
+  mailSyncIntervalSecs: number;
+  mailLatestOnly: boolean;
+  mailThreadCollapse: boolean;
+  mailLastSyncAt: string;
 };
 
 type FolderRow = {
@@ -37,14 +43,32 @@ type SearchWordRow = {
   reading?: string;
   posLabel?: string;
 };
+type EmailFolderRow = {
+  id: number;
+  storeId: string;
+  entryId: string;
+  name: string;
+  pathLabel: string;
+  selected: boolean;
+  itemCount?: number;
+  indexedCount?: number;
+};
 
-type TabId = "howto" | "folders" | "words" | "options" | "remote" | "credits";
+type TabId = "howto" | "folders" | "mail" | "words" | "options" | "remote" | "credits";
 
 type IndexProgressPayload = {
   folderId: number;
   current: number;
   total: number;
   phase: "counting" | "indexing";
+};
+
+type MailSyncProgressPayload = {
+  phase: string;
+  folderLabel: string;
+  current: number;
+  total: number;
+  message: string;
 };
 
 function formatIndexProgress(p: IndexProgressPayload | null): string {
@@ -74,14 +98,15 @@ const SEARCH_MODE_OPTIONS = [
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "howto", label: "操作方法" },
-  { id: "folders", label: "検索対象フォルダ" },
-  { id: "words", label: "検索ワード登録" },
+  { id: "folders", label: "ファイル検索" },
+  { id: "mail", label: "メール検索" },
+  { id: "words", label: "辞書登録" },
   { id: "options", label: "各種設定" },
   { id: "remote", label: "リモート" },
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.4.5";
+const APP_VERSION = "1.6.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -136,6 +161,13 @@ export default function Settings() {
   const [tab, setTab] = useState<TabId>("howto");
   const [lanIp, setLanIp] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
+  const [mailFolders, setMailFolders] = useState<EmailFolderRow[]>([]);
+  const [mailDetect, setMailDetect] = useState<string>("");
+  const [mailBusy, setMailBusy] = useState(false);
+  const [mailProgress, setMailProgress] = useState<MailSyncProgressPayload | null>(
+    null,
+  );
+  const [mailIndexedCount, setMailIndexedCount] = useState(0);
 
   async function reload() {
     const s = await invoke<SettingsData>("get_settings");
@@ -151,6 +183,12 @@ export default function Settings() {
     if (typeof s.posFilterEnabled !== "boolean") {
       s.posFilterEnabled = true;
     }
+    if (typeof s.mailEnabled !== "boolean") s.mailEnabled = false;
+    if (typeof s.mailDaysBack !== "number") s.mailDaysBack = 730;
+    if (typeof s.mailSyncIntervalSecs !== "number") s.mailSyncIntervalSecs = 3600;
+    if (typeof s.mailLatestOnly !== "boolean") s.mailLatestOnly = false;
+    if (typeof s.mailThreadCollapse !== "boolean") s.mailThreadCollapse = true;
+    if (typeof s.mailLastSyncAt !== "string") s.mailLastSyncAt = "";
     setSettings(s);
     const nextFolders = await invoke<FolderRow[]>("list_folders");
     setFolders(nextFolders);
@@ -159,6 +197,16 @@ export default function Settings() {
     );
     setExcludes(await invoke<ExcludePathRow[]>("list_exclude_paths"));
     setSearchWords(await invoke<SearchWordRow[]>("list_search_words"));
+    try {
+      setMailFolders(await invoke<EmailFolderRow[]>("mail_list_folders"));
+    } catch {
+      setMailFolders([]);
+    }
+    try {
+      setMailIndexedCount(await invoke<number>("mail_indexed_count"));
+    } catch {
+      setMailIndexedCount(0);
+    }
     try {
       const ip = await invoke<string | null>("get_lan_ip_hint");
       setLanIp(ip);
@@ -213,6 +261,28 @@ export default function Settings() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<MailSyncProgressPayload>("mail-sync-progress", (event) => {
+      setMailProgress(event.payload);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "mail") return;
+    void invoke<EmailFolderRow[]>("mail_list_folders")
+      .then(setMailFolders)
+      .catch(console.error);
+    void invoke<number>("mail_indexed_count")
+      .then(setMailIndexedCount)
+      .catch(console.error);
+  }, [tab]);
+
   // Settings window stays mounted; refresh when opening this tab.
   useEffect(() => {
     if (tab !== "words") return;
@@ -220,6 +290,79 @@ export default function Settings() {
       .then(setSearchWords)
       .catch(console.error);
   }, [tab]);
+
+  async function detectOutlook() {
+    try {
+      const v = await invoke<string>("mail_detect_outlook");
+      setMailDetect(v);
+      setMessage(`検出: ${v}`);
+    } catch (err) {
+      setMailDetect("");
+      setMessage(`Outlook 検出失敗: ${String(err)}`);
+    }
+  }
+
+  async function refreshMailFolders() {
+    setMailBusy(true);
+    try {
+      const rows = await invoke<EmailFolderRow[]>("mail_refresh_folder_catalog");
+      setMailFolders(rows);
+      setMessage(`Outlook フォルダ ${rows.length} 件を取得しました`);
+    } catch (err) {
+      setMessage(`フォルダ取得失敗: ${String(err)}`);
+    } finally {
+      setMailBusy(false);
+    }
+  }
+
+  async function toggleMailFolder(folder: EmailFolderRow, selected: boolean) {
+    const next = mailFolders.map((f) =>
+      f.storeId === folder.storeId && f.entryId === folder.entryId
+        ? { ...f, selected }
+        : f,
+    );
+    setMailFolders(next);
+    const keys = next
+      .filter((f) => f.selected)
+      .map((f) => ({ storeId: f.storeId, entryId: f.entryId }));
+    try {
+      await invoke("mail_set_selected_folders", { folders: keys });
+    } catch (err) {
+      setMessage(`選択の保存に失敗: ${String(err)}`);
+      await reload();
+    }
+  }
+
+  async function runMailSync() {
+    if (!settings) return;
+    setMailBusy(true);
+    setMailProgress(null);
+    try {
+      if (!settings.mailEnabled) {
+        const saved = await invoke<SettingsData>("update_settings", {
+          settings: { ...settings, mailEnabled: true },
+        });
+        setSettings(saved);
+      }
+      const stats = await invoke<{
+        indexed: number;
+        skipped: number;
+        superseded: number;
+        errors: number;
+        folders: number;
+      }>("mail_run_sync");
+      setMessage(
+        `メール同期完了: インデックス登録 ${stats.indexed} / スキップ ${stats.skipped} / 統合除外 ${stats.superseded} / エラー ${stats.errors}`,
+      );
+      setMailIndexedCount(await invoke<number>("mail_indexed_count"));
+      await reload();
+    } catch (err) {
+      setMessage(`メール同期失敗: ${String(err)}`);
+    } finally {
+      setMailBusy(false);
+      setMailProgress(null);
+    }
+  }
 
   async function saveSettings() {
     if (!settings) return;
@@ -250,7 +393,7 @@ export default function Settings() {
         errors: number;
       }>("run_reindex_folder", { id: row.id });
       setMessage(
-        `フォルダを追加しました（このフォルダのみ索引: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}）。以降の変更は自動監視されます。`,
+        `フォルダを追加しました（このフォルダのみをインデックス: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}）。以降の変更は自動監視されます。`,
       );
       await reload();
     } catch (e) {
@@ -298,7 +441,7 @@ export default function Settings() {
         errors: number;
       }>("run_reindex_folder", { id });
       setMessage(
-        `公開パスを更新しました（このフォルダのみ再索引: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}）`,
+        `公開パスを更新しました（このフォルダのみ再インデックス: 登録 ${stats.indexed} / スキップ ${stats.skipped} / エラー ${stats.errors}）`,
       );
       await reload();
     } catch (e) {
@@ -616,7 +759,7 @@ export default function Settings() {
               <li>
                 「検索対象フォルダ」タブで検索したいフォルダを追加します
               </li>
-              <li>「今すぐインデックス」を実行して全文検索用の索引を作成します</li>
+              <li>「今すぐインデックス」を実行して全文検索用のインデックスを作成します</li>
               <li>
                 任意のアプリで文字列を選択し <kbd>{settings.shortcut}</kbd> を押します
               </li>
@@ -653,9 +796,9 @@ export default function Settings() {
           <section>
             <h2>インデックスの共有（LAN）</h2>
             <p className="muted">
-              同じ LAN 上の別 PC から、この PC の索引を検索できます。ファイル自体をコピーする必要はありません。
+              同じ LAN 上の別 PC から、この PC のインデックスを検索できます。ファイル自体をコピーする必要はありません。
             </p>
-            <h3 className="howto-subhead">索引がある PC（ホスト）</h3>
+            <h3 className="howto-subhead">インデックスがある PC（ホスト）</h3>
             <ol className="howto-steps">
               <li>「検索対象フォルダ」でフォルダを追加し、「今すぐインデックス」を実行します</li>
               <li>
@@ -689,7 +832,7 @@ export default function Settings() {
               </li>
               <li>
                 ホストが <code>C:\...</code>{" "}
-                などローカルパスだけを索引していると、クライアントではプレビューはできてもファイルを開けないことがあります
+                などローカルパスだけをインデックスしていると、クライアントではプレビューはできてもファイルを開けないことがあります
               </li>
               <li>詳細な項目は「リモート」タブでも設定・確認できます</li>
             </ul>
@@ -698,7 +841,7 @@ export default function Settings() {
           <section>
             <h2>ヒント</h2>
             <ul className="howto-tips">
-              <li>登録フォルダ内のファイル変更は自動で監視され、索引に反映されます</li>
+              <li>登録フォルダ内のファイル変更は自動で監視され、インデックスに反映されます</li>
               <li>ショートカットキーの変更はアプリ再起動後に反映されます</li>
               <li>
                 データは <code>%APPDATA%\Argos\</code> に保存されます
@@ -765,7 +908,7 @@ export default function Settings() {
                         {isBusy ? (
                           <span
                             className="folder-busy"
-                            title="このフォルダの索引を処理中です"
+                            title="このフォルダのインデックスを処理中です"
                           >
                             {indexProgress &&
                             indexProgress.folderId === f.id
@@ -797,7 +940,7 @@ export default function Settings() {
                             <button
                               type="button"
                               disabled={indexing}
-                              title="このフォルダだけ索引を読み込み直す"
+                              title="このフォルダを読み込み直す（未変更はスキップ・中断後も続きから可能）"
                               onClick={() => void runReindexFolder(f.id)}
                             >
                               読込
@@ -833,7 +976,7 @@ export default function Settings() {
                             <button
                               type="button"
                               disabled={indexing}
-                              title="UNCパスを保存し、このフォルダだけ再索引する"
+                              title="UNCパスを保存し、このフォルダだけ再インデックスする"
                               onClick={() => void savePublicPath(f.id)}
                             >
                               保存
@@ -847,7 +990,7 @@ export default function Settings() {
               )}
             </ul>
             <p className="field-hint">
-              フォルダ追加時はこのフォルダだけ自動で索引されます。UNC
+              フォルダ追加時はこのフォルダだけ自動でインデックスされます。UNC
               は必要なときだけ「UNC」から設定してください。
             </p>
           </section>
@@ -892,7 +1035,7 @@ export default function Settings() {
             <h2>インデックス</h2>
             <p className="muted">
               登録フォルダ内の PDF / DOCX / DOC / JTD / XLS / XLSX / TXT / Markdown / HTML / JSON
-              を検索用に登録します。既存フォルダのファイル変更は自動監視されるため、通常はフォルダ追加時の自動索引だけで十分です。全フォルダ再構築は、索引の不整合を直すときだけ使ってください。
+              を検索用に登録します。既存フォルダのファイル変更は自動監視されるため、通常はフォルダ追加時の自動インデックスだけで十分です。全フォルダ再構築は、インデックスの不整合を直すときだけ使ってください。
             </p>
             <button
               type="button"
@@ -911,6 +1054,229 @@ export default function Settings() {
         </div>
       ) : null}
 
+      {tab === "mail" ? (
+        <div
+          className="tab-panel"
+          role="tabpanel"
+          id="panel-mail"
+          aria-labelledby="tab-mail"
+        >
+          <section>
+            <h2>Outlookメール検索</h2>
+            <p className="muted">
+              同一 PC の Outlook クラシックのメールを全文検索できます（新しい Outlook
+              のみの環境では利用できません）。LAN
+              リモート検索にはメールは公開されません。下の手順どおりに進めてください。
+            </p>
+            <ol className="mail-flow">
+              <li>Outlook を検出</li>
+              <li>設定を保存</li>
+              <li>フォルダを選んで同期</li>
+            </ol>
+          </section>
+
+          <section className="mail-step">
+            <h3 className="mail-step-title">
+              <span className="mail-step-num" aria-hidden="true">
+                1
+              </span>
+              Outlook を検出
+            </h3>
+            <p className="muted mail-step-desc">
+              この PC に Outlook クラシックが入っているか確認します。初回操作時にセキュリティ許可のダイアログが出ることがあります。
+            </p>
+            <div className="row">
+              <button
+                type="button"
+                onClick={() => void detectOutlook()}
+                disabled={mailBusy}
+              >
+                Outlook を検出
+              </button>
+              {mailDetect ? (
+                <span className="mail-detect-ok">{mailDetect}</span>
+              ) : (
+                <span className="muted">未検出</span>
+              )}
+            </div>
+          </section>
+
+          <section className="mail-step options-form">
+            <h3 className="mail-step-title">
+              <span className="mail-step-num" aria-hidden="true">
+                2
+              </span>
+              設定
+            </h3>
+            <p className="muted mail-step-desc">
+              インデックスのオン／オフと同期の範囲を決め、「設定を保存」を押してください。
+            </p>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={!!settings?.mailEnabled}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({ ...settings, mailEnabled: e.target.checked })
+                }
+              />
+              Outlook メールをインデックスする
+            </label>
+            <label>
+              同期対象の期間（日）
+              <input
+                type="number"
+                min={1}
+                max={3650}
+                value={settings?.mailDaysBack ?? 730}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({
+                    ...settings,
+                    mailDaysBack: Number(e.target.value) || 730,
+                  })
+                }
+              />
+            </label>
+            <label>
+              自動同期間隔（秒・0 で手動のみ）
+              <input
+                type="number"
+                min={0}
+                step={60}
+                value={settings?.mailSyncIntervalSecs ?? 3600}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({
+                    ...settings,
+                    mailSyncIntervalSecs: Number(e.target.value) || 0,
+                  })
+                }
+              />
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={!!settings?.mailThreadCollapse}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({
+                    ...settings,
+                    mailThreadCollapse: e.target.checked,
+                  })
+                }
+              />
+              検索結果で同一スレッドを1行にまとめる（推奨）
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={!!settings?.mailLatestOnly}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({ ...settings, mailLatestOnly: e.target.checked })
+                }
+              />
+              インデックスはスレッド最新通のみ残す（容量節約・古い固有文が欠ける可能性）
+            </label>
+            <div className="row">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void saveSettings()}
+              >
+                設定を保存
+              </button>
+            </div>
+          </section>
+
+          <section className="mail-step">
+            <h3 className="mail-step-title">
+              <span className="mail-step-num" aria-hidden="true">
+                3
+              </span>
+              フォルダの選択・同期
+            </h3>
+            <p className="muted mail-step-desc">
+              まずフォルダ一覧を取得し、対象にチェックを入れてから「今すぐ同期」を実行します。チェックしたフォルダだけが検索対象になります。
+            </p>
+            <div className="row">
+              <button
+                type="button"
+                onClick={() => void refreshMailFolders()}
+                disabled={mailBusy}
+              >
+                フォルダ一覧を取得
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void runMailSync()}
+                disabled={mailBusy}
+              >
+                {mailBusy
+                  ? mailProgress
+                    ? mailProgress.message || "同期中…"
+                    : "同期中…"
+                  : "今すぐ同期"}
+              </button>
+            </div>
+            <p className="field-hint">
+              最終同期: {settings?.mailLastSyncAt || "未実行"} / インデックス済み{" "}
+              {mailIndexedCount.toLocaleString()} 通
+              {mailFolders.length > 0
+                ? ` / 選択中 ${mailFolders.filter((f) => f.selected).length.toLocaleString()} / ${mailFolders.length.toLocaleString()} フォルダ`
+                : null}
+            </p>
+            <ul className="folder-list">
+              {mailFolders.length === 0 ? (
+                <li className="empty">
+                  まだフォルダがありません。上の「フォルダ一覧を取得」を実行してください。
+                </li>
+              ) : (
+                mailFolders.map((f) => {
+                  const count = f.indexedCount ?? 0;
+                  return (
+                    <li
+                      key={`${f.storeId}/${f.entryId}`}
+                      className={
+                        f.selected
+                          ? "folder-item mail-folder-item is-selected"
+                          : "folder-item mail-folder-item"
+                      }
+                    >
+                      <div className="folder-item-top">
+                        <label className="mail-folder-select">
+                          <input
+                            type="checkbox"
+                            checked={f.selected}
+                            onChange={(e) =>
+                              void toggleMailFolder(f, e.target.checked)
+                            }
+                          />
+                          <span className="folder-main">
+                            <span className="folder-path" title={f.pathLabel}>
+                              {f.pathLabel || f.name}
+                            </span>
+                            <span
+                              className="folder-count"
+                              title="Argos にインデックス済みの通数"
+                            >
+                              {count.toLocaleString()} 通
+                            </span>
+                          </span>
+                        </label>
+                      </div>
+                    </li>
+                  );
+                })
+              )}
+            </ul>
+          </section>
+          {message ? <p className="msg">{message}</p> : null}
+        </div>
+      ) : null}
+
       {tab === "words" ? (
         <div
           className="tab-panel"
@@ -919,9 +1285,9 @@ export default function Settings() {
           aria-labelledby="tab-words"
         >
           <section>
-            <h2>検索ワード登録</h2>
+            <h2>辞書登録</h2>
             <p className="muted">
-              法律用語などの複合語を登録すると、検索時に隣接フレーズとして扱われます（索引の分解は変えないため、部分語でもヒットします）。
+              法律用語などの複合語を登録すると、検索時に隣接フレーズとして扱われます（インデックスの分解は変えないため、部分語でもヒットします）。
               各種設定の品詞フィルタと連携し、登録語内の助詞は除外されません。検索ポップアップの「＋」から挿入・その場登録もできます。
             </p>
             <div className="row">
@@ -1197,7 +1563,7 @@ export default function Settings() {
           <section>
             <h2>この PC を検索ホストにする</h2>
             <p className="muted">
-              有効にすると、ローカル索引を LAN 上の他の Argos から検索できるようになります（既定ポート
+              有効にすると、ローカルインデックスを LAN 上の他の Argos から検索できるようになります（既定ポート
               17890）。Windows ファイアウォールで当該ポートの受信を許可してください。
             </p>
             <label className="row-check">
