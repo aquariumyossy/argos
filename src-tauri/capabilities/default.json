@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for Argos windows",
-  "windows": ["main", "popup"],
+  "windows": ["main", "popup", "notes"],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -28,6 +28,7 @@
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
+    "global-shortcut:allow-unregister-all",
     "autostart:allow-enable",
     "autostart:allow-disable",
     "autostart:allow-is-enabled"

@@ -42,16 +42,38 @@ pub fn run() {
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state != ShortcutState::Pressed {
                         return;
                     }
+                    let Some(state) = app.try_state::<Arc<AppState>>() else {
+                        return;
+                    };
+                    let (search_sc, notes_sc) = {
+                        let s = state.settings.read();
+                        (s.shortcut.clone(), s.notes_shortcut.clone())
+                    };
+                    let is_notes = parse_shortcut(&notes_sc)
+                        .map(|sc| &sc == shortcut)
+                        .unwrap_or(false);
+                    let is_search = parse_shortcut(&search_sc)
+                        .map(|sc| &sc == shortcut)
+                        .unwrap_or(false);
                     let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(e) = commands::trigger_search(&app).await {
-                            eprintln!("search trigger failed: {e}");
-                        }
-                    });
+                    if is_notes && !is_search {
+                        tauri::async_runtime::spawn(async move {
+                            show_notes(&app);
+                        });
+                        return;
+                    }
+                    // Default / search shortcut (also if both resolve equal — prefer search).
+                    if is_search || !is_notes {
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = commands::trigger_search(&app).await {
+                                eprintln!("search trigger failed: {e}");
+                            }
+                        });
+                    }
                 })
                 .build(),
         )
@@ -61,6 +83,7 @@ pub fn run() {
                 Box::<dyn std::error::Error>::from(e)
             })?;
             let shortcut = state.settings.read().shortcut.clone();
+            let notes_shortcut = state.settings.read().notes_shortcut.clone();
             let folders = state
                 .db
                 .list_folders()
@@ -74,10 +97,7 @@ pub fn run() {
 
             setup_tray(app.handle())?;
 
-            let parsed = parse_shortcut(&shortcut).unwrap_or_else(|| {
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyA)
-            });
-            app.global_shortcut().register(parsed)?;
+            register_app_shortcuts(app.handle(), &shortcut, &notes_shortcut)?;
 
             if let Some(main) = app.get_webview_window("main") {
                 attach_main_window_handlers(&main);
@@ -86,6 +106,10 @@ pub fn run() {
             if let Some(popup) = app.get_webview_window("popup") {
                 let _ = popup.hide();
                 attach_popup_window_handlers(&popup);
+            }
+            if let Some(notes) = app.get_webview_window("notes") {
+                let _ = notes.hide();
+                attach_notes_window_handlers(&notes);
             }
 
             match watcher::start_watcher(folders, indexer.clone(), app.handle().clone()) {
@@ -206,6 +230,20 @@ pub fn run() {
             commands::mail_list_selected_folder_names,
             commands::mail_run_sync,
             commands::mail_indexed_count,
+            commands::show_notes_window,
+            commands::list_notes,
+            commands::create_note,
+            commands::rename_note,
+            commands::delete_note,
+            commands::get_active_note,
+            commands::set_active_note,
+            commands::update_note_memo,
+            commands::set_note_view_mode,
+            commands::list_note_items,
+            commands::keep_to_note,
+            commands::remove_note_item,
+            commands::update_note_item_memo,
+            commands::reorder_note_items,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Argos");
@@ -283,6 +321,82 @@ fn attach_popup_window_handlers(window: &WebviewWindow) {
             }
         }
     });
+}
+
+fn attach_notes_window_handlers(window: &WebviewWindow) {
+    let handle = window.clone();
+    window.clone().on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Err(e) = handle.hide() {
+                eprintln!("argos: hide notes window failed: {e}");
+            }
+        }
+    });
+}
+
+fn create_notes_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "notes")?;
+    let window = WebviewWindowBuilder::from_config(app, config)
+        .ok()?
+        .build()
+        .map_err(|e| {
+            eprintln!("argos: failed to recreate notes window: {e}");
+            e
+        })
+        .ok()?;
+    attach_notes_window_handlers(&window);
+    Some(window)
+}
+
+fn ensure_notes_window(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(w) = app.get_webview_window("notes") {
+        return Some(w);
+    }
+    eprintln!("argos: notes window missing; recreating");
+    create_notes_window(app)
+}
+
+pub fn show_notes(app: &AppHandle) {
+    let Some(w) = ensure_notes_window(app) else {
+        eprintln!("argos: notes window unavailable");
+        return;
+    };
+    if let Err(e) = w.unminimize() {
+        eprintln!("argos: unminimize notes window failed: {e}");
+    }
+    if let Err(e) = w.show() {
+        eprintln!("argos: show notes window failed: {e}");
+    }
+    if let Err(e) = w.set_focus() {
+        eprintln!("argos: focus notes window failed: {e}");
+    }
+}
+
+pub fn register_app_shortcuts(
+    app: &AppHandle,
+    search: &str,
+    notes: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Unregister known previous combos best-effort, then register both.
+    let _ = app.global_shortcut().unregister_all();
+    let search_parsed = parse_shortcut(search).unwrap_or_else(|| {
+        Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyA)
+    });
+    app.global_shortcut().register(search_parsed)?;
+    if let Some(notes_parsed) = parse_shortcut(notes) {
+        if notes_parsed != search_parsed {
+            if let Err(e) = app.global_shortcut().register(notes_parsed) {
+                eprintln!("argos: notes shortcut register failed: {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn create_main_window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -449,6 +563,17 @@ fn parse_shortcut(s: &str) -> Option<Shortcut> {
         "t" => Code::KeyT,
         "b" => Code::KeyB,
         "v" => Code::KeyV,
+        "n" => Code::KeyN,
+        "m" => Code::KeyM,
+        "h" => Code::KeyH,
+        "j" => Code::KeyJ,
+        "k" => Code::KeyK,
+        "l" => Code::KeyL,
+        "y" => Code::KeyY,
+        "u" => Code::KeyU,
+        "i" => Code::KeyI,
+        "o" => Code::KeyO,
+        "p" => Code::KeyP,
         _ => return None,
     };
     Some(Shortcut::new(Some(mods), code))

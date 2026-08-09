@@ -5,8 +5,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{
-    EmailFolderRow, ExcludePathRow, FolderRow, SearchHistoryTermRow, SearchWordImport,
-    SearchWordImportResult, SearchWordRow, Settings,
+    EmailFolderRow, ExcludePathRow, FolderRow, NoteItemRow, NoteRow, SearchHistoryTermRow,
+    SearchWordImport, SearchWordImportResult, SearchWordRow, Settings,
 };
 use crate::indexer::{IndexProgress, IndexStats};
 use crate::mail::{self, MailSyncProgress, MailSyncStats, OutlookFolderInfo};
@@ -15,7 +15,7 @@ use crate::remote_server;
 use crate::search::{self, SearchHit};
 use crate::selection;
 use crate::state::AppState;
-use crate::{hide_popup_window, show_main, show_popup};
+use crate::{hide_popup_window, show_main, show_notes, show_popup};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +240,15 @@ pub fn update_settings(
     settings.mail_sync_interval_secs = settings.mail_sync_interval_secs.min(7 * 24 * 3600);
     search::ensure_server_token(&mut settings);
 
+    if settings.notes_shortcut.trim().is_empty() {
+        settings.notes_shortcut = "Ctrl+Alt+N".into();
+    }
+    if settings.notes_shortcut == settings.shortcut {
+        return Err("ノート用ショートカットは検索用と同じにできません".into());
+    }
+    let prev_search = state.settings.read().shortcut.clone();
+    let prev_notes = state.settings.read().notes_shortcut.clone();
+
     state.db.save_settings(&settings).map_err(|e| e.to_string())?;
     // Apply autostart
     use tauri_plugin_autostart::ManagerExt;
@@ -251,6 +260,13 @@ pub fn update_settings(
     }
     *state.settings.write() = settings.clone();
     state.sync_remote_server();
+    if settings.shortcut != prev_search || settings.notes_shortcut != prev_notes {
+        if let Err(e) =
+            crate::register_app_shortcuts(&app, &settings.shortcut, &settings.notes_shortcut)
+        {
+            eprintln!("argos: shortcut re-register failed: {e}");
+        }
+    }
     if let Some(w) = app.get_webview_window("popup") {
         crate::apply_popup_initial_size(&app, &w);
         if !w.is_visible().unwrap_or(false) {
@@ -886,4 +902,375 @@ pub async fn mail_run_sync(
 #[tauri::command]
 pub fn mail_indexed_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
     state.db.count_indexed_emails().map_err(|e| e.to_string())
+}
+
+// --- Notes ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteItemSnapshot {
+    pub path: String,
+    pub title: String,
+    pub source: String,
+    pub doc_kind: String,
+    pub paragraph_id: String,
+    pub label: String,
+    pub page: Option<u32>,
+    pub body: String,
+    #[serde(default)]
+    pub highlight_terms: Vec<String>,
+    #[serde(default)]
+    pub mail_from: String,
+    #[serde(default)]
+    pub mail_date: String,
+    #[serde(default)]
+    pub mail_folder: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepToNotePayload {
+    pub query: String,
+    /// Prefer full body when available (e.g. from preview).
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Short snippet fallback when body/preview unavailable.
+    #[serde(default)]
+    pub snippet: Option<String>,
+    pub path: String,
+    pub title: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub doc_kind: String,
+    /// Paragraph / unit id for preview lookup and dedupe.
+    #[serde(default)]
+    pub paragraph_id: String,
+    #[serde(default)]
+    pub label: String,
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub highlight_terms: Vec<String>,
+    #[serde(default)]
+    pub mail_from: String,
+    #[serde(default)]
+    pub mail_date: String,
+    #[serde(default)]
+    pub mail_folder: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepToNoteResult {
+    pub note: NoteRow,
+    pub item: NoteItemRow,
+    pub created: bool,
+}
+
+#[tauri::command]
+pub fn show_notes_window(app: AppHandle) {
+    show_notes(&app);
+}
+
+#[tauri::command]
+pub fn list_notes(state: State<'_, Arc<AppState>>) -> Result<Vec<NoteRow>, String> {
+    state.db.list_notes().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn create_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    title: Option<String>,
+) -> Result<NoteRow, String> {
+    let note = state
+        .db
+        .create_note(title.as_deref().unwrap_or(""))
+        .map_err(|e| e.to_string())?;
+    state
+        .db
+        .set_active_note_id(Some(&note.id))
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("note-updated", ());
+    Ok(note)
+}
+
+#[tauri::command]
+pub fn rename_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    title: String,
+) -> Result<NoteRow, String> {
+    state
+        .db
+        .rename_note(&id, &title)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".into())
+        .map(|n| {
+            let _ = app.emit("note-updated", ());
+            n
+        })
+}
+
+#[tauri::command]
+pub fn delete_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    let active = state.db.get_active_note_id();
+    state.db.delete_note(&id).map_err(|e| e.to_string())?;
+    if active.as_deref() == Some(id.as_str()) {
+        state
+            .db
+            .set_active_note_id(None)
+            .map_err(|e| e.to_string())?;
+    }
+    let _ = app.emit("note-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_active_note(state: State<'_, Arc<AppState>>) -> Result<Option<NoteRow>, String> {
+    let Some(id) = state.db.get_active_note_id() else {
+        return Ok(None);
+    };
+    state.db.get_note(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_active_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<NoteRow, String> {
+    let note = state
+        .db
+        .get_note(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".to_string())?;
+    state
+        .db
+        .set_active_note_id(Some(&note.id))
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("note-updated", ());
+    Ok(note)
+}
+
+#[tauri::command]
+pub fn update_note_memo(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    memo: String,
+) -> Result<NoteRow, String> {
+    state
+        .db
+        .update_note_memo(&id, &memo)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".into())
+        .map(|n| {
+            let _ = app.emit("note-updated", ());
+            n
+        })
+}
+
+#[tauri::command]
+pub fn set_note_view_mode(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    view_mode: String,
+) -> Result<NoteRow, String> {
+    state
+        .db
+        .set_note_view_mode(&id, &view_mode)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".into())
+        .map(|n| {
+            let _ = app.emit("note-updated", ());
+            n
+        })
+}
+
+#[tauri::command]
+pub fn list_note_items(
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+) -> Result<Vec<NoteItemRow>, String> {
+    state
+        .db
+        .list_note_items(&note_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn keep_to_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    payload: KeepToNotePayload,
+) -> Result<KeepToNoteResult, String> {
+    let mut note_id = state.db.get_active_note_id();
+    if let Some(ref id) = note_id {
+        if state.db.get_note(id).map_err(|e| e.to_string())?.is_none() {
+            note_id = None;
+        }
+    }
+    let note = if let Some(id) = note_id {
+        state
+            .db
+            .get_note(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?
+    } else {
+        let created = state
+            .db
+            .create_note("無題のノート")
+            .map_err(|e| e.to_string())?;
+        state
+            .db
+            .set_active_note_id(Some(&created.id))
+            .map_err(|e| e.to_string())?;
+        created
+    };
+
+    let paragraph_id = if payload.paragraph_id.trim().is_empty() {
+        String::new()
+    } else {
+        payload.paragraph_id.trim().to_string()
+    };
+
+    if !paragraph_id.is_empty() {
+        if let Some(existing) = state
+            .db
+            .find_note_item_by_paragraph(&note.id, &paragraph_id)
+            .map_err(|e| e.to_string())?
+        {
+            show_notes(&app);
+            let _ = app.emit("note-updated", ());
+            return Ok(KeepToNoteResult {
+                note,
+                item: existing,
+                created: false,
+            });
+        }
+    }
+
+    let mut body = payload
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let mut highlight_terms = payload.highlight_terms.clone();
+
+    if !paragraph_id.is_empty() {
+        let settings = state.settings.read().clone();
+        if let Ok(Some(hit)) = search::run_preview(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            &paragraph_id,
+        ) {
+            if body.is_none() {
+                let text = hit.preview_text.trim();
+                if !text.is_empty() {
+                    body = Some(text.to_string());
+                }
+            }
+            if highlight_terms.is_empty() && !hit.highlight_terms.is_empty() {
+                highlight_terms = hit.highlight_terms;
+            }
+        }
+    }
+
+    let body = body
+        .or_else(|| {
+            payload
+                .snippet
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    let snapshot = NoteItemSnapshot {
+        path: payload.path,
+        title: payload.title,
+        source: payload.source,
+        doc_kind: payload.doc_kind,
+        paragraph_id: paragraph_id.clone(),
+        label: payload.label,
+        page: payload.page,
+        body,
+        highlight_terms,
+        mail_from: payload.mail_from,
+        mail_date: payload.mail_date,
+        mail_folder: payload.mail_folder,
+    };
+    let item_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+    let item = state
+        .db
+        .insert_note_item(&note.id, payload.query.trim(), &paragraph_id, &item_json)
+        .map_err(|e| e.to_string())?;
+    let note = state
+        .db
+        .get_note(&note.id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(note);
+
+    show_notes(&app);
+    let _ = app.emit("note-updated", ());
+    Ok(KeepToNoteResult {
+        note,
+        item,
+        created: true,
+    })
+}
+
+#[tauri::command]
+pub fn remove_note_item(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    state.db.remove_note_item(&id).map_err(|e| e.to_string())?;
+    let _ = app.emit("note-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_note_item_memo(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    memo: String,
+) -> Result<NoteItemRow, String> {
+    state
+        .db
+        .update_note_item_memo(&id, &memo)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "キープ項目が見つかりません".into())
+        .map(|n| {
+            let _ = app.emit("note-updated", ());
+            n
+        })
+}
+
+#[tauri::command]
+pub fn reorder_note_items(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+    ordered_ids: Vec<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .reorder_note_items(&note_id, &ordered_ids)
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("note-updated", ());
+    Ok(())
 }

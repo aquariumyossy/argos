@@ -79,6 +79,25 @@ function IconFolder() {
   );
 }
 
+function IconKeep() {
+  return (
+    <HitActionIcon>
+      <path d="M5 2.5h6v6.5l-3 2-3-2V2.5Z" />
+      <path d="M8 11v2.5" />
+    </HitActionIcon>
+  );
+}
+
+function IconNotes() {
+  return (
+    <HitActionIcon>
+      <path d="M3.5 3.25h9A1.25 1.25 0 0 1 13.75 4.5v7A1.25 1.25 0 0 1 12.5 12.75h-9A1.25 1.25 0 0 1 2.25 11.5v-7A1.25 1.25 0 0 1 3.5 3.25Z" />
+      <path d="M5.25 6.25h5.5" />
+      <path d="M5.25 8.75h4" />
+    </HitActionIcon>
+  );
+}
+
 function IconList() {
   return (
     <HitActionIcon>
@@ -1114,6 +1133,66 @@ export default function Popup() {
     }
   }, []);
 
+  const openNotes = useCallback(async () => {
+    try {
+      await invoke("show_notes_window");
+      setActionError("");
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, []);
+
+  const keepParagraph = useCallback(
+    async (opts: {
+      paragraphId: string;
+      label?: string;
+      page?: number | null;
+      snippet?: string;
+      body?: string;
+      fileHit: SearchHit;
+    }) => {
+      const { paragraphId, label, page, snippet, body, fileHit } = opts;
+      setActionError("");
+      try {
+        await invoke("keep_to_note", {
+          payload: {
+            query: query.trim(),
+            body: body ?? null,
+            snippet: snippet ?? null,
+            path: fileHit.path,
+            title: fileHit.title,
+            source: fileHit.source,
+            docKind: fileHit.docKind ?? "",
+            paragraphId,
+            label: label ?? fileHit.unitLabel ?? "",
+            page: page ?? fileHit.page ?? null,
+            mailFrom: fileHit.mailFrom ?? "",
+            mailDate: fileHit.mailDate ?? "",
+            mailFolder: fileHit.mailFolder ?? "",
+            highlightTerms: fileHit.highlightTerms ?? [],
+          },
+        });
+      } catch (e) {
+        setActionError(String(e));
+      }
+    },
+    [query],
+  );
+
+  const keepHitFallback = useCallback(
+    async (hit: SearchHit) => {
+      await keepParagraph({
+        paragraphId: hit.id,
+        label: hit.unitLabel || "",
+        page: hit.page,
+        snippet: hit.snippet,
+        body: hit.previewText || undefined,
+        fileHit: hit,
+      });
+    },
+    [keepParagraph],
+  );
+
   const showPreview = useCallback(
     async (target?: SearchHit) => {
       const hit = target ?? hits[index];
@@ -2001,6 +2080,24 @@ export default function Popup() {
             >
               <IconRescope />
             </button>
+            <button
+              type="button"
+              className="hit-action-btn"
+              title="この出現箇所をノートにキープ"
+              aria-label="ノートにキープ"
+              onClick={() =>
+                void keepParagraph({
+                  paragraphId: preview.id,
+                  label: preview.unitLabel || "",
+                  page: preview.page,
+                  snippet: preview.snippet,
+                  body: preview.previewText,
+                  fileHit: preview,
+                })
+              }
+            >
+              <IconKeep />
+            </button>
           </div>
           {occurrences.length > 0 ? (
             <div className="preview-occ-nav" aria-live="polite">
@@ -2132,12 +2229,30 @@ export default function Popup() {
                                   )}
                                 </span>
                               </button>
+                              <button
+                                type="button"
+                                className="hit-paragraph-keep"
+                                title="ノートにキープ"
+                                aria-label="ノートにキープ"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void keepParagraph({
+                                    paragraphId: p.id,
+                                    label: p.label,
+                                    page: p.page,
+                                    snippet: p.snippet,
+                                    fileHit: hit,
+                                  });
+                                }}
+                              >
+                                <IconKeep />
+                              </button>
                             </li>
                           ))}
                           {(hit.matchCount ?? 0) > hit.paragraphs.length ? (
                             <li className="hit-paragraph-more">
                               他 {(hit.matchCount ?? 0) - hit.paragraphs.length}{" "}
-                              件
+                              件（プレビューでキープ可）
                             </li>
                           ) : null}
                         </ul>
@@ -2163,6 +2278,20 @@ export default function Popup() {
                       ) : null}
                     </div>
                     <div className="hit-actions">
+                      {!(hit.paragraphs && hit.paragraphs.length > 0) ? (
+                        <button
+                          type="button"
+                          className="hit-action-btn"
+                          title="ノートにキープ"
+                          aria-label="ノートにキープ"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void keepHitFallback(hit);
+                          }}
+                        >
+                          <IconKeep />
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         className="hit-action-btn"
@@ -2281,6 +2410,15 @@ export default function Popup() {
             </button>
           </>
         )}
+        <button
+          type="button"
+          className="popup-settings-btn"
+          title="ノートを開く"
+          onClick={() => void openNotes()}
+        >
+          <IconNotes />
+          ノート
+        </button>
         <button
           type="button"
           className="popup-settings-btn"

@@ -6,6 +6,7 @@ import "./settings.css";
 
 type SettingsData = {
   shortcut: string;
+  notesShortcut: string;
   maxResults: number;
   fontSize: number;
   indexIntervalSecs: number;
@@ -79,9 +80,13 @@ function formatIndexProgress(p: IndexProgressPayload | null): string {
 
 /** Left-hand-friendly shortcuts that avoid common Windows / IME reserved combos. */
 const SHORTCUT_OPTIONS = [
-  { value: "Ctrl+Alt+A", label: "Ctrl + Alt + A（推奨）" },
+  { value: "Ctrl+Alt+A", label: "Ctrl + Alt + A（推奨・検索）" },
+  { value: "Ctrl+Alt+N", label: "Ctrl + Alt + N（推奨・ノート）" },
+  { value: "Ctrl+Alt+B", label: "Ctrl + Alt + B" },
   { value: "Ctrl+Alt+Space", label: "Ctrl + Alt + Space" },
   { value: "Alt+Shift+Z", label: "Shift + Alt + Z" },
+  { value: "Ctrl+Alt+H", label: "Ctrl + Alt + H" },
+  { value: "Ctrl+Alt+J", label: "Ctrl + Alt + J" },
 ] as const;
 
 const POPUP_POSITION_OPTIONS = [
@@ -106,7 +111,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.7.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -173,6 +178,15 @@ export default function Settings() {
     const s = await invoke<SettingsData>("get_settings");
     if (!SHORTCUT_OPTIONS.some((o) => o.value === s.shortcut)) {
       s.shortcut = SHORTCUT_OPTIONS[0].value;
+    }
+    if (!s.notesShortcut) s.notesShortcut = "Ctrl+Alt+N";
+    if (!SHORTCUT_OPTIONS.some((o) => o.value === s.notesShortcut)) {
+      s.notesShortcut = "Ctrl+Alt+N";
+    }
+    if (s.notesShortcut === s.shortcut) {
+      s.notesShortcut =
+        SHORTCUT_OPTIONS.find((o) => o.value !== s.shortcut)?.value ??
+        "Ctrl+Alt+N";
     }
     if (!POPUP_POSITION_OPTIONS.some((o) => o.value === s.popupPosition)) {
       s.popupPosition = "center";
@@ -1414,7 +1428,16 @@ export default function Settings() {
               <span className="field-leader" aria-hidden="true" />
               <select
                 value={settings.shortcut}
-                onChange={(e) => setSettings({ ...settings, shortcut: e.target.value })}
+                onChange={(e) => {
+                  const shortcut = e.target.value;
+                  let notesShortcut = settings.notesShortcut;
+                  if (notesShortcut === shortcut) {
+                    notesShortcut =
+                      SHORTCUT_OPTIONS.find((o) => o.value !== shortcut)?.value ??
+                      "Ctrl+Alt+N";
+                  }
+                  setSettings({ ...settings, shortcut, notesShortcut });
+                }}
               >
                 {SHORTCUT_OPTIONS.map((o) => (
                   <option key={o.value} value={o.value}>
@@ -1425,7 +1448,28 @@ export default function Settings() {
             </label>
             <p className="field-hint">
               左手で押しやすい候補です。Shift + Alt + Z
-              は、OS の入力言語切替（Alt + Shift）と干渉することがあります。変更は再起動後に反映されます。
+              は、OS の入力言語切替（Alt + Shift）と干渉することがあります。変更は保存時に反映されます。
+            </p>
+            <label>
+              <span className="field-label">ノート用ショートカット</span>
+              <span className="field-leader" aria-hidden="true" />
+              <select
+                value={settings.notesShortcut}
+                onChange={(e) =>
+                  setSettings({ ...settings, notesShortcut: e.target.value })
+                }
+              >
+                {SHORTCUT_OPTIONS.filter((o) => o.value !== settings.shortcut).map(
+                  (o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ),
+                )}
+              </select>
+            </label>
+            <p className="field-hint">
+              ノートウィンドウを開きます。検索用ショートカットと同じ値は選べません。
             </p>
             <label>
               <span className="field-label">検索結果表示数</span>
