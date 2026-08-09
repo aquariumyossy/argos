@@ -18,10 +18,14 @@ enum Job {
     Detect {
         reply: Sender<Result<String, String>>,
     },
+    IsRunning {
+        reply: Sender<bool>,
+    },
     ListFolders {
         reply: Sender<Result<Vec<OutlookFolderInfo>, String>>,
     },
     Sync {
+        allow_launch: bool,
         reply: Sender<Result<MailSyncStats, String>>,
         progress: Sender<MailSyncProgress>,
     },
@@ -56,6 +60,14 @@ impl MailStaHandle {
             .map_err(|_| "Outlook STA 応答なし".to_string())?
     }
 
+    pub fn is_running(&self) -> bool {
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(Job::IsRunning { reply }).is_err() {
+            return false;
+        }
+        rx.recv().unwrap_or(false)
+    }
+
     pub fn list_folders(&self) -> Result<Vec<OutlookFolderInfo>, String> {
         let (reply, rx) = mpsc::channel();
         self.tx
@@ -65,7 +77,8 @@ impl MailStaHandle {
             .map_err(|_| "Outlook STA 応答なし".to_string())?
     }
 
-    pub fn sync_all<F>(&self, on_progress: F) -> Result<MailSyncStats, String>
+    /// User-initiated sync may launch Outlook. Background sync should pass `false`.
+    pub fn sync_all<F>(&self, allow_launch: bool, on_progress: F) -> Result<MailSyncStats, String>
     where
         F: FnMut(MailSyncProgress) + Send + 'static,
     {
@@ -73,12 +86,12 @@ impl MailStaHandle {
         let (ptx, prx) = mpsc::channel::<MailSyncProgress>();
         self.tx
             .send(Job::Sync {
+                allow_launch,
                 reply,
                 progress: ptx,
             })
             .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
 
-        // Drain progress on this thread while waiting — use a helper thread for progress.
         let progress_thread = thread::spawn(move || {
             let mut cb = on_progress;
             while let Ok(p) = prx.recv() {
@@ -110,11 +123,13 @@ impl MailStaHandle {
 fn sta_loop(rx: Receiver<Job>, db: Arc<Db>, backend: Arc<TantivyBackend>) {
     if let Err(e) = outlook_com::com_init() {
         eprintln!("argos: Outlook STA CoInitializeEx failed: {e}");
-        // Still drain jobs with errors
         while let Ok(job) = rx.recv() {
             match job {
                 Job::Detect { reply } => {
                     let _ = reply.send(Err(e.clone()));
+                }
+                Job::IsRunning { reply } => {
+                    let _ = reply.send(false);
                 }
                 Job::ListFolders { reply } => {
                     let _ = reply.send(Err(e.clone()));
@@ -135,11 +150,18 @@ fn sta_loop(rx: Receiver<Job>, db: Arc<Db>, backend: Arc<TantivyBackend>) {
             Job::Detect { reply } => {
                 let _ = reply.send(outlook_com::detect_outlook());
             }
+            Job::IsRunning { reply } => {
+                let _ = reply.send(outlook_com::outlook_is_running());
+            }
             Job::ListFolders { reply } => {
                 let _ = reply.send(outlook_com::list_mail_folders());
             }
-            Job::Sync { reply, progress } => {
-                let result = run_sync(&db, &backend, |p| {
+            Job::Sync {
+                allow_launch,
+                reply,
+                progress,
+            } => {
+                let result = run_sync(&db, &backend, allow_launch, |p| {
                     let _ = progress.send(p);
                 });
                 drop(progress);
@@ -158,7 +180,12 @@ fn sta_loop(rx: Receiver<Job>, db: Arc<Db>, backend: Arc<TantivyBackend>) {
     outlook_com::com_uninit();
 }
 
-fn run_sync<F>(db: &Db, backend: &TantivyBackend, mut on_progress: F) -> Result<MailSyncStats, String>
+fn run_sync<F>(
+    db: &Db,
+    backend: &TantivyBackend,
+    allow_launch: bool,
+    mut on_progress: F,
+) -> Result<MailSyncStats, String>
 where
     F: FnMut(MailSyncProgress),
 {
@@ -172,6 +199,26 @@ where
         .map_err(|e| e.to_string())?;
     if folders.is_empty() {
         return Err("同期する Outlook フォルダが選択されていません".into());
+    }
+
+    // Announce before the blocking launch/retry so the UI can show it immediately.
+    if allow_launch && !outlook_com::outlook_is_running() {
+        on_progress(MailSyncProgress {
+            phase: "starting".into(),
+            folder_label: String::new(),
+            current: 0,
+            total: folders.len() as u32,
+            message: "Outlook を起動しています…".into(),
+        });
+    }
+
+    match outlook_com::connect_outlook(allow_launch) {
+        Ok((_, _info)) => {}
+        Err(e) if !allow_launch => {
+            eprintln!("argos: periodic mail sync skipped: {e}");
+            return Ok(MailSyncStats::default());
+        }
+        Err(e) => return Err(e),
     }
 
     let days = settings.mail_days_back.max(1) as i64;
@@ -198,10 +245,12 @@ where
             message: format!("フォルダ取得中: {}", folder.path_label),
         });
 
+        // Outlook should already be running after connect_outlook above.
         let messages = match outlook_com::fetch_messages_in_folder(
             &folder.entry_id,
             &folder.store_id,
             since,
+            false,
         ) {
             Ok(m) => m,
             Err(e) => {
@@ -224,16 +273,11 @@ where
             }
 
             let path = make_outlook_path(&msg.store_id, &msg.entry_id);
-            // Use full Outlook path (store / folder / …) so same-named folders
-            // across accounts stay distinct in scope filters and the UI.
             let mut msg = msg;
             msg.folder_name = folder.path_label.clone();
             let hash = content_fingerprint(&msg);
 
             if let Ok(Some(existing)) = db.get_email_message_by_path(&path) {
-                // SQLite "indexed" alone is not enough: after moving to index-mail,
-                // rows can still say indexed while Tantivy is empty. Also re-index
-                // when folder label was upgraded from short name → path_label.
                 if existing.content_hash == hash
                     && existing.status == "indexed"
                     && existing.folder_name == msg.folder_name
@@ -244,7 +288,6 @@ where
                 }
             }
 
-            // Optional: keep only newest message per conversation in the index.
             if latest_only && !msg.conversation_id.is_empty() {
                 if let Ok(Some(winner)) = db.get_email_thread_winner(&msg.conversation_id) {
                     if msg.received_unix < winner.date_unix
@@ -265,7 +308,6 @@ where
                         stats.superseded += 1;
                         continue;
                     }
-                    // Newer than previous winner: drop old from index
                     if winner.path != path {
                         let _ = backend.delete_by_path(&winner.path);
                         let _ = db.set_email_message_status(&winner.path, "superseded");
@@ -311,7 +353,7 @@ where
         current: stats.folders,
         total: stats.folders,
         message: format!(
-            "完了: 索引 {} / スキップ {} / エラー {}",
+            "完了: インデックス登録 {} / スキップ {} / エラー {}",
             stats.indexed, stats.skipped, stats.errors
         ),
     });

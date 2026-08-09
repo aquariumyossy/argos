@@ -824,6 +824,11 @@ pub fn mail_detect_outlook(state: State<'_, Arc<AppState>>) -> Result<String, St
 }
 
 #[tauri::command]
+pub fn mail_outlook_running(state: State<'_, Arc<AppState>>) -> bool {
+    state.mail.is_running()
+}
+
+#[tauri::command]
 pub fn mail_list_folders(state: State<'_, Arc<AppState>>) -> Result<Vec<EmailFolderRow>, String> {
     state.db.list_email_folders().map_err(|e| e.to_string())
 }
@@ -889,7 +894,7 @@ pub async fn mail_run_sync(
     let mail = state.mail.clone();
     let app2 = app.clone();
     let stats = tauri::async_runtime::spawn_blocking(move || {
-        mail.sync_all(move |p: MailSyncProgress| {
+        mail.sync_all(true, move |p: MailSyncProgress| {
             let _ = app2.emit("mail-sync-progress", &p);
         })
     })

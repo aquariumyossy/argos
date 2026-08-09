@@ -111,7 +111,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.7.0";
+const APP_VERSION = "1.7.1";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -307,6 +307,10 @@ export default function Settings() {
 
   async function detectOutlook() {
     try {
+      const running = await invoke<boolean>("mail_outlook_running");
+      if (!running) {
+        setMessage("Outlook を起動して接続します…");
+      }
       const v = await invoke<string>("mail_detect_outlook");
       setMailDetect(v);
       setMessage(`検出: ${v}`);
@@ -319,6 +323,10 @@ export default function Settings() {
   async function refreshMailFolders() {
     setMailBusy(true);
     try {
+      const running = await invoke<boolean>("mail_outlook_running");
+      if (!running) {
+        setMessage("Outlook を起動してフォルダ一覧を取得します…");
+      }
       const rows = await invoke<EmailFolderRow[]>("mail_refresh_folder_catalog");
       setMailFolders(rows);
       setMessage(`Outlook フォルダ ${rows.length} 件を取得しました`);
@@ -357,6 +365,23 @@ export default function Settings() {
           settings: { ...settings, mailEnabled: true },
         });
         setSettings(saved);
+      }
+      const running = await invoke<boolean>("mail_outlook_running");
+      if (!running) {
+        const launchMsg = "Outlook を起動して同期します…";
+        setMessage(launchMsg);
+        // Sync button shows mailProgress.message while busy — set it before the long wait.
+        setMailProgress({
+          phase: "starting",
+          folderLabel: "",
+          current: 0,
+          total: 0,
+          message: launchMsg,
+        });
+        // Let React paint the notice before the blocking sync invoke.
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        });
       }
       const stats = await invoke<{
         indexed: number;

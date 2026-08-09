@@ -2,17 +2,28 @@
 
 #![cfg(windows)]
 
+use std::time::{Duration, Instant};
+
 use windows::core::{Interface, BSTR, GUID, PCWSTR};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_LOCAL_SERVER, CLSIDFromProgID,
-    COINIT_APARTMENTTHREADED, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS,
-    IDispatch, EXCEPINFO,
+    CoInitializeEx, CoUninitialize, CLSIDFromProgID, COINIT_APARTMENTTHREADED, DISPATCH_FLAGS,
+    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS, IDispatch, EXCEPINFO,
 };
+use windows::Win32::System::Ole::GetActiveObject;
 use windows::Win32::System::Variant::{
     VariantClear, VariantInit, VARIANT, VT_EMPTY, VT_NULL,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
 
 use crate::mail::sync::{normalize_mail_body, OutlookFolderInfo, OutlookMessage};
+
+/// Result of connecting to classic Outlook via COM.
+#[derive(Debug, Clone, Copy)]
+pub struct OutlookConnectInfo {
+    /// True when this call started Outlook (was not already running).
+    pub launched: bool,
+}
 
 /// Must be called on an STA thread. Pair with `com_uninit`.
 pub fn com_init() -> Result<(), String> {
@@ -29,14 +40,19 @@ pub fn com_uninit() {
     }
 }
 
+/// True when an Outlook.Application is already registered in the ROT.
+pub fn outlook_is_running() -> bool {
+    get_active_outlook().is_ok()
+}
+
 pub fn detect_outlook() -> Result<String, String> {
-    let app = create_outlook()?;
+    let (app, _) = connect_outlook(true)?;
     let version = get_string_prop(&app, "Version").unwrap_or_else(|_| "unknown".into());
     Ok(format!("Outlook {version}"))
 }
 
 pub fn list_mail_folders() -> Result<Vec<OutlookFolderInfo>, String> {
-    let app = create_outlook()?;
+    let (app, _) = connect_outlook(true)?;
     let session = get_session(&app)?;
     let stores = get_dispatch_prop(&session, "Stores")?;
     let store_count = get_i32_prop(&stores, "Count").unwrap_or(0);
@@ -122,8 +138,9 @@ pub fn fetch_messages_in_folder(
     folder_entry_id: &str,
     store_id: &str,
     since_unix: i64,
+    allow_launch: bool,
 ) -> Result<Vec<OutlookMessage>, String> {
-    let app = create_outlook()?;
+    let (app, _) = connect_outlook(allow_launch)?;
     let session = get_session(&app)?;
     let folder = get_folder_from_id(&session, folder_entry_id)?;
     let folder_name = get_string_prop(&folder, "Name").unwrap_or_else(|_| "Folder".into());
@@ -189,27 +206,72 @@ pub fn fetch_messages_in_folder(
 }
 
 pub fn open_mail_item(store_id: &str, entry_id: &str) -> Result<(), String> {
-    let app = create_outlook()?;
+    let (app, _) = connect_outlook(true)?;
     let session = get_session(&app)?;
     let item = get_item_from_id(&session, entry_id, Some(store_id))?;
     let _ = invoke_method0(&item, "Display")?;
     Ok(())
 }
 
-fn create_outlook() -> Result<IDispatch, String> {
+/// Connect to classic Outlook. Prefer a running instance; optionally launch normally
+/// (never via CoCreate / -Embedding). Does not force the main window to the foreground.
+pub fn connect_outlook(allow_launch: bool) -> Result<(IDispatch, OutlookConnectInfo), String> {
+    if let Ok(app) = get_active_outlook() {
+        return Ok((app, OutlookConnectInfo { launched: false }));
+    }
+    if !allow_launch {
+        return Err("Outlook が起動していないためスキップしました".into());
+    }
+    launch_outlook_background()?;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(400));
+        if let Ok(app) = get_active_outlook() {
+            return Ok((app, OutlookConnectInfo { launched: true }));
+        }
+    }
+    Err(
+        "Outlook の起動を確認できませんでした。クラシック Outlook を開いてから再試行してください。"
+            .into(),
+    )
+}
+
+fn get_active_outlook() -> Result<IDispatch, String> {
     unsafe {
         let clsid = CLSIDFromProgID(windows::core::w!("Outlook.Application")).map_err(|e| {
             format!(
                 "Outlook クラシックが見つかりません（{e}）。新しい Outlook のみの環境では利用できません。"
             )
         })?;
-        let unk: windows::core::IUnknown =
-            CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER).map_err(|e| {
-                format!("Outlook を起動できません（{e}）。クラシック Outlook がインストールされているか確認してください。")
-            })?;
+        let mut unk = None;
+        GetActiveObject(&clsid, None, &mut unk).map_err(|_| {
+            "Outlook は起動していません".to_string()
+        })?;
+        let unk = unk.ok_or_else(|| "Outlook は起動していません".to_string())?;
         unk.cast::<IDispatch>()
             .map_err(|e| format!("Outlook IDispatch: {e}"))
     }
+}
+
+fn launch_outlook_background() -> Result<(), String> {
+    unsafe {
+        // Normal process (not -Embedding); do not activate / bring to foreground.
+        let ret = ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::w!("outlook.exe"),
+            None,
+            None,
+            SW_SHOWMINNOACTIVE,
+        );
+        if ret.0 as isize <= 32 {
+            return Err(format!(
+                "Outlook を起動できません（ShellExecute={}). クラシック Outlook がインストールされているか確認してください。",
+                ret.0 as isize
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn get_folder_from_id(session: &IDispatch, entry_id: &str) -> Result<IDispatch, String> {
