@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     pub shortcut: String,
+    /// Global shortcut to show the notes window.
+    pub notes_shortcut: String,
     pub max_results: usize,
     pub font_size: u32,
     pub index_interval_secs: u64,
@@ -41,6 +43,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             shortcut: "Ctrl+Alt+A".into(),
+            notes_shortcut: "Ctrl+Alt+N".into(),
             max_results: 10,
             font_size: 14,
             index_interval_secs: 3600,
@@ -279,6 +282,27 @@ impl Db {
               path TEXT NOT NULL,
               date_unix INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS notes (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL DEFAULT '',
+              memo TEXT NOT NULL DEFAULT '',
+              view_mode TEXT NOT NULL DEFAULT 'list',
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS note_items (
+              id TEXT PRIMARY KEY,
+              note_id TEXT NOT NULL,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              query TEXT NOT NULL DEFAULT '',
+              paragraph_id TEXT NOT NULL DEFAULT '',
+              item_json TEXT NOT NULL DEFAULT '{}',
+              memo TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_note_items_note_id
+              ON note_items(note_id, sort_order);
             "#,
         )?;
         // Migrate older DBs that lack public_path
@@ -320,6 +344,7 @@ impl Db {
             for row in rows.flatten() {
                 match row.0.as_str() {
                     "shortcut" => s.shortcut = row.1,
+                    "notes_shortcut" => s.notes_shortcut = row.1,
                     "max_results" => s.max_results = row.1.parse().unwrap_or(10),
                     "font_size" => s.font_size = row.1.parse().unwrap_or(14),
                     "index_interval_secs" => s.index_interval_secs = row.1.parse().unwrap_or(3600),
@@ -376,6 +401,7 @@ impl Db {
         let conn = self.conn.lock();
         let pairs = [
             ("shortcut", s.shortcut.clone()),
+            ("notes_shortcut", s.notes_shortcut.clone()),
             ("max_results", s.max_results.to_string()),
             ("font_size", s.font_size.to_string()),
             ("index_interval_secs", s.index_interval_secs.to_string()),
@@ -1239,7 +1265,384 @@ impl Db {
         )?;
         Ok(n as u32)
     }
+
+    // --- Notes ---
+
+    pub fn get_active_note_id(&self) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [ACTIVE_NOTE_ID_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|s| !s.is_empty())
+    }
+
+    pub fn set_active_note_id(&self, id: Option<&str>) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        match id {
+            Some(id) if !id.is_empty() => {
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    rusqlite::params![ACTIVE_NOTE_ID_KEY, id],
+                )?;
+            }
+            _ => {
+                conn.execute(
+                    "DELETE FROM settings WHERE key=?1",
+                    [ACTIVE_NOTE_ID_KEY],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_notes(&self) -> Result<Vec<NoteRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, memo, view_mode, created_at, updated_at
+             FROM notes ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(NoteRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                memo: row.get(2)?,
+                view_mode: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn get_note(&self, id: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, memo, view_mode, created_at, updated_at
+             FROM notes WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map([id], |row| {
+            Ok(NoteRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                memo: row.get(2)?,
+                view_mode: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn create_note(&self, title: &str) -> Result<NoteRow, rusqlite::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let title = if title.trim().is_empty() {
+            "無題のノート"
+        } else {
+            title.trim()
+        };
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO notes(id, title, memo, view_mode, created_at, updated_at)
+             VALUES(?1, ?2, '', 'list', ?3, ?3)",
+            rusqlite::params![id, title, now],
+        )?;
+        Ok(NoteRow {
+            id,
+            title: title.to_string(),
+            memo: String::new(),
+            view_mode: "list".into(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn rename_note(&self, id: &str, title: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
+        let title = if title.trim().is_empty() {
+            "無題のノート"
+        } else {
+            title.trim()
+        };
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE notes SET title=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![title, now, id],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_note(id)
+    }
+
+    pub fn update_note_memo(&self, id: &str, memo: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE notes SET memo=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![memo, now, id],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_note(id)
+    }
+
+    pub fn set_note_view_mode(
+        &self,
+        id: &str,
+        view_mode: &str,
+    ) -> Result<Option<NoteRow>, rusqlite::Error> {
+        let view_mode = match view_mode {
+            "grid" => "grid",
+            _ => "list",
+        };
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE notes SET view_mode=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![view_mode, now, id],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_note(id)
+    }
+
+    pub fn touch_note(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE notes SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_note(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute("DELETE FROM notes WHERE id=?1", [id])?;
+        Ok(n > 0)
+    }
+
+    pub fn list_note_items(&self, note_id: &str) -> Result<Vec<NoteItemRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, note_id, sort_order, query, paragraph_id, item_json, memo, created_at
+             FROM note_items WHERE note_id=?1 ORDER BY sort_order ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([note_id], |row| {
+            Ok(NoteItemRow {
+                id: row.get(0)?,
+                note_id: row.get(1)?,
+                sort_order: row.get(2)?,
+                query: row.get(3)?,
+                paragraph_id: row.get(4)?,
+                item_json: row.get(5)?,
+                memo: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn find_note_item_by_paragraph(
+        &self,
+        note_id: &str,
+        paragraph_id: &str,
+    ) -> Result<Option<NoteItemRow>, rusqlite::Error> {
+        if paragraph_id.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, note_id, sort_order, query, paragraph_id, item_json, memo, created_at
+             FROM note_items WHERE note_id=?1 AND paragraph_id=?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![note_id, paragraph_id], |row| {
+            Ok(NoteItemRow {
+                id: row.get(0)?,
+                note_id: row.get(1)?,
+                sort_order: row.get(2)?,
+                query: row.get(3)?,
+                paragraph_id: row.get(4)?,
+                item_json: row.get(5)?,
+                memo: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn next_note_item_sort_order(&self, note_id: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let max: Option<i64> = conn.query_row(
+            "SELECT MAX(sort_order) FROM note_items WHERE note_id=?1",
+            [note_id],
+            |r| r.get(0),
+        )?;
+        Ok(max.unwrap_or(-1) + 1)
+    }
+
+    pub fn insert_note_item(
+        &self,
+        note_id: &str,
+        query: &str,
+        paragraph_id: &str,
+        item_json: &str,
+    ) -> Result<NoteItemRow, rusqlite::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let sort_order = self.next_note_item_sort_order(note_id)?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO note_items(id, note_id, sort_order, query, paragraph_id, item_json, memo, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, '', ?7)",
+            rusqlite::params![id, note_id, sort_order, query, paragraph_id, item_json, now],
+        )?;
+        drop(conn);
+        self.touch_note(note_id)?;
+        Ok(NoteItemRow {
+            id,
+            note_id: note_id.to_string(),
+            sort_order,
+            query: query.to_string(),
+            paragraph_id: paragraph_id.to_string(),
+            item_json: item_json.to_string(),
+            memo: String::new(),
+            created_at: now,
+        })
+    }
+
+    pub fn update_note_item_memo(
+        &self,
+        id: &str,
+        memo: &str,
+    ) -> Result<Option<NoteItemRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE note_items SET memo=?1 WHERE id=?2",
+            rusqlite::params![memo, id],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let note_id: String = conn.query_row(
+            "SELECT note_id FROM note_items WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        drop(conn);
+        self.touch_note(&note_id)?;
+        self.get_note_item(id)
+    }
+
+    pub fn get_note_item(&self, id: &str) -> Result<Option<NoteItemRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, note_id, sort_order, query, paragraph_id, item_json, memo, created_at
+             FROM note_items WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map([id], |row| {
+            Ok(NoteItemRow {
+                id: row.get(0)?,
+                note_id: row.get(1)?,
+                sort_order: row.get(2)?,
+                query: row.get(3)?,
+                paragraph_id: row.get(4)?,
+                item_json: row.get(5)?,
+                memo: row.get(6)?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_note_item(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let note_id: Option<String> = conn
+            .query_row(
+                "SELECT note_id FROM note_items WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .ok();
+        let n = conn.execute("DELETE FROM note_items WHERE id=?1", [id])?;
+        drop(conn);
+        if let Some(note_id) = note_id {
+            self.touch_note(&note_id)?;
+        }
+        Ok(n > 0)
+    }
+
+    pub fn reorder_note_items(
+        &self,
+        note_id: &str,
+        ordered_ids: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        for (i, item_id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE note_items SET sort_order=?1 WHERE id=?2 AND note_id=?3",
+                rusqlite::params![i as i64, item_id, note_id],
+            )?;
+        }
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "UPDATE notes SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, note_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteRow {
+    pub id: String,
+    pub title: String,
+    pub memo: String,
+    pub view_mode: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteItemRow {
+    pub id: String,
+    pub note_id: String,
+    pub sort_order: i64,
+    pub query: String,
+    pub paragraph_id: String,
+    /// JSON string of NoteItemSnapshot.
+    pub item_json: String,
+    pub memo: String,
+    pub created_at: i64,
+}
+
+const ACTIVE_NOTE_ID_KEY: &str = "active_note_id";
 
 #[derive(Debug, Clone)]
 pub struct FileMeta {
