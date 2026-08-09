@@ -174,7 +174,8 @@ pub fn run() {
                         let mail = state.mail.clone();
                         let app2 = app_handle.clone();
                         let _ = tauri::async_runtime::spawn_blocking(move || {
-                            mail.sync_all(move |p| {
+                            // Do not launch Outlook from background sync.
+                            mail.sync_all(false, move |p| {
                                 let _ = app2.emit("mail-sync-progress", &p);
                             })
                         })
@@ -224,6 +225,7 @@ pub fn run() {
             commands::run_reindex_folder,
             commands::set_popup_dragging,
             commands::mail_detect_outlook,
+            commands::mail_outlook_running,
             commands::mail_list_folders,
             commands::mail_refresh_folder_catalog,
             commands::mail_set_selected_folders,

@@ -1103,7 +1103,14 @@ export default function Popup() {
       if (!target) return;
       setActionError("");
       try {
+        if (target.startsWith("outlook:")) {
+          const running = await invoke<boolean>("mail_outlook_running");
+          if (!running) {
+            setActionError("Outlook を起動してメールを開きます…");
+          }
+        }
         await invoke("open_hit", { path: target });
+        setActionError("");
       } catch (e) {
         setActionError(String(e));
       }
@@ -1117,7 +1124,14 @@ export default function Popup() {
       if (!target) return;
       setActionError("");
       try {
+        if (target.startsWith("outlook:")) {
+          const running = await invoke<boolean>("mail_outlook_running");
+          if (!running) {
+            setActionError("Outlook を起動してメールを開きます…");
+          }
+        }
         await invoke("open_containing_folder", { path: target });
+        setActionError("");
       } catch (e) {
         setActionError(String(e));
       }

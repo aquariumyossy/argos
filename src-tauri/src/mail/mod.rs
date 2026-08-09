@@ -12,6 +12,10 @@ pub mod sta_worker;
 pub mod outlook_com {
     use super::sync::{OutlookFolderInfo, OutlookMessage};
 
+    pub fn outlook_is_running() -> bool {
+        false
+    }
+
     pub fn detect_outlook() -> Result<String, String> {
         Err("Outlook 連携は Windows のみ対応です".into())
     }
@@ -24,6 +28,7 @@ pub mod outlook_com {
         _folder_entry_id: &str,
         _store_id: &str,
         _since_unix: i64,
+        _allow_launch: bool,
     ) -> Result<Vec<OutlookMessage>, String> {
         Err("Outlook 連携は Windows のみ対応です".into())
     }
@@ -60,11 +65,19 @@ pub mod sta_worker {
             Err("Outlook 連携は Windows のみ対応です".into())
         }
 
+        pub fn is_running(&self) -> bool {
+            false
+        }
+
         pub fn list_folders(&self) -> Result<Vec<OutlookFolderInfo>, String> {
             Err("Outlook 連携は Windows のみ対応です".into())
         }
 
-        pub fn sync_all<F>(&self, _on_progress: F) -> Result<MailSyncStats, String>
+        pub fn sync_all<F>(
+            &self,
+            _allow_launch: bool,
+            _on_progress: F,
+        ) -> Result<MailSyncStats, String>
         where
             F: FnMut(MailSyncProgress) + Send + 'static,
         {
