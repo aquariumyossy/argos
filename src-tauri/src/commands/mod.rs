@@ -180,7 +180,7 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
     let user_dict = state.user_dict.read().clone();
     let q = query.clone();
     let pos_filter = settings.pos_filter_enabled;
-    let hits = tauri::async_runtime::spawn_blocking(move || {
+    let search_result = tauri::async_runtime::spawn_blocking(move || {
         let result = search::run_search(
             &settings,
             backend.as_ref(),
@@ -198,9 +198,33 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
         (result, terms)
     })
     .await
-    .map_err(|e| e.to_string())?;
-    let (hits, terms) = hits;
-    let hits = hits?;
+    .map_err(|e| e.to_string());
+
+    let (hits, terms) = match search_result {
+        Ok((Ok(hits), terms)) => (hits, terms),
+        Ok((Err(e), _)) => {
+            let _ = app.emit(
+                "search-results",
+                SearchPayload {
+                    query: query.clone(),
+                    hits: Vec::new(),
+                    searching: false,
+                },
+            );
+            return Err(e);
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "search-results",
+                SearchPayload {
+                    query: query.clone(),
+                    hits: Vec::new(),
+                    searching: false,
+                },
+            );
+            return Err(e);
+        }
+    };
     if !terms.is_empty() {
         let _ = state.db.record_search_terms(&terms);
     }
@@ -220,6 +244,11 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
     state.settings.read().clone()
+}
+
+#[tauri::command]
+pub fn is_app_ready() -> bool {
+    crate::is_app_ready()
 }
 
 #[tauri::command]
@@ -647,14 +676,15 @@ pub fn hide_popup(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
     if mail::is_outlook_path(&path) {
         let (store_id, entry_id) = mail::parse_outlook_path(&path)
             .ok_or_else(|| "Outlook メールのパスが不正です".to_string())?;
         let state = app.state::<Arc<AppState>>();
         let mail_h = state.mail.clone();
-        mail_h.open_item(&store_id, &entry_id)?;
-        return Ok(());
+        return tauri::async_runtime::spawn_blocking(move || mail_h.open_item(&store_id, &entry_id))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {
@@ -675,10 +705,10 @@ pub fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
 
 /// Open the folder that contains the file (on Windows, select the file in Explorer).
 #[tauri::command]
-pub fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
+pub async fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
     if mail::is_outlook_path(&path) {
         // Opening the message in Outlook is the closest equivalent.
-        return open_hit(app, path);
+        return open_hit(app, path).await;
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {
@@ -819,13 +849,19 @@ pub struct MailFolderKey {
 }
 
 #[tauri::command]
-pub fn mail_detect_outlook(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    state.mail.detect()
+pub async fn mail_detect_outlook(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let mail = state.mail.clone();
+    tauri::async_runtime::spawn_blocking(move || mail.detect())
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn mail_outlook_running(state: State<'_, Arc<AppState>>) -> bool {
-    state.mail.is_running()
+pub async fn mail_outlook_running(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    let mail = state.mail.clone();
+    tauri::async_runtime::spawn_blocking(move || mail.is_running())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -834,10 +870,13 @@ pub fn mail_list_folders(state: State<'_, Arc<AppState>>) -> Result<Vec<EmailFol
 }
 
 #[tauri::command]
-pub fn mail_refresh_folder_catalog(
+pub async fn mail_refresh_folder_catalog(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<EmailFolderRow>, String> {
-    let listed = state.mail.list_folders()?;
+    let mail = state.mail.clone();
+    let listed = tauri::async_runtime::spawn_blocking(move || mail.list_folders())
+        .await
+        .map_err(|e| e.to_string())??;
     let rows: Vec<EmailFolderRow> = listed
         .into_iter()
         .map(|f: OutlookFolderInfo| EmailFolderRow {
@@ -900,7 +939,8 @@ pub async fn mail_run_sync(
     })
     .await
     .map_err(|e| e.to_string())??;
-    *state.settings.write() = state.db.load_settings();
+    let refreshed = state.db.load_settings();
+    *state.settings.write() = refreshed;
     Ok(stats)
 }
 

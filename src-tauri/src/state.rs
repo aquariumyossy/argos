@@ -37,7 +37,8 @@ impl AppState {
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         let db_path = data_dir.join("argos.db");
         let db = Arc::new(Db::open(&db_path).map_err(|e| e.to_string())?);
-        let settings = db.load_settings();
+        let mut settings = db.load_settings();
+        crate::search::ensure_server_token(&mut settings);
         let _ = db.save_settings(&settings);
 
         let index_dir = data_dir.join("index");
@@ -65,7 +66,7 @@ impl AppState {
         let indexer = Arc::new(Indexer::new(db.clone(), backend.clone()));
         let remote_server = RemoteServerHandle::new();
         let user_dict = Self::build_user_dict(&db);
-        let mail = MailStaHandle::start(db.clone(), mail_backend.clone());
+        let mail = MailStaHandle::start(db.clone(), mail_backend.clone())?;
 
         Ok((
             Self {

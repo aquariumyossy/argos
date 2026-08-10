@@ -10,6 +10,7 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { highlightText } from "../search/highlightText";
 import "./notes.css";
 
@@ -62,6 +63,25 @@ function loadBodyHeights(): Record<string, number> {
     return out;
   } catch {
     return {};
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function formatInvokeError(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object" && "message" in e) {
+    return String((e as { message: unknown }).message);
+  }
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
   }
 }
 
@@ -216,42 +236,107 @@ export default function Notes() {
   );
 
   const viewMode = active?.viewMode === "grid" ? "grid" : "list";
+  const notesReadyRef = useRef(false);
+  const bootstrappingRef = useRef(false);
 
-  const refresh = useCallback(async () => {
-    try {
-      const list = await invoke<NoteRow[]>("list_notes");
-      setNotes(list);
-      let current = await invoke<NoteRow | null>("get_active_note");
-      if (!current && list.length > 0) {
-        current = await invoke<NoteRow>("set_active_note", { id: list[0].id });
-      }
-      setActive(current);
-      if (current) {
-        const nextItems = await invoke<NoteItemRow[]>("list_note_items", {
-          noteId: current.id,
-        });
-        setItems(nextItems);
-      } else {
-        setItems([]);
-      }
-      setError("");
-    } catch (e) {
-      setError(String(e));
+  const loadNotes = useCallback(async () => {
+    const list = await invoke<NoteRow[]>("list_notes");
+    setNotes(list);
+    let current = await invoke<NoteRow | null>("get_active_note");
+    if (!current && list.length > 0) {
+      current = await invoke<NoteRow>("set_active_note", { id: list[0].id });
+    }
+    setActive(current);
+    if (current) {
+      const nextItems = await invoke<NoteItemRow[]>("list_note_items", {
+        noteId: current.id,
+      });
+      setItems(nextItems);
+    } else {
+      setItems([]);
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const refresh = useCallback(async () => {
+    try {
+      await loadNotes();
+      notesReadyRef.current = true;
+      setError("");
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }, [loadNotes]);
+
+  const bootstrapNotes = useCallback(async () => {
+    if (bootstrappingRef.current || notesReadyRef.current) return;
+    bootstrappingRef.current = true;
+    setError("");
+    try {
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        if (attempt > 0) {
+          await sleep(Math.min(50 * 2 ** Math.min(attempt - 1, 4), 1000));
+        }
+        try {
+          await loadNotes();
+          notesReadyRef.current = true;
+          setError("");
+          return;
+        } catch (e) {
+          lastError = e;
+        }
+      }
+      setError(formatInvokeError(lastError));
+    } finally {
+      bootstrappingRef.current = false;
+    }
+  }, [loadNotes]);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen("note-updated", () => {
-      void refresh();
+    void bootstrapNotes();
+  }, [bootstrapNotes]);
+
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let cancelled = false;
+    let unlistenFocus: (() => void) | undefined;
+    let unlistenReady: (() => void) | undefined;
+    void win
+      .onFocusChanged((event) => {
+        if (event.payload && !notesReadyRef.current) {
+          void bootstrapNotes();
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenFocus = fn;
+      });
+    void listen("argos-ready", () => {
+      if (!notesReadyRef.current) {
+        void bootstrapNotes();
+      }
     }).then((fn) => {
-      unlisten = fn;
+      if (cancelled) fn();
+      else unlistenReady = fn;
     });
     return () => {
+      cancelled = true;
+      unlistenFocus?.();
+      unlistenReady?.();
+    };
+  }, [bootstrapNotes]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen("note-updated", () => {
+      void refresh();
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, [refresh]);

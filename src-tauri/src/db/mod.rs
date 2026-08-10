@@ -1251,9 +1251,14 @@ impl Db {
     }
 
     pub fn set_mail_last_sync_now(&self) -> Result<(), rusqlite::Error> {
-        let mut s = self.load_settings();
-        s.mail_last_sync_at = chrono::Utc::now().to_rfc3339();
-        self.save_settings(&s)
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('mail_last_sync_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![now],
+        )?;
+        Ok(())
     }
 
     pub fn count_indexed_emails(&self) -> Result<u32, rusqlite::Error> {

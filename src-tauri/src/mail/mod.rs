@@ -54,11 +54,11 @@ pub mod sta_worker {
     }
 
     impl MailStaHandle {
-        pub fn start(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Self {
-            Self {
+        pub fn start(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Result<Self, String> {
+            Ok(Self {
                 _db: db,
                 _backend: backend,
-            }
+            })
         }
 
         pub fn detect(&self) -> Result<String, String> {

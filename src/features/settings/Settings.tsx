@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./settings.css";
 
@@ -111,7 +112,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.7.1";
+const APP_VERSION = "1.7.2";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -145,8 +146,79 @@ function newToken() {
   return `argos-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function formatInvokeError(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object" && "message" in e) {
+    return String((e as { message: unknown }).message);
+  }
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
+function normalizeSettings(s: SettingsData): SettingsData {
+  if (!SHORTCUT_OPTIONS.some((o) => o.value === s.shortcut)) {
+    s.shortcut = SHORTCUT_OPTIONS[0].value;
+  }
+  if (!s.notesShortcut) s.notesShortcut = "Ctrl+Alt+N";
+  if (!SHORTCUT_OPTIONS.some((o) => o.value === s.notesShortcut)) {
+    s.notesShortcut = "Ctrl+Alt+N";
+  }
+  if (s.notesShortcut === s.shortcut) {
+    s.notesShortcut =
+      SHORTCUT_OPTIONS.find((o) => o.value !== s.shortcut)?.value ??
+      "Ctrl+Alt+N";
+  }
+  if (!POPUP_POSITION_OPTIONS.some((o) => o.value === s.popupPosition)) {
+    s.popupPosition = "center";
+  }
+  if (!SEARCH_MODE_OPTIONS.some((o) => o.value === s.searchMode)) {
+    s.searchMode = "local";
+  }
+  if (typeof s.posFilterEnabled !== "boolean") {
+    s.posFilterEnabled = true;
+  }
+  if (typeof s.mailEnabled !== "boolean") s.mailEnabled = false;
+  if (typeof s.mailDaysBack !== "number") s.mailDaysBack = 730;
+  if (typeof s.mailSyncIntervalSecs !== "number") s.mailSyncIntervalSecs = 3600;
+  if (typeof s.mailLatestOnly !== "boolean") s.mailLatestOnly = false;
+  if (typeof s.mailThreadCollapse !== "boolean") s.mailThreadCollapse = true;
+  if (typeof s.mailLastSyncAt !== "string") s.mailLastSyncAt = "";
+  return s;
+}
+
+/** Wait for AppState to be managed; startup can race the hidden main WebView. */
+async function invokeGetSettingsWithRetry(
+  maxAttempts = 50,
+): Promise<SettingsData> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      await sleep(Math.min(50 * 2 ** Math.min(attempt - 1, 4), 1000));
+    }
+    try {
+      return await invoke<SettingsData>("get_settings");
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(formatInvokeError(lastError));
+}
+
 export default function Settings() {
   const [settings, setSettings] = useState<SettingsData | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [folders, setFolders] = useState<FolderRow[]>([]);
   const [excludes, setExcludes] = useState<ExcludePathRow[]>([]);
   const [searchWords, setSearchWords] = useState<SearchWordRow[]>([]);
@@ -173,37 +245,21 @@ export default function Settings() {
     null,
   );
   const [mailIndexedCount, setMailIndexedCount] = useState(0);
+  const settingsRef = useRef<SettingsData | null>(null);
+  const bootstrappingRef = useRef(false);
 
-  async function reload() {
-    const s = await invoke<SettingsData>("get_settings");
-    if (!SHORTCUT_OPTIONS.some((o) => o.value === s.shortcut)) {
-      s.shortcut = SHORTCUT_OPTIONS[0].value;
-    }
-    if (!s.notesShortcut) s.notesShortcut = "Ctrl+Alt+N";
-    if (!SHORTCUT_OPTIONS.some((o) => o.value === s.notesShortcut)) {
-      s.notesShortcut = "Ctrl+Alt+N";
-    }
-    if (s.notesShortcut === s.shortcut) {
-      s.notesShortcut =
-        SHORTCUT_OPTIONS.find((o) => o.value !== s.shortcut)?.value ??
-        "Ctrl+Alt+N";
-    }
-    if (!POPUP_POSITION_OPTIONS.some((o) => o.value === s.popupPosition)) {
-      s.popupPosition = "center";
-    }
-    if (!SEARCH_MODE_OPTIONS.some((o) => o.value === s.searchMode)) {
-      s.searchMode = "local";
-    }
-    if (typeof s.posFilterEnabled !== "boolean") {
-      s.posFilterEnabled = true;
-    }
-    if (typeof s.mailEnabled !== "boolean") s.mailEnabled = false;
-    if (typeof s.mailDaysBack !== "number") s.mailDaysBack = 730;
-    if (typeof s.mailSyncIntervalSecs !== "number") s.mailSyncIntervalSecs = 3600;
-    if (typeof s.mailLatestOnly !== "boolean") s.mailLatestOnly = false;
-    if (typeof s.mailThreadCollapse !== "boolean") s.mailThreadCollapse = true;
-    if (typeof s.mailLastSyncAt !== "string") s.mailLastSyncAt = "";
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  async function reload(opts?: { retry?: boolean }) {
+    const raw = opts?.retry
+      ? await invokeGetSettingsWithRetry()
+      : await invoke<SettingsData>("get_settings");
+    const s = normalizeSettings(raw);
     setSettings(s);
+    settingsRef.current = s;
+    setLoadError(null);
     const nextFolders = await invoke<FolderRow[]>("list_folders");
     setFolders(nextFolders);
     setPublicPathDrafts(
@@ -229,8 +285,55 @@ export default function Settings() {
     }
   }
 
+  async function bootstrapSettings() {
+    if (bootstrappingRef.current || settingsRef.current) return;
+    bootstrappingRef.current = true;
+    setLoadError(null);
+    try {
+      await reload({ retry: true });
+    } catch (e) {
+      console.error(e);
+      if (!settingsRef.current) {
+        setLoadError(formatInvokeError(e));
+      }
+    } finally {
+      bootstrappingRef.current = false;
+    }
+  }
+
   useEffect(() => {
-    void reload().catch(console.error);
+    void bootstrapSettings();
+  }, []);
+
+  // Window is hide/show (not remounted). Retry if the startup race left settings null.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let cancelled = false;
+    let unlistenFocus: (() => void) | undefined;
+    let unlistenReady: (() => void) | undefined;
+    void win
+      .onFocusChanged((event) => {
+        if (event.payload && !settingsRef.current) {
+          void bootstrapSettings();
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenFocus = fn;
+      });
+    void listen("argos-ready", () => {
+      if (!settingsRef.current) {
+        void bootstrapSettings();
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenReady = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlistenFocus?.();
+      unlistenReady?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -407,7 +510,7 @@ export default function Settings() {
     if (!settings) return;
     const saved = await invoke<SettingsData>("update_settings", { settings });
     setSettings(saved);
-    setMessage("設定を保存しました（ショートカット変更は再起動後に反映）");
+    setMessage("設定を保存しました（ショートカット変更はすぐに反映されます）");
   }
 
   async function addFolder() {
@@ -735,7 +838,27 @@ export default function Settings() {
         : "";
 
   if (!settings) {
-    return <div className="settings loading">読み込み中…</div>;
+    return (
+      <div className="settings loading">
+        {loadError ? (
+          <div className="loading-error">
+            <p>設定の読み込みに失敗しました。</p>
+            <p className="msg">{loadError}</p>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => {
+                void bootstrapSettings();
+              }}
+            >
+              再試行
+            </button>
+          </div>
+        ) : (
+          "読み込み中…"
+        )}
+      </div>
+    );
   }
 
   return (
@@ -881,7 +1004,7 @@ export default function Settings() {
             <h2>ヒント</h2>
             <ul className="howto-tips">
               <li>登録フォルダ内のファイル変更は自動で監視され、インデックスに反映されます</li>
-              <li>ショートカットキーの変更はアプリ再起動後に反映されます</li>
+              <li>ショートカットキーの変更は保存後すぐに反映されます</li>
               <li>
                 データは <code>%APPDATA%\Argos\</code> に保存されます
               </li>
@@ -1576,21 +1699,9 @@ export default function Settings() {
             <p className="field-hint">
               ポップアップを開き直すときにサイズ・位置が適用されます。表示中の手動移動・リサイズは、閉じるまで維持されます。
             </p>
-            <label>
-              <span className="field-label">インデックス更新間隔（秒）</span>
-              <span className="field-leader" aria-hidden="true" />
-              <input
-                type="number"
-                min={60}
-                value={settings.indexIntervalSecs}
-                onChange={(e) =>
-                  setSettings({
-                    ...settings,
-                    indexIntervalSecs: Number(e.target.value) || 3600,
-                  })
-                }
-              />
-            </label>
+            <p className="field-hint">
+              ファイル索引は登録フォルダの変更監視と、設定画面／トレイからの手動再構築で更新されます（定期フル再索引の間隔設定はありません）。
+            </p>
             <label className="row-check">
               <input
                 type="checkbox"

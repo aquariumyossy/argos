@@ -2,9 +2,10 @@
 
 #![cfg(windows)]
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::db::Db;
 use crate::mail::outlook_com;
@@ -13,6 +14,11 @@ use crate::mail::sync::{
     content_fingerprint, index_message, MailSyncProgress, MailSyncStats, OutlookFolderInfo,
 };
 use crate::search::tantivy_backend::TantivyBackend;
+
+/// Short COM ops (detect / list / open). Outlook connect alone can take ~25s.
+const SHORT_JOB_TIMEOUT: Duration = Duration::from_secs(60);
+/// Full mailbox sync may run a long time; still bound so UI never waits forever.
+const SYNC_JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 enum Job {
     Detect {
@@ -41,14 +47,25 @@ pub struct MailStaHandle {
     tx: Sender<Job>,
 }
 
+fn recv_result<T>(rx: Receiver<T>, timeout: Duration, label: &str) -> Result<T, String> {
+    match rx.recv_timeout(timeout) {
+        Ok(v) => Ok(v),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "Outlook STA 応答タイムアウト（{label}、{}秒）",
+            timeout.as_secs()
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err("Outlook STA 応答なし".to_string()),
+    }
+}
+
 impl MailStaHandle {
-    pub fn start(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Self {
+    pub fn start(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("argos-outlook-sta".into())
             .spawn(move || sta_loop(rx, db, backend))
-            .expect("spawn outlook STA thread");
-        Self { tx }
+            .map_err(|e| format!("Outlook STA スレッドを起動できません: {e}"))?;
+        Ok(Self { tx })
     }
 
     pub fn detect(&self) -> Result<String, String> {
@@ -56,8 +73,7 @@ impl MailStaHandle {
         self.tx
             .send(Job::Detect { reply })
             .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
-        rx.recv()
-            .map_err(|_| "Outlook STA 応答なし".to_string())?
+        recv_result(rx, SHORT_JOB_TIMEOUT, "detect")?
     }
 
     pub fn is_running(&self) -> bool {
@@ -65,7 +81,7 @@ impl MailStaHandle {
         if self.tx.send(Job::IsRunning { reply }).is_err() {
             return false;
         }
-        rx.recv().unwrap_or(false)
+        recv_result(rx, SHORT_JOB_TIMEOUT, "is_running").unwrap_or(false)
     }
 
     pub fn list_folders(&self) -> Result<Vec<OutlookFolderInfo>, String> {
@@ -73,8 +89,7 @@ impl MailStaHandle {
         self.tx
             .send(Job::ListFolders { reply })
             .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
-        rx.recv()
-            .map_err(|_| "Outlook STA 応答なし".to_string())?
+        recv_result(rx, SHORT_JOB_TIMEOUT, "list_folders")?
     }
 
     /// User-initiated sync may launch Outlook. Background sync should pass `false`.
@@ -99,9 +114,7 @@ impl MailStaHandle {
             }
         });
 
-        let result = rx
-            .recv()
-            .map_err(|_| "Outlook STA 応答なし".to_string())?;
+        let result = recv_result(rx, SYNC_JOB_TIMEOUT, "sync")?;
         let _ = progress_thread.join();
         result
     }
@@ -115,8 +128,7 @@ impl MailStaHandle {
                 reply,
             })
             .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
-        rx.recv()
-            .map_err(|_| "Outlook STA 応答なし".to_string())?
+        recv_result(rx, SHORT_JOB_TIMEOUT, "open")?
     }
 }
 
