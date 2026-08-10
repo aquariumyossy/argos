@@ -25,9 +25,15 @@ use crate::state::AppState;
 
 /// True while the user is dragging the popup (set from the frontend).
 static POPUP_DRAGGING: AtomicBool = AtomicBool::new(false);
+/// Set after `AppState` is managed so frontends can poll without needing State.
+static APP_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn set_popup_dragging(dragging: bool) {
     POPUP_DRAGGING.store(dragging, Ordering::SeqCst);
+}
+
+pub fn is_app_ready() -> bool {
+    APP_READY.load(Ordering::SeqCst)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -94,10 +100,17 @@ pub fn run() {
                 .collect::<Vec<_>>();
             let indexer = state.indexer.clone();
             app.manage(Arc::new(state));
+            APP_READY.store(true, Ordering::SeqCst);
+            // Frontend may have mounted before AppState was ready; wake retrying loaders.
+            let _ = app.emit("argos-ready", ());
 
-            setup_tray(app.handle())?;
+            if let Err(e) = setup_tray(app.handle()) {
+                eprintln!("argos: tray setup failed (continuing): {e}");
+            }
 
-            register_app_shortcuts(app.handle(), &shortcut, &notes_shortcut)?;
+            if let Err(e) = register_app_shortcuts(app.handle(), &shortcut, &notes_shortcut) {
+                eprintln!("argos: shortcut registration failed (continuing): {e}");
+            }
 
             if let Some(main) = app.get_webview_window("main") {
                 attach_main_window_handlers(&main);
@@ -182,7 +195,8 @@ pub fn run() {
                         .await;
                         // Refresh cached settings (last sync timestamp).
                         let state = app_handle.state::<Arc<AppState>>();
-                        *state.settings.write() = state.db.load_settings();
+                        let refreshed = state.db.load_settings();
+                        *state.settings.write() = refreshed;
                     }
                 });
             }
@@ -191,6 +205,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
+            commands::is_app_ready,
             commands::update_settings,
             commands::list_folders,
             commands::add_folder,
@@ -248,7 +263,9 @@ pub fn run() {
             commands::reorder_note_items,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Argos");
+        .unwrap_or_else(|e| {
+            eprintln!("error while running Argos: {e}");
+        });
 }
 
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -257,8 +274,12 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let quit = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_settings, &reindex, &quit])?;
 
+    let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or("default window icon missing")?;
     let _tray = TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(icon)
         .menu(&menu)
         .tooltip("Argos")
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -445,7 +466,7 @@ pub fn show_main(app: &AppHandle) {
 }
 
 pub fn show_popup(app: &AppHandle) -> Option<WebviewWindow> {
-    let w = app.get_webview_window("popup")?;
+    let w = ensure_popup_window(app)?;
     // Keep user-dragged position / resized size while the popup stays open
     let visible = w.is_visible().unwrap_or(false);
     if !visible {
@@ -456,6 +477,33 @@ pub fn show_popup(app: &AppHandle) -> Option<WebviewWindow> {
     let _ = w.show();
     let _ = w.set_focus();
     Some(w)
+}
+
+fn create_popup_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "popup")?;
+    let window = WebviewWindowBuilder::from_config(app, config)
+        .ok()?
+        .build()
+        .map_err(|e| {
+            eprintln!("argos: failed to recreate popup window: {e}");
+            e
+        })
+        .ok()?;
+    attach_popup_window_handlers(&window);
+    Some(window)
+}
+
+fn ensure_popup_window(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(w) = app.get_webview_window("popup") {
+        return Some(w);
+    }
+    eprintln!("argos: popup window missing; recreating");
+    create_popup_window(app)
 }
 
 pub fn apply_popup_initial_size(app: &AppHandle, w: &WebviewWindow) {

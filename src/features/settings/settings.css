@@ -451,6 +451,18 @@ kbd {
   padding: 40px;
 }
 
+.loading-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  max-width: 480px;
+}
+
+.loading-error p {
+  margin: 0;
+}
+
 .credits-block + .credits-block {
   margin-top: 32px;
 }

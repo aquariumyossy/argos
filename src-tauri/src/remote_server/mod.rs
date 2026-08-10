@@ -151,12 +151,21 @@ async fn preview(
 /// Manages the lifecycle of the LAN search HTTP server.
 pub struct RemoteServerHandle {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    /// Active server identity so unrelated settings saves do not bounce the bind.
+    running: Arc<Mutex<Option<RunningServer>>>,
+}
+
+struct RunningServer {
+    port: u32,
+    token: String,
+    pos_filter_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RemoteServerHandle {
     pub fn new() -> Self {
         Self {
             shutdown: Mutex::new(None),
+            running: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -164,9 +173,10 @@ impl RemoteServerHandle {
         if let Some(tx) = self.shutdown.lock().take() {
             let _ = tx.send(());
         }
+        *self.running.lock() = None;
     }
 
-    /// Apply settings: stop existing server, start if enabled.
+    /// Apply settings: restart only when enabled/port/token change.
     pub fn sync(
         &self,
         enabled: bool,
@@ -175,28 +185,48 @@ impl RemoteServerHandle {
         backend: Arc<TantivyBackend>,
         pos_filter_enabled: bool,
     ) {
-        self.stop();
         if !enabled {
+            self.stop();
             return;
         }
         if token.trim().is_empty() {
             eprintln!("argos: remote server not started (token empty)");
+            self.stop();
             return;
         }
         if !(1..=65535).contains(&port) {
             eprintln!("argos: remote server not started (invalid port {port})");
+            self.stop();
             return;
         }
+
+        {
+            let running = self.running.lock();
+            if let Some(cfg) = running.as_ref() {
+                if cfg.port == port && cfg.token == token {
+                    cfg.pos_filter_enabled
+                        .store(pos_filter_enabled, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+
+        self.stop();
 
         let (tx, rx) = oneshot::channel::<()>();
         *self.shutdown.lock() = Some(tx);
 
+        let pos_filter = Arc::new(std::sync::atomic::AtomicBool::new(pos_filter_enabled));
+        *self.running.lock() = Some(RunningServer {
+            port,
+            token: token.to_string(),
+            pos_filter_enabled: pos_filter.clone(),
+        });
+
         let state = ServerState {
             backend,
             token: Arc::new(token.to_string()),
-            pos_filter_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
-                pos_filter_enabled,
-            )),
+            pos_filter_enabled: pos_filter,
         };
         let app = Router::new()
             .route("/health", get(health))
@@ -205,11 +235,20 @@ impl RemoteServerHandle {
             .with_state(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port as u16));
+        let running = self.running.clone();
+        let expected_port = port;
+        let expected_token = token.to_string();
         tauri::async_runtime::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("argos: remote server bind failed on {addr}: {e}");
+                    let mut slot = running.lock();
+                    if let Some(cfg) = slot.as_ref() {
+                        if cfg.port == expected_port && cfg.token == expected_token {
+                            *slot = None;
+                        }
+                    }
                     return;
                 }
             };

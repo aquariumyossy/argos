@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,29 +17,55 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 pub struct Indexer {
     db: Arc<Db>,
     backend: Arc<TantivyBackend>,
+    /// Blocks watcher updates while a full/folder rebuild holds the index.
+    reindex_busy: AtomicBool,
 }
 
 impl Indexer {
     pub fn new(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Self {
-        Self { db, backend }
+        Self {
+            db,
+            backend,
+            reindex_busy: AtomicBool::new(false),
+        }
+    }
+
+    fn begin_reindex(&self) -> Result<(), String> {
+        if self
+            .reindex_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("インデックス再構築が既に実行中です".into());
+        }
+        Ok(())
+    }
+
+    fn end_reindex(&self) {
+        self.reindex_busy.store(false, Ordering::SeqCst);
     }
 
     pub fn reindex_all<F>(&self, mut on_progress: F) -> Result<IndexStats, String>
     where
         F: FnMut(IndexProgress),
     {
-        // Full rebuild so removed folders / orphaned chunks disappear
-        self.backend.clear_all()?;
-        self.db.clear_all_files().map_err(|e| e.to_string())?;
+        self.begin_reindex()?;
+        let result = (|| {
+            // Full rebuild so removed folders / orphaned chunks disappear
+            self.backend.clear_all()?;
+            self.db.clear_all_files().map_err(|e| e.to_string())?;
 
-        let folders = self.db.list_folders().map_err(|e| e.to_string())?;
-        let excludes = self.load_excludes()?;
+            let folders = self.db.list_folders().map_err(|e| e.to_string())?;
+            let excludes = self.load_excludes()?;
 
-        let mut stats = IndexStats::default();
-        for folder in folders.into_iter().filter(|f| f.enabled) {
-            stats.merge(self.crawl_folder(&folder, &excludes, false, &mut on_progress));
-        }
-        Ok(stats)
+            let mut stats = IndexStats::default();
+            for folder in folders.into_iter().filter(|f| f.enabled) {
+                stats.merge(self.crawl_folder(&folder, &excludes, false, &mut on_progress));
+            }
+            Ok(stats)
+        })();
+        self.end_reindex();
+        result
     }
 
     /// Resume-friendly reindex for one folder: keep existing docs, skip unchanged
@@ -51,18 +78,23 @@ impl Indexer {
     where
         F: FnMut(IndexProgress),
     {
-        let folder = self
-            .db
-            .get_folder(folder_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "フォルダが見つかりません".to_string())?;
+        self.begin_reindex()?;
+        let result = (|| {
+            let folder = self
+                .db
+                .get_folder(folder_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "フォルダが見つかりません".to_string())?;
 
-        if !folder.enabled {
-            return Err("フォルダが無効です".into());
-        }
+            if !folder.enabled {
+                return Err("フォルダが無効です".into());
+            }
 
-        let excludes = self.load_excludes()?;
-        Ok(self.crawl_folder(&folder, &excludes, true, &mut on_progress))
+            let excludes = self.load_excludes()?;
+            Ok(self.crawl_folder(&folder, &excludes, true, &mut on_progress))
+        })();
+        self.end_reindex();
+        result
     }
 
     fn load_excludes(&self) -> Result<Vec<String>, String> {
@@ -192,6 +224,9 @@ impl Indexer {
     }
 
     pub fn index_path(&self, folder: &str, path: &Path) -> Result<IndexAction, String> {
+        if self.reindex_busy.load(Ordering::SeqCst) {
+            return Ok(IndexAction::Skipped);
+        }
         if !path.is_file() || !extractor::is_supported(path) {
             return Ok(IndexAction::Skipped);
         }
@@ -209,6 +244,9 @@ impl Indexer {
     }
 
     pub fn remove_path(&self, path: &Path) -> Result<(), String> {
+        if self.reindex_busy.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let fs_str = pathutil::simplify_windows_path(&path.to_string_lossy());
         // Delete both filesystem form and any public-path rewritten form.
         let mut candidates = vec![fs_str.clone()];
