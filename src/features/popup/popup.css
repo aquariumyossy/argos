@@ -933,6 +933,25 @@
   background: #f7e8e4;
   border: 1px solid #e0b8b0;
   border-radius: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.popup-error-action {
+  flex-shrink: 0;
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid #c48a82;
+  border-radius: 4px;
+  background: #fff;
+  color: #7a2e2e;
+  cursor: pointer;
+}
+
+.popup-error-action:hover {
+  background: #fdf6f4;
 }
 
 .hit-snippet {

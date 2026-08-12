@@ -251,6 +251,27 @@ li.empty {
   opacity: 0.85;
 }
 
+.folder-item.is-missing {
+  border-left: 3px solid var(--danger);
+  padding-left: 10px;
+}
+
+.folder-item.is-missing .folder-path {
+  color: var(--danger);
+}
+
+.folder-missing-hint {
+  margin: 0;
+  font-size: 0.9em;
+  color: var(--danger);
+  line-height: 1.4;
+}
+
+.folder-rebind {
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .folder-public-toggle.is-active {
   border-color: var(--accent);
   color: var(--accent);

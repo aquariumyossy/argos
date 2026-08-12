@@ -267,6 +267,71 @@ impl Indexer {
         Ok(())
     }
 
+    /// Rebind a registered folder to a new filesystem path without re-extracting content.
+    pub fn rebind_folder_path(
+        &self,
+        folder_id: i64,
+        new_path: &str,
+    ) -> Result<FolderRow, String> {
+        self.begin_reindex()?;
+        let result = (|| {
+            let folder = self
+                .db
+                .get_folder(folder_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "フォルダが見つかりません".to_string())?;
+            let new_path = pathutil::simplify_windows_path(new_path.trim());
+            if new_path.is_empty() {
+                return Err("フォルダパスが空です".into());
+            }
+            if !std::path::Path::new(&new_path).is_dir() {
+                return Err("指定されたパスにフォルダがありません".into());
+            }
+            if folder.path.eq_ignore_ascii_case(&new_path) {
+                return Ok(folder);
+            }
+
+            let old_indexed =
+                pathutil::effective_public_root(&folder.path, &folder.public_path);
+            let new_indexed =
+                pathutil::effective_public_root(&new_path, &folder.public_path);
+
+            // Tantivy first while docs still key off the old `folder` field.
+            self.backend.remap_folder_prefix(
+                &folder.path,
+                &new_path,
+                &old_indexed,
+                &new_indexed,
+            )?;
+
+            self.db
+                .remap_file_paths_prefix(folder_id, &old_indexed, &new_indexed)
+                .map_err(|e| {
+                    format!(
+                        "インデックスのパス更新後に DB 更新へ失敗しました（{e}）。設定から「読込」で復旧を試してください"
+                    )
+                })?;
+
+            let updated = self
+                .db
+                .update_folder_path(folder_id, &new_path)
+                .map_err(|e| {
+                    format!(
+                        "索引は更新されましたがフォルダ登録の更新に失敗しました（{e}）。設定から「読込」で復旧を試してください"
+                    )
+                })?
+                .ok_or_else(|| "フォルダが見つかりません".to_string())?;
+
+            eprintln!(
+                "argos: rebound folder '{}' -> '{}' (indexed root '{}' -> '{}')",
+                folder.path, new_path, old_indexed, new_indexed
+            );
+            Ok(updated)
+        })();
+        self.end_reindex();
+        result
+    }
+
     fn index_one(
         &self,
         folder: &str,

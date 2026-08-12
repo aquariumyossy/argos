@@ -37,6 +37,7 @@ type FolderRow = {
   publicPath: string;
   enabled: boolean;
   indexedCount: number;
+  exists?: boolean;
 };
 type ExcludePathRow = { id: number; path: string };
 type SearchWordRow = {
@@ -112,7 +113,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.7.2";
+const APP_VERSION = "1.7.4";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -600,6 +601,32 @@ export default function Settings() {
     await reload();
   }
 
+  async function rebindFolder(id: number) {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "変更後のフォルダ場所を選択",
+    });
+    if (typeof selected !== "string" || !selected) return;
+    setIndexing(true);
+    setBusyFolderId(id);
+    setIndexProgress(null);
+    try {
+      await invoke<FolderRow>("update_folder_path", { id, path: selected });
+      setMessage(
+        "フォルダの場所を更新しました（既存インデックスを紐づけ直しました。本文の再読み込みはしていません）。",
+      );
+      await reload();
+    } catch (e) {
+      setMessage(`失敗: ${String(e)}`);
+      await reload().catch(() => undefined);
+    } finally {
+      setBusyFolderId(null);
+      setIndexProgress(null);
+      setIndexing(false);
+    }
+  }
+
   async function runReindexFolder(id: number) {
     setIndexing(true);
     setBusyFolderId(id);
@@ -1053,11 +1080,18 @@ export default function Settings() {
                     publicPathDrafts[f.id] ?? f.publicPath ?? "";
                   const hasPublicPath = publicDraft.trim().length > 0;
                   const isBusy = busyFolderId === f.id;
+                  const isMissing = f.exists === false;
                   return (
                     <li
                       key={f.id}
                       className={
-                        isBusy ? "folder-item is-busy" : "folder-item"
+                        [
+                          "folder-item",
+                          isBusy ? "is-busy" : "",
+                          isMissing ? "is-missing" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")
                       }
                     >
                       <div className="folder-item-top">
@@ -1079,6 +1113,26 @@ export default function Settings() {
                           </span>
                         ) : (
                           <span className="folder-actions">
+                            {isMissing ? (
+                              <button
+                                type="button"
+                                className="folder-rebind"
+                                disabled={indexing}
+                                title="リネーム／移動後の新しい場所を指定して既存インデックスを紐づけ直す"
+                                onClick={() => void rebindFolder(f.id)}
+                              >
+                                場所を指定
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={indexing}
+                                title="エクスプローラーなどでフォルダ名を変更・移動したときに使います。新しい場所を選び、既存の検索インデックスを紐づけ直します（本文の再読み込みはしません）"
+                                onClick={() => void rebindFolder(f.id)}
+                              >
+                                パス変更
+                              </button>
+                            )}
                             <button
                               type="button"
                               className={
@@ -1119,6 +1173,11 @@ export default function Settings() {
                           </span>
                         )}
                       </div>
+                      {isMissing ? (
+                        <p className="folder-missing-hint">
+                          場所が見つかりません。フォルダをリネーム／移動した場合は「場所を指定」で新しいパスを選んでください。
+                        </p>
+                      ) : null}
                       {publicOpen && !isBusy ? (
                         <label className="folder-public">
                           <span className="field-label">
