@@ -2294,7 +2294,20 @@ export default function Popup() {
         </ul>
       )}
 
-      {actionError ? <div className="popup-error">{actionError}</div> : null}
+      {actionError ? (
+        <div className="popup-error">
+          <span>{actionError}</span>
+          {actionError.includes("場所が変わった") ? (
+            <button
+              type="button"
+              className="popup-error-action"
+              onClick={() => void openSettings()}
+            >
+              設定を開く
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       <footer className="popup-footer">
         {preview ? (

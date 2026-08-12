@@ -339,6 +339,59 @@ pub fn update_folder_public_path(
         .ok_or_else(|| "フォルダが見つかりません".to_string())
 }
 
+/// Rebind a registered folder to a new path and remap the index (no content re-extract).
+#[tauri::command]
+pub fn update_folder_path(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    path: String,
+) -> Result<FolderRow, String> {
+    let new_path = crate::pathutil::simplify_windows_path(path.trim());
+    if new_path.is_empty() {
+        return Err("フォルダパスが空です".into());
+    }
+    if !std::path::Path::new(&new_path).is_dir() {
+        return Err("指定されたパスにフォルダがありません".into());
+    }
+
+    let folder = state
+        .db
+        .get_folder(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "フォルダが見つかりません".to_string())?;
+
+    if folder.path.eq_ignore_ascii_case(&new_path) {
+        return Ok(folder);
+    }
+
+    // Reject collision with another registered folder (case-insensitive).
+    let folders = state.db.list_folders().map_err(|e| e.to_string())?;
+    if folders
+        .iter()
+        .any(|f| f.id != id && f.path.eq_ignore_ascii_case(&new_path))
+    {
+        return Err("このパスは既に検索対象として登録されています".into());
+    }
+
+    let old_path = folder.path.clone();
+    state.unwatch_folder(&old_path);
+
+    match state.indexer.rebind_folder_path(id, &new_path) {
+        Ok(row) => {
+            state.watch_folder(&row.path);
+            let _ = app.emit("folders-updated", ());
+            Ok(row)
+        }
+        Err(e) => {
+            if std::path::Path::new(&old_path).is_dir() {
+                state.watch_folder(&old_path);
+            }
+            Err(e)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn remove_folder(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     // Snapshot paths before DB delete so we can purge Tantivy
@@ -688,10 +741,7 @@ pub async fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {
-        return Err(
-            "ファイルを開けません。リモート上のパスの可能性があります。ホスト PC で開くか、共有パス（UNC）で再インデックスしてください。"
-                .into(),
-        );
+        return Err(missing_open_path_message(&app, &path, true));
     }
     app.opener()
         .open_path(&path, None::<&str>)
@@ -712,10 +762,7 @@ pub async fn open_containing_folder(app: AppHandle, path: String) -> Result<(), 
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {
-        return Err(
-            "パスが見つかりません。リモート上のパスの可能性があります。ホスト PC で開くか、共有パス（UNC）で再インデックスしてください。"
-                .into(),
-        );
+        return Err(missing_open_path_message(&app, &path, false));
     }
 
     #[cfg(windows)]
@@ -747,6 +794,39 @@ pub async fn open_containing_folder(app: AppHandle, path: String) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn missing_open_path_message(app: &AppHandle, path: &str, is_file: bool) -> String {
+    let remote_hint = if is_file {
+        "ファイルを開けません。リモート上のパスの可能性があります。ホスト PC で開くか、共有パス（UNC）で再インデックスしてください。"
+    } else {
+        "パスが見つかりません。リモート上のパスの可能性があります。ホスト PC で開くか、共有パス（UNC）で再インデックスしてください。"
+    };
+
+    let Some(state) = app.try_state::<Arc<AppState>>() else {
+        return remote_hint.to_string();
+    };
+    let Ok(folders) = state.db.list_folders() else {
+        return remote_hint.to_string();
+    };
+
+    let simplified = pathutil::simplify_windows_path(path);
+    let parent_missing = folders.iter().any(|f| {
+        !f.exists
+            && (pathutil::path_starts_with(&simplified, &f.path)
+                || pathutil::path_starts_with(
+                    &simplified,
+                    &pathutil::effective_public_root(&f.path, &f.public_path),
+                ))
+    });
+    let any_missing = folders.iter().any(|f| !f.exists);
+
+    if parent_missing || any_missing {
+        "パスが見つかりません。登録フォルダの場所が変わった可能性があります。設定で「パス変更」してください。"
+            .into()
+    } else {
+        remote_hint.to_string()
+    }
 }
 
 #[tauri::command]

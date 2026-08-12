@@ -210,6 +210,7 @@ pub fn run() {
             commands::list_folders,
             commands::add_folder,
             commands::update_folder_public_path,
+            commands::update_folder_path,
             commands::remove_folder,
             commands::list_exclude_paths,
             commands::add_exclude_path,

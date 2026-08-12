@@ -264,6 +264,129 @@ impl TantivyBackend {
         Ok(())
     }
 
+    /// Rewrite `folder` / `path` / `doc_key` for all docs under `old_folder` without re-extracting body.
+    /// `old_path_prefix` / `new_path_prefix` are the indexed path roots (`effective_public_root`).
+    pub fn remap_folder_prefix(
+        &self,
+        old_folder: &str,
+        new_folder: &str,
+        old_path_prefix: &str,
+        new_path_prefix: &str,
+    ) -> Result<u64, String> {
+        if self.kind != IndexKind::File {
+            return Err("remap_folder_prefix is only for the file index".into());
+        }
+        let old_folder = pathutil::simplify_windows_path(old_folder);
+        let new_folder = pathutil::simplify_windows_path(new_folder);
+        let old_path_prefix = pathutil::simplify_windows_path(old_path_prefix);
+        let new_path_prefix = pathutil::simplify_windows_path(new_path_prefix);
+        if old_folder.is_empty() || new_folder.is_empty() {
+            return Err("フォルダパスが空です".into());
+        }
+        if old_folder.eq_ignore_ascii_case(&new_folder)
+            && old_path_prefix.eq_ignore_ascii_case(&new_path_prefix)
+        {
+            return Ok(0);
+        }
+
+        // IMPORTANT: drop Searcher before commit/reload. Keeping a Searcher across
+        // reload is undefined behavior and can STATUS_HEAP_CORRUPTION on Windows.
+        let rewritten = {
+            let searcher = self.reader.searcher();
+            let term = Term::from_field_text(self.fields.folder, &old_folder);
+            let query = TermQuery::new(term, IndexRecordOption::Basic);
+            let limit = (searcher.num_docs() as usize).max(1);
+            let top = searcher
+                .search(&query, &TopDocs::with_limit(limit))
+                .map_err(|e| e.to_string())?;
+
+            let get = |doc: &TantivyDocument, f: Field| -> String {
+                doc.get_first(f)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+            let mut rewritten: Vec<TantivyDocument> = Vec::with_capacity(top.len());
+            for (_score, addr) in top {
+                let doc = searcher.doc(addr).map_err(|e| e.to_string())?;
+                let old_path = get(&doc, self.fields.path);
+                let new_path =
+                    pathutil::rewrite_prefix(&old_path, &old_path_prefix, &new_path_prefix);
+                let old_key = get(&doc, self.fields.doc_key);
+                let new_key = if let Some((path_part, rest)) = old_key.split_once('#') {
+                    let rewritten_path =
+                        pathutil::rewrite_prefix(path_part, &old_path_prefix, &new_path_prefix);
+                    format!("{rewritten_path}#{rest}")
+                } else {
+                    pathutil::rewrite_prefix(&old_key, &old_path_prefix, &new_path_prefix)
+                };
+
+                let mut out = TantivyDocument::default();
+                out.add_text(self.fields.title, get(&doc, self.fields.title));
+                out.add_text(self.fields.body, get(&doc, self.fields.body));
+                out.add_text(self.fields.path, new_path);
+                out.add_text(self.fields.mtime, get(&doc, self.fields.mtime));
+                out.add_text(self.fields.size, get(&doc, self.fields.size));
+                out.add_text(self.fields.ext, get(&doc, self.fields.ext));
+                out.add_text(self.fields.folder, &new_folder);
+                out.add_text(self.fields.page, get(&doc, self.fields.page));
+                out.add_text(self.fields.chunk_id, get(&doc, self.fields.chunk_id));
+                out.add_text(self.fields.doc_key, new_key);
+                out.add_text(self.fields.unit_id, get(&doc, self.fields.unit_id));
+                out.add_text(self.fields.unit_label, get(&doc, self.fields.unit_label));
+                out.add_text(self.fields.unit_kind, get(&doc, self.fields.unit_kind));
+                rewritten.push(out);
+            }
+            rewritten
+        };
+
+        let count = rewritten.len() as u64;
+        {
+            let mut writer = self.writer.lock();
+            let del = Term::from_field_text(self.fields.folder, &old_folder);
+            writer.delete_term(del);
+            for doc in rewritten {
+                writer.add_document(doc).map_err(|e| e.to_string())?;
+            }
+            writer.commit().map_err(|e| e.to_string())?;
+        }
+
+        // Compact: merge segments so deleted (old-path) docs are physically dropped.
+        // Soft-fail — remap already committed; search still works without compaction.
+        if let Err(e) = self.compact_segments() {
+            eprintln!("argos: post-remap compact failed (index remapped, search OK): {e}");
+        }
+
+        self.reader.reload().map_err(|e| e.to_string())?;
+        Ok(count)
+    }
+
+    /// Merge all searchable segments and garbage-collect obsolete files.
+    /// Used after bulk delete+add (e.g. folder path remap) to drop tombstones.
+    fn compact_segments(&self) -> Result<(), String> {
+        let segment_ids = self
+            .index
+            .searchable_segment_ids()
+            .map_err(|e| e.to_string())?;
+        if segment_ids.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut writer = self.writer.lock();
+            // Even a single segment benefits: merge rewrites without deleted docs.
+            writer
+                .merge(&segment_ids)
+                .wait()
+                .map_err(|e| e.to_string())?;
+            writer
+                .garbage_collect_files()
+                .wait()
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn clear_all(&self) -> Result<(), String> {
         let mut writer = self.writer.lock();
         writer.delete_all_documents().map_err(|e| e.to_string())?;

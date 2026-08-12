@@ -119,6 +119,20 @@ pub struct FolderRow {
     pub enabled: bool,
     /// Number of files registered in the index for this folder.
     pub indexed_count: u32,
+    /// Live filesystem check (not persisted). True when `path` is an existing directory.
+    #[serde(default)]
+    pub exists: bool,
+}
+
+fn folder_path_exists(path: &str) -> bool {
+    std::path::Path::new(path).is_dir()
+}
+
+impl FolderRow {
+    pub fn with_exists(mut self) -> Self {
+        self.exists = folder_path_exists(&self.path);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,9 +504,10 @@ impl Db {
                 public_path: row.get(2)?,
                 enabled: row.get::<_, i64>(3)? != 0,
                 indexed_count: row.get::<_, i64>(4)? as u32,
+                exists: false,
             })
         })?;
-        Ok(rows.flatten().collect())
+        Ok(rows.flatten().map(FolderRow::with_exists).collect())
     }
 
     pub fn add_folder(
@@ -522,7 +537,9 @@ impl Db {
             public_path,
             enabled: true,
             indexed_count: 0,
-        })
+            exists: false,
+        }
+        .with_exists())
     }
 
     pub fn update_folder_public_path(
@@ -540,6 +557,69 @@ impl Db {
         }
         drop(conn);
         self.get_folder(id)
+    }
+
+    /// Update the registered filesystem path for a folder (rebind after rename/move).
+    pub fn update_folder_path(
+        &self,
+        id: i64,
+        new_path: &str,
+    ) -> Result<Option<FolderRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE folders SET path=?1 WHERE id=?2",
+            rusqlite::params![new_path, id],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        drop(conn);
+        self.get_folder(id)
+    }
+
+    /// Rewrite `files.path` prefix for one folder. Uses a two-phase update to avoid UNIQUE clashes.
+    pub fn remap_file_paths_prefix(
+        &self,
+        folder_id: i64,
+        from_prefix: &str,
+        to_prefix: &str,
+    ) -> Result<u32, rusqlite::Error> {
+        let from = crate::pathutil::simplify_windows_path(from_prefix);
+        let to = crate::pathutil::simplify_windows_path(to_prefix);
+        if from.is_empty() || to.is_empty() || from.eq_ignore_ascii_case(&to) {
+            return Ok(0);
+        }
+        let paths = self.list_file_paths_by_folder(folder_id)?;
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        const TEMP_MARK: &str = "\u{0001}argos_remap\u{0001}";
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for path in &paths {
+            let new_path = crate::pathutil::rewrite_prefix(path, &from, &to);
+            if new_path == *path {
+                continue;
+            }
+            pairs.push((path.clone(), new_path));
+        }
+        for (old, _) in &pairs {
+            tx.execute(
+                "UPDATE files SET path=?1 WHERE path=?2 AND folder_id=?3",
+                rusqlite::params![format!("{TEMP_MARK}{old}"), old, folder_id],
+            )?;
+        }
+        let mut updated = 0u32;
+        for (old, new_path) in &pairs {
+            tx.execute(
+                "UPDATE files SET path=?1 WHERE path=?2 AND folder_id=?3",
+                rusqlite::params![new_path, format!("{TEMP_MARK}{old}"), folder_id],
+            )?;
+            updated += 1;
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn remove_folder(&self, id: i64) -> Result<Option<String>, rusqlite::Error> {
@@ -569,10 +649,11 @@ impl Db {
                 public_path: row.get(2)?,
                 enabled: row.get::<_, i64>(3)? != 0,
                 indexed_count: row.get::<_, i64>(4)? as u32,
+                exists: false,
             })
         })?;
         if let Some(Ok(row)) = rows.next() {
-            return Ok(Some(row));
+            return Ok(Some(row.with_exists()));
         }
         Ok(None)
     }
@@ -592,10 +673,11 @@ impl Db {
                 public_path: row.get(2)?,
                 enabled: row.get::<_, i64>(3)? != 0,
                 indexed_count: row.get::<_, i64>(4)? as u32,
+                exists: false,
             })
         })?;
         if let Some(Ok(row)) = rows.next() {
-            return Ok(Some(row));
+            return Ok(Some(row.with_exists()));
         }
         Ok(None)
     }
