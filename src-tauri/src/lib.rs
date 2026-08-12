@@ -233,6 +233,7 @@ pub fn run() {
             commands::open_containing_folder,
             commands::get_preview,
             commands::read_text_file,
+            commands::write_text_file,
             commands::test_remote_connection,
             commands::get_lan_ip_hint,
             commands::show_settings_window,
@@ -261,6 +262,7 @@ pub fn run() {
             commands::remove_note_item,
             commands::update_note_item_memo,
             commands::reorder_note_items,
+            commands::reorder_notes,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

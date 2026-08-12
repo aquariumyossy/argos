@@ -781,6 +781,18 @@ pub fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(p).map_err(|e| e.to_string())
 }
 
+/// Write UTF-8 text to a path chosen by the user (e.g. note Markdown export).
+#[tauri::command]
+pub fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err("保存先フォルダが存在しません".into());
+        }
+    }
+    std::fs::write(p, contents.as_bytes()).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn test_remote_connection(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let settings = state.settings.read().clone();
@@ -1315,6 +1327,20 @@ pub fn reorder_note_items(
     state
         .db
         .reorder_note_items(&note_id, &ordered_ids)
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("note-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reorder_notes(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    ordered_ids: Vec<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .reorder_notes(&ordered_ids)
         .map_err(|e| e.to_string())?;
     let _ = app.emit("note-updated", ());
     Ok(())

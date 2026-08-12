@@ -287,6 +287,7 @@ impl Db {
               title TEXT NOT NULL DEFAULT '',
               memo TEXT NOT NULL DEFAULT '',
               view_mode TEXT NOT NULL DEFAULT 'list',
+              sort_order INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
@@ -323,6 +324,28 @@ impl Db {
             "ALTER TABLE email_folders ADD COLUMN item_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Note list manual ordering (sidebar drag).
+        let notes_sort_added = conn
+            .execute(
+                "ALTER TABLE notes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok();
+        if notes_sort_added {
+            let ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM notes ORDER BY updated_at DESC, created_at DESC",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.flatten().collect()
+            };
+            for (i, id) in ids.iter().enumerate() {
+                conn.execute(
+                    "UPDATE notes SET sort_order=?1 WHERE id=?2",
+                    rusqlite::params![i as i64, id],
+                )?;
+            }
+        }
         // Ensure FK is on for this connection (WAL batch may not stick across all cases)
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(Self {
@@ -1307,8 +1330,8 @@ impl Db {
     pub fn list_notes(&self) -> Result<Vec<NoteRow>, rusqlite::Error> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, title, memo, view_mode, created_at, updated_at
-             FROM notes ORDER BY updated_at DESC",
+            "SELECT id, title, memo, view_mode, sort_order, created_at, updated_at
+             FROM notes ORDER BY sort_order ASC, updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(NoteRow {
@@ -1316,8 +1339,9 @@ impl Db {
                 title: row.get(1)?,
                 memo: row.get(2)?,
                 view_mode: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                sort_order: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         Ok(rows.flatten().collect())
@@ -1326,7 +1350,7 @@ impl Db {
     pub fn get_note(&self, id: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, title, memo, view_mode, created_at, updated_at
+            "SELECT id, title, memo, view_mode, sort_order, created_at, updated_at
              FROM notes WHERE id=?1",
         )?;
         let mut rows = stmt.query_map([id], |row| {
@@ -1335,8 +1359,9 @@ impl Db {
                 title: row.get(1)?,
                 memo: row.get(2)?,
                 view_mode: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                sort_order: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         match rows.next() {
@@ -1344,6 +1369,12 @@ impl Db {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+
+    fn next_note_sort_order(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+        let max: Option<i64> =
+            conn.query_row("SELECT MAX(sort_order) FROM notes", [], |row| row.get(0))?;
+        Ok(max.map(|m| m + 1).unwrap_or(0))
     }
 
     pub fn create_note(&self, title: &str) -> Result<NoteRow, rusqlite::Error> {
@@ -1355,16 +1386,18 @@ impl Db {
             title.trim()
         };
         let conn = self.conn.lock();
+        let sort_order = Self::next_note_sort_order(&conn)?;
         conn.execute(
-            "INSERT INTO notes(id, title, memo, view_mode, created_at, updated_at)
-             VALUES(?1, ?2, '', 'list', ?3, ?3)",
-            rusqlite::params![id, title, now],
+            "INSERT INTO notes(id, title, memo, view_mode, sort_order, created_at, updated_at)
+             VALUES(?1, ?2, '', 'list', ?3, ?4, ?4)",
+            rusqlite::params![id, title, sort_order, now],
         )?;
         Ok(NoteRow {
             id,
             title: title.to_string(),
             memo: String::new(),
             view_mode: "list".into(),
+            sort_order,
             created_at: now,
             updated_at: now,
         })
@@ -1620,6 +1653,19 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn reorder_notes(&self, ordered_ids: &[String]) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        for (i, note_id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE notes SET sort_order=?1 WHERE id=?2",
+                rusqlite::params![i as i64, note_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1629,6 +1675,7 @@ pub struct NoteRow {
     pub title: String,
     pub memo: String,
     pub view_mode: String,
+    pub sort_order: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
