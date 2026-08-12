@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -12,6 +13,18 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { highlightText } from "../search/highlightText";
+import {
+  applyLegalMdHighlights,
+  clearLegalMdHighlights,
+  formatLegalDisplayHtml,
+  legalMdHighlightTerms,
+  type LegalDisplayKind,
+} from "./legalMdFormat";
+import {
+  buildNoteExportMarkdown,
+  noteExportFilename,
+  saveNoteMarkdown,
+} from "./exportNoteText";
 import "./notes.css";
 
 const SIDEBAR_MIN = 160;
@@ -22,6 +35,39 @@ const SIDEBAR_WIDTH_KEY = "argos.notes.sidebarWidth";
 const BODY_HEIGHT_MIN = 72;
 const BODY_HEIGHT_MAX = 800;
 const BODY_HEIGHTS_KEY = "argos.notes.bodyHeights";
+
+const LEGAL_MD_FORMAT_KEY = "argos.notes.legalMdFormat";
+const PRINT_OPTS_KEY = "argos.notes.printOpts";
+
+type PrintOpts = {
+  path: boolean;
+  query: boolean;
+  itemMemo: boolean;
+  noteMemo: boolean;
+};
+
+const DEFAULT_PRINT_OPTS: PrintOpts = {
+  path: true,
+  query: true,
+  itemMemo: true,
+  noteMemo: true,
+};
+
+function loadPrintOpts(): PrintOpts {
+  try {
+    const raw = localStorage.getItem(PRINT_OPTS_KEY);
+    if (!raw) return { ...DEFAULT_PRINT_OPTS };
+    const parsed = JSON.parse(raw) as Partial<PrintOpts>;
+    return {
+      path: parsed.path !== false,
+      query: parsed.query !== false,
+      itemMemo: parsed.itemMemo !== false,
+      noteMemo: parsed.noteMemo !== false,
+    };
+  } catch {
+    return { ...DEFAULT_PRINT_OPTS };
+  }
+}
 
 function clampSidebarWidth(w: number, containerWidth?: number): number {
   const maxByWindow =
@@ -66,6 +112,14 @@ function loadBodyHeights(): Record<string, number> {
   }
 }
 
+function loadLegalMdFormat(): boolean {
+  try {
+    return localStorage.getItem(LEGAL_MD_FORMAT_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
@@ -90,6 +144,7 @@ type NoteRow = {
   title: string;
   memo: string;
   viewMode: string;
+  sortOrder: number;
   createdAt: number;
   updatedAt: number;
 };
@@ -224,10 +279,16 @@ export default function Notes() {
   const [renameDraft, setRenameDraft] = useState("");
   const [dragId, setDragId] = useState<string | null>(null);
   const [draggableId, setDraggableId] = useState<string | null>(null);
+  const [noteDragId, setNoteDragId] = useState<string | null>(null);
+  const [noteDraggableId, setNoteDraggableId] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [bodyHeights, setBodyHeights] = useState<Record<string, number>>(loadBodyHeights);
   const [resizingBodyId, setResizingBodyId] = useState<string | null>(null);
+  const [legalMdFormat, setLegalMdFormat] = useState(loadLegalMdFormat);
+  const [printOpts, setPrintOpts] = useState(loadPrintOpts);
+  const [printMenuOpen, setPrintMenuOpen] = useState(false);
+  const printMenuRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bodyRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const noteMemoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -363,6 +424,41 @@ export default function Notes() {
       /* ignore */
     }
   }, [bodyHeights]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LEGAL_MD_FORMAT_KEY, legalMdFormat ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [legalMdFormat]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PRINT_OPTS_KEY, JSON.stringify(printOpts));
+    } catch {
+      /* ignore */
+    }
+  }, [printOpts]);
+
+  useEffect(() => {
+    if (!printMenuOpen) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      const el = printMenuRef.current;
+      if (el && !el.contains(e.target as Node)) {
+        setPrintMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPrintMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocMouseDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [printMenuOpen]);
 
   const onSidebarResizeStart = useCallback((e: ReactMouseEvent) => {
     if (e.button !== 0) return;
@@ -599,6 +695,66 @@ export default function Notes() {
     [active, dragId, items, refresh],
   );
 
+  const onNoteListMouseDown = useCallback((e: ReactMouseEvent, id: string) => {
+    const el = e.target as HTMLElement | null;
+    if (el?.closest(".notes-list-note-handle")) {
+      setNoteDraggableId(id);
+      return;
+    }
+    setNoteDraggableId(null);
+  }, []);
+
+  const onNoteDragStart = useCallback(
+    (e: DragEvent, id: string) => {
+      if (noteDraggableId !== id) {
+        e.preventDefault();
+        return;
+      }
+      setNoteDragId(id);
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/note-id", id);
+      e.dataTransfer.setData("text/plain", id);
+    },
+    [noteDraggableId],
+  );
+
+  const onNoteDrop = useCallback(
+    async (e: DragEvent, targetId: string) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const sourceId =
+        noteDragId ||
+        e.dataTransfer.getData("text/note-id") ||
+        e.dataTransfer.getData("text/plain");
+      setNoteDragId(null);
+      setNoteDraggableId(null);
+      if (!sourceId || sourceId === targetId) return;
+      const ids = notes.map((n) => n.id);
+      const from = ids.indexOf(sourceId);
+      const to = ids.indexOf(targetId);
+      if (from < 0 || to < 0) return;
+      const next = [...ids];
+      next.splice(from, 1);
+      next.splice(to, 0, sourceId);
+      setNotes((prev) => {
+        const map = new Map(prev.map((n) => [n.id, n]));
+        return next
+          .map((id, i) => {
+            const n = map.get(id);
+            return n ? { ...n, sortOrder: i } : null;
+          })
+          .filter(Boolean) as NoteRow[];
+      });
+      try {
+        await invoke("reorder_notes", { orderedIds: next });
+      } catch (err) {
+        setError(formatInvokeError(err));
+        await refresh();
+      }
+    },
+    [noteDragId, notes, refresh],
+  );
+
   const parsedItems = useMemo(
     () =>
       items.map((it) => ({
@@ -608,6 +764,92 @@ export default function Notes() {
     [items],
   );
 
+  const legalFormattedItems = useMemo(() => {
+    if (!legalMdFormat) return [];
+    const out: {
+      id: string;
+      html: string;
+      kind: LegalDisplayKind;
+      terms: string[];
+    }[] = [];
+    for (const { row, snap } of parsedItems) {
+      if (!snap.body) continue;
+      const formatted = formatLegalDisplayHtml(snap.path, snap.body);
+      if (!formatted) continue;
+      out.push({
+        id: row.id,
+        html: formatted.html,
+        kind: formatted.kind,
+        terms: legalMdHighlightTerms(row.query, snap.highlightTerms),
+      });
+    }
+    return out;
+  }, [legalMdFormat, parsedItems]);
+
+  const legalFormattedById = useMemo(() => {
+    const map = new Map<
+      string,
+      { html: string; kind: LegalDisplayKind; terms: string[] }
+    >();
+    for (const item of legalFormattedItems) {
+      map.set(item.id, {
+        html: item.html,
+        kind: item.kind,
+        terms: item.terms,
+      });
+    }
+    return map;
+  }, [legalFormattedItems]);
+
+  useLayoutEffect(() => {
+    if (!legalMdFormat || legalFormattedItems.length === 0) {
+      clearLegalMdHighlights();
+      return;
+    }
+    const entries: { el: HTMLElement; terms: string[] }[] = [];
+    for (const item of legalFormattedItems) {
+      const el = bodyRefs.current.get(item.id);
+      if (el) entries.push({ el, terms: item.terms });
+    }
+    applyLegalMdHighlights(entries);
+    return () => clearLegalMdHighlights();
+  }, [legalMdFormat, legalFormattedItems]);
+
+  const exportActiveNoteText = useCallback(async () => {
+    if (!active) return;
+    const exportItems = parsedItems.map(({ row, snap }) => ({
+      path: snap.path,
+      title: snap.title,
+      label: snap.label,
+      body: snap.body,
+      query: row.query,
+      memo: row.memo,
+      page: snap.page,
+    }));
+    const markdown = buildNoteExportMarkdown(
+      { title: active.title, memo: active.memo },
+      exportItems,
+    );
+    try {
+      await saveNoteMarkdown(markdown, noteExportFilename(active.title));
+      setError("");
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }, [active, parsedItems]);
+
+  const printActiveNote = useCallback(() => {
+    setPrintMenuOpen(false);
+    // Let the menu close before the print dialog paints.
+    requestAnimationFrame(() => {
+      window.print();
+    });
+  }, []);
+
+  const togglePrintOpt = useCallback((key: keyof PrintOpts) => {
+    setPrintOpts((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
   return (
     <div
       ref={rootRef}
@@ -615,6 +857,10 @@ export default function Notes() {
         "notes",
         resizingSidebar ? "notes--resizing" : "",
         resizingBodyId ? "notes--resizing-body" : "",
+        printOpts.path ? "" : "print-omit-path",
+        printOpts.query ? "" : "print-omit-query",
+        printOpts.itemMemo ? "" : "print-omit-item-memo",
+        printOpts.noteMemo ? "" : "print-omit-note-memo",
       ]
         .filter(Boolean)
         .join(" ")}
@@ -636,10 +882,29 @@ export default function Notes() {
             {notes.map((n) => (
               <li
                 key={n.id}
-                className={
-                  active?.id === n.id ? "notes-list-item active" : "notes-list-item"
-                }
+                className={[
+                  active?.id === n.id ? "notes-list-item active" : "notes-list-item",
+                  noteDragId === n.id ? "notes-list-item--dragging" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                draggable={noteDraggableId === n.id}
+                onMouseDown={(e) => onNoteListMouseDown(e, n.id)}
+                onDragStart={(e) => onNoteDragStart(e, n.id)}
+                onDragOver={onDragOver}
+                onDrop={(e) => void onNoteDrop(e, n.id)}
+                onDragEnd={() => {
+                  setNoteDragId(null);
+                  setNoteDraggableId(null);
+                }}
               >
+                <span
+                  className="notes-list-note-handle"
+                  title="ドラッグで並べ替え"
+                  aria-hidden="true"
+                >
+                  <IconGrip />
+                </span>
                 {renamingId === n.id ? (
                   <form
                     className="notes-rename-form"
@@ -712,21 +977,104 @@ export default function Notes() {
                   {items.length} 件キープ · 左のハンドルをドラッグで並べ替え
                 </p>
               </div>
-              <div className="notes-view-toggle" role="group" aria-label="表示切替">
+              <div className="notes-main-head-actions">
                 <button
                   type="button"
-                  className={viewMode === "list" ? "active" : ""}
-                  onClick={() => void setViewMode("list")}
+                  className="notes-legal-toggle"
+                  title="見出し付き Markdown を保存"
+                  onClick={() => void exportActiveNoteText()}
                 >
-                  リスト
+                  MD
                 </button>
+                <div className="notes-print-menu" ref={printMenuRef}>
+                  <button
+                    type="button"
+                    className={
+                      printMenuOpen
+                        ? "notes-legal-toggle active"
+                        : "notes-legal-toggle"
+                    }
+                    title="印刷する項目を選んで印刷（PDF 可）"
+                    aria-expanded={printMenuOpen}
+                    aria-haspopup="menu"
+                    onClick={() => setPrintMenuOpen((v) => !v)}
+                  >
+                    印刷
+                  </button>
+                  {printMenuOpen ? (
+                    <div className="notes-print-dropdown" role="menu">
+                      <p className="notes-print-dropdown-title">印刷に含める項目</p>
+                      <label className="notes-print-opt">
+                        <input
+                          type="checkbox"
+                          checked={printOpts.path}
+                          onChange={() => togglePrintOpt("path")}
+                        />
+                        パス
+                      </label>
+                      <label className="notes-print-opt">
+                        <input
+                          type="checkbox"
+                          checked={printOpts.query}
+                          onChange={() => togglePrintOpt("query")}
+                        />
+                        検索クエリ
+                      </label>
+                      <label className="notes-print-opt">
+                        <input
+                          type="checkbox"
+                          checked={printOpts.itemMemo}
+                          onChange={() => togglePrintOpt("itemMemo")}
+                        />
+                        アイテムメモ
+                      </label>
+                      <label className="notes-print-opt">
+                        <input
+                          type="checkbox"
+                          checked={printOpts.noteMemo}
+                          onChange={() => togglePrintOpt("noteMemo")}
+                        />
+                        ノートメモ
+                      </label>
+                      <button
+                        type="button"
+                        className="notes-btn primary notes-print-go"
+                        onClick={() => printActiveNote()}
+                      >
+                        印刷する
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
                 <button
                   type="button"
-                  className={viewMode === "grid" ? "active" : ""}
-                  onClick={() => void setViewMode("grid")}
+                  className={
+                    legalMdFormat
+                      ? "notes-legal-toggle active"
+                      : "notes-legal-toggle"
+                  }
+                  aria-pressed={legalMdFormat}
+                  title="法令MD・裁判例を見やすく表示（表示のみ）"
+                  onClick={() => setLegalMdFormat((v) => !v)}
                 >
-                  グリッド
+                  整形
                 </button>
+                <div className="notes-view-toggle" role="group" aria-label="表示切替">
+                  <button
+                    type="button"
+                    className={viewMode === "list" ? "active" : ""}
+                    onClick={() => void setViewMode("list")}
+                  >
+                    リスト
+                  </button>
+                  <button
+                    type="button"
+                    className={viewMode === "grid" ? "active" : ""}
+                    onClick={() => void setViewMode("grid")}
+                  >
+                    グリッド
+                  </button>
+                </div>
               </div>
             </header>
 
@@ -752,7 +1100,9 @@ export default function Notes() {
                   viewMode === "grid" ? "notes-items notes-items--grid" : "notes-items"
                 }
               >
-                {parsedItems.map(({ row, snap }) => (
+                {parsedItems.map(({ row, snap }) => {
+                  const legal = legalFormattedById.get(row.id);
+                  return (
                   <li
                     key={row.id}
                     className={
@@ -828,25 +1178,48 @@ export default function Notes() {
                           : "notes-item-body-wrap"
                       }
                     >
-                      <div
-                        className="notes-item-body"
-                        ref={(node) => {
-                          if (node) bodyRefs.current.set(row.id, node);
-                          else bodyRefs.current.delete(row.id);
-                        }}
-                        style={
-                          bodyHeights[row.id] != null
-                            ? {
-                                height: bodyHeights[row.id],
-                                maxHeight: "none",
-                              }
-                            : undefined
-                        }
-                      >
-                        {snap.body
-                          ? highlightText(snap.body, row.query, snap.highlightTerms)
-                          : "（本文なし）"}
-                      </div>
+                      {legal ? (
+                        <div
+                          className={
+                            legal.kind === "court"
+                              ? "notes-item-body notes-item-body--legal-md notes-item-body--court-case"
+                              : "notes-item-body notes-item-body--legal-md"
+                          }
+                          ref={(node) => {
+                            if (node) bodyRefs.current.set(row.id, node);
+                            else bodyRefs.current.delete(row.id);
+                          }}
+                          style={
+                            bodyHeights[row.id] != null
+                              ? {
+                                  height: bodyHeights[row.id],
+                                  maxHeight: "none",
+                                }
+                              : undefined
+                          }
+                          dangerouslySetInnerHTML={{ __html: legal.html }}
+                        />
+                      ) : (
+                        <div
+                          className="notes-item-body"
+                          ref={(node) => {
+                            if (node) bodyRefs.current.set(row.id, node);
+                            else bodyRefs.current.delete(row.id);
+                          }}
+                          style={
+                            bodyHeights[row.id] != null
+                              ? {
+                                  height: bodyHeights[row.id],
+                                  maxHeight: "none",
+                                }
+                              : undefined
+                          }
+                        >
+                          {snap.body
+                            ? highlightText(snap.body, row.query, snap.highlightTerms)
+                            : "（本文なし）"}
+                        </div>
+                      )}
                       <div
                         className="notes-body-resize"
                         role="separator"
@@ -869,7 +1242,8 @@ export default function Notes() {
                       onChange={(e) => onItemMemoChange(row.id, e.target.value)}
                     />
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             )}
           </>
