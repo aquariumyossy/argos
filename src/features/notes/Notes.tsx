@@ -210,6 +210,42 @@ function isOutlookPath(path: string): boolean {
   return path.startsWith("outlook:") || path.includes("outlook:");
 }
 
+function isOutlookSnapshot(snap: NoteItemSnapshot): boolean {
+  return (
+    snap.source === "outlook" ||
+    snap.docKind === "email" ||
+    isOutlookPath(snap.path)
+  );
+}
+
+/** Compact folder meta: `受信トレイ（半蔵門総合法律事務所）`. */
+function formatMailFolderMeta(pathLabel: string): string {
+  const parts = pathLabel
+    .split("/")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return pathLabel.trim();
+  const store = parts[0];
+  let i = 1;
+  while (
+    i < parts.length &&
+    parts[i].localeCompare(store, undefined, { sensitivity: "accent" }) === 0
+  ) {
+    i += 1;
+  }
+  const folderParts = parts.slice(i);
+  if (folderParts.length === 0) return store;
+  return `${folderParts.join("／")}（${store}）`;
+}
+
+function noteItemSourceLabel(snap: NoteItemSnapshot): string {
+  if (!isOutlookSnapshot(snap)) return snap.path;
+  const from = (snap.mailFrom ?? "").trim();
+  const folder = (snap.mailFolder ?? "").trim();
+  const folderLabel = folder ? formatMailFolderMeta(folder) : "";
+  return [from, folderLabel].filter(Boolean).join(" · ") || "Outlook メール";
+}
+
 function ActionIcon({ children }: { children: ReactNode }) {
   return (
     <svg
@@ -1168,8 +1204,15 @@ export default function Notes() {
                         </button>
                       </div>
                     </div>
-                    <div className="notes-item-path" title={snap.path}>
-                      {snap.path}
+                    <div
+                      className={
+                        isOutlookSnapshot(snap)
+                          ? "notes-item-path notes-item-path--mail"
+                          : "notes-item-path"
+                      }
+                      title={snap.path}
+                    >
+                      {noteItemSourceLabel(snap)}
                     </div>
                     <div
                       className={

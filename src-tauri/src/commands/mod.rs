@@ -141,7 +141,11 @@ fn collect_search_scopes(
                 is_root: false,
             })
             .collect();
-        subs.sort_by(|a, b| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()));
+        subs.sort_by(|a, b| {
+            a.label
+                .to_ascii_lowercase()
+                .cmp(&b.label.to_ascii_lowercase())
+        });
         out.extend(subs);
     }
     Ok(out)
@@ -259,7 +263,10 @@ pub fn update_settings(
 ) -> Result<Settings, String> {
     settings.popup_width = settings.popup_width.clamp(320, 1200);
     settings.popup_height = settings.popup_height.clamp(280, 1000);
-    if !matches!(settings.popup_position.as_str(), "left" | "center" | "right") {
+    if !matches!(
+        settings.popup_position.as_str(),
+        "left" | "center" | "right"
+    ) {
         settings.popup_position = "center".into();
     }
     settings.search_mode = search::normalize_search_mode(&settings.search_mode);
@@ -278,7 +285,10 @@ pub fn update_settings(
     let prev_search = state.settings.read().shortcut.clone();
     let prev_notes = state.settings.read().notes_shortcut.clone();
 
-    state.db.save_settings(&settings).map_err(|e| e.to_string())?;
+    state
+        .db
+        .save_settings(&settings)
+        .map_err(|e| e.to_string())?;
     // Apply autostart
     use tauri_plugin_autostart::ManagerExt;
     let launcher = app.autolaunch();
@@ -411,10 +421,7 @@ pub fn remove_folder(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), Str
     state.backend.delete_by_folder(&folder.path)?;
     state.backend.delete_paths(&file_paths)?;
 
-    state
-        .db
-        .remove_folder(id)
-        .map_err(|e| e.to_string())?;
+    state.db.remove_folder(id).map_err(|e| e.to_string())?;
     eprintln!(
         "argos: removed folder '{}' (purged {} file paths from index)",
         folder.path,
@@ -488,12 +495,7 @@ pub fn update_search_word(
     }
     let row = state
         .db
-        .update_search_word(
-            id,
-            &word,
-            reading.as_deref(),
-            pos_label.as_deref(),
-        )
+        .update_search_word(id, &word, reading.as_deref(), pos_label.as_deref())
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "検索ワードが見つかりません".to_string())?;
     state.refresh_user_dict();
@@ -514,10 +516,7 @@ pub fn remove_search_word(
 }
 
 #[tauri::command]
-pub fn clear_search_words(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<u64, String> {
+pub fn clear_search_words(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<u64, String> {
     let n = state.db.clear_search_words().map_err(|e| e.to_string())?;
     state.refresh_user_dict();
     emit_search_words_updated(&app);
@@ -540,48 +539,96 @@ pub fn import_search_words(
 }
 
 #[tauri::command]
-pub fn search_query(
+pub async fn search_query(
     state: State<'_, Arc<AppState>>,
     query: String,
     path_prefix: Option<String>,
     exts: Option<Vec<String>>,
 ) -> Result<Vec<SearchHit>, String> {
-    let settings = state.settings.read().clone();
-    let limit = settings.max_results;
-    let prefix = path_prefix
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let exts = search::normalize_exts(exts);
-    let user_dict = state.user_dict.read().clone();
-    search::run_search_with_mail_options(
-        &settings,
-        state.backend.as_ref(),
-        Some(state.mail_backend.as_ref()),
-        &query,
-        limit,
-        prefix,
-        exts.as_deref(),
-        &user_dict,
-    )
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = state.settings.read().clone();
+        let limit = settings.max_results;
+        let prefix = path_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let exts = search::normalize_exts(exts);
+        let user_dict = state.user_dict.read().clone();
+        search::run_search_with_mail_options(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            &query,
+            limit,
+            prefix,
+            exts.as_deref(),
+            &user_dict,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn search_path_matches(
+pub async fn search_path_matches(
     state: State<'_, Arc<AppState>>,
     query: String,
     path: String,
+    source: Option<String>,
 ) -> Result<Vec<SearchHit>, String> {
-    let settings = state.settings.read().clone();
-    let user_dict = state.user_dict.read().clone();
-    search::run_path_matches(
-        &settings,
-        state.backend.as_ref(),
-        Some(state.mail_backend.as_ref()),
-        &query,
-        &path,
-        &user_dict,
-    )
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = state.settings.read().clone();
+        let user_dict = state.user_dict.read().clone();
+        search::run_list_path_matches(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            &query,
+            &path,
+            source.as_deref(),
+            &user_dict,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewFileResult {
+    pub units: Vec<SearchHit>,
+    pub excerpt: bool,
+    pub match_ids: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn preview_file(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    path: String,
+) -> Result<PreviewFileResult, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = state.settings.read().clone();
+        let user_dict = state.user_dict.read().clone();
+        search::run_preview_file(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            &query,
+            &path,
+            &user_dict,
+        )
+        .map(|p| PreviewFileResult {
+            units: p.units,
+            excerpt: p.excerpt,
+            match_ids: p.match_ids,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -607,11 +654,7 @@ pub fn list_search_scopes(
         })
         .collect();
 
-    let filtered = match query
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let filtered = match query.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => all,
         Some(q) => {
             let settings = state.settings.read().clone();
@@ -680,19 +723,15 @@ pub fn list_search_history_terms(
 }
 
 #[tauri::command]
-pub fn record_search_query(
-    state: State<'_, Arc<AppState>>,
-    query: String,
-) -> Result<(), String> {
+pub fn record_search_query(state: State<'_, Arc<AppState>>, query: String) -> Result<(), String> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(());
     }
     let pos_filter = state.settings.read().pos_filter_enabled;
     let backend = state.backend.clone();
-    let terms = search::extract_search_terms(q, |text| {
-        backend.morph_content_surfaces(text, pos_filter)
-    })?;
+    let terms =
+        search::extract_search_terms(q, |text| backend.morph_content_surfaces(text, pos_filter))?;
     state
         .db
         .record_search_terms(&terms)
@@ -735,9 +774,11 @@ pub async fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
             .ok_or_else(|| "Outlook メールのパスが不正です".to_string())?;
         let state = app.state::<Arc<AppState>>();
         let mail_h = state.mail.clone();
-        return tauri::async_runtime::spawn_blocking(move || mail_h.open_item(&store_id, &entry_id))
-            .await
-            .map_err(|e| e.to_string())?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            mail_h.open_item(&store_id, &entry_id)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {
@@ -830,17 +871,22 @@ fn missing_open_path_message(app: &AppHandle, path: &str, is_file: bool) -> Stri
 }
 
 #[tauri::command]
-pub fn get_preview(
+pub async fn get_preview(
     state: State<'_, Arc<AppState>>,
     hit_id: String,
 ) -> Result<Option<SearchHit>, String> {
-    let settings = state.settings.read().clone();
-    search::run_preview(
-        &settings,
-        state.backend.as_ref(),
-        Some(state.mail_backend.as_ref()),
-        &hit_id,
-    )
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = state.settings.read().clone();
+        search::run_preview(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            &hit_id,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Read a local `.json` file as UTF-8 text for full-file preview.
@@ -1094,6 +1140,9 @@ pub struct KeepToNotePayload {
     pub mail_date: String,
     #[serde(default)]
     pub mail_folder: String,
+    /// When true, do not bring the notes window to the front.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1242,10 +1291,8 @@ pub fn list_note_items(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn keep_to_note(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
+fn insert_keep_item(
+    state: &AppState,
     payload: KeepToNotePayload,
 ) -> Result<KeepToNoteResult, String> {
     let mut note_id = state.db.get_active_note_id();
@@ -1284,8 +1331,6 @@ pub fn keep_to_note(
             .find_note_item_by_paragraph(&note.id, &paragraph_id)
             .map_err(|e| e.to_string())?
         {
-            show_notes(&app);
-            let _ = app.emit("note-updated", ());
             return Ok(KeepToNoteResult {
                 note,
                 item: existing,
@@ -1358,14 +1403,120 @@ pub fn keep_to_note(
         .get_note(&note.id)
         .map_err(|e| e.to_string())?
         .unwrap_or(note);
-
-    show_notes(&app);
-    let _ = app.emit("note-updated", ());
     Ok(KeepToNoteResult {
         note,
         item,
         created: true,
     })
+}
+
+#[tauri::command]
+pub fn keep_to_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    payload: KeepToNotePayload,
+) -> Result<KeepToNoteResult, String> {
+    let silent = payload.silent;
+    let result = insert_keep_item(state.inner().as_ref(), payload)?;
+    if !silent {
+        show_notes(&app);
+    }
+    let _ = app.emit("note-updated", ());
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeepPathMatchesResult {
+    pub created: u32,
+    pub skipped: u32,
+}
+
+#[tauri::command]
+pub async fn keep_path_matches(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    path: String,
+    title: String,
+    source: String,
+    doc_kind: String,
+    mail_from: String,
+    mail_date: String,
+    mail_folder: String,
+) -> Result<KeepPathMatchesResult, String> {
+    let state = state.inner().clone();
+    let result =
+        tauri::async_runtime::spawn_blocking(move || -> Result<KeepPathMatchesResult, String> {
+            let settings = state.settings.read().clone();
+            let user_dict = state.user_dict.read().clone();
+            let hits = search::run_path_matches(
+                &settings,
+                state.backend.as_ref(),
+                Some(state.mail_backend.as_ref()),
+                &query,
+                &path,
+                &user_dict,
+            )?;
+            let mut created = 0u32;
+            let mut skipped = 0u32;
+            for hit in hits {
+                let result = insert_keep_item(
+                    state.as_ref(),
+                    KeepToNotePayload {
+                        query: query.clone(),
+                        body: Some(hit.preview_text),
+                        snippet: Some(hit.snippet),
+                        path: path.clone(),
+                        title: if title.is_empty() {
+                            hit.title
+                        } else {
+                            title.clone()
+                        },
+                        source: if source.is_empty() {
+                            hit.source
+                        } else {
+                            source.clone()
+                        },
+                        doc_kind: if doc_kind.is_empty() {
+                            hit.doc_kind
+                        } else {
+                            doc_kind.clone()
+                        },
+                        paragraph_id: hit.id,
+                        label: hit.unit_label,
+                        page: hit.page,
+                        highlight_terms: hit.highlight_terms,
+                        mail_from: if mail_from.is_empty() {
+                            hit.mail_from
+                        } else {
+                            mail_from.clone()
+                        },
+                        mail_date: if mail_date.is_empty() {
+                            hit.mail_date
+                        } else {
+                            mail_date.clone()
+                        },
+                        mail_folder: if mail_folder.is_empty() {
+                            hit.mail_folder
+                        } else {
+                            mail_folder.clone()
+                        },
+                        silent: true,
+                    },
+                )?;
+                if result.created {
+                    created += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            Ok(KeepPathMatchesResult { created, skipped })
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+    let _ = app.emit("note-updated", ());
+    Ok(result)
 }
 
 #[tauri::command]

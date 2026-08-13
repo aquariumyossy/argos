@@ -6,13 +6,13 @@ use lindera::mode::{Mode, Penalty};
 use lindera::segmenter::Segmenter;
 use lindera_tantivy::tokenizer::LinderaTokenizer;
 use parking_lot::Mutex;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{DocSetCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
 };
 use tantivy::tokenizer::TokenStream;
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term, TantivyDocument};
+use tantivy::{doc, DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::pathutil;
 
@@ -567,9 +567,10 @@ impl TantivyBackend {
             if !seen.insert(surface.clone()) {
                 continue;
             }
-            let is_noun = morph
-                .iter()
-                .any(|t| (t.surface == *surface || t.surface.contains(surface.as_str())) && t.major_pos == "名詞");
+            let is_noun = morph.iter().any(|t| {
+                (t.surface == *surface || t.surface.contains(surface.as_str()))
+                    && t.major_pos == "名詞"
+            });
             if pos_filter && is_noun {
                 nouns.push(surface.clone());
             } else {
@@ -637,7 +638,9 @@ impl TantivyBackend {
             return None;
         }
         if tokens.len() == 1 {
-            return Some(Box::new(BooleanQuery::new(self.term_in_title_or_body(&tokens[0]))));
+            return Some(Box::new(BooleanQuery::new(
+                self.term_in_title_or_body(&tokens[0]),
+            )));
         }
         let mut per_field: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for field in [self.fields.title, self.fields.body] {
@@ -793,26 +796,14 @@ impl TantivyBackend {
         let chunk_id = get(self.fields.chunk_id).parse().ok();
         let key = get(self.fields.doc_key);
         let unit_label = get(self.fields.unit_label);
-        let mail_from = self
-            .fields
-            .mail_from
-            .map(|f| get(f))
-            .unwrap_or_default();
-        let mail_date = self
-            .fields
-            .mail_date
-            .map(|f| get(f))
-            .unwrap_or_default();
+        let mail_from = self.fields.mail_from.map(|f| get(f)).unwrap_or_default();
+        let mail_date = self.fields.mail_date.map(|f| get(f)).unwrap_or_default();
         let mail_conversation_id = self
             .fields
             .mail_conversation_id
             .map(|f| get(f))
             .unwrap_or_default();
-        let mail_folder = self
-            .fields
-            .mail_folder
-            .map(|f| get(f))
-            .unwrap_or_default();
+        let mail_folder = self.fields.mail_folder.map(|f| get(f)).unwrap_or_default();
         let snippet = make_snippet(&body, query, highlight_terms, 100);
         let haystack = format!("{title} {body} {mail_from}");
         let mut terms: Vec<String> = Vec::new();
@@ -862,8 +853,26 @@ pub struct ParsedQuery {
 fn is_stop_token(t: &str) -> bool {
     matches!(
         t,
-        "の" | "を" | "に" | "は" | "が" | "も" | "と" | "で" | "へ" | "や" | "か" | "など"
-            | "より" | "から" | "まで" | "て" | "た" | "れ" | "せ" | "し" | "さ"
+        "の" | "を"
+            | "に"
+            | "は"
+            | "が"
+            | "も"
+            | "と"
+            | "で"
+            | "へ"
+            | "や"
+            | "か"
+            | "など"
+            | "より"
+            | "から"
+            | "まで"
+            | "て"
+            | "た"
+            | "れ"
+            | "せ"
+            | "し"
+            | "さ"
     )
 }
 
@@ -1183,9 +1192,7 @@ impl TantivyBackend {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
-        let ext_filter: Option<Vec<String>> = exts
-            .filter(|e| !e.is_empty())
-            .map(|e| e.to_vec());
+        let ext_filter: Option<Vec<String>> = exts.filter(|e| !e.is_empty()).map(|e| e.to_vec());
         // Use path as stored in the index (hit.path), not simplified — STRING TermQuery is exact.
         let exact = exact_path
             .map(str::trim)
@@ -1365,7 +1372,8 @@ impl TantivyBackend {
             self.search_scored(query, limit, None, None, pos_filter_enabled, Some(path))?;
         // Fallback if TermQuery missed due to path normalization drift: prefix scope.
         if scored.is_empty() {
-            scored = self.search_scored(query, limit, Some(path), None, pos_filter_enabled, None)?;
+            scored =
+                self.search_scored(query, limit, Some(path), None, pos_filter_enabled, None)?;
             scored.retain(|(_, hit)| {
                 pathutil::simplify_windows_path(&hit.path)
                     .eq_ignore_ascii_case(&pathutil::simplify_windows_path(path))
@@ -1387,6 +1395,128 @@ impl TantivyBackend {
         );
         Ok(hits)
     }
+
+    /// Addresses of all indexed units for one path. Does not load stored bodies.
+    pub fn unit_addrs_for_path(&self, path: &str) -> Result<HashSet<DocAddress>, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let addrs = self.unit_addrs_for_path_term(path)?;
+        if !addrs.is_empty() {
+            return Ok(addrs);
+        }
+        let simplified = pathutil::simplify_windows_path(path);
+        if !simplified.eq_ignore_ascii_case(path) {
+            return self.unit_addrs_for_path_term(&simplified);
+        }
+        Ok(addrs)
+    }
+
+    fn unit_addrs_for_path_term(&self, path: &str) -> Result<HashSet<DocAddress>, String> {
+        let searcher = self.reader.searcher();
+        let term = Term::from_field_text(self.fields.path, path);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        searcher
+            .search(&query, &DocSetCollector)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Load stored hits for already-collected addresses.
+    pub fn hits_from_addrs(
+        &self,
+        addrs: impl IntoIterator<Item = DocAddress>,
+    ) -> Result<Vec<SearchHit>, String> {
+        let searcher = self.reader.searcher();
+        let mut hits = Vec::new();
+        for addr in addrs {
+            let doc: TantivyDocument = searcher.doc(addr).map_err(|e| e.to_string())?;
+            if let Some(hit) = self.hit_from_doc(0.0, &doc, "", &[]) {
+                hits.push(hit);
+            }
+        }
+        Ok(hits)
+    }
+
+    /// All indexed units for one file, document order. No query scoring.
+    pub fn units_for_path(&self, path: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(vec![]);
+        }
+        let limit = limit.max(1);
+        let addrs = self.unit_addrs_for_path(path)?;
+        let mut hits = self.hits_from_addrs(addrs)?;
+        sort_units_document_order(&mut hits);
+        Ok(hits.into_iter().take(limit).collect())
+    }
+
+    /// Units whose `chunk_id` is in `chunk_ids` (path ∧ chunk_id OR). Loads those bodies only.
+    pub fn units_for_path_chunk_ids(
+        &self,
+        path: &str,
+        chunk_ids: &[u32],
+    ) -> Result<Vec<SearchHit>, String> {
+        let path = path.trim();
+        if path.is_empty() || chunk_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut hits = self.units_for_path_chunk_ids_term(path, chunk_ids)?;
+        if hits.is_empty() {
+            let simplified = pathutil::simplify_windows_path(path);
+            if !simplified.eq_ignore_ascii_case(path) {
+                hits = self.units_for_path_chunk_ids_term(&simplified, chunk_ids)?;
+            }
+        }
+        sort_units_document_order(&mut hits);
+        Ok(hits)
+    }
+
+    fn units_for_path_chunk_ids_term(
+        &self,
+        path: &str,
+        chunk_ids: &[u32],
+    ) -> Result<Vec<SearchHit>, String> {
+        let mut ids: Vec<u32> = chunk_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let path_q = TermQuery::new(
+            Term::from_field_text(self.fields.path, path),
+            IndexRecordOption::Basic,
+        );
+        let shoulds: Vec<(Occur, Box<dyn Query>)> = ids
+            .iter()
+            .map(|id| {
+                let term = Term::from_field_text(self.fields.chunk_id, &id.to_string());
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        let chunks_q = BooleanQuery::new(shoulds);
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(path_q) as Box<dyn Query>),
+            (Occur::Must, Box::new(chunks_q) as Box<dyn Query>),
+        ]);
+        let searcher = self.reader.searcher();
+        let addrs = searcher
+            .search(&query, &DocSetCollector)
+            .map_err(|e| e.to_string())?;
+        self.hits_from_addrs(addrs)
+    }
+}
+
+fn sort_units_document_order(hits: &mut [SearchHit]) {
+    hits.sort_by(|a, b| {
+        a.chunk_id
+            .unwrap_or(0)
+            .cmp(&b.chunk_id.unwrap_or(0))
+            .then_with(|| a.page.unwrap_or(0).cmp(&b.page.unwrap_or(0)))
+    });
 }
 
 /// Prefer higher-score units; drop near-duplicates in the same file.
@@ -1502,8 +1632,14 @@ impl SearchBackend for TantivyBackend {
         // Unit budget ≈ pre-paragraph TopDocs size so nesting does not explode fetch_n.
         // search_scored applies only a mild over-fetch on top of this.
         let unit_limit = (limit * 8).max(40);
-        let scored =
-            self.search_scored(query, unit_limit, path_prefix, exts, pos_filter_enabled, None)?;
+        let scored = self.search_scored(
+            query,
+            unit_limit,
+            path_prefix,
+            exts,
+            pos_filter_enabled,
+            None,
+        )?;
 
         // Group by path; scored is already best-score-first.
         let mut order: Vec<String> = Vec::new();
@@ -1649,7 +1785,11 @@ mod tests {
             9.0,
         );
         let kept = dedupe_path_units(vec![a, b, other]);
-        assert_eq!(kept.len(), 2, "high body overlap merges; different label kept");
+        assert_eq!(
+            kept.len(),
+            2,
+            "high body overlap merges; different label kept"
+        );
         assert!(kept.iter().any(|h| h.id == "a#0"));
         assert!(kept.iter().any(|h| h.id == "a#2"));
         assert!(!kept.iter().any(|h| h.id == "a#1"));
@@ -1688,7 +1828,11 @@ mod tests {
             9.0,
         );
         let kept = dedupe_path_units(vec![a, b]);
-        assert_eq!(kept.len(), 2, "shared parent label must not merge distinct chunks");
+        assert_eq!(
+            kept.len(),
+            2,
+            "shared parent label must not merge distinct chunks"
+        );
     }
 
     #[test]
@@ -1751,13 +1895,8 @@ mod tests {
             )
             .expect("index good");
 
-        let hits = backend
-            .search(good, 10, None, None, true)
-            .expect("search");
-        assert!(
-            !hits.is_empty(),
-            "expected the good doc to match"
-        );
+        let hits = backend.search(good, 10, None, None, true).expect("search");
+        assert!(!hits.is_empty(), "expected the good doc to match");
         assert!(
             hits[0].path.contains("good"),
             "junk-only debris must not outrank content doc: {:?}",
@@ -1769,7 +1908,10 @@ mod tests {
             hits[0].highlight_terms
         );
         assert!(
-            !hits[0].highlight_terms.iter().any(|t| t == "そうした" || t == "い"),
+            !hits[0]
+                .highlight_terms
+                .iter()
+                .any(|t| t == "そうした" || t == "い"),
             "chips must not be debris: {:?}",
             hits[0].highlight_terms
         );
@@ -1843,7 +1985,14 @@ mod tests {
         let file = dir.join("doc.txt");
         std::fs::write(&file, &body).unwrap();
         backend
-            .index_file(&file, file.to_str().unwrap(), dir.to_str().unwrap(), 1, 1, &extracted)
+            .index_file(
+                &file,
+                file.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                1,
+                1,
+                &extracted,
+            )
             .expect("index");
 
         // Direct term probe
@@ -1889,15 +2038,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let backend = TantivyBackend::open(&dir).expect("open index").backend;
 
-        // Distinct, varied fillers so long-split units are not near-duplicates.
-        let filler_a: String = (0..700)
+        // Distinct articles so they stay separate units (not one oversized split).
+        let filler_a: String = (0..80)
             .map(|i| char::from_u32(0x3042 + (i % 40) as u32).unwrap())
             .collect();
-        let filler_b: String = (0..700)
+        let filler_b: String = (0..80)
             .map(|i| char::from_u32(0x30a2 + (i % 40) as u32).unwrap())
             .collect();
         let body = format!(
-            "損害賠償について。{filler_a}次に損害賠償を述べる。{filler_b}最後に損害賠償。"
+            "第1条 損害賠償について。{filler_a}\n\n第2条 次に損害賠償を述べる。{filler_b}"
         );
         let path = dir.join("multi.txt");
         let path_str = path.to_str().unwrap().to_string();
@@ -1916,7 +2065,9 @@ mod tests {
             )
             .expect("index");
 
-        let list = backend.search("損害賠償", 10, None, None, false).expect("search");
+        let list = backend
+            .search("損害賠償", 10, None, None, false)
+            .expect("search");
         assert_eq!(list.len(), 1, "list stays one hit per file");
 
         let matches = backend
@@ -1941,6 +2092,67 @@ mod tests {
             !list[0].paragraphs.is_empty(),
             "file hit should nest paragraph snippets"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn units_for_path_is_document_order_and_keeps_late_units() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-units-path-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
+
+        let mut body = String::new();
+        for i in 0..50 {
+            body.push_str(&format!(
+                "第{i}条 これはプレビュー用のダミー本文を十分長くした段落です。さらに文字数を稼ぐための追記。番号{i:04}。\n\n"
+            ));
+        }
+        body.push_str(
+            "第99条 弁済による代位の要件をここに置く。これは末尾ユニットとして独立させる。\n\n",
+        );
+        let path = dir.join("civil.md");
+        let path_str = path.to_str().unwrap().to_string();
+        std::fs::write(&path, &body).unwrap();
+        backend
+            .index_file(
+                &path,
+                &path_str,
+                dir.to_str().unwrap(),
+                1,
+                body.len() as u64,
+                &crate::extractor::ExtractedDoc {
+                    title: "civil".into(),
+                    pages: vec![body],
+                },
+            )
+            .expect("index");
+
+        let head = backend.units_for_path(&path_str, 10).expect("head");
+        assert_eq!(head.len(), 10);
+        let head_chunks: Vec<u32> = head.iter().map(|h| h.chunk_id.unwrap_or(0)).collect();
+        assert_eq!(head_chunks, (0..10).collect::<Vec<u32>>());
+        assert!(
+            !head.iter().any(|h| h.preview_text.contains("弁済による代位")),
+            "small window is the start of the file, not score-top docs"
+        );
+
+        let all = backend.units_for_path(&path_str, 200).expect("all");
+        assert!(
+            all.iter().any(|h| h.preview_text.contains("弁済による代位")),
+            "late unit must be present once the window covers the file"
+        );
+        let chunks: Vec<u32> = all.iter().map(|h| h.chunk_id.unwrap_or(0)).collect();
+        let mut sorted = chunks.clone();
+        sorted.sort();
+        assert_eq!(chunks, sorted, "units ordered by chunk_id");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

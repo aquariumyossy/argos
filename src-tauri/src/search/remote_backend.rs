@@ -17,6 +17,13 @@ struct SearchRequest<'a> {
     exts: Option<&'a [String]>,
 }
 
+#[derive(Serialize)]
+struct PathMatchesRequest<'a> {
+    query: &'a str,
+    path: &'a str,
+    limit: usize,
+}
+
 #[derive(Deserialize)]
 struct SearchResponse {
     hits: Vec<SearchHit>,
@@ -92,6 +99,61 @@ impl RemoteArgosBackend {
 
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.token)
+    }
+
+    /// Matching units for one remote file (host `/path_matches`).
+    pub fn path_matches(
+        &self,
+        query: &str,
+        path: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/path_matches", self.base_url);
+        let limit = limit.clamp(1, 50);
+        let resp = self
+            .client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .json(&PathMatchesRequest {
+                query,
+                path,
+                limit,
+            })
+            .send()
+            .map_err(|e| format!("リモート段落の取得に失敗: {e}"))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("リモート認証に失敗しました（トークンを確認）".into());
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            return Err(
+                "ホストを同じバージョンに更新してください（段落の追加取得に未対応）".into(),
+            );
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "リモート段落の取得に失敗: HTTP {}",
+                resp.status()
+            ));
+        }
+        let body: SearchResponse = resp
+            .json()
+            .map_err(|e| format!("リモート段落の解析に失敗: {e}"))?;
+        let want = crate::pathutil::simplify_windows_path(path);
+        let mut hits = body.hits;
+        hits.retain(|h| {
+            crate::pathutil::simplify_windows_path(&h.path).eq_ignore_ascii_case(&want)
+        });
+        for hit in &mut hits {
+            hit.source = "remote".into();
+        }
+        hits.truncate(limit);
+        Ok(hits)
     }
 }
 

@@ -499,6 +499,14 @@
   text-align: left;
 }
 
+.notes-item-path--mail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
 .notes-item-body-wrap {
   display: flex;
   flex-direction: column;
@@ -708,16 +716,12 @@
   line-height: 1.55;
   overflow-wrap: anywhere;
   word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .notes-item-body--court-case .notes-court-badge {
   color: var(--muted);
   font-weight: 500;
-}
-
-.notes-item-body--court-case a {
-  color: var(--accent);
-  text-decoration: underline;
 }
 
 .notes-items--grid .notes-item-body {

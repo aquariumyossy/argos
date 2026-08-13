@@ -1,5 +1,6 @@
 //! Outlook Classic COM mail sync (separate from FS indexer).
 
+pub mod ole_date;
 pub mod path;
 pub mod sync;
 

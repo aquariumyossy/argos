@@ -148,6 +148,46 @@ async fn preview(
     Ok(Json(PreviewResponse { hit }))
 }
 
+#[derive(Deserialize)]
+struct PathMatchesRequest {
+    query: String,
+    path: String,
+    limit: Option<usize>,
+}
+
+/// Matching units for one file (not aggregated). Used by the client's "show more".
+async fn path_matches(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<PathMatchesRequest>,
+) -> Result<Json<SearchResponse>, (StatusCode, String)> {
+    check_bearer(&headers, &state.token)?;
+    let path = body.path.trim().to_string();
+    if path.is_empty() {
+        return Ok(Json(SearchResponse { hits: Vec::new() }));
+    }
+    if crate::mail::is_outlook_path(&path) {
+        return Ok(Json(SearchResponse { hits: Vec::new() }));
+    }
+    let limit = body.limit.unwrap_or(50).clamp(1, 50);
+    let backend = state.backend.clone();
+    let query = body.query;
+    let pos_filter = state
+        .pos_filter_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut hits = tauri::async_runtime::spawn_blocking(move || {
+        backend.matches_for_path(&query, &path, limit, pos_filter)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    hits = crate::search::filter_out_email_hits(hits);
+    for hit in &mut hits {
+        hit.source = "remote".into();
+    }
+    Ok(Json(SearchResponse { hits }))
+}
+
 /// Manages the lifecycle of the LAN search HTTP server.
 pub struct RemoteServerHandle {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
@@ -231,6 +271,7 @@ impl RemoteServerHandle {
         let app = Router::new()
             .route("/health", get(health))
             .route("/search", post(search))
+            .route("/path_matches", post(path_matches))
             .route("/preview", post(preview))
             .with_state(state);
 

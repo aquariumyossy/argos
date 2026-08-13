@@ -181,6 +181,9 @@ pub fn suggest_from_history(
     let Some(token) = last_query_token(query) else {
         return Vec::new();
     };
+    if token.is_empty() && query.trim().is_empty() {
+        return recent_history_suggestions(history, registered);
+    }
     let committed = committed_query_terms(query);
     let now = now_secs();
     let mut scored: Vec<SearchTermSuggestion> = Vec::new();
@@ -192,8 +195,7 @@ pub fn suggest_from_history(
         .collect();
 
     let already = |term: &str| {
-        committed.iter().any(|c| c == term)
-            || (!token.is_empty() && term == token.as_str())
+        committed.iter().any(|c| c == term) || (!token.is_empty() && term == token.as_str())
     };
 
     let push_or_merge = |scored: &mut Vec<SearchTermSuggestion>, sug: SearchTermSuggestion| {
@@ -328,10 +330,49 @@ pub fn suggest_from_history(
         }
     }
 
-    scored.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.term.cmp(&b.term)));
+    scored.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.term.cmp(&b.term))
+    });
     scored.dedup_by(|a, b| a.term == b.term);
     scored.truncate(SUGGEST_LIMIT);
     scored
+}
+
+/// Newest-first unique terms for an empty query (address-bar style).
+fn recent_history_suggestions(
+    history: &SearchTermHistory,
+    registered: &[String],
+) -> Vec<SearchTermSuggestion> {
+    let registered_set: std::collections::HashSet<&str> = registered
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out: Vec<SearchTermSuggestion> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for event in &history.events {
+        for term in &event.terms {
+            let t = term.trim();
+            if t.is_empty() || !seen.insert(t.to_string()) {
+                continue;
+            }
+            out.push(SearchTermSuggestion {
+                term: t.to_string(),
+                display_prefix: String::new(),
+                display_rest: t.to_string(),
+                kind: "recent".into(),
+                score: (SUGGEST_LIMIT - out.len()) as f32,
+                from_history: true,
+                from_registered: registered_set.contains(t),
+            });
+            if out.len() >= SUGGEST_LIMIT {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -367,7 +408,8 @@ mod tests {
         };
         let sug = suggest_from_history(&history, &[], "損害");
         assert!(
-            sug.iter().any(|s| s.term == "損害賠償" && s.kind == "prefix"),
+            sug.iter()
+                .any(|s| s.term == "損害賠償" && s.kind == "prefix"),
             "{sug:?}"
         );
         let hit = sug.iter().find(|s| s.term == "損害賠償").unwrap();
@@ -384,5 +426,46 @@ mod tests {
                 .any(|s| s.term == "損害賠償" && s.from_registered && !s.from_history),
             "{sug:?}"
         );
+    }
+
+    #[test]
+    fn empty_query_suggests_recent_history() {
+        let now = now_secs();
+        let mut stats = HashMap::new();
+        stats.insert(
+            "後の語".into(),
+            SearchTermStat {
+                count: 1,
+                last: now,
+            },
+        );
+        stats.insert(
+            "先の語".into(),
+            SearchTermStat {
+                count: 1,
+                last: now - 10,
+            },
+        );
+        let history = SearchTermHistory {
+            events: vec![
+                SearchTermEvent {
+                    terms: vec!["後の語".into()],
+                    t: now,
+                },
+                SearchTermEvent {
+                    terms: vec!["先の語".into(), "後の語".into()],
+                    t: now - 10,
+                },
+            ],
+            stats,
+        };
+        let sug = suggest_from_history(&history, &["後の語".into()], "");
+        assert_eq!(
+            sug.iter().map(|s| s.term.as_str()).collect::<Vec<_>>(),
+            vec!["後の語", "先の語"]
+        );
+        assert_eq!(sug[0].kind, "recent");
+        assert!(sug[0].from_history && sug[0].from_registered);
+        assert!(suggest_from_history(&SearchTermHistory::default(), &[], "").is_empty());
     }
 }

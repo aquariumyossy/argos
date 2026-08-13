@@ -19,6 +19,8 @@ export type CourtCaseJson = {
   gist?: string;
   case_gist?: string;
   ref_law?: string;
+  /** Full judgment text when present (courts.go.jp dumps). */
+  contents?: string;
   lawsuit_id?: string;
   detail_page_link?: string;
   full_pdf_link?: string;
@@ -75,16 +77,6 @@ function formatEraDate(d: CourtCaseDate | undefined): string | null {
   if (month != null) out += `${month}月`;
   if (day != null) out += `${day}日`;
   return out;
-}
-
-function safeHttpsUrl(url: string): string | null {
-  try {
-    const u = new URL(url);
-    if (u.protocol !== "https:") return null;
-    return u.href;
-  } catch {
-    return null;
-  }
 }
 
 function htmlRow(label: string, htmlValue: string): string {
@@ -146,16 +138,8 @@ function collectCourtCasePlainRows(
   const refLaw = asNonEmptyString(data.ref_law);
   if (refLaw) rows.push({ label: "参照法令", value: transform(refLaw) });
 
-  const linkLines: string[] = [];
-  const detail = asNonEmptyString(data.detail_page_link);
-  const detailUrl = detail ? safeHttpsUrl(detail) : null;
-  if (detailUrl) linkLines.push(`詳細ページ: ${detailUrl}`);
-  const pdf = asNonEmptyString(data.full_pdf_link);
-  const pdfUrl = pdf ? safeHttpsUrl(pdf) : null;
-  if (pdfUrl) linkLines.push(`PDF: ${pdfUrl}`);
-  if (linkLines.length > 0) {
-    rows.push({ label: "リンク", value: linkLines.join("\n") });
-  }
+  const contents = asNonEmptyString(data.contents);
+  if (contents) rows.push({ label: "本文", value: transform(contents) });
 
   return rows;
 }
@@ -211,20 +195,6 @@ export function formatCourtCaseJsonHtml(
   if (plainRows.length === 0) return null;
 
   const rows = plainRows.map((r) => {
-    if (r.label === "リンク") {
-      const parts: string[] = [];
-      for (const line of r.value.split("\n")) {
-        const m = /^(詳細ページ|PDF):\s*(https:\/\/\S+)$/.exec(line.trim());
-        if (m?.[1] && m[2]) {
-          parts.push(
-            `<a href="${escapeHtml(m[2])}" target="_blank" rel="noopener noreferrer">${escapeHtml(m[1])}</a>`,
-          );
-        } else if (line.trim()) {
-          parts.push(escapeHtml(line.trim()));
-        }
-      }
-      return htmlRow(r.label, parts.join(" · "));
-    }
     if (r.label === "裁判所") {
       const escaped = escapeHtml(r.value).replace(
         /（([^）]+)）$/,

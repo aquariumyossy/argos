@@ -293,6 +293,7 @@ where
                 if existing.content_hash == hash
                     && existing.status == "indexed"
                     && existing.folder_name == msg.folder_name
+                    && (existing.date_unix > 0 || msg.received_unix <= 0)
                     && backend.has_path(&path).unwrap_or(false)
                 {
                     stats.skipped += 1;
