@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 pub mod history;
@@ -126,7 +128,9 @@ pub fn collapse_email_threads(hits: Vec<SearchHit>) -> Vec<SearchHit> {
             let new_date: i64 = hit.mail_date.parse().unwrap_or(0);
             if new_date >= old_date {
                 let mut merged = hit;
-                merged.match_count = out[idx].match_count.saturating_add(merged.match_count.max(1));
+                merged.match_count = out[idx]
+                    .match_count
+                    .saturating_add(merged.match_count.max(1));
                 out[idx] = merged;
             } else {
                 out[idx].match_count = out[idx].match_count.saturating_add(1);
@@ -228,8 +232,7 @@ pub fn run_search(
             // Mail index is local-only; merge when unscoped (or mailfolder handled above).
             if should_query_mail(settings, path_prefix, exts) {
                 if let Some(mail_be) = mail {
-                    let mail_hits =
-                        mail_be.search(&rewritten, limit, None, None, pos_filter)?;
+                    let mail_hits = mail_be.search(&rewritten, limit, None, None, pos_filter)?;
                     hits = merge_hits_by_score(hits, mail_hits, limit);
                 }
             }
@@ -265,8 +268,7 @@ pub fn run_search(
             )?;
             if should_query_mail(settings, path_prefix, exts) {
                 if let Some(mail_be) = mail {
-                    let mail_hits =
-                        mail_be.search(&rewritten, limit, None, None, pos_filter)?;
+                    let mail_hits = mail_be.search(&rewritten, limit, None, None, pos_filter)?;
                     hits = merge_hits_by_score(hits, mail_hits, limit);
                 }
             }
@@ -425,6 +427,19 @@ pub fn run_preview(
 }
 
 const PATH_MATCHES_LIMIT: usize = 50;
+/// Full bodies are loaded only when the file has at most this many units.
+const PREVIEW_FILE_UNIT_CAP: usize = 200;
+const PREVIEW_FILE_CHAR_CAP: usize = 50_000;
+const PREVIEW_FILE_CONTEXT: usize = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewFile {
+    pub units: Vec<SearchHit>,
+    /// True when only a window around matches is returned.
+    pub excerpt: bool,
+    pub match_ids: Vec<String>,
+}
 
 /// Matching chunks for one file (local index only). Used by preview occurrence navigation.
 pub fn run_path_matches(
@@ -455,6 +470,174 @@ pub fn run_path_matches(
     )
 }
 
+/// List "show more": remote hits go to the host; local/mail stay on this machine.
+pub fn run_list_path_matches(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    query: &str,
+    path: &str,
+    source: Option<&str>,
+    user_dict: &UserDictMatcher,
+) -> Result<Vec<SearchHit>, String> {
+    if source.is_some_and(|s| s.eq_ignore_ascii_case("remote")) {
+        let rewritten = apply_user_dictionary(query, user_dict);
+        let remote = RemoteArgosBackend::from_settings(settings)?;
+        return remote.path_matches(&rewritten, path, PATH_MATCHES_LIMIT);
+    }
+    run_path_matches(settings, local, mail, query, path, user_dict)
+}
+
+/// Indexed units for one file in document order, optionally trimmed to a match window.
+pub fn run_preview_file(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    query: &str,
+    path: &str,
+    user_dict: &UserDictMatcher,
+) -> Result<PreviewFile, String> {
+    let matches = run_path_matches(settings, local, mail, query, path, user_dict)?;
+    let backend = if crate::mail::is_outlook_path(path) {
+        mail.ok_or_else(|| "メール索引がありません".to_string())?
+    } else {
+        local
+    };
+    let addrs = backend.unit_addrs_for_path(path)?;
+    if addrs.len() <= PREVIEW_FILE_UNIT_CAP {
+        let all = backend.hits_from_addrs(addrs)?;
+        return Ok(assemble_preview_file(all, matches));
+    }
+    let chunk_ids =
+        preview_chunk_window(&matches, PREVIEW_FILE_CONTEXT, PREVIEW_FILE_UNIT_CAP as u32);
+    let window = backend.units_for_path_chunk_ids(path, &chunk_ids)?;
+    let mut preview = assemble_preview_file(window, matches);
+    preview.excerpt = true;
+    Ok(preview)
+}
+
+/// chunk_id ± context around matches. If none have a chunk_id, take the file head.
+fn preview_chunk_window(matches: &[SearchHit], context: usize, fallback_cap: u32) -> Vec<u32> {
+    let ctx = context as u32;
+    let mut ids = BTreeSet::new();
+    for m in matches {
+        let Some(c) = m.chunk_id else {
+            continue;
+        };
+        let from = c.saturating_sub(ctx);
+        let to = c.saturating_add(ctx);
+        for id in from..=to {
+            ids.insert(id);
+        }
+    }
+    if ids.is_empty() {
+        return (0..fallback_cap).collect();
+    }
+    ids.into_iter().collect()
+}
+
+/// Insert match hits that `units_for_path` missed, then keep document order.
+fn merge_missing_match_units(all: &mut Vec<SearchHit>, matches: &[SearchHit]) {
+    let have: HashSet<String> = all.iter().map(|h| h.id.clone()).collect();
+    for m in matches {
+        if !have.contains(&m.id) {
+            all.push(m.clone());
+        }
+    }
+    all.sort_by(|a, b| {
+        a.chunk_id
+            .unwrap_or(0)
+            .cmp(&b.chunk_id.unwrap_or(0))
+            .then_with(|| a.page.unwrap_or(0).cmp(&b.page.unwrap_or(0)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn union_highlight_terms(hits: &[SearchHit]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for h in hits {
+        for t in &h.highlight_terms {
+            if !t.is_empty() && seen.insert(t.clone()) {
+                out.push(t.clone());
+            }
+        }
+    }
+    out
+}
+
+fn stamp_highlight_terms(units: &mut [SearchHit], terms: &[String]) {
+    if terms.is_empty() {
+        return;
+    }
+    for unit in units {
+        let mut seen: HashSet<String> = unit.highlight_terms.iter().cloned().collect();
+        for t in terms {
+            if seen.insert(t.clone()) {
+                unit.highlight_terms.push(t.clone());
+            }
+        }
+    }
+}
+
+fn assemble_preview_file(mut all: Vec<SearchHit>, matches: Vec<SearchHit>) -> PreviewFile {
+    let match_ids: Vec<String> = matches.iter().map(|h| h.id.clone()).collect();
+    let highlight_terms = union_highlight_terms(&matches);
+    merge_missing_match_units(&mut all, &matches);
+    let total_chars: usize = all.iter().map(|h| h.preview_text.chars().count()).sum();
+    let within_cap = all.len() <= PREVIEW_FILE_UNIT_CAP && total_chars <= PREVIEW_FILE_CHAR_CAP;
+    if within_cap {
+        stamp_highlight_terms(&mut all, &highlight_terms);
+        return PreviewFile {
+            units: all,
+            excerpt: false,
+            match_ids,
+        };
+    }
+    if match_ids.is_empty() {
+        let mut units: Vec<SearchHit> = all.into_iter().take(PREVIEW_FILE_UNIT_CAP).collect();
+        stamp_highlight_terms(&mut units, &highlight_terms);
+        return PreviewFile {
+            units,
+            excerpt: true,
+            match_ids,
+        };
+    }
+    let match_set: HashSet<&str> = match_ids.iter().map(|s| s.as_str()).collect();
+    let match_indices: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(i, unit)| match_set.contains(unit.id.as_str()).then_some(i))
+        .collect();
+    let keep = preview_keep_mask(all.len(), &match_indices, PREVIEW_FILE_CONTEXT);
+    let mut units: Vec<SearchHit> = all
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(u, k)| k.then_some(u))
+        .collect();
+    stamp_highlight_terms(&mut units, &highlight_terms);
+    PreviewFile {
+        units,
+        excerpt: true,
+        match_ids,
+    }
+}
+
+fn preview_keep_mask(len: usize, match_indices: &[usize], context: usize) -> Vec<bool> {
+    let mut keep = vec![false; len];
+    for &i in match_indices {
+        if i >= len {
+            continue;
+        }
+        let from = i.saturating_sub(context);
+        let to = (i + context + 1).min(len);
+        for slot in keep.iter_mut().take(to).skip(from) {
+            *slot = true;
+        }
+    }
+    keep
+}
+
 pub fn normalize_search_mode(mode: &str) -> String {
     match mode {
         "remote" | "hybrid" => mode.into(),
@@ -465,5 +648,187 @@ pub fn normalize_search_mode(mode: &str) -> String {
 pub fn ensure_server_token(settings: &mut Settings) {
     if settings.remote_server_enabled && settings.remote_server_token.trim().is_empty() {
         settings.remote_server_token = uuid::Uuid::new_v4().to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        assemble_preview_file, preview_chunk_window, preview_keep_mask, run_preview_file,
+        SearchHit, TantivyBackend, UserDictMatcher,
+    };
+    use crate::db::Settings;
+    use crate::extractor::ExtractedDoc;
+
+    fn dummy_hit(id: &str, chunk: u32, text: &str) -> SearchHit {
+        SearchHit {
+            id: id.into(),
+            title: "t".into(),
+            snippet: text.chars().take(40).collect(),
+            path: r"C:\a.md".into(),
+            page: Some(1),
+            chunk_id: Some(chunk),
+            score: 1.0,
+            source: "local".into(),
+            preview_text: text.into(),
+            highlight_terms: vec![],
+            match_count: 1,
+            paragraphs: vec![],
+            unit_label: String::new(),
+            mail_from: String::new(),
+            mail_date: String::new(),
+            mail_conversation_id: String::new(),
+            mail_folder: String::new(),
+            doc_kind: "file".into(),
+        }
+    }
+
+    #[test]
+    fn preview_keep_mask_includes_match_neighbors() {
+        let keep = preview_keep_mask(8, &[3], 2);
+        assert_eq!(
+            keep,
+            vec![false, true, true, true, true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn preview_keep_mask_merges_nearby_windows() {
+        let keep = preview_keep_mask(6, &[0, 5], 1);
+        assert_eq!(keep, vec![true, true, false, false, true, true]);
+    }
+
+    #[test]
+    fn assemble_keeps_matches_missing_from_fetched_units() {
+        let filler = "あ".repeat(50);
+        let all: Vec<SearchHit> = (0..210)
+            .map(|i| dummy_hit(&format!("f#{i}"), i, &filler))
+            .collect();
+        let late = dummy_hit("f#500", 500, "第499条（弁済による代位の要件）");
+        let preview = assemble_preview_file(all, vec![late.clone()]);
+        assert!(preview.excerpt);
+        assert_eq!(preview.match_ids, vec!["f#500".to_string()]);
+        assert!(
+            preview.units.iter().any(|u| u.id == "f#500"),
+            "match outside the fetch window must still appear in the excerpt"
+        );
+    }
+
+    #[test]
+    fn assemble_under_cap_returns_whole_file() {
+        let all: Vec<SearchHit> = (0..10)
+            .map(|i| dummy_hit(&format!("f#{i}"), i, "短い"))
+            .collect();
+        let hit = all[3].clone();
+        let preview = assemble_preview_file(all, vec![hit]);
+        assert!(!preview.excerpt);
+        assert_eq!(preview.units.len(), 10);
+        assert_eq!(preview.match_ids, vec!["f#3".to_string()]);
+    }
+
+    #[test]
+    fn assemble_stamps_match_highlight_terms_on_units() {
+        let all: Vec<SearchHit> = (0..5)
+            .map(|i| dummy_hit(&format!("f#{i}"), i, "短い"))
+            .collect();
+        let mut hit = all[2].clone();
+        hit.highlight_terms = vec!["反社会的勢力".into(), "排除".into()];
+        let preview = assemble_preview_file(all, vec![hit]);
+        assert!(preview
+            .units
+            .iter()
+            .all(|u| u.highlight_terms.iter().any(|t| t == "反社会的勢力")
+                && u.highlight_terms.iter().any(|t| t == "排除")));
+    }
+
+    #[test]
+    fn preview_chunk_window_expands_neighbors() {
+        let hit = dummy_hit("f#10", 10, "x");
+        assert_eq!(
+            preview_chunk_window(&[hit], 2, 200),
+            vec![8, 9, 10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn preview_chunk_window_falls_back_to_file_head() {
+        let mut hit = dummy_hit("f#x", 0, "x");
+        hit.chunk_id = None;
+        assert_eq!(preview_chunk_window(&[hit], 2, 4), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn run_preview_file_large_file_returns_late_match_window_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-preview-window-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
+
+        let mut body = String::new();
+        for i in 0..220 {
+            body.push_str(&format!(
+                "第{i}条 これはプレビュー用のダミー本文を十分長くした段落です。さらに文字数を稼ぐための追記。番号{i:04}。\n\n"
+            ));
+        }
+        body.push_str(
+            "第999条 弁済による代位の要件をここに置く。これは末尾ユニットとして独立させる。\n\n",
+        );
+        let path = dir.join("civil.md");
+        let path_str = path.to_str().unwrap().to_string();
+        std::fs::write(&path, &body).unwrap();
+        let n = backend
+            .index_file(
+                &path,
+                &path_str,
+                dir.to_str().unwrap(),
+                1,
+                body.len() as u64,
+                &ExtractedDoc {
+                    title: "civil".into(),
+                    pages: vec![body],
+                },
+            )
+            .expect("index");
+        assert!(
+            n > 200,
+            "fixture must exceed PREVIEW_FILE_UNIT_CAP, got {n}"
+        );
+
+        let preview = run_preview_file(
+            &Settings::default(),
+            &backend,
+            None,
+            "弁済による代位",
+            &path_str,
+            &UserDictMatcher::from_words(Vec::<String>::new()),
+        )
+        .expect("preview");
+
+        assert!(preview.excerpt, "large file must be an excerpt");
+        assert!(
+            preview.units.len() < n,
+            "must not return every unit: got {} of {n}",
+            preview.units.len()
+        );
+        assert!(
+            preview
+                .units
+                .iter()
+                .any(|u| u.preview_text.contains("弁済による代位")),
+            "late match must be present: {:?}",
+            preview.units.iter().map(|u| &u.id).collect::<Vec<_>>()
+        );
+        assert!(
+            !preview.units.iter().any(|u| u.chunk_id == Some(0)),
+            "file head must not be loaded for a late-only match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -113,7 +113,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.7.4";
+const APP_VERSION = "1.8.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -716,6 +716,19 @@ export default function Settings() {
     }
   }
 
+  async function clearSearchHistory() {
+    const ok = window.confirm(
+      "検索履歴をすべて削除しますか？\nこの操作は取り消せません。",
+    );
+    if (!ok) return;
+    try {
+      await invoke("clear_search_term_history");
+      setMessage("検索履歴を削除しました");
+    } catch (e) {
+      setMessage(`履歴の削除に失敗: ${String(e)}`);
+    }
+  }
+
   function parseSearchWordsCsv(text: string): {
     word: string;
     reading: string;
@@ -965,7 +978,11 @@ export default function Settings() {
               </li>
               <li>
                 <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
-                <span>プレビューを表示</span>
+                <span>プレビューを表示（本文をスクロール）</span>
+              </li>
+              <li>
+                <kbd>←</kbd> / <kbd>→</kbd>
+                <span>プレビュー中、次／前のマッチへスクロール</span>
               </li>
               <li>
                 <kbd>Shift</kbd>+<kbd>Enter</kbd>
@@ -980,6 +997,9 @@ export default function Settings() {
                 <span>ポップアップを閉じる</span>
               </li>
             </ul>
+            <p className="muted">
+              検索欄の語をドラッグすると「隣接にする」「辞書に登録」が出せます。入力欄が空のときは最近の検索語が候補になります。
+            </p>
           </section>
 
           <section>
@@ -1509,7 +1529,7 @@ export default function Settings() {
             <h2>辞書登録</h2>
             <p className="muted">
               法律用語などの複合語を登録すると、検索時に隣接フレーズとして扱われます（インデックスの分解は変えないため、部分語でもヒットします）。
-              各種設定の品詞フィルタと連携し、登録語内の助詞は除外されません。検索ポップアップの「＋」から挿入・その場登録もできます。
+              各種設定の品詞フィルタと連携し、登録語内の助詞は除外されません。検索ポップアップでは語をドラッグして「辞書に登録」できます。入力中の候補からも履歴・登録語を選べます。
             </p>
             <div className="row">
               <input
@@ -1545,6 +1565,9 @@ export default function Settings() {
                 disabled={searchWords.length === 0}
               >
                 すべて削除
+              </button>
+              <button type="button" onClick={() => void clearSearchHistory()}>
+                検索履歴をクリア
               </button>
             </div>
             <p className="field-hint">

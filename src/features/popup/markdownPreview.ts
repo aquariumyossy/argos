@@ -1,49 +1,10 @@
 import { marked } from "marked";
+import { collectHighlightTerms } from "../search/highlightTerms";
 
 const PREVIEW_HIGHLIGHT_NAME = "argos-preview";
 
 function escapeRegExp(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Split query for highlight using the same delimiters as the Rust parser (outside quotes). */
-function highlightTermsFromQuery(query: string): string[] {
-  const chars = Array.from(query.trim());
-  const out: string[] = [];
-  let i = 0;
-  const isDelim = (c: string) => /[\s\u3000,\uFF0C\u3001]/.test(c);
-
-  while (i < chars.length) {
-    while (i < chars.length && isDelim(chars[i])) i += 1;
-    if (i >= chars.length) break;
-
-    const exclude = chars[i] === "-" && i + 1 < chars.length && !isDelim(chars[i + 1]);
-    if (exclude) i += 1;
-
-    if (chars[i] === '"') {
-      i += 1;
-      const start = i;
-      let closed = false;
-      while (i < chars.length) {
-        if (chars[i] === '"') {
-          closed = true;
-          break;
-        }
-        i += 1;
-      }
-      const inner = chars.slice(start, i).join("").trim();
-      if (closed) i += 1;
-      if (!exclude && inner) out.push(inner);
-      if (!closed) break;
-      continue;
-    }
-
-    const start = i;
-    while (i < chars.length && !isDelim(chars[i])) i += 1;
-    const term = chars.slice(start, i).join("").trim();
-    if (!exclude && term) out.push(term);
-  }
-  return out;
 }
 
 /** Strip markdown syntax so search terms match rendered text, not raw markers. */
@@ -60,43 +21,14 @@ function stripMarkdownFromTerm(term: string): string {
   return t;
 }
 
-function isUsefulHighlightTerm(term: string): boolean {
-  if (!term) return false;
-  return /[\p{L}\p{N}\p{Script=Han}]/u.test(term);
-}
-
-/** Drop tokens that are substrings of a longer kept term (e.g. 解/除 inside 解除). */
-function dropSubsumedTerms(terms: string[]): string[] {
-  const sorted = [...terms].sort((a, b) => b.length - a.length);
-  const kept: string[] = [];
-  for (const term of sorted) {
-    const lower = term.toLowerCase();
-    const subsumed = kept.some(
-      (longer) => longer.length > term.length && longer.toLowerCase().includes(lower),
-    );
-    if (!subsumed) kept.push(term);
-  }
-  return kept;
-}
-
 export function collectPreviewHighlightTerms(
   query: string,
   highlightTerms?: string[],
 ): string[] {
-  const fromHit = (highlightTerms ?? []).filter((t) => t.trim().length > 0);
-  const fromQuery =
-    fromHit.length > 0
-      ? []
-      : highlightTermsFromQuery(query).filter((t) => {
-          const hasDelim = /[\s\u3000,\uFF0C\u3001]/.test(t);
-          if (!hasDelim && Array.from(t).length >= 8) return false;
-          return true;
-        });
-  const raw = [...fromHit, ...fromQuery];
-  const cleaned = Array.from(
-    new Set(raw.map(stripMarkdownFromTerm).filter(isUsefulHighlightTerm)),
-  );
-  return dropSubsumedTerms(cleaned).sort((a, b) => b.length - a.length);
+  const strippedExtra = (highlightTerms ?? [])
+    .map(stripMarkdownFromTerm)
+    .filter(Boolean);
+  return collectHighlightTerms(stripMarkdownFromTerm(query) || query, strippedExtra);
 }
 
 /** Normalize chunk text so block-level markdown parses even when the chunk starts mid-document. */
@@ -136,8 +68,69 @@ export function formatJsonForPreview(raw: string): string {
   try {
     return JSON.stringify(JSON.parse(raw), null, 2);
   } catch {
-    return raw;
+    return decodeJsonStringEscapes(raw);
   }
+}
+
+/** Turn JSON string escapes into real characters so indexed chunks match formatted text. */
+export function decodeJsonStringEscapes(s: string): string {
+  return s
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, '"');
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function jsonValueHtml(value: unknown): string {
+  if (value === null) {
+    return `<span class="preview-json-null">null</span>`;
+  }
+  if (typeof value === "boolean" || typeof value === "number") {
+    return `<span class="preview-json-scalar">${escapeHtml(String(value))}</span>`;
+  }
+  if (typeof value === "string") {
+    return `<span class="preview-json-string">${escapeHtml(value)}</span>`;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return `<span class="preview-json-empty">[]</span>`;
+    }
+    const items = value.map((v) => `<li>${jsonValueHtml(v)}</li>`).join("");
+    return `<ol class="preview-json-array">${items}</ol>`;
+  }
+  if (typeof value !== "object") {
+    return `<span class="preview-json-scalar">${escapeHtml(String(value))}</span>`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) {
+    return `<span class="preview-json-empty">{}</span>`;
+  }
+  const rows = entries.map(
+    ([k, v]) =>
+      `<div class="preview-json-row"><dt>${escapeHtml(k)}</dt><dd>${jsonValueHtml(v)}</dd></div>`,
+  );
+  return `<dl class="preview-json-object">${rows.join("")}</dl>`;
+}
+
+/** Key/value HTML for generic JSON (real line breaks in strings). Null if not an object/array. */
+export function formatGenericJsonHtml(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  return `<div class="preview-json">${jsonValueHtml(parsed)}</div>`;
 }
 
 /** Collapse whitespace for matching index chunks against pretty-printed JSON. */
@@ -208,6 +201,33 @@ export function findJsonHitOffset(
   return findCollapsedNeedleOffset(displayText, snippet);
 }
 
+/**
+ * Locate an index chunk inside formatted (non-JSON-source) preview text.
+ * Unescapes `\\n` / `\\"` in the needle so court-case HTML can be matched.
+ */
+export function findFormattedContentOffset(
+  haystack: string,
+  previewText: string,
+  snippet: string,
+): number {
+  const decodedPreview = decodeJsonStringEscapes(previewText);
+  const decodedSnippet = decodeJsonStringEscapes(snippet);
+  const fromPreview = findCollapsedNeedleOffset(haystack, decodedPreview);
+  if (fromPreview >= 0) {
+    const core = stripSnippetEllipsis(decodedSnippet).trim();
+    if (core.length >= 8) {
+      const refined = findCollapsedNeedleOffset(haystack, core);
+      if (refined >= fromPreview) return refined;
+    }
+    return fromPreview;
+  }
+  const fromSnippet = findCollapsedNeedleOffset(haystack, decodedSnippet);
+  if (fromSnippet >= 0) return fromSnippet;
+  const run = decodedPreview.match(/[\p{L}\p{N}][\p{L}\p{N}\s、。．，]{7,}/u);
+  if (run?.[0]) return findCollapsedNeedleOffset(haystack, run[0]);
+  return -1;
+}
+
 /** Split extracted HTML body on blank lines for prose preview paragraphs. */
 export function splitProseParagraphs(text: string): string[] {
   return text
@@ -260,11 +280,10 @@ export function clearPreviewHighlights(): void {
   CSS.highlights?.delete(PREVIEW_HIGHLIGHT_NAME);
 }
 
-/** Paint highlights without inserting elements so inline layout stays intact. */
-export function applyPreviewHighlights(container: HTMLElement, terms: string[]): void {
-  clearPreviewHighlights();
-  if (terms.length === 0 || !CSS.highlights) return;
-
+function collectPreviewHighlightRanges(
+  container: HTMLElement,
+  terms: string[],
+): Range[] {
   const ranges: Range[] = [];
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
@@ -292,7 +311,20 @@ export function applyPreviewHighlights(container: HTMLElement, terms: string[]):
       }
     }
   }
+  return ranges;
+}
 
+/** Paint highlights without inserting elements so inline layout stays intact. */
+export function applyPreviewHighlights(
+  containers: HTMLElement[],
+  terms: string[],
+): void {
+  clearPreviewHighlights();
+  if (terms.length === 0 || !CSS.highlights || containers.length === 0) return;
+
+  const ranges = containers.flatMap((el) =>
+    collectPreviewHighlightRanges(el, terms),
+  );
   if (ranges.length > 0) {
     CSS.highlights.set(PREVIEW_HIGHLIGHT_NAME, new Highlight(...ranges));
   }

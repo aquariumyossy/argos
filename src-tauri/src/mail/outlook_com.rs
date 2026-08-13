@@ -11,7 +11,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Ole::GetActiveObject;
 use windows::Win32::System::Variant::{
-    VariantClear, VariantInit, VARIANT, VT_EMPTY, VT_NULL,
+    VariantChangeType, VariantClear, VariantInit, VAR_CHANGE_FLAGS, VARIANT, VT_BSTR, VT_BYREF,
+    VT_CY, VT_DATE, VT_EMPTY, VT_I2, VT_I4, VT_I8, VT_NULL, VT_R4, VT_R8, VT_UI2, VT_UI4,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
@@ -159,6 +160,7 @@ pub fn fetch_messages_in_folder(
 
     let count = get_i32_prop(&restricted, "Count").unwrap_or(0);
     let mut out = Vec::new();
+    let mut missing_dates = 0u32;
     for i in 1..=count {
         let item = match get_item_dispatch(&restricted, i) {
             Ok(it) => it,
@@ -184,6 +186,9 @@ pub fn fetch_messages_in_folder(
             .or_else(|_| get_date_unix(&item, "SentOn"))
             .unwrap_or(0);
         let last_mod_unix = get_date_unix(&item, "LastModificationTime").unwrap_or(received_unix);
+        if received_unix <= 0 {
+            missing_dates += 1;
+        }
 
         if since_unix > 0 && received_unix > 0 && received_unix < since_unix {
             continue;
@@ -201,6 +206,11 @@ pub fn fetch_messages_in_folder(
             received_unix,
             last_mod_unix,
         });
+    }
+    if missing_dates > 0 {
+        eprintln!(
+            "argos: {missing_dates}/{count} messages in '{folder_name}' had no usable ReceivedTime/SentOn"
+        );
     }
     Ok(out)
 }
@@ -318,7 +328,37 @@ fn get_i32_prop(obj: &IDispatch, name: &str) -> Result<i32, String> {
 
 fn get_date_unix(obj: &IDispatch, name: &str) -> Result<i64, String> {
     let v = invoke(obj, name, DISPATCH_PROPERTYGET, &[])?;
-    ole_date_to_unix(&v)
+    match ole_date_to_unix(&v) {
+        Ok(n) if n > 0 => return Ok(n),
+        _ => {}
+    }
+    get_mapi_date_unix(obj, name)
+}
+
+fn mapi_date_schema(name: &str) -> Option<&'static str> {
+    match name {
+        "ReceivedTime" => Some("http://schemas.microsoft.com/mapi/proptag/0x0E060040"),
+        "SentOn" => Some("http://schemas.microsoft.com/mapi/proptag/0x00390040"),
+        "LastModificationTime" => Some("http://schemas.microsoft.com/mapi/proptag/0x30080040"),
+        _ => None,
+    }
+}
+
+fn get_mapi_date_unix(obj: &IDispatch, name: &str) -> Result<i64, String> {
+    let schema = mapi_date_schema(name).ok_or_else(|| format!("no MAPI schema for {name}"))?;
+    let pa = get_dispatch_prop(obj, "PropertyAccessor")?;
+    let v = invoke(
+        &pa,
+        "GetProperty",
+        DISPATCH_METHOD,
+        &[bstr_variant(schema)],
+    )?;
+    let n = ole_date_to_unix(&v)?;
+    if n <= 0 {
+        Err(format!("empty MAPI date ({name})"))
+    } else {
+        Ok(n)
+    }
 }
 
 fn get_item_dispatch(collection: &IDispatch, index: i32) -> Result<IDispatch, String> {
@@ -414,11 +454,117 @@ fn i32_from_variant(v: &VARIANT) -> Result<i32, String> {
 fn ole_date_to_unix(v: &VARIANT) -> Result<i64, String> {
     let vt = v.vt();
     if vt == VT_EMPTY || vt == VT_NULL {
-        return Ok(0);
+        return Err("empty date VARIANT".into());
     }
-    let ole = f64::try_from(v).map_err(|e| format!("expected date VARIANT: {e}"))?;
-    let seconds = ((ole - 25569.0) * 86400.0).round() as i64;
-    Ok(seconds)
+    if let Some(n) = unsafe { variant_numeric(v) } {
+        let unix = crate::mail::ole_date::numeric_to_unix(n);
+        if unix > 0 {
+            return Ok(unix);
+        }
+    }
+    if vt == VT_BSTR {
+        if let Ok(s) = BSTR::try_from(v) {
+            if let Some(unix) = crate::mail::ole_date::parse_outlook_date_string(&s.to_string()) {
+                return Ok(unix);
+            }
+        }
+    }
+    if let Some(unix) = variant_change_to_unix(v, VT_R8, |dest| unsafe {
+        variant_numeric(dest).map(crate::mail::ole_date::numeric_to_unix)
+    }) {
+        if unix > 0 {
+            return Ok(unix);
+        }
+    }
+    if let Some(unix) = variant_change_to_unix(v, VT_BSTR, |dest| {
+        BSTR::try_from(dest)
+            .ok()
+            .and_then(|s| crate::mail::ole_date::parse_outlook_date_string(&s.to_string()))
+    }) {
+        if unix > 0 {
+            return Ok(unix);
+        }
+    }
+    Err(format!("expected date VARIANT (vt={})", vt.0))
+}
+
+fn variant_change_to_unix<F>(v: &VARIANT, vt: windows::Win32::System::Variant::VARENUM, f: F) -> Option<i64>
+where
+    F: FnOnce(&VARIANT) -> Option<i64>,
+{
+    unsafe {
+        let mut dest = VariantInit();
+        let ok = VariantChangeType(&mut dest, v, VAR_CHANGE_FLAGS(0), vt).is_ok();
+        let out = if ok { f(&dest) } else { None };
+        out
+    }
+}
+
+unsafe fn variant_numeric(v: &VARIANT) -> Option<f64> {
+    let rec = &*v.Anonymous.Anonymous;
+    let vt = rec.vt;
+    let byref = vt.contains(VT_BYREF);
+    let base = windows::Win32::System::Variant::VARENUM(vt.0 & !VT_BYREF.0);
+    let inner = &rec.Anonymous;
+    if byref {
+        return if base == VT_DATE || base == VT_R8 {
+            let p = inner.pdate;
+            if p.is_null() {
+                None
+            } else {
+                Some(*p)
+            }
+        } else if base == VT_R4 {
+            let p = inner.pfltVal;
+            if p.is_null() {
+                None
+            } else {
+                Some(*p as f64)
+            }
+        } else if base == VT_I4 {
+            let p = inner.plVal;
+            if p.is_null() {
+                None
+            } else {
+                Some(*p as f64)
+            }
+        } else if base == VT_I8 {
+            let p = inner.pllVal;
+            if p.is_null() {
+                None
+            } else {
+                Some(*p as f64)
+            }
+        } else if base == VT_CY {
+            let p = inner.pcyVal;
+            if p.is_null() {
+                None
+            } else {
+                Some((*p).int64 as f64 / 10_000.0)
+            }
+        } else {
+            None
+        };
+    }
+    if base == VT_DATE || base == VT_R8 {
+        Some(inner.date)
+    } else if base == VT_R4 {
+        Some(inner.fltVal as f64)
+    } else if base == VT_I2 {
+        Some(inner.iVal as f64)
+    } else if base == VT_I4 {
+        Some(inner.lVal as f64)
+    } else if base == VT_I8 {
+        Some(inner.llVal as f64)
+    } else if base == VT_UI2 {
+        Some(inner.uiVal as f64)
+    } else if base == VT_UI4 {
+        Some(inner.ulVal as f64)
+    } else if base == VT_CY {
+        Some(inner.cyVal.int64 as f64 / 10_000.0)
+    } else {
+        None
+    }
 }
 
 fn bstr_variant(s: &str) -> VARIANT {
