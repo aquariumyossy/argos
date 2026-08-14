@@ -72,6 +72,8 @@ type MailSyncProgressPayload = {
   current: number;
   total: number;
   message: string;
+  indexedTotal: number;
+  folderIndexed: number;
 };
 
 function formatIndexProgress(p: IndexProgressPayload | null): string {
@@ -113,7 +115,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "1.8.1";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -382,7 +384,20 @@ export default function Settings() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<MailSyncProgressPayload>("mail-sync-progress", (event) => {
-      setMailProgress(event.payload);
+      const p = event.payload;
+      setMailProgress(p);
+      if (typeof p.indexedTotal === "number") {
+        setMailIndexedCount(p.indexedTotal);
+      }
+      if (p.phase === "indexing" && p.folderLabel) {
+        setMailFolders((prev) =>
+          prev.map((f) =>
+            f.pathLabel === p.folderLabel || f.name === p.folderLabel
+              ? { ...f, indexedCount: p.folderIndexed }
+              : f,
+          ),
+        );
+      }
     }).then((fn) => {
       unlisten = fn;
     });
@@ -481,6 +496,8 @@ export default function Settings() {
           current: 0,
           total: 0,
           message: launchMsg,
+          indexedTotal: mailIndexedCount,
+          folderIndexed: 0,
         });
         // Let React paint the notice before the blocking sync invoke.
         await new Promise<void>((resolve) => {

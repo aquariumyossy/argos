@@ -7,6 +7,8 @@
 pub const UNIT_MIN_CHARS: usize = 40;
 /// Split units longer than this into sub-chunks (parent label kept).
 pub const UNIT_MAX_CHARS: usize = 1000;
+/// Mail bodies stay one unit unless longer than this (no blank-line split).
+pub const MAIL_UNIT_MAX_CHARS: usize = 16000;
 /// Overlap when splitting oversized units (boundary-straddle only; keep tiny).
 pub const UNIT_SPLIT_OVERLAP: usize = 16;
 
@@ -17,7 +19,7 @@ pub struct SearchUnit {
     /// Stable within a file for this index build (0-based sequence).
     pub unit_id: u32,
     pub label: String,
-    /// `paragraph` or `chunk` (oversized split).
+    /// `paragraph`, `message` (one email), or `chunk` (oversized split).
     pub kind: String,
 }
 
@@ -43,8 +45,7 @@ pub fn segment_pages(pages: &[String]) -> Vec<SearchUnit> {
     let mut unit_id = 0u32;
     for (text, page) in merged {
         let label = unit_label(&text, unit_id);
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() <= UNIT_MAX_CHARS {
+        if text.chars().count() <= UNIT_MAX_CHARS {
             units.push(SearchUnit {
                 text,
                 page,
@@ -55,28 +56,69 @@ pub fn segment_pages(pages: &[String]) -> Vec<SearchUnit> {
             unit_id += 1;
             continue;
         }
-        // Oversized: sliding windows, keep parent label.
-        let mut start = 0usize;
-        while start < chars.len() {
-            let end = (start + UNIT_MAX_CHARS).min(chars.len());
-            let piece: String = chars[start..end].iter().collect();
-            if piece.chars().any(|c| !c.is_whitespace()) {
-                units.push(SearchUnit {
-                    text: piece,
-                    page,
-                    unit_id,
-                    label: label.clone(),
-                    kind: "chunk".into(),
-                });
-                unit_id += 1;
-            }
-            if end >= chars.len() {
-                break;
-            }
-            start = end.saturating_sub(UNIT_SPLIT_OVERLAP).max(start + 1);
-        }
+        push_windowed_chunks(&mut units, &mut unit_id, &text, page, &label, UNIT_MAX_CHARS);
     }
     units
+}
+
+/// One search unit per email unless the body exceeds [`MAIL_UNIT_MAX_CHARS`].
+/// Does not split on blank lines (greetings, signatures, quoted replies stay together).
+pub fn segment_mail_body(body: &str) -> Vec<SearchUnit> {
+    let text = body.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let label = unit_label(text, 0);
+    if text.chars().count() <= MAIL_UNIT_MAX_CHARS {
+        return vec![SearchUnit {
+            text: text.to_string(),
+            page: Some(1),
+            unit_id: 0,
+            label,
+            kind: "message".into(),
+        }];
+    }
+    let mut units = Vec::new();
+    let mut unit_id = 0u32;
+    push_windowed_chunks(
+        &mut units,
+        &mut unit_id,
+        text,
+        Some(1),
+        &label,
+        MAIL_UNIT_MAX_CHARS,
+    );
+    units
+}
+
+fn push_windowed_chunks(
+    units: &mut Vec<SearchUnit>,
+    unit_id: &mut u32,
+    text: &str,
+    page: Option<u32>,
+    label: &str,
+    max_chars: usize,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let end = (start + max_chars).min(chars.len());
+        let piece: String = chars[start..end].iter().collect();
+        if piece.chars().any(|c| !c.is_whitespace()) {
+            units.push(SearchUnit {
+                text: piece,
+                page,
+                unit_id: *unit_id,
+                label: label.to_string(),
+                kind: "chunk".into(),
+            });
+            *unit_id += 1;
+        }
+        if end >= chars.len() {
+            break;
+        }
+        start = end.saturating_sub(UNIT_SPLIT_OVERLAP).max(start + 1);
+    }
 }
 
 fn split_blank_line_blocks(text: &str) -> Vec<String> {
@@ -285,5 +327,39 @@ mod tests {
             article_label_at_start("第三条の二\n本文"),
             Some("第三条の二".into())
         );
+    }
+
+    #[test]
+    fn mail_keeps_blank_line_paragraphs_as_one_unit() {
+        let body = "\
+○○様
+
+お世話になっております。△△の□□です。
+
+先日ご相談の件、下記のとおりご連絡します。
+
+よろしくお願いいたします。
+";
+        let units = segment_mail_body(body);
+        assert_eq!(units.len(), 1, "got {} units: {:?}", units.len(), units);
+        assert_eq!(units[0].kind, "message");
+        assert!(units[0].text.contains("先日ご相談"));
+        assert!(units[0].text.contains("よろしくお願い"));
+    }
+
+    #[test]
+    fn mail_oversized_body_splits_into_chunks() {
+        let text: String = (0..MAIL_UNIT_MAX_CHARS + 500)
+            .map(|i| char::from_u32(0x3042 + (i % 20) as u32).unwrap())
+            .collect();
+        let units = segment_mail_body(&text);
+        assert!(units.len() >= 2, "got {} units", units.len());
+        assert!(units.iter().all(|u| u.kind == "chunk"));
+        assert_ne!(units[0].text, units[1].text);
+    }
+
+    #[test]
+    fn mail_whitespace_only_is_empty() {
+        assert!(segment_mail_body("  \n\n  ").is_empty());
     }
 }
