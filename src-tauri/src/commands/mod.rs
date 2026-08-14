@@ -774,11 +774,14 @@ pub async fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
             .ok_or_else(|| "Outlook メールのパスが不正です".to_string())?;
         let state = app.state::<Arc<AppState>>();
         let mail_h = state.mail.clone();
-        return tauri::async_runtime::spawn_blocking(move || {
+        let opened = tauri::async_runtime::spawn_blocking(move || {
             mail_h.open_item(&store_id, &entry_id)
         })
         .await
         .map_err(|e| e.to_string())?;
+        opened?;
+        hide_popup_window(&app);
+        return Ok(());
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {

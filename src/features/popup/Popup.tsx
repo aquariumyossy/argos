@@ -1139,12 +1139,6 @@ export default function Popup() {
       if (!target) return;
       setActionError("");
       try {
-        if (target.startsWith("outlook:")) {
-          const running = await invoke<boolean>("mail_outlook_running");
-          if (!running) {
-            setActionError("Outlook を起動してメールを開きます…");
-          }
-        }
         await invoke("open_hit", { path: target });
         setActionError("");
       } catch (e) {
@@ -1158,14 +1152,9 @@ export default function Popup() {
     async (path?: string) => {
       const target = path ?? hits[index]?.path;
       if (!target) return;
+      if (target.startsWith("outlook:")) return;
       setActionError("");
       try {
-        if (target.startsWith("outlook:")) {
-          const running = await invoke<boolean>("mail_outlook_running");
-          if (!running) {
-            setActionError("Outlook を起動してメールを開きます…");
-          }
-        }
         await invoke("open_containing_folder", { path: target });
         setActionError("");
       } catch (e) {
@@ -1517,7 +1506,7 @@ export default function Popup() {
         }
         if (e.key === "Enter" && e.shiftKey) {
           e.preventDefault();
-          void openFolder();
+          if (!isOutlookHit(preview)) void openFolder();
           return;
         }
         if (e.key === "Enter") {
@@ -1544,7 +1533,8 @@ export default function Popup() {
       }
       if (e.key === "Enter" && e.shiftKey) {
         e.preventDefault();
-        void openFolder();
+        const hit = hits[index];
+        if (!hit || !isOutlookHit(hit)) void openFolder();
         return;
       }
       if (e.key === "Enter") {
@@ -1560,7 +1550,8 @@ export default function Popup() {
     extPickerOpen,
     folderPickerOpen,
     hidePopup,
-    hits.length,
+    hits,
+    index,
     openFolder,
     openSelected,
     preview,
@@ -1636,6 +1627,9 @@ export default function Popup() {
     { dir: "SouthEast", className: "resize-se" },
     { dir: "SouthWest", className: "resize-sw" },
   ];
+
+  const currentHit = preview ?? hits[index];
+  const currentIsMail = currentHit ? isOutlookHit(currentHit) : false;
 
   return (
     <div className="popup">
@@ -2118,21 +2112,25 @@ export default function Popup() {
             <button
               type="button"
               className="hit-action-btn"
-              title="ファイルを開く (Enter)"
-              aria-label="ファイルを開く"
+              title={
+                isOutlookHit(preview) ? "メールを開く (Enter)" : "ファイルを開く (Enter)"
+              }
+              aria-label={isOutlookHit(preview) ? "メールを開く" : "ファイルを開く"}
               onClick={() => void openSelected()}
             >
               <IconOpenFile />
             </button>
-            <button
-              type="button"
-              className="hit-action-btn"
-              title="フォルダを開く (Shift+Enter)"
-              aria-label="フォルダを開く"
-              onClick={() => void openFolder(preview.path)}
-            >
-              <IconFolder />
-            </button>
+            {!isOutlookHit(preview) ? (
+              <button
+                type="button"
+                className="hit-action-btn"
+                title="フォルダを開く (Shift+Enter)"
+                aria-label="フォルダを開く"
+                onClick={() => void openFolder(preview.path)}
+              >
+                <IconFolder />
+              </button>
+            ) : null}
             <button
               type="button"
               className="hit-action-btn"
@@ -2253,6 +2251,10 @@ export default function Popup() {
               const maxScore = Math.max(...hits.map((h) => h.score), 0);
               return hits.map((hit, i) => {
                 const level = scoreLevel(hit.score, maxScore);
+                const mailHit = isOutlookHit(hit);
+                const nestParagraphs =
+                  (hit.paragraphs?.length ?? 0) > 0 &&
+                  !(mailHit && (hit.paragraphs?.length ?? 0) <= 1);
                 return (
                   <li
                     key={`${hit.source}-${hit.id}`}
@@ -2322,7 +2324,7 @@ export default function Popup() {
                             : ""}
                         </div>
                       ) : null}
-                      {hit.paragraphs && hit.paragraphs.length > 0 ? (
+                      {nestParagraphs ? (
                         <ul className="hit-paragraphs">
                           {(expandedParas[hit.path] ?? hit.paragraphs).map(
                             (p) => (
@@ -2394,7 +2396,7 @@ export default function Popup() {
                         </div>
                       )}
                       <div className="hit-path" title={hit.path}>
-                        {hit.matchCount && hit.matchCount > 1
+                        {!mailHit && hit.matchCount && hit.matchCount > 1
                           ? `マッチ ${hit.matchCount} 段落 · `
                           : null}
                         {hit.path}
@@ -2416,8 +2418,8 @@ export default function Popup() {
                       <button
                         type="button"
                         className="hit-action-btn"
-                        title="ファイルを開く (Enter)"
-                        aria-label="ファイルを開く"
+                        title={mailHit ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
+                        aria-label={mailHit ? "メールを開く" : "ファイルを開く"}
                         onClick={(e) => {
                           e.stopPropagation();
                           void openSelected(hit.path);
@@ -2450,18 +2452,20 @@ export default function Popup() {
                       >
                         <IconRescope />
                       </button>
-                      <button
-                        type="button"
-                        className="hit-action-btn"
-                        title="フォルダを開く (Shift+Enter)"
-                        aria-label="フォルダを開く"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void openFolder(hit.path);
-                        }}
-                      >
-                        <IconFolder />
-                      </button>
+                      {!mailHit ? (
+                        <button
+                          type="button"
+                          className="hit-action-btn"
+                          title="フォルダを開く (Shift+Enter)"
+                          aria-label="フォルダを開く"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void openFolder(hit.path);
+                          }}
+                        >
+                          <IconFolder />
+                        </button>
+                      ) : null}
                     </div>
                   </li>
                 );
@@ -2493,7 +2497,9 @@ export default function Popup() {
             <button
               type="button"
               className="popup-footer-action"
-              title="ファイルを開く (Enter)"
+              title={
+                isOutlookHit(preview) ? "メールを開く (Enter)" : "ファイルを開く (Enter)"
+              }
               onClick={() => void openSelected()}
             >
               Enter 開く
@@ -2513,19 +2519,21 @@ export default function Popup() {
             <button
               type="button"
               className="popup-footer-action"
-              title="ファイルを開く (Enter)"
+              title={currentIsMail ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
               onClick={() => void openSelected()}
             >
               Enter 開く
             </button>
-            <button
-              type="button"
-              className="popup-footer-action"
-              title="フォルダを開く (Shift+Enter)"
-              onClick={() => void openFolder()}
-            >
-              Shift+Enter フォルダ
-            </button>
+            {!currentIsMail ? (
+              <button
+                type="button"
+                className="popup-footer-action"
+                title="フォルダを開く (Shift+Enter)"
+                onClick={() => void openFolder()}
+              >
+                Shift+Enter フォルダ
+              </button>
+            ) : null}
             <button
               type="button"
               className="popup-footer-action"

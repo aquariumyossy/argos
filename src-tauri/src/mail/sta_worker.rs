@@ -2,6 +2,7 @@
 
 #![cfg(windows)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -45,6 +46,8 @@ enum Job {
 #[derive(Clone)]
 pub struct MailStaHandle {
     tx: Sender<Job>,
+    /// True while the STA thread is inside `run_sync` (including Outlook fetch).
+    syncing: Arc<AtomicBool>,
 }
 
 fn recv_result<T>(rx: Receiver<T>, timeout: Duration, label: &str) -> Result<T, String> {
@@ -61,11 +64,13 @@ fn recv_result<T>(rx: Receiver<T>, timeout: Duration, label: &str) -> Result<T, 
 impl MailStaHandle {
     pub fn start(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Job>();
+        let syncing = Arc::new(AtomicBool::new(false));
+        let syncing_thread = syncing.clone();
         thread::Builder::new()
             .name("argos-outlook-sta".into())
-            .spawn(move || sta_loop(rx, db, backend))
+            .spawn(move || sta_loop(rx, db, backend, syncing_thread))
             .map_err(|e| format!("Outlook STA スレッドを起動できません: {e}"))?;
-        Ok(Self { tx })
+        Ok(Self { tx, syncing })
     }
 
     pub fn detect(&self) -> Result<String, String> {
@@ -120,6 +125,12 @@ impl MailStaHandle {
     }
 
     pub fn open_item(&self, store_id: &str, entry_id: &str) -> Result<(), String> {
+        if self.syncing.load(Ordering::SeqCst) {
+            return Err(
+                "メール同期中のため Outlook で開けません。同期の完了後に再試行してください。"
+                    .into(),
+            );
+        }
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(Job::Open {
@@ -132,7 +143,12 @@ impl MailStaHandle {
     }
 }
 
-fn sta_loop(rx: Receiver<Job>, db: Arc<Db>, backend: Arc<TantivyBackend>) {
+fn sta_loop(
+    rx: Receiver<Job>,
+    db: Arc<Db>,
+    backend: Arc<TantivyBackend>,
+    syncing: Arc<AtomicBool>,
+) {
     if let Err(e) = outlook_com::com_init() {
         eprintln!("argos: Outlook STA CoInitializeEx failed: {e}");
         while let Ok(job) = rx.recv() {
@@ -173,9 +189,11 @@ fn sta_loop(rx: Receiver<Job>, db: Arc<Db>, backend: Arc<TantivyBackend>) {
                 reply,
                 progress,
             } => {
+                syncing.store(true, Ordering::SeqCst);
                 let result = run_sync(&db, &backend, allow_launch, |p| {
                     let _ = progress.send(p);
                 });
+                syncing.store(false, Ordering::SeqCst);
                 drop(progress);
                 let _ = reply.send(result);
             }
@@ -215,13 +233,15 @@ where
 
     // Announce before the blocking launch/retry so the UI can show it immediately.
     if allow_launch && !outlook_com::outlook_is_running() {
-        on_progress(MailSyncProgress {
-            phase: "starting".into(),
-            folder_label: String::new(),
-            current: 0,
-            total: folders.len() as u32,
-            message: "Outlook を起動しています…".into(),
-        });
+        on_progress(mail_progress(
+            db,
+            "starting",
+            "",
+            0,
+            folders.len() as u32,
+            "Outlook を起動しています…",
+            0,
+        ));
     }
 
     match outlook_com::connect_outlook(allow_launch) {
@@ -240,22 +260,26 @@ where
     let mut stats = MailSyncStats::default();
     stats.folders = folders.len() as u32;
 
-    on_progress(MailSyncProgress {
-        phase: "starting".into(),
-        folder_label: String::new(),
-        current: 0,
-        total: folders.len() as u32,
-        message: "Outlook 同期を開始".into(),
-    });
+    on_progress(mail_progress(
+        db,
+        "starting",
+        "",
+        0,
+        folders.len() as u32,
+        "Outlook 同期を開始",
+        0,
+    ));
 
     for (fi, folder) in folders.iter().enumerate() {
-        on_progress(MailSyncProgress {
-            phase: "folder".into(),
-            folder_label: folder.path_label.clone(),
-            current: fi as u32 + 1,
-            total: folders.len() as u32,
-            message: format!("フォルダ取得中: {}", folder.path_label),
-        });
+        on_progress(mail_progress(
+            db,
+            "folder",
+            folder.path_label.clone(),
+            fi as u32 + 1,
+            folders.len() as u32,
+            format!("フォルダ取得中: {}", folder.path_label),
+            0,
+        ));
 
         // Outlook should already be running after connect_outlook above.
         let messages = match outlook_com::fetch_messages_in_folder(
@@ -273,22 +297,14 @@ where
         };
 
         let total = messages.len() as u32;
+        let mut folder_indexed = 0u32;
         for (mi, msg) in messages.into_iter().enumerate() {
-            if mi % 25 == 0 {
-                on_progress(MailSyncProgress {
-                    phase: "indexing".into(),
-                    folder_label: folder.path_label.clone(),
-                    current: mi as u32 + 1,
-                    total,
-                    message: format!("{} ({}/{})", folder.path_label, mi + 1, total),
-                });
-            }
-
             let path = make_outlook_path(&msg.store_id, &msg.entry_id);
             let mut msg = msg;
             msg.folder_name = folder.path_label.clone();
             let hash = content_fingerprint(&msg);
 
+            let mut skip_index = false;
             if let Ok(Some(existing)) = db.get_email_message_by_path(&path) {
                 if existing.content_hash == hash
                     && existing.status == "indexed"
@@ -297,11 +313,12 @@ where
                     && backend.has_path(&path).unwrap_or(false)
                 {
                     stats.skipped += 1;
-                    continue;
+                    folder_indexed += 1;
+                    skip_index = true;
                 }
             }
 
-            if latest_only && !msg.conversation_id.is_empty() {
+            if !skip_index && latest_only && !msg.conversation_id.is_empty() {
                 if let Ok(Some(winner)) = db.get_email_thread_winner(&msg.conversation_id) {
                     if msg.received_unix < winner.date_unix
                         || (msg.received_unix == winner.date_unix && path != winner.path)
@@ -319,56 +336,92 @@ where
                             "superseded",
                         );
                         stats.superseded += 1;
-                        continue;
-                    }
-                    if winner.path != path {
+                        skip_index = true;
+                    } else if winner.path != path {
                         let _ = backend.delete_by_path(&winner.path);
                         let _ = db.set_email_message_status(&winner.path, "superseded");
                     }
                 }
             }
 
-            match index_message(backend, &msg) {
-                Ok(_) => {
-                    let _ = db.upsert_email_message(
-                        &path,
-                        &msg.store_id,
-                        &msg.entry_id,
-                        &msg.conversation_id,
-                        &msg.folder_name,
-                        &msg.from,
-                        &msg.subject,
-                        msg.received_unix,
-                        &hash,
-                        "indexed",
-                    );
-                    if !msg.conversation_id.is_empty() {
-                        let _ = db.upsert_email_thread(
-                            &msg.conversation_id,
+            if !skip_index {
+                match index_message(backend, &msg) {
+                    Ok(_) => {
+                        let _ = db.upsert_email_message(
                             &path,
+                            &msg.store_id,
+                            &msg.entry_id,
+                            &msg.conversation_id,
+                            &msg.folder_name,
+                            &msg.from,
+                            &msg.subject,
                             msg.received_unix,
+                            &hash,
+                            "indexed",
                         );
+                        if !msg.conversation_id.is_empty() {
+                            let _ = db.upsert_email_thread(
+                                &msg.conversation_id,
+                                &path,
+                                msg.received_unix,
+                            );
+                        }
+                        stats.indexed += 1;
+                        folder_indexed += 1;
                     }
-                    stats.indexed += 1;
+                    Err(e) => {
+                        eprintln!("argos: index email failed ({path}): {e}");
+                        stats.errors += 1;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("argos: index email failed ({path}): {e}");
-                    stats.errors += 1;
-                }
+            }
+
+            if mi % 25 == 0 || mi + 1 == total as usize {
+                on_progress(mail_progress(
+                    db,
+                    "indexing",
+                    folder.path_label.clone(),
+                    mi as u32 + 1,
+                    total,
+                    format!("{} ({}/{})", folder.path_label, mi + 1, total),
+                    folder_indexed,
+                ));
             }
         }
     }
 
     let _ = db.set_mail_last_sync_now();
-    on_progress(MailSyncProgress {
-        phase: "done".into(),
-        folder_label: String::new(),
-        current: stats.folders,
-        total: stats.folders,
-        message: format!(
+    on_progress(mail_progress(
+        db,
+        "done",
+        "",
+        stats.folders,
+        stats.folders,
+        format!(
             "完了: インデックス登録 {} / スキップ {} / エラー {}",
             stats.indexed, stats.skipped, stats.errors
         ),
-    });
+        0,
+    ));
     Ok(stats)
+}
+
+fn mail_progress(
+    db: &Db,
+    phase: &str,
+    folder_label: impl Into<String>,
+    current: u32,
+    total: u32,
+    message: impl Into<String>,
+    folder_indexed: u32,
+) -> MailSyncProgress {
+    MailSyncProgress {
+        phase: phase.into(),
+        folder_label: folder_label.into(),
+        current,
+        total,
+        message: message.into(),
+        indexed_total: db.count_indexed_emails().unwrap_or(0),
+        folder_indexed,
+    }
 }

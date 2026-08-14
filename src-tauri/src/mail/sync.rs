@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::extractor;
-use crate::extractor::segment_pages;
+use crate::extractor::segment_mail_body;
 use crate::mail::path::make_outlook_path;
 use crate::search::tantivy_backend::{EmailDocMeta, TantivyBackend};
 
@@ -48,6 +48,10 @@ pub struct MailSyncProgress {
     pub current: u32,
     pub total: u32,
     pub message: String,
+    /// Running total of `email_messages` with status=indexed (for live UI).
+    pub indexed_total: u32,
+    /// Indexed count for `folder_label` so far in this folder pass.
+    pub folder_indexed: u32,
 }
 
 /// Prefer plain body; fall back to HTML stripped to text.
@@ -89,7 +93,7 @@ pub fn index_message(
     } else {
         msg.body_text.clone()
     };
-    let units = segment_pages(&[body.clone()]);
+    let units = segment_mail_body(&body);
     let meta = EmailDocMeta {
         from: msg.from.clone(),
         date_unix: msg.received_unix,

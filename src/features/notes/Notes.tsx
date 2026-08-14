@@ -1176,13 +1176,13 @@ export default function Notes() {
                         <button
                           type="button"
                           className="notes-icon-btn"
-                          title="開く"
-                          aria-label="開く"
+                          title={isOutlookSnapshot(snap) ? "メールを開く" : "開く"}
+                          aria-label={isOutlookSnapshot(snap) ? "メールを開く" : "開く"}
                           onClick={() => void openPath(snap.path)}
                         >
                           <IconOpenFile />
                         </button>
-                        {!isOutlookPath(snap.path) ? (
+                        {!isOutlookSnapshot(snap) ? (
                           <button
                             type="button"
                             className="notes-icon-btn"

@@ -23,8 +23,9 @@ use super::{ParagraphHit, SearchBackend, SearchHit};
 pub const INDEX_SCHEMA_VERSION: u32 = 5;
 const SCHEMA_VERSION_FILE: &str = "argos_schema_version";
 
-/// Mail index schema (separate directory: `index-mail/`).
-pub const MAIL_INDEX_SCHEMA_VERSION: u32 = 1;
+/// Mail index schema / chunking strategy (separate directory: `index-mail/`).
+/// Bump to wipe the mail index when on-disk schema or unit granularity changes.
+pub const MAIL_INDEX_SCHEMA_VERSION: u32 = 2;
 const MAIL_SCHEMA_VERSION_FILE: &str = "argos_mail_schema_version";
 
 /// Nested paragraphs shown under each file hit in the popup list.

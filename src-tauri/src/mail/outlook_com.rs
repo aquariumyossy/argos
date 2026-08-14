@@ -218,9 +218,45 @@ pub fn fetch_messages_in_folder(
 pub fn open_mail_item(store_id: &str, entry_id: &str) -> Result<(), String> {
     let (app, _) = connect_outlook(true)?;
     let session = get_session(&app)?;
-    let item = get_item_from_id(&session, entry_id, Some(store_id))?;
-    let _ = invoke_method0(&item, "Display")?;
+    let item = get_item_from_id(&session, entry_id, Some(store_id)).or_else(|with_store| {
+        get_item_from_id(&session, entry_id, None).map_err(|without_store| {
+            format!("メールを取得できません（{with_store} / {without_store}）")
+        })
+    })?;
+
+    display_mail_item(&item)?;
+    activate_inspector(&item);
+    activate_outlook_window(&app);
     Ok(())
+}
+
+fn display_mail_item(item: &IDispatch) -> Result<(), String> {
+    invoke_method0(item, "Display")
+        .or_else(|_| invoke(item, "Display", DISPATCH_METHOD, &[bool_variant(false)]))
+        .map(|_| ())
+        .map_err(|e| format!("メールを表示できません: {e}"))
+}
+
+fn activate_inspector(item: &IDispatch) {
+    let inspector = get_dispatch_prop(item, "GetInspector").or_else(|_| {
+        invoke_method0(item, "GetInspector").and_then(|v| dispatch_from_variant(&v))
+    });
+    let Ok(insp) = inspector else {
+        return;
+    };
+    let _ = invoke_method0(&insp, "Activate");
+}
+
+fn activate_outlook_window(app: &IDispatch) {
+    if let Ok(win) = get_dispatch_prop(app, "ActiveWindow") {
+        let _ = invoke_method0(&win, "Activate");
+        return;
+    }
+    if let Ok(v) = invoke_method0(app, "ActiveWindow") {
+        if let Ok(win) = dispatch_from_variant(&v) {
+            let _ = invoke_method0(&win, "Activate");
+        }
+    }
 }
 
 /// Connect to classic Outlook. Prefer a running instance; optionally launch normally
