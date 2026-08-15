@@ -145,7 +145,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.9.0";
+const APP_VERSION = "1.9.1";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -2160,7 +2160,7 @@ export default function Settings() {
                 />
               </label>
               <p className="field-hint">
-                モデルがインデックス検索ツールを使うときの件数です（1〜8）。検索窓から手動で送るときは関係ありません。
+                モデルがインデックス検索ツールを使うときのファイル件数です（1〜8）。1ファイルから最大3段落まで返すため、実際の段落数はこれより多くなります。検索窓から手動で送るときは関係ありません。
               </p>
               <label className="llm-prompt-label">
                 <span className="field-label">システムプロンプト</span>

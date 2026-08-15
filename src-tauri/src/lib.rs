@@ -275,6 +275,7 @@ pub fn run() {
             llm::commands::llm_list_threads,
             llm::commands::llm_create_thread,
             llm::commands::llm_rename_thread,
+            llm::commands::llm_set_thread_scope,
             llm::commands::llm_delete_thread,
             llm::commands::llm_get_active_thread,
             llm::commands::llm_set_active_thread,

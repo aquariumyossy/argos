@@ -84,6 +84,12 @@ pub fn format_sources(sources: &[LlmSourceRow]) -> String {
             out.push_str(" — ");
             out.push_str(s.path.trim());
         }
+        // Without the id the model cannot call read_unit, so a shortened tool hit would
+        // be a dead end. Only shown where it is actionable: paragraph grain with an id.
+        let pid = s.paragraph_id.trim();
+        if !pid.is_empty() && !crate::llm::grain::is_file_grain(&s.grain) {
+            out.push_str(&format!(" (paragraph_id: {pid})"));
+        }
         out.push('\n');
         out.push_str(s.body.trim());
         out.push_str("\n\n");
@@ -380,6 +386,23 @@ mod tests {
         let mut s = src(id, origin, sort, body);
         s.grain = "file".into();
         s
+    }
+
+    /// Without the id in the block, `read_unit` cannot be called and a shortened tool hit
+    /// becomes a dead end.
+    #[test]
+    fn paragraph_sources_expose_their_id() {
+        let out = format_sources(&[src("u1", "tool", 0, "本文")]);
+        assert!(
+            out.contains("(paragraph_id: u1)"),
+            "paragraph grain must be readable via read_unit: {out}"
+        );
+        // A whole file has no single paragraph to re-read.
+        let file = format_sources(&[src_file("f1", "attach", 0, "本文")]);
+        assert!(
+            !file.contains("paragraph_id"),
+            "file grain must not advertise a paragraph id: {file}"
+        );
     }
 
     fn consumed(id: &str, origin: &str, sort: i64, body: &str, user_id: &str, cite: i64) -> LlmSourceRow {

@@ -2085,6 +2085,26 @@ impl Db {
         }
     }
 
+    /// Folder scope for this thread's index searches. Empty means the whole index.
+    pub fn set_llm_thread_scope(
+        &self,
+        id: &str,
+        path_prefix: &str,
+    ) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE llm_threads SET path_prefix=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![path_prefix.trim(), now, id],
+        )?;
+        drop(conn);
+        if n == 0 {
+            Ok(None)
+        } else {
+            self.get_llm_thread(id)
+        }
+    }
+
     pub fn delete_llm_thread(&self, id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock();
         let n = conn.execute("DELETE FROM llm_threads WHERE id=?1", [id])?;

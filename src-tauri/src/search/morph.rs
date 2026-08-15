@@ -92,6 +92,31 @@ impl MorphToken {
     pub fn should_drop_for_phrase(&self) -> bool {
         self.is_symbol() || self.surface.trim().is_empty()
     }
+
+    /// Nouns that may join an adjacent noun into one compound (裁判 + 例 → 裁判例).
+    ///
+    /// 非自立 (こと / もの / ため) and 代名詞 (これ / それ) never carry meaning on their
+    /// own and must not glue unrelated nouns together.
+    pub fn can_join_compound(&self) -> bool {
+        self.major_pos == "名詞"
+            && !matches!(self.pos_detail1.as_str(), "非自立" | "代名詞")
+            && !self.surface.trim().is_empty()
+            && !self.is_symbol()
+    }
+
+    /// 接頭詞 attaches to the following noun (第 + 555 + 条 → 第555条) but is meaningless
+    /// on its own, so it may start a compound and never stands as a unit.
+    pub fn is_prefix_only(&self) -> bool {
+        self.major_pos == "接頭詞"
+    }
+}
+
+/// One search unit extracted from a query: a single content word or a noun compound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryUnit {
+    pub text: String,
+    /// True when built by joining two or more adjacent 名詞 surfaces.
+    pub compound: bool,
 }
 
 pub struct MorphAnalyzer {
@@ -212,6 +237,112 @@ impl MorphAnalyzer {
         }
         Ok(content)
     }
+
+    /// Split a query into search units, joining adjacent nouns into compounds.
+    ///
+    /// The index tokenizer runs in `Mode::Decompose`, so 裁判例 is stored as adjacent
+    /// 裁判 / 例. Keeping the compound intact here lets the caller build one adjacency
+    /// PhraseQuery instead of OR-ing the pieces, which is what makes multi-word queries
+    /// selective at all.
+    ///
+    /// `drop_intent` additionally removes question boilerplate (内容 / 調べ / …), but only
+    /// from standalone units — a compound such as 本件 or 因果関係 is always kept.
+    pub fn query_units(
+        &self,
+        text: &str,
+        pos_filter: bool,
+        drop_intent: bool,
+    ) -> Result<Vec<QueryUnit>, String> {
+        let tokens = self.analyze(text)?;
+        let mut units: Vec<QueryUnit> = Vec::new();
+        let mut run: Vec<&MorphToken> = Vec::new();
+
+        let flush = |run: &mut Vec<&MorphToken>, units: &mut Vec<QueryUnit>| {
+            if run.is_empty() {
+                return;
+            }
+            let compound = run.len() >= 2;
+            // A run of nothing but 接頭詞 carries no meaning (bare 第 matches everything).
+            let meaningful = run.iter().any(|t| !t.is_prefix_only());
+            let text: String = run.iter().map(|t| t.surface.as_str()).collect();
+            run.clear();
+            if meaningful && !text.trim().is_empty() {
+                units.push(QueryUnit { text, compound });
+            }
+        };
+
+        for t in &tokens {
+            if t.can_join_compound() {
+                run.push(t);
+                continue;
+            }
+            flush(&mut run, &mut units);
+            if t.is_prefix_only() {
+                // Starts the next compound instead of standing alone.
+                run.push(t);
+                continue;
+            }
+            let drop = if pos_filter {
+                t.should_drop_for_content()
+            } else {
+                is_legacy_stop_surface(&t.surface) || t.is_symbol()
+            };
+            if drop {
+                continue;
+            }
+            units.push(QueryUnit {
+                text: t.surface.clone(),
+                compound: false,
+            });
+        }
+        flush(&mut run, &mut units);
+
+        // Dedupe by surface, keeping first occurrence.
+        let mut seen = std::collections::HashSet::new();
+        units.retain(|u| seen.insert(u.text.clone()));
+
+        if drop_intent {
+            let kept: Vec<QueryUnit> = units
+                .iter()
+                .filter(|u| u.compound || !is_query_intent_term(&u.text))
+                .cloned()
+                .collect();
+            // Never strip the query down to nothing.
+            if !kept.is_empty() {
+                units = kept;
+            }
+        }
+
+        if units.is_empty() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty()
+                && !is_legacy_stop_surface(trimmed)
+                && !is_single_hiragana(trimmed)
+            {
+                units.push(QueryUnit {
+                    text: trimmed.to_string(),
+                    compound: false,
+                });
+            }
+        }
+        Ok(units)
+    }
+}
+
+/// Question boilerplate that survives POS filtering but matches almost every document.
+///
+/// Only ever applied to standalone units, so 本件 / 事件 / 因果関係 keep their 件 / 関係.
+pub fn is_query_intent_term(t: &str) -> bool {
+    const INTENT: &[&str] = &[
+        // meta nouns a question adds around the real subject
+        "内容", "詳細", "概要", "要旨", "記載", "部分", "箇所", "情報", "資料", "文書", "書面",
+        "一覧", "説明", "意味", "件", "場合", "関係", "こと", "もの", "ため", "ところ", "とき",
+        "際", "点", "旨",
+        // instruction verbs / stems
+        "教え", "教える", "調べ", "調べる", "探し", "探す", "示し", "示す", "述べ", "挙げ",
+        "まとめ", "整理", "要約", "確認",
+    ];
+    INTENT.contains(&t.trim())
 }
 
 fn is_single_hiragana(s: &str) -> bool {
@@ -452,6 +583,65 @@ mod tests {
         let m = UserDictMatcher::from_words(["損害賠償"]);
         let q = apply_user_dictionary("\"損害賠償\" -慰謝料", &m);
         assert_eq!(q, "\"損害賠償\" -慰謝料");
+    }
+
+    #[test]
+    fn query_units_join_adjacent_nouns() {
+        let morph = MorphAnalyzer::new().expect("morph");
+        let units = morph
+            .query_units("業務委託契約の解除", true, false)
+            .expect("units");
+        assert!(
+            units.iter().any(|u| u.text == "業務委託契約" && u.compound),
+            "adjacent nouns must stay one search unit: {units:?}"
+        );
+        assert!(
+            units.iter().any(|u| u.text == "解除"),
+            "other content words survive: {units:?}"
+        );
+        assert!(
+            !units.iter().any(|u| u.text == "の"),
+            "particles are dropped: {units:?}"
+        );
+    }
+
+    /// A citation must become one unit so it is not split into a bare 第 that matches
+    /// every statute.
+    #[test]
+    fn query_units_absorb_the_article_prefix() {
+        let morph = MorphAnalyzer::new().expect("morph");
+        let units = morph.query_units("第555条", true, false).expect("units");
+        assert_eq!(
+            units.iter().map(|u| u.text.as_str()).collect::<Vec<_>>(),
+            vec!["第555条"],
+            "接頭詞 joins the following noun instead of standing alone: {units:?}"
+        );
+    }
+
+    #[test]
+    fn query_units_drop_question_boilerplate_but_keep_the_subject() {
+        let morph = MorphAnalyzer::new().expect("morph");
+        let units = morph
+            .query_units("この件に関する裁判例の内容を教えて", true, true)
+            .expect("units");
+        assert!(
+            units.iter().any(|u| u.text == "裁判例"),
+            "the subject must survive: {units:?}"
+        );
+        for noise in ["件", "内容", "教え"] {
+            assert!(
+                !units.iter().any(|u| u.text == noise),
+                "{noise} matches almost every document: {units:?}"
+            );
+        }
+    }
+
+    /// Stripping boilerplate must never empty the query.
+    #[test]
+    fn query_units_keep_boilerplate_when_it_is_all_there_is() {
+        let morph = MorphAnalyzer::new().expect("morph");
+        let units = morph.query_units("内容", true, true).expect("units");
+        assert!(!units.is_empty(), "must not strip the query to nothing");
     }
 
     #[test]
