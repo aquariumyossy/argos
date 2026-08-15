@@ -29,6 +29,15 @@ type SettingsData = {
   mailLatestOnly: boolean;
   mailThreadCollapse: boolean;
   mailLastSyncAt: string;
+  llmBaseUrl: string;
+  llmApiKey: string;
+  llmModel: string;
+  llmTimeoutMs: number;
+  llmMaxContextChars: number;
+  llmSystemPrompt: string;
+  llmThinking: "auto" | "brief" | "off";
+  llmThinkingBudget: number;
+  llmSearchTopK: number;
 };
 
 type FolderRow = {
@@ -57,7 +66,7 @@ type EmailFolderRow = {
   indexedCount?: number;
 };
 
-type TabId = "howto" | "folders" | "mail" | "words" | "options" | "remote" | "credits";
+type TabId = "howto" | "folders" | "mail" | "words" | "options" | "llm" | "remote" | "credits";
 
 type IndexProgressPayload = {
   folderId: number;
@@ -75,6 +84,26 @@ type MailSyncProgressPayload = {
   indexedTotal: number;
   folderIndexed: number;
 };
+
+function llmUrlLooksRemote(url: string): boolean {
+  const u = url.trim();
+  if (!u) return false;
+  return !/127\.0\.0\.1|localhost|\[::1\]/i.test(u);
+}
+
+function withLlmPreset(currentUrl: string, port: number): string {
+  try {
+    const raw = currentUrl.trim();
+    const u = new URL(raw.includes("://") ? raw : `http://${raw}`);
+    u.port = String(port);
+    u.pathname = "/v1";
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return `http://127.0.0.1:${port}/v1`;
+  }
+}
 
 function formatIndexProgress(p: IndexProgressPayload | null): string {
   if (!p) return "処理中…";
@@ -111,11 +140,12 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "mail", label: "メール検索" },
   { id: "words", label: "辞書登録" },
   { id: "options", label: "各種設定" },
+  { id: "llm", label: "ローカルLLM" },
   { id: "remote", label: "リモート" },
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.8.1";
+const APP_VERSION = "1.9.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -196,6 +226,32 @@ function normalizeSettings(s: SettingsData): SettingsData {
   if (typeof s.mailLatestOnly !== "boolean") s.mailLatestOnly = false;
   if (typeof s.mailThreadCollapse !== "boolean") s.mailThreadCollapse = true;
   if (typeof s.mailLastSyncAt !== "string") s.mailLastSyncAt = "";
+  if (typeof s.llmBaseUrl !== "string" || !s.llmBaseUrl.trim()) {
+    s.llmBaseUrl = "http://127.0.0.1:11434/v1";
+  }
+  if (typeof s.llmApiKey !== "string") s.llmApiKey = "";
+  if (typeof s.llmModel !== "string") s.llmModel = "";
+  if (typeof s.llmTimeoutMs !== "number" || !Number.isFinite(s.llmTimeoutMs)) {
+    s.llmTimeoutMs = 120000;
+  }
+  if (typeof s.llmMaxContextChars !== "number" || !Number.isFinite(s.llmMaxContextChars)) {
+    s.llmMaxContextChars = 80000;
+  }
+  if (typeof s.llmSystemPrompt !== "string" || !s.llmSystemPrompt.trim()) {
+    s.llmSystemPrompt =
+      "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。";
+  }
+  if (s.llmThinking !== "auto" && s.llmThinking !== "brief" && s.llmThinking !== "off") {
+    s.llmThinking = "brief";
+  }
+  if (typeof s.llmThinkingBudget !== "number" || !Number.isFinite(s.llmThinkingBudget)) {
+    s.llmThinkingBudget = 2048;
+  }
+  if (typeof s.llmSearchTopK !== "number" || !Number.isFinite(s.llmSearchTopK)) {
+    s.llmSearchTopK = 4;
+  } else {
+    s.llmSearchTopK = Math.min(8, Math.max(1, Math.round(s.llmSearchTopK)));
+  }
   return s;
 }
 
@@ -241,6 +297,8 @@ export default function Settings() {
   const [tab, setTab] = useState<TabId>("howto");
   const [lanIp, setLanIp] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
+  const [testingLlm, setTestingLlm] = useState(false);
+  const [llmModels, setLlmModels] = useState<string[]>([]);
   const [mailFolders, setMailFolders] = useState<EmailFolderRow[]>([]);
   const [mailDetect, setMailDetect] = useState<string>("");
   const [mailBusy, setMailBusy] = useState(false);
@@ -870,6 +928,33 @@ export default function Settings() {
     }
   }
 
+  async function testLlm() {
+    if (!settings) return;
+    setTestingLlm(true);
+    setMessage("LLM 接続テスト中…");
+    try {
+      const saved = await invoke<SettingsData>("update_settings", { settings });
+      setSettings(saved);
+      const result = await invoke<{
+        message: string;
+        loopback: boolean;
+        models: { id: string }[];
+      }>("llm_test_connection");
+      const ids = result.models.map((m) => m.id);
+      setLlmModels(ids);
+      if (!saved.llmModel.trim() && ids.length > 0) {
+        const next = { ...saved, llmModel: ids[0] };
+        setSettings(next);
+        await invoke("update_settings", { settings: next });
+      }
+      setMessage(result.message);
+    } catch (e) {
+      setMessage(`LLM 接続テスト失敗: ${formatInvokeError(e)}`);
+    } finally {
+      setTestingLlm(false);
+    }
+  }
+
   async function testRemote() {
     if (!settings) return;
     setTesting(true);
@@ -1062,6 +1147,42 @@ export default function Settings() {
               </li>
               <li>詳細な項目は「リモート」タブでも設定・確認できます</li>
             </ul>
+          </section>
+
+          <section>
+            <h2>ローカルLLM</h2>
+            <p className="muted">
+              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（MTPLX / Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります。
+            </p>
+            <ol className="howto-steps">
+              <li>MTPLX 等を起動し、使いたいモデルを読み込みます</li>
+              <li>
+                ベース URL は <code>/v1</code> まで含めます。例:{" "}
+                <code>http://127.0.0.1:8000/v1</code>
+                。ホストとポートだけ入力した場合は保存時に自動で付きます
+              </li>
+              <li>
+                別の PC から Tailscale / LAN で使うときは、Mac 側が{" "}
+                <code>127.0.0.1</code> だけではなく外向きに待っている必要があります（
+                <code>mtplx serve --host 0.0.0.0 --port 8000 --api-key 任意</code>
+                、または <code>tailscale serve 8000</code>）
+              </li>
+              <li>
+                サーバ側のコンテキスト長（Ollama なら <code>num_ctx</code>）を{" "}
+                <strong>64k 以上</strong>にしてください。モデル最大が 262k
+                でも、サーバ既定が 4k のままだと長い会話は失敗します
+              </li>
+              <li>
+                「ローカルLLM」タブで URL を入れ、「接続テスト」するとモデル一覧を取得します
+              </li>
+              <li>トレイから「チャットを開く」</li>
+              <li>
+                検索ヒットやノートの「チャット」から、送り先の会話を選べます。ノートは全体が1つの出典セットになります。同じ会話へ追送することもできます。
+              </li>
+              <li>
+                Qwen の思考が長いときは「ローカルLLM」タブの思考を「短くする」か「オフ」にしてください
+              </li>
+            </ol>
           </section>
 
           <section>
@@ -1799,7 +1920,7 @@ export default function Settings() {
               ポップアップを開き直すときにサイズ・位置が適用されます。表示中の手動移動・リサイズは、閉じるまで維持されます。
             </p>
             <p className="field-hint">
-              ファイル索引は登録フォルダの変更監視と、設定画面／トレイからの手動再構築で更新されます（定期フル再索引の間隔設定はありません）。
+              ファイルインデックスは登録フォルダの変更監視と、設定画面／トレイからの手動再構築で更新されます（定期フル再インデックスの間隔設定はありません）。
             </p>
             <label className="row-check">
               <input
@@ -1824,6 +1945,251 @@ export default function Settings() {
             <p className="field-hint">
               自然文クエリのノイズを減らします。ユーザ辞書や &quot;フレーズ&quot; 内の助詞は除外しません。
             </p>
+            <button type="button" className="primary" onClick={() => void saveSettings()}>
+              設定を保存
+            </button>
+            {message ? <p className="msg">{message}</p> : null}
+          </section>
+        </div>
+      ) : null}
+
+      {tab === "llm" ? (
+        <div
+          className="tab-panel"
+          role="tabpanel"
+          id="panel-llm"
+          aria-labelledby="tab-llm"
+        >
+          <section>
+            <h2>ローカルLLM</h2>
+            <p className="muted">
+              OpenAI 互換の <code>/v1/chat/completions</code> に接続します。ホストとポートだけ書いた場合は保存時に{" "}
+              <code>/v1</code> を付けます。
+            </p>
+            <p className="muted">
+              サーバ側のコンテキスト長（Ollama の <code>num_ctx</code> など）を 64k
+              以上にしてください。
+            </p>
+            {llmUrlLooksRemote(settings.llmBaseUrl) ? (
+              <p className="msg">
+                URL がこの PC 以外を指しています。インデックスの本文が外部へ送られる可能性があります。
+              </p>
+            ) : null}
+            <div className="row" style={{ marginBottom: 12 }}>
+              <button
+                type="button"
+                onClick={() =>
+                  setSettings({
+                    ...settings,
+                    llmBaseUrl: "http://127.0.0.1:11434/v1",
+                  })
+                }
+              >
+                Ollama
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setSettings({
+                    ...settings,
+                    llmBaseUrl: "http://127.0.0.1:1234/v1",
+                  })
+                }
+              >
+                LM Studio
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setSettings({
+                    ...settings,
+                    llmBaseUrl: "http://127.0.0.1:8080/v1",
+                  })
+                }
+              >
+                llama.cpp
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  setSettings({
+                    ...settings,
+                    llmBaseUrl: withLlmPreset(settings.llmBaseUrl, 8000),
+                  })
+                }
+              >
+                MTPLX
+              </button>
+            </div>
+            <div className="options-form">
+              <label>
+                <span className="field-label">ベース URL</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  value={settings.llmBaseUrl}
+                  onChange={(e) =>
+                    setSettings({ ...settings, llmBaseUrl: e.target.value })
+                  }
+                  placeholder="http://127.0.0.1:8000/v1"
+                />
+              </label>
+              <label>
+                <span className="field-label">API キー（任意）</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={settings.llmApiKey}
+                  onChange={(e) =>
+                    setSettings({ ...settings, llmApiKey: e.target.value })
+                  }
+                />
+              </label>
+              <label>
+                <span className="field-label">モデル</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  list="llm-model-list"
+                  value={settings.llmModel}
+                  onChange={(e) =>
+                    setSettings({ ...settings, llmModel: e.target.value })
+                  }
+                  placeholder="接続テストで一覧を取得"
+                />
+                {llmModels.length > 0 ? (
+                  <datalist id="llm-model-list">
+                    {llmModels.map((id) => (
+                      <option key={id} value={id} />
+                    ))}
+                  </datalist>
+                ) : null}
+              </label>
+              <label>
+                <span className="field-label">タイムアウト（ミリ秒）</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  type="number"
+                  min={5000}
+                  max={600000}
+                  value={settings.llmTimeoutMs}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      llmTimeoutMs: Number(e.target.value) || 120000,
+                    })
+                  }
+                />
+              </label>
+              <p className="field-hint">
+                トークンが止まってから切る待ち時間です。思考中でも流れている限り待ちます。
+              </p>
+              <label>
+                <span className="field-label">思考</span>
+                <span className="field-leader" aria-hidden="true" />
+                <select
+                  value={settings.llmThinking}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      llmThinking: e.target.value as SettingsData["llmThinking"],
+                    })
+                  }
+                >
+                  <option value="brief">短くする</option>
+                  <option value="off">オフ</option>
+                  <option value="auto">サーバ任せ</option>
+                </select>
+              </label>
+              {settings.llmThinking === "brief" ? (
+                <label>
+                  <span className="field-label">思考の上限（トークン）</span>
+                  <span className="field-leader" aria-hidden="true" />
+                  <input
+                    type="number"
+                    min={64}
+                    max={32000}
+                    value={settings.llmThinkingBudget}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        llmThinkingBudget: Number(e.target.value) || 2048,
+                      })
+                    }
+                  />
+                </label>
+              ) : null}
+              <p className="field-hint">
+                Qwen の長い思考はプロンプトだけではあまり短くなりません。「短くする」は上限トークンをサーバに渡し、「オフ」は思考そのものを止めます。
+              </p>
+              <label>
+                <span className="field-label">コンテキスト目安（文字）</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  type="number"
+                  min={4000}
+                  max={200000}
+                  value={settings.llmMaxContextChars}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      llmMaxContextChars: Number(e.target.value) || 80000,
+                    })
+                  }
+                />
+              </label>
+              <p className="field-hint">
+                出典と会話履歴を合わせた送信量の目安です。サーバのコンテキスト長より小さくしてください。
+              </p>
+              <label>
+                <span className="field-label">インデックス検索の件数</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={settings.llmSearchTopK}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      llmSearchTopK: Math.min(
+                        8,
+                        Math.max(1, Number(e.target.value) || 4),
+                      ),
+                    })
+                  }
+                />
+              </label>
+              <p className="field-hint">
+                モデルがインデックス検索ツールを使うときの件数です（1〜8）。検索窓から手動で送るときは関係ありません。
+              </p>
+              <label className="llm-prompt-label">
+                <span className="field-label">システムプロンプト</span>
+                <textarea
+                  rows={5}
+                  value={settings.llmSystemPrompt}
+                  onChange={(e) =>
+                    setSettings({ ...settings, llmSystemPrompt: e.target.value })
+                  }
+                />
+              </label>
+            </div>
+            <div className="row" style={{ marginTop: 12 }}>
+              <button
+                type="button"
+                disabled={testingLlm}
+                onClick={() => void testLlm()}
+              >
+                {testingLlm ? "テスト中…" : "接続テスト"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void invoke("show_chat_window")}
+              >
+                チャットを開く
+              </button>
+            </div>
+          </section>
+          <section>
             <button type="button" className="primary" onClick={() => void saveSettings()}>
               設定を保存
             </button>

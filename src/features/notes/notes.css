@@ -190,6 +190,8 @@
 .notes-main-head-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
   flex-shrink: 0;
 }
@@ -247,7 +249,7 @@
   top: calc(100% + 6px);
   right: 0;
   z-index: 40;
-  min-width: 11.5rem;
+  min-width: 14rem;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -432,6 +434,12 @@
 
 .notes-drag-handle:active {
   cursor: grabbing;
+}
+
+.notes-chat-notice {
+  margin: 0 16px 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .notes-item-top {

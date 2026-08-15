@@ -221,7 +221,7 @@ where
 {
     let settings = db.load_settings();
     if !settings.mail_enabled {
-        return Err("Outlook メール索引が無効です".into());
+        return Err("Outlook メールインデックスが無効です".into());
     }
 
     let folders = db

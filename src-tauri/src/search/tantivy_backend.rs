@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -16,6 +17,7 @@ use tantivy::{doc, DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Ta
 
 use crate::pathutil;
 
+use super::legal_ref::{has_legal_ref, legal_ref_cite_variants, normalize_legal_refs};
 use super::morph::{is_noise_highlight_term, MorphAnalyzer};
 use super::{ParagraphHit, SearchBackend, SearchHit};
 
@@ -654,10 +656,39 @@ impl TantivyBackend {
         Some(Box::new(BooleanQuery::new(per_field)))
     }
 
+    /// 第555条 → (第555条 | 第五百五十五条 | 第五五五条 | …) as adjacent phrases.
+    /// The index stores the original spelling, so the alternatives have to come from
+    /// the query. Never OR the bare numerals (五 / 百 alone would match all of 民法).
+    fn legal_cite_group(&self, parsed: &ParsedQuery) -> Result<Option<Box<dyn Query>>, String> {
+        let mut seen = HashSet::new();
+        let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for raw in &parsed.includes {
+            for variant in legal_ref_cite_variants(raw) {
+                if !seen.insert(variant.clone()) {
+                    continue;
+                }
+                let tokens = self.passage_tokens(&variant)?;
+                // A single token would degrade to a TermQuery OR in
+                // `phrase_in_title_or_body`; that must not become a Must clause.
+                if tokens.len() < 2 {
+                    continue;
+                }
+                if let Some(q) = self.phrase_in_title_or_body(&tokens) {
+                    shoulds.push((Occur::Should, q));
+                }
+            }
+        }
+        if shoulds.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(BooleanQuery::new(shoulds))))
+    }
+
     fn build_parsed_query(
         &self,
         parsed: &ParsedQuery,
         pos_filter: bool,
+        cite_required: bool,
     ) -> Result<Option<Box<dyn Query>>, String> {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
@@ -677,6 +708,18 @@ impl TantivyBackend {
                     }
                 }
             }
+        }
+
+        // Quoted phrases are left alone: quoting is a request for the exact spelling.
+        if let Some(q) = self.legal_cite_group(parsed)? {
+            clauses.push((
+                if cite_required {
+                    Occur::Must
+                } else {
+                    Occur::Should
+                },
+                q,
+            ));
         }
 
         for phrase in &parsed.phrases {
@@ -738,6 +781,11 @@ impl TantivyBackend {
             } else if tokens.len() == 1 && tokens[0] == *raw {
                 push(raw.clone());
             }
+            // Every spelling of the citation; `hit_from_doc` keeps only the one the
+            // document actually uses, and the snippet anchors on it because it is long.
+            for cite in legal_ref_cite_variants(raw) {
+                push(cite);
+            }
             for tok in tokens {
                 push(tok);
             }
@@ -754,15 +802,24 @@ impl TantivyBackend {
         Ok(out)
     }
 
+    /// `cite_norm` folds every citation spelling to the Arabic form. The candidate
+    /// text is normalized the same way, so 第五百五十五条 and 第555条 compare equal
+    /// here even though the inverted index kept them apart.
     fn proximity_tokens_for(
         &self,
         parsed: &ParsedQuery,
         pos_filter: bool,
+        cite_norm: bool,
     ) -> Result<Vec<String>, String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for raw in &parsed.includes {
-            for tok in self.content_tokens(raw, pos_filter)? {
+            let raw = if cite_norm {
+                normalize_legal_refs(raw)
+            } else {
+                raw.clone()
+            };
+            for tok in self.content_tokens(&raw, pos_filter)? {
                 if seen.insert(tok.clone()) {
                     out.push(tok);
                 }
@@ -1183,12 +1240,17 @@ impl TantivyBackend {
             return Ok(vec![]);
         }
 
-        let Some(tantivy_q) = self.build_parsed_query(&parsed, pos_filter_enabled)? else {
+        // A citation in the query means the article number is the point of the search;
+        // require it so 第555条 is not buried under every chunk that mentions 民法.
+        let cite_norm = parsed.includes.iter().any(|r| has_legal_ref(r));
+        let Some(tantivy_q) = self.build_parsed_query(&parsed, pos_filter_enabled, cite_norm)?
+        else {
             return Ok(vec![]);
         };
 
         let highlight_terms = self.highlight_terms_for(&parsed, pos_filter_enabled)?;
-        let proximity_tokens = self.proximity_tokens_for(&parsed, pos_filter_enabled)?;
+        let proximity_tokens =
+            self.proximity_tokens_for(&parsed, pos_filter_enabled, cite_norm)?;
         let scope = path_prefix
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1265,13 +1327,24 @@ impl TantivyBackend {
             .map_err(|e| e.to_string())?;
         eprintln!("argos: tantivy_raw_hits={}", top.len());
 
+        // Nothing carries that citation in any spelling: fall back to the ordinary
+        // free-word search rather than returning nothing.
+        if top.is_empty() && cite_norm {
+            if let Some(relaxed_q) = self.build_parsed_query(&parsed, pos_filter_enabled, false)? {
+                top = searcher
+                    .search(&*wrap_filters(relaxed_q), &TopDocs::with_limit(fetch_n))
+                    .map_err(|e| e.to_string())?;
+                eprintln!("argos: cite_must_empty -> cite_should hits={}", top.len());
+            }
+        }
+
         // POS-filtered TermQuery can miss when the inverted index lacks those exact
         // surfaces (tokenizer drift / partial index) even though the stored body
         // contains the nouns. Fall back to a looser retrieval query, then keep the
         // content proximity filter so chips stay on 光景 / 見慣れ — not そうした / い.
         let mut used_loose_retrieval = false;
         if top.is_empty() && pos_filter_enabled && !proximity_tokens.is_empty() {
-            if let Some(loose_q) = self.build_parsed_query(&parsed, false)? {
+            if let Some(loose_q) = self.build_parsed_query(&parsed, false, false)? {
                 top = searcher
                     .search(&*wrap_filters(loose_q), &TopDocs::with_limit(fetch_n))
                     .map_err(|e| e.to_string())?;
@@ -1326,6 +1399,7 @@ impl TantivyBackend {
             }
             let haystack = format!("{} {}", hit.title, hit.preview_text);
 
+            // Exclusions stay on the original text: `-第五百五十五条` means that spelling.
             if parsed
                 .exclude_phrases
                 .iter()
@@ -1334,10 +1408,15 @@ impl TantivyBackend {
                 continue;
             }
 
+            let prox_hay: Cow<str> = if cite_norm {
+                Cow::Owned(normalize_legal_refs(&haystack))
+            } else {
+                Cow::Borrowed(haystack.as_str())
+            };
             let (overlap, span) = if proximity_tokens.is_empty() {
                 (0, 1)
             } else {
-                proximity_span(&haystack, &proximity_tokens)
+                proximity_span(&prox_hay, &proximity_tokens)
             };
             if min_overlap > 0 && overlap < min_overlap {
                 continue;
@@ -1345,7 +1424,7 @@ impl TantivyBackend {
             let compact = if proximity_tokens.is_empty() {
                 1.0
             } else {
-                compactness_score(&proximity_tokens, &haystack, span)
+                compactness_score(&proximity_tokens, &prox_hay, span)
             };
             // Prefer many matches that appear close together (contract-friendly).
             let combined = (overlap as f32) * 10.0 * compact + score;
@@ -2155,5 +2234,171 @@ mod tests {
         assert_eq!(chunks, sorted, "units ordered by chunk_id");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TestIndex {
+        dir: std::path::PathBuf,
+        backend: TantivyBackend,
+    }
+
+    impl TestIndex {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "argos-tantivy-{tag}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let backend = TantivyBackend::open(&dir).expect("open index").backend;
+            Self { dir, backend }
+        }
+
+        fn add(&self, name: &str, body: &str) {
+            let path = self.dir.join(format!("{name}.txt"));
+            std::fs::write(&path, body).unwrap();
+            self.backend
+                .index_file(
+                    &path,
+                    path.to_str().unwrap(),
+                    self.dir.to_str().unwrap(),
+                    1,
+                    body.len() as u64,
+                    &crate::extractor::ExtractedDoc {
+                        title: name.into(),
+                        pages: vec![body.into()],
+                    },
+                )
+                .expect("index");
+        }
+    }
+
+    impl Drop for TestIndex {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn arabic_query_finds_place_value_kanji_article() {
+        let idx = TestIndex::new("cite-place");
+        idx.add(
+            "civil",
+            "第五百五十五条　売買は、当事者の一方がある財産権を相手方に移転することを約し、\
+             相手方がこれに対してその代金を支払うことを約することによって、その効力を生ずる。",
+        );
+
+        let hits = idx
+            .backend
+            .search("民法第555条の条文を示して", 10, None, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "第555条 must reach 第五百五十五条 without reindexing"
+        );
+        assert!(
+            hits[0].preview_text.contains("第五百五十五条"),
+            "unexpected top hit: {:?}",
+            hits[0].preview_text
+        );
+    }
+
+    #[test]
+    fn arabic_query_finds_digit_run_kanji_article() {
+        let idx = TestIndex::new("cite-digits");
+        idx.add(
+            "hanrei",
+            "本件について、第五〇九条の適用が問題となる。原審の判断は是認できない。",
+        );
+
+        let hits = idx
+            .backend
+            .search("第509条", 10, None, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "zero-padded digit runs in old case law must match"
+        );
+        assert!(hits[0].preview_text.contains("第五〇九条"));
+    }
+
+    #[test]
+    fn kanji_query_still_finds_kanji_article() {
+        // Normalizing the proximity haystack must not break the direct spelling.
+        let idx = TestIndex::new("cite-kanji-query");
+        idx.add("civil", "第五百五十五条　売買は当事者の一方が財産権を移転する。");
+
+        let hits = idx
+            .backend
+            .search("第五百五十五条", 10, None, None, true)
+            .expect("search");
+        assert!(!hits.is_empty(), "kanji query must keep matching kanji text");
+    }
+
+    #[test]
+    fn cite_highlight_uses_the_spelling_in_the_document() {
+        let idx = TestIndex::new("cite-highlight");
+        idx.add(
+            "civil",
+            "総則の説明が続く。ここは前置きである。第五百五十五条　売買は当事者の一方が財産権を移転する。",
+        );
+
+        let hits = idx
+            .backend
+            .search("第555条", 10, None, None, true)
+            .expect("search");
+        assert!(!hits.is_empty());
+        let terms = &hits[0].highlight_terms;
+        assert!(
+            terms.iter().any(|t| t == "第五百五十五条"),
+            "chip must be the spelling the document uses: {terms:?}"
+        );
+        assert!(
+            !terms.iter().any(|t| t == "第555条"),
+            "absent spellings must be dropped: {terms:?}"
+        );
+        assert!(
+            hits[0].snippet.contains("第五百五十五条"),
+            "snippet should anchor on the article: {:?}",
+            hits[0].snippet
+        );
+    }
+
+    #[test]
+    fn cite_must_falls_back_when_no_document_has_the_article() {
+        let idx = TestIndex::new("cite-fallback");
+        idx.add(
+            "civil",
+            "売買契約の解除について、民法の規定と判例の立場を整理する。",
+        );
+
+        let hits = idx
+            .backend
+            .search("民法第999条", 10, None, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "a missing article must relax to free-word search, not return nothing"
+        );
+    }
+
+    #[test]
+    fn dates_are_not_expanded_as_articles() {
+        let idx = TestIndex::new("cite-date");
+        idx.add("memo", "打合せは2026年5月15日に実施した。議事録は別紙のとおり。");
+        idx.add("other", "第十五条　この契約は当事者の合意により変更できる。");
+
+        let hits = idx
+            .backend
+            .search("2026年5月15日", 10, None, None, true)
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].path.contains("memo"),
+            "a date must not be read as 第15条: {:?}",
+            hits[0].path
+        );
     }
 }

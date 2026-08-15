@@ -24,6 +24,9 @@ import {
   splitProseParagraphs,
 } from "./markdownPreview";
 import { formatLegalDisplayHtml, formatLegalMdHtml } from "../notes/legalMdFormat";
+import { formatExportBody } from "../notes/exportNoteText";
+import ChatDestPicker, { attachToChat } from "../chat/ChatDestPicker";
+import NoteDestPicker, { keepToNote } from "../notes/NoteDestPicker";
 import { highlightText } from "../search/highlightText";
 import {
   dictionaryWordFromSelection,
@@ -96,6 +99,14 @@ function IconKeep() {
   );
 }
 
+function IconChat() {
+  return (
+    <HitActionIcon>
+      <path d="M3.25 3.5h9.5A1.25 1.25 0 0 1 14 4.75v5.25A1.25 1.25 0 0 1 12.75 11.25H8.1L4.75 13.5v-2.25H3.25A1.25 1.25 0 0 1 2 10V4.75A1.25 1.25 0 0 1 3.25 3.5Z" />
+    </HitActionIcon>
+  );
+}
+
 function IconNotes() {
   return (
     <HitActionIcon>
@@ -103,6 +114,26 @@ function IconNotes() {
       <path d="M5.25 6.25h5.5" />
       <path d="M5.25 8.75h4" />
     </HitActionIcon>
+  );
+}
+
+function IconSettings() {
+  return (
+    <svg
+      className="hit-action-icon"
+      viewBox="0 0 24 24"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </svg>
   );
 }
 
@@ -137,6 +168,63 @@ function OverlayCloseBtn({ onClose }: { onClose: () => void }) {
     >
       ×
     </button>
+  );
+}
+
+function HitUnitCard({
+  label,
+  snippet,
+  query,
+  highlightTerms,
+  previewTitle,
+  onPreview,
+  onKeep,
+  onChat,
+}: {
+  label: string;
+  snippet: string;
+  query: string;
+  highlightTerms?: string[];
+  previewTitle: string;
+  onPreview: () => void;
+  onKeep: (id: "new" | string) => void;
+  onChat: (id: "new" | string) => void;
+}) {
+  return (
+    <li className="hit-paragraph">
+      <button
+        type="button"
+        className="hit-paragraph-btn"
+        title={previewTitle}
+        onClick={(e) => {
+          e.stopPropagation();
+          onPreview();
+        }}
+      >
+        {label ? (
+          <span className="hit-paragraph-label">{label}</span>
+        ) : null}
+        <span className="hit-paragraph-snippet">
+          {highlight(snippet, query, highlightTerms)}
+        </span>
+      </button>
+      <NoteDestPicker
+        buttonClassName="hit-paragraph-keep"
+        title="ノートにキープ"
+        ariaLabel="ノートにキープ"
+        onPick={onKeep}
+      >
+        <IconKeep />
+      </NoteDestPicker>
+      <ChatDestPicker
+        buttonClassName="hit-paragraph-keep"
+        title="チャットに送る"
+        ariaLabel="チャットに送る"
+        onPick={onChat}
+      >
+        <IconChat />
+      </ChatDestPicker>
+    </li>
   );
 }
 
@@ -297,8 +385,6 @@ function previewNavIds(file: PreviewFileResult | null): string[] {
   if (ids.length) return ids;
   return file.units[0] ? [file.units[0].id] : [];
 }
-
-type KeepPathMatchesResult = { created: number; skipped: number };
 
 /** Parent directory of a Windows / UNC file path. Not for outlook: virtual paths. */
 function parentDir(path: string): string | null {
@@ -1181,20 +1267,32 @@ export default function Popup() {
     }
   }, []);
 
+  const openChat = useCallback(async () => {
+    try {
+      await invoke("show_chat_window");
+      setActionError("");
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, []);
+
   const keepParagraph = useCallback(
-    async (opts: {
-      paragraphId: string;
-      label?: string;
-      page?: number | null;
-      snippet?: string;
-      body?: string;
-      fileHit: SearchHit;
-    }) => {
+    async (
+      opts: {
+        paragraphId: string;
+        label?: string;
+        page?: number | null;
+        snippet?: string;
+        body?: string;
+        fileHit: SearchHit;
+      },
+      noteId: "new" | string,
+    ) => {
       const { paragraphId, label, page, snippet, body, fileHit } = opts;
       setActionError("");
       try {
-        const result = await invoke<{ created: boolean }>("keep_to_note", {
-          payload: {
+        const result = await keepToNote(
+          {
             query: query.trim(),
             body: body ?? null,
             snippet: snippet ?? null,
@@ -1209,10 +1307,19 @@ export default function Popup() {
             mailDate: fileHit.mailDate ?? "",
             mailFolder: fileHit.mailFolder ?? "",
             highlightTerms: fileHit.highlightTerms ?? [],
-            silent: true,
           },
-        });
-        showKeepNotice(result.created ? "キープした" : "すでにキープ済み");
+          noteId,
+        );
+        const dest = result.note?.title?.trim() || "無題のノート";
+        if (result.created) {
+          showKeepNotice(
+            result.createdNote
+              ? "新しいノートにキープした"
+              : `『${dest}』にキープした`,
+          );
+        } else {
+          showKeepNotice(`『${dest}』にすでにキープ済み`);
+        }
       } catch (e) {
         setActionError(String(e));
       }
@@ -1220,35 +1327,87 @@ export default function Popup() {
     [query, showKeepNotice],
   );
 
-  const keepFileMatches = useCallback(
-    async (hit: SearchHit) => {
+  const resolveChatBody = useCallback(
+    async (opts: {
+      paragraphId: string;
+      path: string;
+      previewText?: string;
+      snippet?: string;
+    }): Promise<string> => {
+      let body = (opts.previewText ?? "").trim();
+      const snippet = (opts.snippet ?? "").trim();
+      const looksThin =
+        !body || body === snippet || [...body].length < 80;
+      if (looksThin && opts.paragraphId) {
+        try {
+          const hit = await invoke<SearchHit | null>("get_preview", {
+            hitId: opts.paragraphId,
+          });
+          const preview = hit?.previewText?.trim() ?? "";
+          if ([...preview].length > [...body].length) {
+            body = preview;
+          }
+        } catch {
+          /* keep existing text */
+        }
+      }
+      if (!body) body = snippet;
+      return formatExportBody(opts.path, body);
+    },
+    [],
+  );
+
+  const sendHitToChat = useCallback(
+    async (
+      opts: {
+        paragraphId: string;
+        path: string;
+        title: string;
+        previewText?: string;
+        snippet?: string;
+      },
+      threadId: "new" | string,
+    ) => {
       setActionError("");
       try {
-        const result = await invoke<KeepPathMatchesResult>("keep_path_matches", {
-          query: query.trim(),
-          path: hit.path,
-          title: hit.title,
-          source: hit.source,
-          docKind: hit.docKind ?? "",
-          mailFrom: hit.mailFrom ?? "",
-          mailDate: hit.mailDate ?? "",
-          mailFolder: hit.mailFolder ?? "",
-        });
-        const n = result.created;
-        if (n === 0 && result.skipped > 0) {
-          showKeepNotice("すでにキープ済み");
-        } else if (n === 0) {
-          showKeepNotice("キープする段落がありません");
-        } else {
-          showKeepNotice(
-            n === 1 ? "キープした" : `${n} 段落をキープした`,
+        const body = await resolveChatBody(opts);
+        if (!body.trim()) {
+          setActionError(
+            "本文が取れませんでした。プレビューを開いてから送ってください。",
           );
+          return;
+        }
+        const result = await attachToChat(
+          [
+            {
+              path: opts.path,
+              title: opts.title,
+              paragraphId: opts.paragraphId,
+              body,
+              query: query.trim(),
+              origin: "attach",
+            },
+          ],
+          opts.title.trim() || null,
+          threadId,
+        );
+        const dest = result.thread?.title?.trim() || "新しい会話";
+        if (result.added > 0) {
+          showKeepNotice(
+            result.createdThread
+              ? "新しいチャットに送った"
+              : `『${dest}』に追加した`,
+          );
+        } else if (result.skipped > 0) {
+          showKeepNotice("同じ出典がすでに読込前にあります");
+        } else {
+          showKeepNotice("本文が空のため送れませんでした");
         }
       } catch (e) {
         setActionError(String(e));
       }
     },
-    [query, showKeepNotice],
+    [query, resolveChatBody, showKeepNotice],
   );
 
   const showPreview = useCallback(
@@ -2140,27 +2299,59 @@ export default function Popup() {
             >
               <IconRescope />
             </button>
-            <button
-              type="button"
-              className="hit-action-btn"
-              title="この段落をノートにキープ"
-              aria-label="ノートにキープ"
-              onClick={() => {
+            <NoteDestPicker
+              buttonClassName="hit-action-btn"
+              title={
+                isOutlookHit(preview)
+                  ? "このメールをノートにキープ"
+                  : "この段落をノートにキープ"
+              }
+              ariaLabel="ノートにキープ"
+              onPick={(id) => {
                 const unit =
                   previewFile?.units.find((u) => u.id === previewUnitId) ??
                   preview;
-                void keepParagraph({
-                  paragraphId: unit.id,
-                  label: unit.unitLabel || "",
-                  page: unit.page,
-                  snippet: unit.snippet,
-                  body: unit.previewText,
-                  fileHit: preview,
-                });
+                void keepParagraph(
+                  {
+                    paragraphId: unit.id,
+                    label: unit.unitLabel || "",
+                    page: unit.page,
+                    snippet: unit.snippet,
+                    body: unit.previewText,
+                    fileHit: preview,
+                  },
+                  id,
+                );
               }}
             >
               <IconKeep />
-            </button>
+            </NoteDestPicker>
+            <ChatDestPicker
+              buttonClassName="hit-action-btn"
+              title={
+                isOutlookHit(preview)
+                  ? "このメールをチャットに送る"
+                  : "この段落をチャットに送る"
+              }
+              ariaLabel="チャットに送る"
+              onPick={(id) => {
+                const unit =
+                  previewFile?.units.find((u) => u.id === previewUnitId) ??
+                  preview;
+                void sendHitToChat(
+                  {
+                    paragraphId: unit.id,
+                    path: preview.path,
+                    title: preview.title,
+                    previewText: unit.previewText,
+                    snippet: unit.snippet,
+                  },
+                  id,
+                );
+              }}
+            >
+              <IconChat />
+            </ChatDestPicker>
           </div>
           {(previewFile?.matchIds.length ?? 0) > 1 ? (
             <div className="preview-occ-nav" aria-live="polite">
@@ -2324,52 +2515,86 @@ export default function Popup() {
                             : ""}
                         </div>
                       ) : null}
-                      {nestParagraphs ? (
+                      {mailHit ? (
+                        <ul className="hit-paragraphs">
+                          <HitUnitCard
+                            label=""
+                            snippet={hit.snippet}
+                            query={query}
+                            highlightTerms={hit.highlightTerms}
+                            previewTitle="このメールをプレビュー"
+                            onPreview={() => {
+                              setIndex(i);
+                              void showPreview(hit);
+                            }}
+                            onKeep={(id) => {
+                              void keepParagraph(
+                                {
+                                  paragraphId: hit.id,
+                                  label: hit.unitLabel || "メール",
+                                  page: hit.page,
+                                  snippet: hit.snippet,
+                                  body: hit.previewText,
+                                  fileHit: hit,
+                                },
+                                id,
+                              );
+                            }}
+                            onChat={(id) => {
+                              void sendHitToChat(
+                                {
+                                  paragraphId: hit.id,
+                                  path: hit.path,
+                                  title: hit.title,
+                                  previewText: hit.previewText,
+                                  snippet: hit.snippet,
+                                },
+                                id,
+                              );
+                            }}
+                          />
+                        </ul>
+                      ) : nestParagraphs ? (
                         <ul className="hit-paragraphs">
                           {(expandedParas[hit.path] ?? hit.paragraphs).map(
                             (p) => (
-                            <li key={p.id} className="hit-paragraph">
-                              <button
-                                type="button"
-                                className="hit-paragraph-btn"
-                                title="この段落をプレビュー"
-                                onClick={(e) => {
-                                  e.stopPropagation();
+                              <HitUnitCard
+                                key={p.id}
+                                label={p.label || "段落"}
+                                snippet={p.snippet}
+                                query={query}
+                                highlightTerms={hit.highlightTerms}
+                                previewTitle="この段落をプレビュー"
+                                onPreview={() => {
                                   setIndex(i);
                                   void previewParagraph(p.id, hit);
                                 }}
-                              >
-                                <span className="hit-paragraph-label">
-                                  {p.label || "段落"}
-                                </span>
-                                <span className="hit-paragraph-snippet">
-                                  {highlight(
-                                    p.snippet,
-                                    query,
-                                    hit.highlightTerms,
-                                  )}
-                                </span>
-                              </button>
-                              <button
-                                type="button"
-                                className="hit-paragraph-keep"
-                                title="ノートにキープ"
-                                aria-label="ノートにキープ"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  void keepParagraph({
-                                    paragraphId: p.id,
-                                    label: p.label,
-                                    page: p.page,
-                                    snippet: p.snippet,
-                                    fileHit: hit,
-                                  });
+                                onKeep={(id) => {
+                                  void keepParagraph(
+                                    {
+                                      paragraphId: p.id,
+                                      label: p.label,
+                                      page: p.page,
+                                      snippet: p.snippet,
+                                      fileHit: hit,
+                                    },
+                                    id,
+                                  );
                                 }}
-                              >
-                                <IconKeep />
-                              </button>
-                            </li>
-                          ))}
+                                onChat={(id) => {
+                                  void sendHitToChat(
+                                    {
+                                      paragraphId: p.id,
+                                      path: hit.path,
+                                      title: hit.title,
+                                      snippet: p.snippet,
+                                    },
+                                    id,
+                                  );
+                                }}
+                              />
+                            ),
+                          )}
                           {!expandedParas[hit.path] &&
                           (hit.matchCount ?? 0) >
                             (hit.paragraphs?.length ?? 0) ? (
@@ -2406,30 +2631,6 @@ export default function Popup() {
                       <button
                         type="button"
                         className="hit-action-btn"
-                        title="このファイルのヒット段落をキープ"
-                        aria-label="ファイルをキープ"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void keepFileMatches(hit);
-                        }}
-                      >
-                        <IconKeep />
-                      </button>
-                      <button
-                        type="button"
-                        className="hit-action-btn"
-                        title={mailHit ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
-                        aria-label={mailHit ? "メールを開く" : "ファイルを開く"}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void openSelected(hit.path);
-                        }}
-                      >
-                        <IconOpenFile />
-                      </button>
-                      <button
-                        type="button"
-                        className="hit-action-btn"
                         title="プレビュー (Ctrl+Enter)"
                         aria-label="プレビュー"
                         onClick={(e) => {
@@ -2443,14 +2644,14 @@ export default function Popup() {
                       <button
                         type="button"
                         className="hit-action-btn"
-                        title="このフォルダ内で再検索"
-                        aria-label="このフォルダ内で再検索"
+                        title={mailHit ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
+                        aria-label={mailHit ? "メールを開く" : "ファイルを開く"}
                         onClick={(e) => {
                           e.stopPropagation();
-                          rescopeToHitFolder(hit);
+                          void openSelected(hit.path);
                         }}
                       >
-                        <IconRescope />
+                        <IconOpenFile />
                       </button>
                       {!mailHit ? (
                         <button
@@ -2466,6 +2667,18 @@ export default function Popup() {
                           <IconFolder />
                         </button>
                       ) : null}
+                      <button
+                        type="button"
+                        className="hit-action-btn"
+                        title="このフォルダ内で再検索"
+                        aria-label="このフォルダ内で再検索"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          rescopeToHitFolder(hit);
+                        }}
+                      >
+                        <IconRescope />
+                      </button>
                     </div>
                   </li>
                 );
@@ -2552,22 +2765,35 @@ export default function Popup() {
             </button>
           </>
         )}
-        <button
-          type="button"
-          className="popup-settings-btn"
-          title="ノートを開く"
-          onClick={() => void openNotes()}
-        >
-          <IconNotes />
-          ノート
-        </button>
-        <button
-          type="button"
-          className="popup-settings-btn"
-          onClick={() => void openSettings()}
-        >
-          設定
-        </button>
+        <div className="popup-footer-windows">
+          <button
+            type="button"
+            className="popup-settings-btn"
+            title="チャット"
+            aria-label="チャット"
+            onClick={() => void openChat()}
+          >
+            <IconChat />
+          </button>
+          <button
+            type="button"
+            className="popup-settings-btn"
+            title="ノート"
+            aria-label="ノート"
+            onClick={() => void openNotes()}
+          >
+            <IconNotes />
+          </button>
+          <button
+            type="button"
+            className="popup-settings-btn"
+            title="設定"
+            aria-label="設定"
+            onClick={() => void openSettings()}
+          >
+            <IconSettings />
+          </button>
+        </div>
       </footer>
     </div>
   );

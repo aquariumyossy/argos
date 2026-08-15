@@ -1041,32 +1041,30 @@
   text-decoration-color: currentColor;
 }
 
-.popup-settings-btn {
+.popup-footer-windows {
   margin-left: auto;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font-size: 11px;
-  font-family: inherit;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  text-decoration-color: transparent;
-  cursor: pointer;
-  opacity: 0.7;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
 }
 
-.popup-settings-btn + .popup-settings-btn {
-  margin-left: 10px;
+.popup-settings-btn {
+  padding: 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.75;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .popup-settings-btn:hover {
   opacity: 1;
   color: var(--ink);
-  text-decoration-color: currentColor;
+  background: rgba(0, 0, 0, 0.04);
 }
 
 .preview {
