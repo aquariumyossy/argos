@@ -351,6 +351,114 @@
   opacity: 0.5;
 }
 
+.chat-tpl.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chat-scope {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.chat-scope-clear {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.chat-scope-clear:hover:not(:disabled) {
+  color: var(--danger);
+}
+
+/* Opens upward: the composer sits at the bottom of the window. */
+.chat-scope-picker {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: min(420px, 80vw);
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 22%);
+  padding: 6px;
+}
+
+.chat-scope-filter {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.85em;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+}
+
+.chat-scope-picker ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.chat-scope-picker li > button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.85em;
+  text-align: left;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.chat-scope-picker li > button:hover,
+.chat-scope-picker li > button[aria-selected="true"] {
+  background: var(--bg-hover, rgb(127 127 127 / 12%));
+}
+
+.chat-scope-picker li > button.scope-sub .chat-scope-label {
+  padding-left: 12px;
+  color: var(--muted);
+}
+
+.chat-scope-kind {
+  flex: none;
+  font-size: 0.85em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+.chat-scope-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-scope-empty {
+  color: var(--muted);
+  font-size: 0.85em;
+  padding: 6px;
+}
+
 .chat-char-meter {
   margin-left: auto;
   color: var(--muted);

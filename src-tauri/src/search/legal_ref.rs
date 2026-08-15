@@ -336,6 +336,35 @@ pub fn has_legal_ref(text: &str) -> bool {
     !find_legal_refs(text).is_empty()
 }
 
+/// Char ranges `[start, end)` of every citation in `text`.
+///
+/// Retrieval builds the citation clause from `legal_ref_cite_variants`, so the same
+/// characters must not also become free search units — that would inflate the
+/// `minimum_number_should_match` denominator with terms the citation clause already
+/// requires.
+pub fn legal_ref_spans(text: &str) -> Vec<(usize, usize)> {
+    find_legal_refs(text)
+        .into_iter()
+        .map(|r| (r.start, r.end))
+        .collect()
+}
+
+/// Replace every citation span with spaces, keeping char offsets stable.
+pub fn mask_legal_refs(text: &str) -> String {
+    let spans = legal_ref_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    for (start, end) in spans {
+        for slot in chars.iter_mut().take(end.min(len)).skip(start) {
+            *slot = ' ';
+        }
+    }
+    chars.into_iter().collect()
+}
+
 /// Just the citation strings (第555条 / 第五百五十五条 / …), not the surrounding query.
 /// These are meant to be tokenized and OR-ed as adjacent phrases.
 pub fn legal_ref_cite_variants(text: &str) -> Vec<String> {

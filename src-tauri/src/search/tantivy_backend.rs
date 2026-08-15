@@ -8,7 +8,7 @@ use lindera::segmenter::Segmenter;
 use lindera_tantivy::tokenizer::LinderaTokenizer;
 use parking_lot::Mutex;
 use tantivy::collector::{DocSetCollector, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
 };
@@ -17,9 +17,11 @@ use tantivy::{doc, DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Ta
 
 use crate::pathutil;
 
-use super::legal_ref::{has_legal_ref, legal_ref_cite_variants, normalize_legal_refs};
+use super::legal_ref::{
+    has_legal_ref, legal_ref_cite_variants, mask_legal_refs, normalize_legal_refs,
+};
 use super::morph::{is_noise_highlight_term, MorphAnalyzer};
-use super::{ParagraphHit, SearchBackend, SearchHit};
+use super::{ParagraphHit, SearchBackend, SearchHit, SearchOpts};
 
 /// Bump when Tantivy on-disk schema changes. Triggers wipe + full reindex.
 pub const INDEX_SCHEMA_VERSION: u32 = 5;
@@ -34,6 +36,28 @@ const MAIL_SCHEMA_VERSION_FILE: &str = "argos_mail_schema_version";
 const NESTED_PARAGRAPH_LIMIT: usize = 3;
 /// Collapse near-duplicate units in the same file (shared label / body overlap).
 const DEDUPE_BODY_OVERLAP: f32 = 0.45;
+
+/// `title` holds the file name only. It is a very short field, so BM25 length
+/// normalization makes one matching token outscore a body full of matches. Damp it
+/// without silencing it: case-law file names carry the court, case number and date.
+const TITLE_BOOST: f32 = 0.6;
+
+/// Rescore weights, applied as multipliers on BM25 so they follow the index scale.
+/// `coverage` is the share of query units found in the hit, so the score is monotone in
+/// the number of matched units — more matches can never rank lower.
+const W_COVERAGE: f32 = 1.5;
+const W_PROXIMITY: f32 = 1.0;
+/// `unit_label` is the paragraph heading (`第N条…` or the first 36 chars).
+const W_LABEL: f32 = 0.6;
+
+/// Share of query units a hit must match, tried in order. Precision mode starts strict
+/// and relaxes; the popup keeps its historical single-unit recall.
+const PRECISION_RATIOS: &[f32] = &[0.7, 0.5, 0.0];
+const RECALL_RATIOS: &[f32] = &[0.0];
+
+/// A retrieval query with the `minimum_number_should_match` it settled on. The ladder uses
+/// the minimum to skip rungs that would re-run an identical query.
+type BuiltQuery = (Box<dyn Query>, usize);
 
 /// Which on-disk index this backend owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +660,76 @@ impl TantivyBackend {
         per_token
     }
 
+    /// Index-tokenized search units for the free (unquoted) part of the query.
+    ///
+    /// One unit becomes one Should clause, so `minimum_number_should_match` counts words
+    /// and compounds rather than the two title/body alternatives of each word. Tokens
+    /// always come from the index tokenizer, so every Term exists in the inverted index.
+    fn search_units_for(
+        &self,
+        parsed: &ParsedQuery,
+        pos_filter: bool,
+        drop_intent: bool,
+    ) -> Result<Vec<Vec<String>>, String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for raw in &parsed.includes {
+            // `legal_cite_group` already requires these characters; letting them become
+            // free units too would inflate the minimum-should denominator.
+            let masked = if has_legal_ref(raw) {
+                mask_legal_refs(raw)
+            } else {
+                raw.clone()
+            };
+            let units = {
+                let morph = self.morph.lock();
+                morph.query_units(&masked, pos_filter, drop_intent)?
+            };
+            for unit in units {
+                let tokens = self.passage_tokens(&unit.text)?;
+                if tokens.is_empty() {
+                    continue;
+                }
+                if !seen.insert(tokens.join("\u{1}")) {
+                    continue;
+                }
+                out.push(tokens);
+            }
+        }
+        Ok(out)
+    }
+
+    /// One Should clause: an adjacency phrase for compounds, a term for single words.
+    /// `title` is damped because it is only the file name.
+    fn unit_clause(&self, tokens: &[String]) -> Option<Box<dyn Query>> {
+        if tokens.is_empty() {
+            return None;
+        }
+        let mut per_field: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for field in [self.fields.title, self.fields.body] {
+            let inner: Box<dyn Query> = if tokens.len() == 1 {
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, &tokens[0]),
+                    IndexRecordOption::WithFreqs,
+                ))
+            } else {
+                Box::new(PhraseQuery::new(
+                    tokens
+                        .iter()
+                        .map(|t| Term::from_field_text(field, t))
+                        .collect(),
+                ))
+            };
+            let scoped: Box<dyn Query> = if field == self.fields.title {
+                Box::new(BoostQuery::new(inner, TITLE_BOOST))
+            } else {
+                inner
+            };
+            per_field.push((Occur::Should, scoped));
+        }
+        Some(Box::new(BooleanQuery::new(per_field)))
+    }
+
     fn phrase_in_title_or_body(&self, tokens: &[String]) -> Option<Box<dyn Query>> {
         if tokens.is_empty() {
             return None;
@@ -684,42 +778,38 @@ impl TantivyBackend {
         Ok(Some(Box::new(BooleanQuery::new(shoulds))))
     }
 
+    /// Build the retrieval query, returning it with the Should minimum it ended up using.
+    ///
+    /// `min_should_ratio` is the share of search units a document must match. `0.0` means
+    /// one unit is enough, which is the historical behaviour used by the popup.
     fn build_parsed_query(
         &self,
         parsed: &ParsedQuery,
+        units: &[Vec<String>],
+        min_should_ratio: f32,
         pos_filter: bool,
         cite_required: bool,
-    ) -> Result<Option<Box<dyn Query>>, String> {
+    ) -> Result<Option<BuiltQuery>, String> {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        let mut should_units = 0usize;
+        let mut has_must = false;
 
-        for raw in &parsed.includes {
-            let tokens = self.content_tokens(raw, pos_filter)?;
-            for tok in &tokens {
-                // Flatten title/body Should into the parent query.
-                clauses.extend(self.term_in_title_or_body(tok));
-            }
-            // Passage match: exact morph token sequence (including particles) finds
-            // the selected sentence even when OR-of-content-tokens is too weak alone.
-            if raw.chars().count() >= 4 {
-                let passage = self.passage_tokens(raw)?;
-                if passage.len() >= 2 {
-                    if let Some(q) = self.phrase_in_title_or_body(&passage) {
-                        clauses.push((Occur::Should, q));
-                    }
-                }
+        for tokens in units {
+            if let Some(q) = self.unit_clause(tokens) {
+                clauses.push((Occur::Should, q));
+                should_units += 1;
             }
         }
 
         // Quoted phrases are left alone: quoting is a request for the exact spelling.
         if let Some(q) = self.legal_cite_group(parsed)? {
-            clauses.push((
-                if cite_required {
-                    Occur::Must
-                } else {
-                    Occur::Should
-                },
-                q,
-            ));
+            if cite_required {
+                clauses.push((Occur::Must, q));
+                has_must = true;
+            } else {
+                clauses.push((Occur::Should, q));
+                should_units += 1;
+            }
         }
 
         for phrase in &parsed.phrases {
@@ -727,6 +817,7 @@ impl TantivyBackend {
             if let Some(q) = self.phrase_in_title_or_body(&tokens) {
                 // Quoted phrases are required (Google-like).
                 clauses.push((Occur::Must, q));
+                has_must = true;
             }
         }
 
@@ -753,13 +844,60 @@ impl TantivyBackend {
         if clauses.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        // A citation or a quoted phrase is already the precise part of the query, so the
+        // remaining words only rank. Requiring them too turns 民法 第555条 into zero hits
+        // against a statute file whose articles never repeat the act's name.
+        //
+        // Tantivy also answers with an EmptyScorer when the minimum exceeds the number of
+        // Should clauses, and when the minimum is positive but there are none at all.
+        let min_should = if should_units == 0 || has_must {
+            0
+        } else {
+            (((should_units as f32) * min_should_ratio).ceil() as usize).clamp(1, should_units)
+        };
+        Ok(Some((
+            Box::new(BooleanQuery::with_minimum_required_clauses(
+                clauses, min_should,
+            )),
+            min_should,
+        )))
+    }
+
+    /// Surface strings of the query's search units, for chips and proximity scoring.
+    /// Compounds stay whole (裁判例, not 裁判 + 例).
+    fn unit_surfaces_for(
+        &self,
+        parsed: &ParsedQuery,
+        pos_filter: bool,
+        drop_intent: bool,
+        cite_norm: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for raw in &parsed.includes {
+            let raw = if cite_norm {
+                normalize_legal_refs(raw)
+            } else {
+                raw.clone()
+            };
+            let units = {
+                let morph = self.morph.lock();
+                morph.query_units(&raw, pos_filter, drop_intent)?
+            };
+            for unit in units {
+                if seen.insert(unit.text.clone()) {
+                    out.push(unit.text);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn highlight_terms_for(
         &self,
         parsed: &ParsedQuery,
         pos_filter: bool,
+        drop_intent: bool,
     ) -> Result<Vec<String>, String> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -772,13 +910,11 @@ impl TantivyBackend {
             }
             out.push(s);
         };
+        let units = self.unit_surfaces_for(parsed, pos_filter, drop_intent, false)?;
         for raw in &parsed.includes {
-            let tokens = self.content_tokens(raw, pos_filter)?;
-            // Prefer filtered morph tokens for chips. Keep the raw include only when
-            // it is itself a single content token (or POS filter is off).
-            if !pos_filter {
-                push(raw.clone());
-            } else if tokens.len() == 1 && tokens[0] == *raw {
+            // Keep the raw include only when it is itself a single unit (or POS filter
+            // is off), otherwise chips would repeat the whole sentence.
+            if !pos_filter || (units.len() == 1 && units[0] == *raw) {
                 push(raw.clone());
             }
             // Every spelling of the citation; `hit_from_doc` keeps only the one the
@@ -786,9 +922,9 @@ impl TantivyBackend {
             for cite in legal_ref_cite_variants(raw) {
                 push(cite);
             }
-            for tok in tokens {
-                push(tok);
-            }
+        }
+        for unit in units {
+            push(unit);
         }
         for phrase in &parsed.phrases {
             // Show the registered/quoted phrase as one chip; skip particle pieces.
@@ -802,6 +938,10 @@ impl TantivyBackend {
         Ok(out)
     }
 
+    /// Tokens for the overlap / compactness rescore. These are matched as plain
+    /// substrings of the candidate text, so compounds must stay whole — splitting 裁判例
+    /// into 裁判 and 例 would count one match as two and wreck the span measurement.
+    ///
     /// `cite_norm` folds every citation spelling to the Arabic form. The candidate
     /// text is normalized the same way, so 第五百五十五条 and 第555条 compare equal
     /// here even though the inverted index kept them apart.
@@ -809,22 +949,11 @@ impl TantivyBackend {
         &self,
         parsed: &ParsedQuery,
         pos_filter: bool,
+        drop_intent: bool,
         cite_norm: bool,
     ) -> Result<Vec<String>, String> {
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for raw in &parsed.includes {
-            let raw = if cite_norm {
-                normalize_legal_refs(raw)
-            } else {
-                raw.clone()
-            };
-            for tok in self.content_tokens(&raw, pos_filter)? {
-                if seen.insert(tok.clone()) {
-                    out.push(tok);
-                }
-            }
-        }
+        let mut out = self.unit_surfaces_for(parsed, pos_filter, drop_intent, cite_norm)?;
+        let mut seen: HashSet<String> = out.iter().cloned().collect();
         for phrase in &parsed.phrases {
             // Prefer the whole phrase string for proximity / overlap checks.
             if seen.insert(phrase.clone()) {
@@ -1058,6 +1187,39 @@ fn haystack_contains_phrase(haystack: &str, phrase: &str) -> bool {
     !phrase.is_empty() && haystack.contains(phrase)
 }
 
+/// How strongly the paragraph heading carries a query unit: `1.0` when the heading starts
+/// with it, `0.5` when it only mentions it, `0.0` otherwise.
+///
+/// `unit_label` is the leading `第N条…` for statutes and the first 36 characters
+/// otherwise, so it doubles as a heading for ordinary documents (`第3 争点`,
+/// `1 事実の概要`). A paragraph that *is* the article beats commentary that merely
+/// discusses it, and a heading always begins with its subject. Reads the stored field, so
+/// no reindex is involved.
+fn label_match_strength(unit_label: &str, tokens: &[String], cite_norm: bool) -> f32 {
+    let label = unit_label.trim();
+    if label.is_empty() || tokens.is_empty() {
+        return 0.0;
+    }
+    let hay: Cow<str> = if cite_norm {
+        Cow::Owned(normalize_legal_refs(label))
+    } else {
+        Cow::Borrowed(label)
+    };
+    let mut best = 0.0f32;
+    for t in tokens {
+        if t.chars().count() < 2 {
+            continue;
+        }
+        if hay.starts_with(t.as_str()) {
+            return 1.0;
+        }
+        if hay.contains(t.as_str()) {
+            best = best.max(0.5);
+        }
+    }
+    best
+}
+
 /// Char-index ranges `[start, end)` for every occurrence of `needle` in `hay`.
 fn find_occurrences(hay: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() {
@@ -1221,6 +1383,7 @@ impl TantivyBackend {
     /// Score-ranked chunk hits, optionally scoped by path prefix. Does not dedupe by path.
     /// When `exact_path` is set, AND a path TermQuery so all chunks of that file are retrieved.
     /// When `exts` is set, AND an extension TermQuery (OR across the list).
+    #[allow(clippy::too_many_arguments)]
     fn search_scored(
         &self,
         query: &str,
@@ -1229,6 +1392,7 @@ impl TantivyBackend {
         exts: Option<&[String]>,
         pos_filter_enabled: bool,
         exact_path: Option<&str>,
+        opts: SearchOpts,
     ) -> Result<Vec<(f32, SearchHit)>, String> {
         let q = query.trim();
         if q.is_empty() {
@@ -1243,14 +1407,20 @@ impl TantivyBackend {
         // A citation in the query means the article number is the point of the search;
         // require it so 第555条 is not buried under every chunk that mentions 民法.
         let cite_norm = parsed.includes.iter().any(|r| has_legal_ref(r));
-        let Some(tantivy_q) = self.build_parsed_query(&parsed, pos_filter_enabled, cite_norm)?
-        else {
-            return Ok(vec![]);
-        };
+        // Only the chat tool sends question sentences, and only those carry boilerplate.
+        // Words the user typed are meant literally, so nothing is dropped from them.
+        let drop_intent = opts.precision;
+        // Separating words with a space is a deliberate act: the user listed the terms a
+        // document should carry, so requiring most of them is what they asked for. A
+        // selected sentence has no separators and stays a single include, keeping the
+        // recall the popup depends on.
+        let require_most = opts.precision || parsed.includes.len() >= 2;
+        let units = self.search_units_for(&parsed, pos_filter_enabled, drop_intent)?;
 
-        let highlight_terms = self.highlight_terms_for(&parsed, pos_filter_enabled)?;
+        let highlight_terms =
+            self.highlight_terms_for(&parsed, pos_filter_enabled, drop_intent)?;
         let proximity_tokens =
-            self.proximity_tokens_for(&parsed, pos_filter_enabled, cite_norm)?;
+            self.proximity_tokens_for(&parsed, pos_filter_enabled, drop_intent, cite_norm)?;
         let scope = path_prefix
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1262,18 +1432,12 @@ impl TantivyBackend {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         eprintln!(
-            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exts={:?} exact_path={:?} pos_filter={}",
-            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, ext_filter, exact, pos_filter_enabled
+            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exts={:?} exact_path={:?} pos_filter={} precision={} require_most={}",
+            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, ext_filter, exact, pos_filter_enabled, opts.precision, require_most
         );
         eprintln!(
-            "argos: highlight_terms={:?} content_for_includes={:?}",
-            highlight_terms,
-            parsed
-                .includes
-                .iter()
-                .map(|r| self.content_tokens(r, pos_filter_enabled))
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap_or_default()
+            "argos: highlight_terms={:?} search_units={:?}",
+            highlight_terms, units
         );
 
         let wrap_filters = |inner: Box<dyn Query>| -> Box<dyn Query> {
@@ -1322,118 +1486,166 @@ impl TantivyBackend {
         } else {
             (limit * 2).max(40).min(200)
         };
-        let mut top = searcher
-            .search(&*wrap_filters(tantivy_q), &TopDocs::with_limit(fetch_n))
-            .map_err(|e| e.to_string())?;
-        eprintln!("argos: tantivy_raw_hits={}", top.len());
+        // Scope / extension / exclusion filters plus the proximity rescore. Runs per rung
+        // of the ladder, because `min_overlap` can reject everything retrieval found —
+        // `find_occurrences` compares characters exactly, so an ASCII term the index
+        // matched case-insensitively contributes no overlap here.
+        let rescore = |top: Vec<(f32, DocAddress)>,
+                       min_overlap: usize|
+         -> Result<Vec<(f32, SearchHit)>, String> {
+            let mut scored: Vec<(f32, SearchHit)> = Vec::new();
+            for (score, addr) in top {
+                let doc: TantivyDocument = searcher.doc(addr).map_err(|e| e.to_string())?;
+                let Some(mut hit) = self.hit_from_doc(score, &doc, q, &highlight_terms) else {
+                    continue;
+                };
+                if let Some(ref prefix) = scope {
+                    if let Some(folder) = prefix.strip_prefix("mailfolder:") {
+                        if self.kind != IndexKind::Mail {
+                            continue;
+                        }
+                        let folder = folder.trim();
+                        if !hit.mail_folder.eq_ignore_ascii_case(folder) {
+                            continue;
+                        }
+                    } else if crate::mail::is_outlook_path(&hit.path)
+                        || !pathutil::path_starts_with(&hit.path, prefix)
+                    {
+                        continue;
+                    }
+                }
+                if let Some(ref list) = ext_filter {
+                    let hit_ext = super::path_extension(&hit.path);
+                    if !list.iter().any(|e| e == &hit_ext) {
+                        continue;
+                    }
+                }
+                let haystack = format!("{} {}", hit.title, hit.preview_text);
 
-        // Nothing carries that citation in any spelling: fall back to the ordinary
-        // free-word search rather than returning nothing.
-        if top.is_empty() && cite_norm {
-            if let Some(relaxed_q) = self.build_parsed_query(&parsed, pos_filter_enabled, false)? {
-                top = searcher
-                    .search(&*wrap_filters(relaxed_q), &TopDocs::with_limit(fetch_n))
-                    .map_err(|e| e.to_string())?;
-                eprintln!("argos: cite_must_empty -> cite_should hits={}", top.len());
+                // Exclusions stay on the original text: `-第五百五十五条` means that spelling.
+                if parsed
+                    .exclude_phrases
+                    .iter()
+                    .any(|p| haystack_contains_phrase(&haystack, p))
+                {
+                    continue;
+                }
+
+                let prox_hay: Cow<str> = if cite_norm {
+                    Cow::Owned(normalize_legal_refs(&haystack))
+                } else {
+                    Cow::Borrowed(haystack.as_str())
+                };
+                let (overlap, span) = if proximity_tokens.is_empty() {
+                    (0, 1)
+                } else {
+                    proximity_span(&prox_hay, &proximity_tokens)
+                };
+                if min_overlap > 0 && overlap < min_overlap {
+                    continue;
+                }
+                let compact = if proximity_tokens.is_empty() {
+                    1.0
+                } else {
+                    compactness_score(&proximity_tokens, &prox_hay, span)
+                };
+                // Multipliers on BM25, so the boost follows the index scale instead of a
+                // fixed constant, and the score is monotone in `overlap`: matching more of
+                // the query can never rank a hit lower. Compactness only sweetens a match
+                // that is already broad, it cannot outweigh coverage.
+                let coverage = if proximity_tokens.is_empty() {
+                    0.0
+                } else {
+                    (overlap as f32) / (proximity_tokens.len() as f32)
+                };
+                let label_bonus =
+                    W_LABEL * label_match_strength(&hit.unit_label, &proximity_tokens, cite_norm);
+                let combined = score
+                    * (1.0 + W_COVERAGE * coverage + W_PROXIMITY * coverage * compact + label_bonus);
+                hit.score = combined;
+                scored.push((combined, hit));
             }
-        }
-
-        // POS-filtered TermQuery can miss when the inverted index lacks those exact
-        // surfaces (tokenizer drift / partial index) even though the stored body
-        // contains the nouns. Fall back to a looser retrieval query, then keep the
-        // content proximity filter so chips stay on 光景 / 見慣れ — not そうした / い.
-        let mut used_loose_retrieval = false;
-        if top.is_empty() && pos_filter_enabled && !proximity_tokens.is_empty() {
-            if let Some(loose_q) = self.build_parsed_query(&parsed, false, false)? {
-                top = searcher
-                    .search(&*wrap_filters(loose_q), &TopDocs::with_limit(fetch_n))
-                    .map_err(|e| e.to_string())?;
-                used_loose_retrieval = true;
-                eprintln!(
-                    "argos: pos_filter_raw_empty -> loose_retrieval hits={}",
-                    top.len()
-                );
-            }
-        }
-
-        // Phrase-only: require the phrase string; free tokens keep half-overlap rule.
-        // With POS filtering, tokens are already contentful — requiring half of them
-        // drops useful noun-only hits (e.g. query has 光景+見慣れ but a doc only has 光景).
-        // Loose retrieval must still require a content-term substring overlap.
-        let min_overlap = if proximity_tokens.is_empty() {
-            0
-        } else if parsed.includes.is_empty() {
-            proximity_tokens.len().min(1)
-        } else if pos_filter_enabled || used_loose_retrieval {
-            1
-        } else {
-            ((proximity_tokens.len() + 1) / 2).max(1)
+            Ok(scored)
         };
 
-        let mut scored: Vec<(f32, SearchHit)> = Vec::new();
-        for (score, addr) in top {
-            let doc: TantivyDocument = searcher.doc(addr).map_err(|e| e.to_string())?;
-            let Some(mut hit) = self.hit_from_doc(score, &doc, q, &highlight_terms) else {
-                continue;
-            };
-            if let Some(ref prefix) = scope {
-                if let Some(folder) = prefix.strip_prefix("mailfolder:") {
-                    if self.kind != IndexKind::Mail {
-                        continue;
-                    }
-                    let folder = folder.trim();
-                    if !hit.mail_folder.eq_ignore_ascii_case(folder) {
-                        continue;
-                    }
-                } else if crate::mail::is_outlook_path(&hit.path) {
-                    continue;
-                } else if !pathutil::path_starts_with(&hit.path, prefix) {
-                    continue;
-                }
+        // Post-filter strength follows what the rung actually required. Ratio 0 keeps the
+        // historical rules: one content token is enough under POS filtering, half of them
+        // otherwise (the popup searches whole selected sentences).
+        let min_overlap_for = |ratio: f32, loose: bool| -> usize {
+            let n = proximity_tokens.len();
+            if n == 0 {
+                0
+            } else if parsed.includes.is_empty() {
+                n.min(1)
+            } else if ratio > 0.0 {
+                (((n as f32) * ratio).ceil() as usize).clamp(1, n)
+            } else if pos_filter_enabled || loose {
+                1
+            } else {
+                n.div_ceil(2).max(1)
             }
-            if let Some(ref list) = ext_filter {
-                let hit_ext = super::path_extension(&hit.path);
-                if !list.iter().any(|e| e == &hit_ext) {
-                    continue;
-                }
-            }
-            let haystack = format!("{} {}", hit.title, hit.preview_text);
+        };
 
-            // Exclusions stay on the original text: `-第五百五十五条` means that spelling.
-            if parsed
-                .exclude_phrases
-                .iter()
-                .any(|p| haystack_contains_phrase(&haystack, p))
-            {
-                continue;
-            }
+        // Retrieval ladder: try the strictest share of search units first and relax until
+        // something survives the rescore. The last rung reproduces the historical query,
+        // so a stricter rung can only ever return fewer hits — never zero where the old
+        // behaviour returned some.
+        let ratios = if require_most {
+            PRECISION_RATIOS
+        } else {
+            RECALL_RATIOS
+        };
+        // Compounds are adjacency phrases. If nothing matches them, split them into
+        // single terms as a last resort so a partial word still finds something.
+        let flat_units: Vec<Vec<String>> = units
+            .iter()
+            .flat_map(|u| u.iter().map(|t| vec![t.clone()]))
+            .collect();
 
-            let prox_hay: Cow<str> = if cite_norm {
-                Cow::Owned(normalize_legal_refs(&haystack))
-            } else {
-                Cow::Borrowed(haystack.as_str())
+        // Skip rungs that would re-run an identical query (a Must clause collapses every
+        // ratio to the same minimum).
+        let mut last_sig: Option<(usize, bool, bool)> = None;
+        for stage in 0..(ratios.len() + 2) {
+            let (stage_units, ratio, loose) = match stage {
+                s if s < ratios.len() => (&units, ratios[s], false),
+                // Same units, but let the citation be optional.
+                s if s == ratios.len() => (&units, 0.0, false),
+                _ => (&flat_units, 0.0, true),
             };
-            let (overlap, span) = if proximity_tokens.is_empty() {
-                (0, 1)
-            } else {
-                proximity_span(&prox_hay, &proximity_tokens)
+            let cite_required = cite_norm && stage < ratios.len();
+            if stage > ratios.len() && flat_units.len() == units.len() {
+                break; // No compounds to split; the previous rung already covered this.
+            }
+            let Some((tantivy_q, min_should)) = self.build_parsed_query(
+                &parsed,
+                stage_units,
+                ratio,
+                pos_filter_enabled,
+                cite_required,
+            )?
+            else {
+                continue;
             };
-            if min_overlap > 0 && overlap < min_overlap {
+            let sig = (min_should, cite_required, loose);
+            if last_sig == Some(sig) {
                 continue;
             }
-            let compact = if proximity_tokens.is_empty() {
-                1.0
-            } else {
-                compactness_score(&proximity_tokens, &prox_hay, span)
-            };
-            // Prefer many matches that appear close together (contract-friendly).
-            let combined = (overlap as f32) * 10.0 * compact + score;
-            hit.score = combined;
-            scored.push((combined, hit));
+            last_sig = Some(sig);
+            let top = searcher
+                .search(&*wrap_filters(tantivy_q), &TopDocs::with_limit(fetch_n))
+                .map_err(|e| e.to_string())?;
+            let effective_ratio = if min_should == 0 { 0.0 } else { ratio };
+            let mut scored = rescore(top, min_overlap_for(effective_ratio, loose))?;
+            eprintln!(
+                "argos: retrieval stage={stage} min_should={min_should} cite_required={cite_required} kept={}",
+                scored.len()
+            );
+            if !scored.is_empty() {
+                scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+                return Ok(scored);
+            }
         }
-
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        Ok(scored)
+        Ok(Vec::new())
     }
 
     /// All matching chunks for one file, ordered by chunk_id (for preview navigation).
@@ -1448,12 +1660,26 @@ impl TantivyBackend {
         if path.is_empty() {
             return Ok(vec![]);
         }
-        let mut scored =
-            self.search_scored(query, limit, None, None, pos_filter_enabled, Some(path))?;
+        let mut scored = self.search_scored(
+            query,
+            limit,
+            None,
+            None,
+            pos_filter_enabled,
+            Some(path),
+            SearchOpts::default(),
+        )?;
         // Fallback if TermQuery missed due to path normalization drift: prefix scope.
         if scored.is_empty() {
-            scored =
-                self.search_scored(query, limit, Some(path), None, pos_filter_enabled, None)?;
+            scored = self.search_scored(
+                query,
+                limit,
+                Some(path),
+                None,
+                pos_filter_enabled,
+                None,
+                SearchOpts::default(),
+            )?;
             scored.retain(|(_, hit)| {
                 pathutil::simplify_windows_path(&hit.path)
                     .eq_ignore_ascii_case(&pathutil::simplify_windows_path(path))
@@ -1709,6 +1935,25 @@ impl SearchBackend for TantivyBackend {
         exts: Option<&[String]>,
         pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
+        self.search_opts(
+            query,
+            limit,
+            path_prefix,
+            exts,
+            pos_filter_enabled,
+            SearchOpts::default(),
+        )
+    }
+
+    fn search_opts(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+        exts: Option<&[String]>,
+        pos_filter_enabled: bool,
+        opts: SearchOpts,
+    ) -> Result<Vec<SearchHit>, String> {
         // Unit budget ≈ pre-paragraph TopDocs size so nesting does not explode fetch_n.
         // search_scored applies only a mild over-fetch on top of this.
         let unit_limit = (limit * 8).max(40);
@@ -1719,6 +1964,7 @@ impl SearchBackend for TantivyBackend {
             exts,
             pos_filter_enabled,
             None,
+            opts,
         )?;
 
         // Group by path; scored is already best-score-first.
@@ -1733,6 +1979,9 @@ impl SearchBackend for TantivyBackend {
             groups.entry(path).or_default().push(hit);
         }
 
+        // `per_file_units` returns paragraphs directly. A statute file holds hundreds of
+        // articles and a long contract many clauses, so collapsing to one unit per file
+        // would hide everything but the single best match.
         let mut hits: Vec<SearchHit> = Vec::new();
         for path in order {
             let Some(mut units) = groups.remove(&path) else {
@@ -1760,13 +2009,22 @@ impl SearchBackend for TantivyBackend {
                     page: u.page,
                 })
                 .collect();
-            let mut best = units.into_iter().next().expect("non-empty");
-            best.match_count = match_count;
-            best.paragraphs = paragraphs;
-            hits.push(best);
+            let take = opts.per_file_units.unwrap_or(1).max(1);
+            for mut unit in units.into_iter().take(take) {
+                unit.match_count = match_count;
+                unit.paragraphs = paragraphs.clone();
+                hits.push(unit);
+                if hits.len() >= limit {
+                    break;
+                }
+            }
             if hits.len() >= limit {
                 break;
             }
+        }
+        // Per-file fan-out can order paragraphs behind a weaker file's best unit.
+        if opts.per_file_units.is_some() {
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
         }
         eprintln!(
             "argos: final_hits={} sample_terms={:?}",
@@ -1829,6 +2087,63 @@ mod tests {
         let p = parse_query_syntax("契約-慰謝料");
         assert_eq!(p.includes, vec!["契約-慰謝料"]);
         assert!(p.excludes.is_empty());
+    }
+
+    /// Documents how `Mode::Decompose` splits domain compounds, which is why a query unit
+    /// has to become an adjacency phrase rather than an OR of its pieces.
+    #[test]
+    fn compound_queries_become_adjacency_units() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-units-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
+        for probe in ["裁判例", "損害賠償", "業務委託契約", "第555条"] {
+            eprintln!("{probe} -> {:?}", backend.tokenize_ja(probe).unwrap());
+        }
+
+        let parsed = parse_query_syntax("この件に関する裁判例を調べて");
+        let units = backend.search_units_for(&parsed, true, true).unwrap();
+        eprintln!("units={units:?}");
+        assert!(
+            units.iter().any(|u| u.concat() == "裁判例"),
+            "裁判例 must survive as one unit: {units:?}"
+        );
+        assert!(
+            !units.iter().any(|u| u.concat() == "件"),
+            "question boilerplate must be dropped in precision mode: {units:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A citation is enforced by `legal_cite_group`, so it must not also become a free
+    /// unit — that would double-count it in the minimum-should denominator.
+    #[test]
+    fn citation_is_not_also_a_free_unit() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-tantivy-cite-unit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let backend = TantivyBackend::open(&dir).expect("open index").backend;
+        let parsed = parse_query_syntax("民法第555条の内容を教えて");
+        let units = backend.search_units_for(&parsed, true, true).unwrap();
+        eprintln!("units={units:?}");
+        assert!(units.iter().any(|u| u.concat() == "民法"));
+        assert!(
+            !units.iter().any(|u| u.concat().contains("555")),
+            "citation chars are masked out of free units: {units:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2399,6 +2714,262 @@ mod tests {
             hits[0].path.contains("memo"),
             "a date must not be read as 第15条: {:?}",
             hits[0].path
+        );
+    }
+
+    fn llm_opts() -> SearchOpts {
+        SearchOpts::for_llm(3)
+    }
+
+    /// A compound must not decay into an OR of its pieces: 裁判例 is indexed as adjacent
+    /// 裁判 / 例, so a document that only says 例 has to stay out.
+    #[test]
+    fn compound_query_excludes_partial_token_noise() {
+        let idx = TestIndex::new("compound-noise");
+        idx.add(
+            "guide",
+            "記載例を示す。例として次の書式を用いる。作成例は別紙のとおりであり、例外も列挙する。",
+        );
+        idx.add(
+            "hanrei",
+            "同種の裁判例では、契約の解除が認められている。裁判例の傾向を整理する。",
+        );
+
+        let hits = idx
+            .backend
+            .search_opts("この件に関する裁判例を調べて", 10, None, None, true, llm_opts())
+            .expect("search");
+        assert!(!hits.is_empty(), "裁判例 must match the case-law document");
+        assert!(
+            hits.iter().all(|h| !h.path.contains("guide")),
+            "a document matching only 例 must not be returned: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// The score must be monotone in the number of matched units. The old additive form
+    /// let a one-word hit with perfect compactness beat a three-word hit.
+    #[test]
+    fn more_matched_units_score_higher() {
+        let idx = TestIndex::new("score-monotonic");
+        idx.add(
+            "one",
+            "解雇に関する社内規程の運用について、担当部門の記録を残す。",
+        );
+        idx.add(
+            "three",
+            "解雇の有効性が争われた裁判例では、就業規則の周知が重視された。",
+        );
+
+        let hits = idx
+            .backend
+            .search_opts("解雇 有効性 裁判例", 10, None, None, true, llm_opts())
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].path.contains("three"),
+            "the hit matching all three units must rank first: {:?}",
+            hits.iter().map(|h| (&h.path, h.score)).collect::<Vec<_>>()
+        );
+    }
+
+    /// A statute file is one file with many articles. Collapsing it to a single unit
+    /// would hide every article but the best-scoring one.
+    #[test]
+    fn per_file_units_returns_several_paragraphs_of_one_file() {
+        let idx = TestIndex::new("per-file-units");
+        // Each article must clear `UNIT_MIN_CHARS` or the blocks merge into one unit, and
+        // the wording must differ or `dedupe_path_units` collapses them as near-copies.
+        let articles = [
+            "第1条　催告による解除について定める。債権者が相当の期間を定めて履行を請求し、\
+             その期間内に履行がないときは、解除の意思表示をすることができる。",
+            "第2条　無催告解除が認められる場合を列挙する。履行が不能となったとき、\
+             債務者が明確に拒絶したとき、定期行為の時期を過ぎたときは直ちに解除できる。",
+            "第3条　解除の効果として原状回復の義務を負う。すでに給付を受けた当事者は\
+             相手方を元の状態に復させ、金銭には受領の時からの利息を付する。",
+            "第4条　解除権の行使期間と消滅を定める。権利者が長期間これを行使しないとき、\
+             相手方は期間を定めて確答を求めることができ、返答がなければ解除権は失われる。",
+            "第5条　当事者が複数あるときの解除の取扱いを明らかにする。権利は全員から\
+             全員に対してのみ行使でき、一人について消滅したときは全員について消滅する。",
+            "第6条　解除と損害賠償との関係を確認的に述べる。契約を終了させたことは、\
+             債務の不履行によって生じた損害の賠償を請求することを妨げるものではない。",
+        ];
+        let mut body = String::new();
+        for a in articles {
+            body.push_str(a);
+            body.push_str("\n\n");
+        }
+        idx.add("civil", &body);
+
+        let one = idx
+            .backend
+            .search("解除", 10, None, None, true)
+            .expect("search");
+        assert_eq!(one.len(), 1, "default retrieval aggregates to one unit/file");
+        assert!(one[0].match_count > 1, "match_count reports the rest");
+
+        let many = idx
+            .backend
+            .search_opts("解除", 10, None, None, true, llm_opts())
+            .expect("search opts");
+        assert!(
+            many.len() > 1,
+            "LLM retrieval must return several paragraphs of the same file: {}",
+            many.len()
+        );
+        assert!(
+            many.len() <= 3,
+            "but no more than the per-file cap: {}",
+            many.len()
+        );
+        let ids: HashSet<&str> = many.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids.len(), many.len(), "returned units must be distinct");
+    }
+
+    /// `unit_label` is the paragraph heading. A hit whose heading is the thing asked
+    /// about beats one that merely mentions it in passing — no reindex involved.
+    #[test]
+    fn heading_match_outranks_passing_mention() {
+        let idx = TestIndex::new("label-bonus");
+        idx.add(
+            "commentary",
+            "解説として、第五百五十五条の趣旨を他の条文と比較しつつ長めに論じる。\
+             ここでは制度の沿革と学説の対立、実務上の運用まで幅広く触れておく。",
+        );
+        idx.add(
+            "civil",
+            "第五百五十五条　売買は、当事者の一方がある財産権を相手方に移転することを約し、\
+             相手方がこれに対してその代金を支払うことを約することによって、その効力を生ずる。",
+        );
+
+        let hits = idx
+            .backend
+            .search_opts("民法 第555条", 10, None, None, true, llm_opts())
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].path.contains("civil"),
+            "the article itself must outrank commentary about it: {:?}",
+            hits.iter().map(|h| (&h.path, h.score)).collect::<Vec<_>>()
+        );
+    }
+
+    /// `minimum_number_should_match` yields an EmptyScorer when the minimum is positive
+    /// but no Should clause exists. A quoted-only query is all Must, so it must clamp to 0.
+    #[test]
+    fn quoted_only_query_still_matches() {
+        let idx = TestIndex::new("quoted-only");
+        idx.add("contract", "本売買契約は、甲乙間の合意により成立する。");
+
+        let hits = idx
+            .backend
+            .search_opts("\"売買契約\"", 10, None, None, true, llm_opts())
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "a phrase-only query must not be clamped into an empty scorer"
+        );
+    }
+
+    /// Precision mode must not regress the popup, whose queries are whole selected
+    /// sentences and where one matching noun is a useful hit.
+    #[test]
+    fn recall_mode_keeps_single_unit_hits() {
+        let idx = TestIndex::new("recall-mode");
+        idx.add("scene", "この光景は印象的だった。");
+
+        let hits = idx
+            .backend
+            .search("そうした光景を見慣れています", 10, None, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "the popup path must keep matching on a single noun"
+        );
+    }
+
+    /// Typing words separated by a space is a deliberate list, so the popup requires most
+    /// of them. A selected sentence has no separators and must stay loose.
+    #[test]
+    fn spaced_words_are_and_but_a_sentence_stays_or() {
+        let idx = TestIndex::new("spaced-and");
+        idx.add(
+            "partial",
+            "解雇に関する社内規程の運用について、担当部門が保管する記録の一覧を示す。",
+        );
+        idx.add(
+            "both",
+            "解雇の有効性が争われた事案について、就業規則の周知の程度が検討された。",
+        );
+
+        let spaced = idx
+            .backend
+            .search("解雇 有効性", 10, None, None, true)
+            .expect("spaced");
+        assert!(!spaced.is_empty());
+        assert!(
+            spaced.iter().all(|h| !h.path.contains("partial")),
+            "a spaced query must require both words: {:?}",
+            spaced.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+
+        // No separator: one include, so the historical single-unit recall applies.
+        let sentence = idx
+            .backend
+            .search("解雇の有効性について", 10, None, None, true)
+            .expect("sentence");
+        assert!(
+            sentence.iter().any(|h| h.path.contains("partial")),
+            "a pasted sentence must keep matching on one noun: {:?}",
+            sentence.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// The strictest rung may retrieve documents that the `min_overlap` post-filter then
+    /// rejects. The ladder has to relax on the *kept* count, or the query returns nothing
+    /// where the old single-word rule returned a hit.
+    #[test]
+    fn ladder_relaxes_when_the_post_filter_rejects_everything() {
+        let idx = TestIndex::new("ladder-relax");
+        // The index lowercases ASCII, so retrieval matches `PDF`; the proximity filter
+        // compares characters exactly and does not.
+        idx.add(
+            "spec",
+            "契約書の提出方法について、pdf 形式での提出を求める旨をここに定める。",
+        );
+
+        let hits = idx
+            .backend
+            .search("契約書 PDF", 10, None, None, true)
+            .expect("search");
+        assert!(
+            !hits.is_empty(),
+            "a term that only the index can match must not empty the result set"
+        );
+    }
+
+    /// Excludes and quoted phrases must survive the restructured ladder.
+    #[test]
+    fn spaced_query_still_honours_exclusions() {
+        let idx = TestIndex::new("spaced-exclude");
+        idx.add(
+            "damages",
+            "解雇の有効性を争う事案において、慰謝料の請求も併せて行われた。",
+        );
+        idx.add(
+            "rules",
+            "解雇の有効性について、就業規則の周知の程度が問題となった事案である。",
+        );
+
+        let hits = idx
+            .backend
+            .search("解雇 有効性 -慰謝料", 10, None, None, true)
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|h| !h.path.contains("damages")),
+            "excluded term must still remove the document: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
         );
     }
 }

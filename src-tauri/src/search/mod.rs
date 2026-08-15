@@ -68,6 +68,29 @@ pub struct ParagraphHit {
     pub page: Option<u32>,
 }
 
+/// Retrieval tuning that differs between the popup and the LLM tool.
+///
+/// The popup searches a sentence the user selected and wants recall: one matching noun
+/// is a useful hit. The LLM tool asks a question and wants precision, and it needs
+/// paragraph-level results because a statute file holds hundreds of articles.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOpts {
+    /// Require a share of the query's search units to match, and drop question boilerplate.
+    pub precision: bool,
+    /// `Some(n)`: return units directly, at most `n` per file. `None`: one best unit per file.
+    pub per_file_units: Option<usize>,
+}
+
+impl SearchOpts {
+    /// Settings used by the chat tool.
+    pub fn for_llm(per_file_units: usize) -> Self {
+        Self {
+            precision: true,
+            per_file_units: Some(per_file_units.max(1)),
+        }
+    }
+}
+
 pub trait SearchBackend: Send + Sync {
     fn search(
         &self,
@@ -77,6 +100,21 @@ pub trait SearchBackend: Send + Sync {
         exts: Option<&[String]>,
         pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String>;
+
+    /// Backends that cannot honour `opts` fall back to the default retrieval.
+    fn search_opts(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+        exts: Option<&[String]>,
+        pos_filter_enabled: bool,
+        opts: SearchOpts,
+    ) -> Result<Vec<SearchHit>, String> {
+        let _ = opts;
+        self.search(query, limit, path_prefix, exts, pos_filter_enabled)
+    }
+
     fn preview(&self, hit_id: &str) -> Result<Option<SearchHit>, String>;
 }
 
@@ -207,6 +245,36 @@ pub fn run_search(
     exts: Option<&[String]>,
     user_dict: &UserDictMatcher,
 ) -> Result<Vec<SearchHit>, String> {
+    run_search_with_opts(
+        settings,
+        local,
+        mail,
+        query,
+        limit,
+        path_prefix,
+        exts,
+        user_dict,
+        SearchOpts::default(),
+    )
+}
+
+/// `run_search` with retrieval tuning.
+///
+/// `opts` only reaches backends this process owns. Remote and hybrid file search keeps
+/// the default retrieval, because mixing paragraph-level local hits with file-level
+/// remote hits would make the merged ranking meaningless.
+#[allow(clippy::too_many_arguments)]
+pub fn run_search_with_opts(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    query: &str,
+    limit: usize,
+    path_prefix: Option<&str>,
+    exts: Option<&[String]>,
+    user_dict: &UserDictMatcher,
+    opts: SearchOpts,
+) -> Result<Vec<SearchHit>, String> {
     let rewritten = apply_user_dictionary(query, user_dict);
     let pos_filter = settings.pos_filter_enabled;
     match settings.search_mode.as_str() {
@@ -226,6 +294,7 @@ pub fn run_search(
                     path_prefix,
                     exts,
                     pos_filter,
+                    opts,
                 );
             }
             let remote = RemoteArgosBackend::from_settings(settings)?;
@@ -233,7 +302,14 @@ pub fn run_search(
             // Mail index is local-only; merge when unscoped (or mailfolder handled above).
             if should_query_mail(settings, path_prefix, exts) {
                 if let Some(mail_be) = mail {
-                    let mail_hits = mail_be.search(&rewritten, limit, None, None, pos_filter)?;
+                    let mail_hits = mail_be.search_opts(
+                        &rewritten,
+                        limit,
+                        None,
+                        None,
+                        pos_filter,
+                        mail_opts(opts),
+                    )?;
                     hits = merge_hits_by_score(hits, mail_hits, limit);
                 }
             }
@@ -255,6 +331,7 @@ pub fn run_search(
                     path_prefix,
                     exts,
                     pos_filter,
+                    opts,
                 );
             }
             let remote = RemoteArgosBackend::from_settings(settings)?;
@@ -269,7 +346,14 @@ pub fn run_search(
             )?;
             if should_query_mail(settings, path_prefix, exts) {
                 if let Some(mail_be) = mail {
-                    let mail_hits = mail_be.search(&rewritten, limit, None, None, pos_filter)?;
+                    let mail_hits = mail_be.search_opts(
+                        &rewritten,
+                        limit,
+                        None,
+                        None,
+                        pos_filter,
+                        mail_opts(opts),
+                    )?;
                     hits = merge_hits_by_score(hits, mail_hits, limit);
                 }
             }
@@ -284,7 +368,16 @@ pub fn run_search(
             path_prefix,
             exts,
             pos_filter,
+            opts,
         ),
+    }
+}
+
+/// One email is one unit, so paragraph-level fan-out only duplicates long messages.
+fn mail_opts(opts: SearchOpts) -> SearchOpts {
+    SearchOpts {
+        precision: opts.precision,
+        per_file_units: None,
     }
 }
 
@@ -303,6 +396,7 @@ fn should_query_mail(
     exts.map(|e| e.is_empty()).unwrap_or(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_local_with_mail(
     settings: &Settings,
     local: &TantivyBackend,
@@ -312,6 +406,7 @@ fn search_local_with_mail(
     path_prefix: Option<&str>,
     exts: Option<&[String]>,
     pos_filter: bool,
+    opts: SearchOpts,
 ) -> Result<Vec<SearchHit>, String> {
     let prefix = path_prefix.map(str::trim).filter(|s| !s.is_empty());
     if let Some(p) = prefix {
@@ -322,20 +417,21 @@ fn search_local_with_mail(
             let Some(mail_be) = mail else {
                 return Ok(Vec::new());
             };
-            return mail_be.search(query, limit, Some(p), None, pos_filter);
+            return mail_be.search_opts(query, limit, Some(p), None, pos_filter, mail_opts(opts));
         }
         // Filesystem scope: files only.
-        return local.search(query, limit, Some(p), exts, pos_filter);
+        return local.search_opts(query, limit, Some(p), exts, pos_filter, opts);
     }
 
-    let file_hits = local.search(query, limit, None, exts, pos_filter)?;
+    let file_hits = local.search_opts(query, limit, None, exts, pos_filter, opts)?;
     if !should_query_mail(settings, None, exts) {
         return Ok(file_hits);
     }
     let Some(mail_be) = mail else {
         return Ok(file_hits);
     };
-    let mail_hits = mail_be.search(query, limit, None, None, pos_filter)?;
+    let mail_hits =
+        mail_be.search_opts(query, limit, None, None, pos_filter, mail_opts(opts))?;
     Ok(merge_hits_by_score(file_hits, mail_hits, limit))
 }
 
@@ -361,12 +457,63 @@ pub fn run_search_with_mail_options(
     exts: Option<&[String]>,
     user_dict: &UserDictMatcher,
 ) -> Result<Vec<SearchHit>, String> {
+    run_search_with_mail_opts(
+        settings,
+        local,
+        mail,
+        query,
+        limit,
+        path_prefix,
+        exts,
+        user_dict,
+        SearchOpts::default(),
+    )
+}
+
+/// Retrieval for the chat tool: precision-first, paragraph-level.
+#[allow(clippy::too_many_arguments)]
+pub fn run_search_precise(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    query: &str,
+    limit: usize,
+    path_prefix: Option<&str>,
+    exts: Option<&[String]>,
+    user_dict: &UserDictMatcher,
+    per_file_units: usize,
+) -> Result<Vec<SearchHit>, String> {
+    run_search_with_mail_opts(
+        settings,
+        local,
+        mail,
+        query,
+        limit,
+        path_prefix,
+        exts,
+        user_dict,
+        SearchOpts::for_llm(per_file_units),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_search_with_mail_opts(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    query: &str,
+    limit: usize,
+    path_prefix: Option<&str>,
+    exts: Option<&[String]>,
+    user_dict: &UserDictMatcher,
+    opts: SearchOpts,
+) -> Result<Vec<SearchHit>, String> {
     let fetch = if settings.mail_thread_collapse {
         (limit * 3).max(limit)
     } else {
         limit
     };
-    let mut hits = run_search(
+    let mut hits = run_search_with_opts(
         settings,
         local,
         mail,
@@ -375,11 +522,12 @@ pub fn run_search_with_mail_options(
         path_prefix,
         exts,
         user_dict,
+        opts,
     )?;
     if settings.mail_thread_collapse {
         hits = collapse_email_threads(hits);
-        hits.truncate(limit);
     }
+    hits.truncate(limit);
     Ok(hits)
 }
 

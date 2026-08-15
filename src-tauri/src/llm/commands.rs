@@ -94,11 +94,19 @@ async fn execute_tool_off_runtime(
     thread_id: String,
     name: String,
     arguments: String,
+    thread_scope: Option<String>,
     next_cite: i64,
 ) -> (ToolExec, i64) {
     match tokio::task::spawn_blocking(move || {
         let mut n = next_cite;
-        let exec = tools::execute_tool(&state, &thread_id, &name, &arguments, &mut n);
+        let exec = tools::execute_tool(
+            &state,
+            &thread_id,
+            &name,
+            &arguments,
+            thread_scope.as_deref(),
+            &mut n,
+        );
         (exec, n)
     })
     .await
@@ -112,6 +120,21 @@ async fn execute_tool_off_runtime(
             next_cite,
         ),
     }
+}
+
+/// Trim one tool result to what is left of the reserve, keeping the head (the highest
+/// scoring hits) and telling the model the rest was cut.
+fn fit_tool_content(content: String, budget: usize, used: usize) -> String {
+    let left = budget.saturating_sub(used);
+    if left == 0 {
+        return "（文脈の上限に達したため、この結果は省略しました）".into();
+    }
+    if content.chars().count() <= left {
+        return content;
+    }
+    let mut out: String = content.chars().take(left).collect();
+    out.push_str("\n（以下、文脈の上限により省略）");
+    out
 }
 
 #[tauri::command]
@@ -152,6 +175,21 @@ pub fn llm_rename_thread(
     state
         .db
         .rename_llm_thread(&id, title.trim())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "会話が見つかりません".into())
+}
+
+/// Restrict this thread's index searches to one folder (or `mailfolder:<name>`).
+/// An empty `path_prefix` clears the scope.
+#[tauri::command]
+pub fn llm_set_thread_scope(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    path_prefix: String,
+) -> Result<LlmThreadRow, String> {
+    state
+        .db
+        .set_llm_thread_scope(&id, &path_prefix)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "会話が見つかりません".into())
 }
@@ -296,12 +334,16 @@ pub async fn llm_send(
         .map_err(|e| e.to_string())?;
     let settings = state.settings.read().clone();
     let max_chars = settings.llm_max_context_chars as usize;
-    let (assembled, stats) = assemble_turns(
-        &llm::system_for_request(&settings),
-        &sources,
-        &history,
-        max_chars,
-    );
+    let thread_scope = Some(thread.path_prefix.trim().to_string()).filter(|s| !s.is_empty());
+    let mut system = llm::system_for_request(&settings);
+    // Without this the model reads an empty result as "nothing exists" and keeps
+    // rephrasing, instead of reporting that the folder does not contain the answer.
+    if let Some(ref scope) = thread_scope {
+        system.push_str(&format!(
+            "\nインデックス検索は「{scope}」配下に限定されています。ここに無いものは索引外として扱ってください。"
+        ));
+    }
+    let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
     let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
     let truncated = stats.truncated;
     let context_chars = stats.total_chars;
@@ -328,6 +370,10 @@ pub async fn llm_send(
     let mut warning: Option<String> = None;
     let mut rounds = 0usize;
     let mut current_turns = assembled;
+    // Tool output is appended after the context was already sized, so it needs its own
+    // allowance. A quarter of the window leaves room for the history and the answer.
+    let tool_budget = (max_chars / 4).max(2_000);
+    let mut tool_used = 0usize;
     let result_text;
 
     loop {
@@ -462,19 +508,35 @@ pub async fn llm_send(
                             thread.id.clone(),
                             tc.name.clone(),
                             tc.arguments.clone(),
+                            thread_scope.clone(),
                             next_cite,
                         )
                         .await;
                         next_cite = new_cite;
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
+                        // `assemble_turns` sized the context before any tool ran, so tool
+                        // output is pure overflow. Trim it to the reserve instead of
+                        // letting the request exceed the window and get truncated by the
+                        // server, which would drop the question itself.
+                        let content = fit_tool_content(exec.content, tool_budget, tool_used);
+                        tool_used += content.chars().count();
                         current_turns.push(ChatTurn {
                             role: "tool".into(),
-                            content: exec.content,
+                            content,
                             name: Some(tc.name),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
                         });
+                    }
+                    // The reserve is spent; answer from what the rounds already produced.
+                    if tool_used >= tool_budget {
+                        use_tools = false;
+                        extra_final = true;
+                        current_turns.push(ChatTurn::text(
+                            "user",
+                            "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。",
+                        ));
                     }
                     continue;
                 }
@@ -845,3 +907,35 @@ pub fn llm_attach_sources(
         created_thread,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tool output is appended after `assemble_turns` already sized the context, so it has
+    /// to be trimmed here or the request overflows the window.
+    #[test]
+    fn tool_results_are_trimmed_to_the_reserve() {
+        let body = "あ".repeat(100);
+        assert_eq!(
+            fit_tool_content(body.clone(), 500, 0),
+            body,
+            "content within the reserve passes through untouched"
+        );
+
+        let trimmed = fit_tool_content(body.clone(), 60, 0);
+        assert!(trimmed.chars().count() < body.chars().count());
+        assert!(
+            trimmed.contains("省略"),
+            "the model must be told the result was cut: {trimmed}"
+        );
+
+        let exhausted = fit_tool_content(body, 60, 60);
+        assert!(
+            exhausted.contains("省略"),
+            "a spent reserve yields a notice, not silence: {exhausted}"
+        );
+        assert!(exhausted.chars().count() < 40);
+    }
+}
+

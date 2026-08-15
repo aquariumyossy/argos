@@ -7,9 +7,15 @@ import "./chat.css";
 type LlmThreadRow = {
   id: string;
   title: string;
+  /** Folder scope for index searches in this thread. Empty means the whole index. */
+  pathPrefix?: string;
   createdAt: number;
   updatedAt: number;
 };
+
+type SearchScopeRow = { path: string; label: string; isRoot: boolean };
+
+type SearchScopesResult = { recent: SearchScopeRow[]; scopes: SearchScopeRow[] };
 
 type LlmMessageRow = {
   id: string;
@@ -75,6 +81,26 @@ const TPL_SUMMARY =
   "添付した出典を日本語で要約してください。重要な結論と根拠を短く。";
 const TPL_POINTS =
   "争点、結論、根拠を箇条書きで整理してください。根拠には出典番号 [n] を付けてください。";
+
+function formatMailScopeLabel(raw: string): string {
+  const parts = raw
+    .split(/[\\/]/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length <= 1) return raw.trim();
+  const store = parts[0];
+  return `${parts.slice(1).join("／")}（${store}）`;
+}
+
+/** Short chip text for a scope path. */
+function scopeChipLabel(path: string, label?: string | null): string {
+  if (label && label.trim()) return label.trim();
+  if (path.startsWith("mailfolder:")) {
+    return formatMailScopeLabel(path.slice("mailfolder:".length));
+  }
+  const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
+  return normalized.split("\\").filter(Boolean).pop() || path;
+}
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -176,6 +202,9 @@ export default function Chat() {
   const [maxContextChars, setMaxContextChars] = useState(80_000);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [scopePickerOpen, setScopePickerOpen] = useState(false);
+  const [scopeRows, setScopeRows] = useState<SearchScopeRow[]>([]);
+  const [scopeFilter, setScopeFilter] = useState("");
   const listRef = useRef<HTMLDivElement | null>(null);
   const bootstrappingRef = useRef(false);
   const activeIdRef = useRef<string | null>(null);
@@ -423,6 +452,63 @@ export default function Chat() {
       setError(formatInvokeError(e));
     }
   }
+
+  /// Scoping the thread narrows every index search the model runs, which is the most
+  /// reliable way to keep a question about one matter out of unrelated folders.
+  const openScopePicker = useCallback(async () => {
+    try {
+      const result = await invoke<SearchScopesResult>("list_search_scopes", {
+        query: null,
+      });
+      let rows = result.scopes ?? [];
+      try {
+        const mailNames = await invoke<string[]>("mail_list_selected_folder_names");
+        rows = [
+          ...rows,
+          ...(mailNames ?? []).map((name) => ({
+            path: `mailfolder:${name}`,
+            label: formatMailScopeLabel(name),
+            isRoot: true,
+          })),
+        ];
+      } catch {
+        // Outlook mail not configured — file scopes are enough.
+      }
+      setScopeRows(rows);
+      setScopeFilter("");
+      setScopePickerOpen(true);
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }, []);
+
+  const applyScope = useCallback(
+    async (pathPrefix: string) => {
+      setScopePickerOpen(false);
+      const id = activeIdRef.current;
+      if (!id) return;
+      try {
+        const t = await invoke<LlmThreadRow>("llm_set_thread_scope", {
+          id,
+          pathPrefix,
+        });
+        setThreads((prev) => prev.map((x) => (x.id === id ? t : x)));
+        setActive((prev) => (prev?.id === id ? t : prev));
+      } catch (e) {
+        setError(formatInvokeError(e));
+      }
+    },
+    [],
+  );
+
+  const filteredScopeRows = useMemo(() => {
+    const q = scopeFilter.trim().toLowerCase();
+    if (!q) return scopeRows;
+    return scopeRows.filter(
+      (s) =>
+        s.label.toLowerCase().includes(q) || s.path.toLowerCase().includes(q),
+    );
+  }, [scopeRows, scopeFilter]);
 
   async function openSource(s: LlmSourceRow) {
     const path = s.path.trim();
@@ -807,6 +893,92 @@ export default function Chat() {
             </div>
           ) : null}
           <div className="chat-composer-tools">
+            <div className="chat-scope">
+              <button
+                type="button"
+                className={`chat-tpl${active?.pathPrefix ? " is-active" : ""}`}
+                disabled={busy || !active}
+                title="この会話の検索対象フォルダを絞る"
+                aria-expanded={scopePickerOpen}
+                onClick={() => {
+                  if (scopePickerOpen) setScopePickerOpen(false);
+                  else void openScopePicker();
+                }}
+              >
+                {active?.pathPrefix
+                  ? `範囲: ${scopeChipLabel(active.pathPrefix)}`
+                  : "検索範囲"}
+              </button>
+              {active?.pathPrefix ? (
+                <button
+                  type="button"
+                  className="chat-scope-clear"
+                  title="検索範囲を解除"
+                  aria-label="検索範囲を解除"
+                  disabled={busy}
+                  onClick={() => void applyScope("")}
+                >
+                  ×
+                </button>
+              ) : null}
+              {scopePickerOpen ? (
+                <div
+                  className="chat-scope-picker"
+                  role="listbox"
+                  aria-label="検索対象フォルダ"
+                >
+                  <input
+                    className="chat-scope-filter"
+                    value={scopeFilter}
+                    placeholder="フォルダ名で絞り込み…"
+                    spellCheck={false}
+                    autoFocus
+                    onChange={(e) => setScopeFilter(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setScopePickerOpen(false);
+                    }}
+                  />
+                  {filteredScopeRows.length === 0 ? (
+                    <div className="chat-scope-empty">
+                      {scopeRows.length === 0
+                        ? "検索対象フォルダがありません。設定からフォルダを追加してください。"
+                        : "一致するフォルダがありません。"}
+                    </div>
+                  ) : (
+                    <ul>
+                      <li>
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={!active?.pathPrefix}
+                          onClick={() => void applyScope("")}
+                        >
+                          <span className="chat-scope-kind">全体</span>
+                          <span className="chat-scope-label">索引全体</span>
+                        </button>
+                      </li>
+                      {filteredScopeRows.map((s) => (
+                        <li key={s.path}>
+                          <button
+                            type="button"
+                            role="option"
+                            aria-selected={active?.pathPrefix === s.path}
+                            className={s.isRoot ? "scope-root" : "scope-sub"}
+                            title={s.path}
+                            onClick={() => void applyScope(s.path)}
+                          >
+                            {s.isRoot ? (
+                              <span className="chat-scope-kind">ルート</span>
+                            ) : null}
+                            <span className="chat-scope-label">{s.label}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ) : null}
+            </div>
             <button
               type="button"
               className="chat-tpl"
