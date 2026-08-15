@@ -2,6 +2,7 @@ pub mod commands;
 pub mod db;
 pub mod extractor;
 pub mod indexer;
+pub mod llm;
 pub mod mail;
 pub mod pathutil;
 pub mod remote_server;
@@ -123,6 +124,10 @@ pub fn run() {
             if let Some(notes) = app.get_webview_window("notes") {
                 let _ = notes.hide();
                 attach_notes_window_handlers(&notes);
+            }
+            if let Some(chat) = app.get_webview_window("chat") {
+                let _ = chat.hide();
+                attach_chat_window_handlers(&chat);
             }
 
             match watcher::start_watcher(folders, indexer.clone(), app.handle().clone()) {
@@ -266,6 +271,23 @@ pub fn run() {
             commands::update_note_item_memo,
             commands::reorder_note_items,
             commands::reorder_notes,
+            llm::commands::show_chat_window,
+            llm::commands::llm_list_threads,
+            llm::commands::llm_create_thread,
+            llm::commands::llm_rename_thread,
+            llm::commands::llm_delete_thread,
+            llm::commands::llm_get_active_thread,
+            llm::commands::llm_set_active_thread,
+            llm::commands::llm_list_messages,
+            llm::commands::llm_list_sources,
+            llm::commands::llm_attach_sources,
+            llm::commands::llm_remove_source,
+            llm::commands::llm_preview_source_file,
+            llm::commands::llm_set_source_grain,
+            llm::commands::llm_send,
+            llm::commands::llm_cancel,
+            llm::commands::llm_test_connection,
+            llm::commands::llm_list_models,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {
@@ -275,9 +297,10 @@ pub fn run() {
 
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let show_settings = MenuItem::with_id(app, "settings", "設定を開く", true, None::<&str>)?;
+    let chat_item = MenuItem::with_id(app, "chat", "チャットを開く", true, None::<&str>)?;
     let reindex = MenuItem::with_id(app, "reindex", "インデックス再構築", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_settings, &reindex, &quit])?;
+    let menu = Menu::with_items(app, &[&show_settings, &chat_item, &reindex, &quit])?;
 
     let icon = app
         .default_window_icon()
@@ -290,6 +313,9 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "settings" => {
                 show_main(app);
+            }
+            "chat" => {
+                show_chat(app);
             }
             "reindex" => {
                 let state = app.state::<Arc<AppState>>();
@@ -363,6 +389,18 @@ fn attach_notes_window_handlers(window: &WebviewWindow) {
     });
 }
 
+fn attach_chat_window_handlers(window: &WebviewWindow) {
+    let handle = window.clone();
+    window.clone().on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Err(e) = handle.hide() {
+                eprintln!("argos: hide chat window failed: {e}");
+            }
+        }
+    });
+}
+
 fn create_notes_window(app: &AppHandle) -> Option<WebviewWindow> {
     let config = app
         .config()
@@ -403,6 +441,49 @@ pub fn show_notes(app: &AppHandle) {
     }
     if let Err(e) = w.set_focus() {
         eprintln!("argos: focus notes window failed: {e}");
+    }
+}
+
+fn create_chat_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "chat")?;
+    let window = WebviewWindowBuilder::from_config(app, config)
+        .ok()?
+        .build()
+        .map_err(|e| {
+            eprintln!("argos: failed to recreate chat window: {e}");
+            e
+        })
+        .ok()?;
+    attach_chat_window_handlers(&window);
+    Some(window)
+}
+
+fn ensure_chat_window(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(w) = app.get_webview_window("chat") {
+        return Some(w);
+    }
+    eprintln!("argos: chat window missing; recreating");
+    create_chat_window(app)
+}
+
+pub fn show_chat(app: &AppHandle) {
+    let Some(w) = ensure_chat_window(app) else {
+        eprintln!("argos: chat window unavailable");
+        return;
+    };
+    if let Err(e) = w.unminimize() {
+        eprintln!("argos: unminimize chat window failed: {e}");
+    }
+    if let Err(e) = w.show() {
+        eprintln!("argos: show chat window failed: {e}");
+    }
+    if let Err(e) = w.set_focus() {
+        eprintln!("argos: focus chat window failed: {e}");
     }
 }
 

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -10,6 +11,11 @@ use crate::remote_server::RemoteServerHandle;
 use crate::search::tantivy_backend::TantivyBackend;
 use crate::search::UserDictMatcher;
 use crate::watcher::WatcherHandle;
+
+pub struct LlmJob {
+    pub request_id: String,
+    pub cancel: Arc<AtomicBool>,
+}
 
 pub struct AppState {
     pub db: Arc<Db>,
@@ -26,6 +32,7 @@ pub struct AppState {
     pub user_dict: RwLock<UserDictMatcher>,
     /// Outlook Classic COM worker (STA). Always present; errors if Outlook missing.
     pub mail: MailStaHandle,
+    pub llm_job: RwLock<Option<LlmJob>>,
 }
 
 impl AppState {
@@ -80,6 +87,7 @@ impl AppState {
                 watcher: RwLock::new(None),
                 user_dict: RwLock::new(user_dict),
                 mail,
+                llm_job: RwLock::new(None),
             },
             opened.needs_full_reindex,
         ))
@@ -127,5 +135,26 @@ impl AppState {
         };
         self.remote_server
             .sync(enabled, port, &token, self.backend.clone(), pos_filter);
+    }
+
+    pub fn is_llm_busy(&self) -> bool {
+        self.llm_job.read().is_some()
+    }
+
+    pub fn start_llm(&self, request_id: String, _thread_id: String, cancel: Arc<AtomicBool>) {
+        *self.llm_job.write() = Some(LlmJob { request_id, cancel });
+    }
+
+    pub fn finish_llm(&self, request_id: &str) {
+        let mut job = self.llm_job.write();
+        if job.as_ref().is_some_and(|j| j.request_id == request_id) {
+            *job = None;
+        }
+    }
+
+    pub fn cancel_llm(&self) {
+        if let Some(job) = self.llm_job.write().take() {
+            job.cancel.store(true, Ordering::SeqCst);
+        }
     }
 }

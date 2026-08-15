@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Argos",
-  "version": "1.8.1",
+  "version": "1.9.0",
   "identifier": "com.argos.search",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -41,6 +41,19 @@
         "height": 640,
         "minWidth": 480,
         "minHeight": 360,
+        "visible": false,
+        "resizable": true,
+        "center": true,
+        "focus": true,
+        "dragDropEnabled": false
+      },
+      {
+        "label": "chat",
+        "title": "Argos　チャット",
+        "width": 960,
+        "height": 720,
+        "minWidth": 560,
+        "minHeight": 400,
         "visible": false,
         "resizable": true,
         "center": true,

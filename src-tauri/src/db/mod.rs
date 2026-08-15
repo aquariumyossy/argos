@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     pub shortcut: String,
     /// Global shortcut to show the notes window.
@@ -37,7 +37,33 @@ pub struct Settings {
     pub mail_thread_collapse: bool,
     /// Last successful mail sync (RFC3339), empty if never.
     pub mail_last_sync_at: String,
+    /// OpenAI-compatible base URL, e.g. http://127.0.0.1:11434/v1
+    pub llm_base_url: String,
+    pub llm_api_key: String,
+    pub llm_model: String,
+    pub llm_timeout_ms: u32,
+    /// Soft cap for source + history characters sent in one request.
+    pub llm_max_context_chars: u32,
+    pub llm_system_prompt: String,
+    /// "auto" | "brief" | "off" — Qwen thinking / enable_thinking.
+    pub llm_thinking: String,
+    /// Token cap for thinking when mode is brief (also sent if auto and > 0).
+    pub llm_thinking_budget: u32,
+    pub llm_search_top_k: u32,
 }
+
+pub const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+pub const LEGACY_LLM_SYSTEM_PROMPT: &str =
+    "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。";
+/// Previous default after tools were added (「索引」表記). Unedited copies are replaced.
+pub const LEGACY_TOOL_LLM_SYSTEM_PROMPT: &str =
+    "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。索引を検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。";
+pub const DEFAULT_LLM_SYSTEM_PROMPT: &str =
+    "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。";
+pub const DEFAULT_LLM_TIMEOUT_MS: u32 = 120_000;
+pub const DEFAULT_LLM_MAX_CONTEXT_CHARS: u32 = 80_000;
+pub const DEFAULT_LLM_THINKING: &str = "brief";
+pub const DEFAULT_LLM_THINKING_BUDGET: u32 = 2_048;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -65,8 +91,114 @@ impl Default for Settings {
             mail_latest_only: false,
             mail_thread_collapse: true,
             mail_last_sync_at: String::new(),
+            llm_base_url: DEFAULT_LLM_BASE_URL.into(),
+            llm_api_key: String::new(),
+            llm_model: String::new(),
+            llm_timeout_ms: DEFAULT_LLM_TIMEOUT_MS,
+            llm_max_context_chars: DEFAULT_LLM_MAX_CONTEXT_CHARS,
+            llm_system_prompt: DEFAULT_LLM_SYSTEM_PROMPT.into(),
+            llm_thinking: DEFAULT_LLM_THINKING.into(),
+            llm_thinking_budget: DEFAULT_LLM_THINKING_BUDGET,
+            llm_search_top_k: 4,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmThreadRow {
+    pub id: String,
+    pub title: String,
+    pub search_enabled: bool,
+    pub path_prefix: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmMessageRow {
+    pub id: String,
+    pub thread_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSourceRow {
+    pub id: String,
+    pub thread_id: String,
+    pub sort_order: i64,
+    pub origin: String,
+    pub path: String,
+    pub title: String,
+    pub paragraph_id: String,
+    pub body: String,
+    pub query: String,
+    pub created_at: i64,
+    #[serde(default = "default_llm_source_grain")]
+    pub grain: String,
+    #[serde(default)]
+    pub unit_body: String,
+    #[serde(default)]
+    pub injected_user_message_id: String,
+    #[serde(default)]
+    pub cited_assistant_message_id: String,
+    #[serde(default)]
+    pub cite_no: i64,
+}
+
+impl LlmSourceRow {
+    pub fn is_pending(&self) -> bool {
+        self.injected_user_message_id.trim().is_empty()
+    }
+
+    pub fn is_tool_origin(&self) -> bool {
+        self.origin.eq_ignore_ascii_case("tool")
+    }
+}
+
+fn default_llm_source_grain() -> String {
+    "unit".into()
+}
+
+const LLM_SOURCE_COLS: &str =
+    "id, thread_id, sort_order, origin, path, title, paragraph_id, body, query, created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no";
+
+const LLM_THREAD_COLS: &str =
+    "id, title, search_enabled, path_prefix, created_at, updated_at";
+
+fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
+    Ok(LlmThreadRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        search_enabled: row.get::<_, i64>(2)? != 0,
+        path_prefix: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn map_llm_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmSourceRow> {
+    Ok(LlmSourceRow {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        sort_order: row.get(2)?,
+        origin: row.get(3)?,
+        path: row.get(4)?,
+        title: row.get(5)?,
+        paragraph_id: row.get(6)?,
+        body: row.get(7)?,
+        query: row.get(8)?,
+        created_at: row.get(9)?,
+        grain: row.get::<_, String>(10).unwrap_or_else(|_| "unit".into()),
+        unit_body: row.get::<_, String>(11).unwrap_or_default(),
+        injected_user_message_id: row.get::<_, String>(12).unwrap_or_default(),
+        cited_assistant_message_id: row.get::<_, String>(13).unwrap_or_default(),
+        cite_no: row.get::<_, i64>(14).unwrap_or(0),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +450,44 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_note_items_note_id
               ON note_items(note_id, sort_order);
+            CREATE TABLE IF NOT EXISTS llm_threads (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL DEFAULT '',
+              search_enabled INTEGER NOT NULL DEFAULT 1,
+              path_prefix TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS llm_messages (
+              id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_messages_thread
+              ON llm_messages(thread_id, created_at);
+            CREATE TABLE IF NOT EXISTS llm_thread_sources (
+              id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              origin TEXT NOT NULL DEFAULT 'attach',
+              path TEXT NOT NULL DEFAULT '',
+              title TEXT NOT NULL DEFAULT '',
+              paragraph_id TEXT NOT NULL DEFAULT '',
+              body TEXT NOT NULL DEFAULT '',
+              query TEXT NOT NULL DEFAULT '',
+              grain TEXT NOT NULL DEFAULT 'unit',
+              unit_body TEXT NOT NULL DEFAULT '',
+              injected_user_message_id TEXT NOT NULL DEFAULT '',
+              cited_assistant_message_id TEXT NOT NULL DEFAULT '',
+              cite_no INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_thread_sources_thread
+              ON llm_thread_sources(thread_id, sort_order);
             "#,
         )?;
         // Migrate older DBs that lack public_path
@@ -338,6 +508,50 @@ impl Db {
             "ALTER TABLE email_folders ADD COLUMN item_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN grain TEXT NOT NULL DEFAULT 'unit'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN unit_body TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let consume_cols_added = conn
+            .execute(
+                "ALTER TABLE llm_thread_sources ADD COLUMN injected_user_message_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .is_ok();
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN cited_assistant_message_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN cite_no INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        if consume_cols_added {
+            conn.execute_batch(
+                "UPDATE llm_thread_sources
+                 SET
+                   injected_user_message_id = COALESCE((
+                     SELECT id FROM llm_messages
+                     WHERE thread_id = llm_thread_sources.thread_id AND role = 'user'
+                     ORDER BY created_at ASC, id ASC LIMIT 1
+                   ), ''),
+                   cited_assistant_message_id = COALESCE((
+                     SELECT id FROM llm_messages
+                     WHERE thread_id = llm_thread_sources.thread_id AND role = 'assistant'
+                     ORDER BY created_at ASC, id ASC LIMIT 1
+                   ), ''),
+                   cite_no = CASE WHEN cite_no = 0 THEN sort_order + 1 ELSE cite_no END
+                 WHERE injected_user_message_id = ''
+                   AND EXISTS (
+                     SELECT 1 FROM llm_messages
+                     WHERE thread_id = llm_thread_sources.thread_id AND role = 'assistant'
+                   );",
+            )?;
+        }
         // Note list manual ordering (sidebar drag).
         let notes_sort_added = conn
             .execute(
@@ -427,6 +641,48 @@ impl Db {
                         s.mail_thread_collapse = !(row.1 == "0" || row.1 == "false")
                     }
                     "mail_last_sync_at" => s.mail_last_sync_at = row.1,
+                    "llm_base_url" => {
+                        s.llm_base_url = if row.1.trim().is_empty() {
+                            DEFAULT_LLM_BASE_URL.into()
+                        } else {
+                            row.1
+                        }
+                    }
+                    "llm_api_key" => s.llm_api_key = row.1,
+                    "llm_model" => s.llm_model = row.1,
+                    "llm_timeout_ms" => {
+                        s.llm_timeout_ms = row.1.parse().unwrap_or(DEFAULT_LLM_TIMEOUT_MS)
+                    }
+                    "llm_max_context_chars" => {
+                        s.llm_max_context_chars =
+                            row.1.parse().unwrap_or(DEFAULT_LLM_MAX_CONTEXT_CHARS)
+                    }
+                    "llm_system_prompt" => {
+                        s.llm_system_prompt = if row.1.is_empty()
+                            || row.1 == LEGACY_LLM_SYSTEM_PROMPT
+                            || row.1 == LEGACY_TOOL_LLM_SYSTEM_PROMPT
+                        {
+                            DEFAULT_LLM_SYSTEM_PROMPT.into()
+                        } else {
+                            row.1
+                        }
+                    }
+                    "llm_search_top_k" => {
+                        s.llm_search_top_k = row.1.parse().unwrap_or(4).clamp(1, 8)
+                    }
+                    "llm_thinking" => {
+                        s.llm_thinking = match row.1.as_str() {
+                            "auto" | "brief" | "off" => row.1,
+                            _ => DEFAULT_LLM_THINKING.into(),
+                        }
+                    }
+                    "llm_thinking_budget" => {
+                        s.llm_thinking_budget = row
+                            .1
+                            .parse()
+                            .unwrap_or(DEFAULT_LLM_THINKING_BUDGET)
+                            .min(32_000)
+                    }
                     _ => {}
                 }
             }
@@ -478,6 +734,21 @@ impl Db {
                 if s.mail_thread_collapse { "1" } else { "0" }.to_string(),
             ),
             ("mail_last_sync_at", s.mail_last_sync_at.clone()),
+            ("llm_base_url", s.llm_base_url.clone()),
+            ("llm_api_key", s.llm_api_key.clone()),
+            ("llm_model", s.llm_model.clone()),
+            ("llm_timeout_ms", s.llm_timeout_ms.to_string()),
+            (
+                "llm_max_context_chars",
+                s.llm_max_context_chars.to_string(),
+            ),
+            ("llm_system_prompt", s.llm_system_prompt.clone()),
+            ("llm_thinking", s.llm_thinking.clone()),
+            (
+                "llm_thinking_budget",
+                s.llm_thinking_budget.to_string(),
+            ),
+            ("llm_search_top_k", s.llm_search_top_k.to_string()),
         ];
         for (k, v) in pairs {
             conn.execute(
@@ -1748,6 +2019,457 @@ impl Db {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn list_llm_threads(&self) -> Result<Vec<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_THREAD_COLS} FROM llm_threads ORDER BY updated_at DESC, created_at DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], map_llm_thread)?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn get_llm_thread(&self, id: &str) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!("SELECT {LLM_THREAD_COLS} FROM llm_threads WHERE id=?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map([id], map_llm_thread)?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn create_llm_thread(
+        &self,
+        title: &str,
+        search_enabled: bool,
+    ) -> Result<LlmThreadRow, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let enabled = if search_enabled { 1 } else { 0 };
+        conn.execute(
+            "INSERT INTO llm_threads(id, title, search_enabled, path_prefix, created_at, updated_at)
+             VALUES(?1, ?2, ?3, '', ?4, ?4)",
+            rusqlite::params![id, title, enabled, now],
+        )?;
+        Ok(LlmThreadRow {
+            id,
+            title: title.to_string(),
+            search_enabled,
+            path_prefix: String::new(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn rename_llm_thread(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE llm_threads SET title=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![title, now, id],
+        )?;
+        drop(conn);
+        if n == 0 {
+            Ok(None)
+        } else {
+            self.get_llm_thread(id)
+        }
+    }
+
+    pub fn delete_llm_thread(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute("DELETE FROM llm_threads WHERE id=?1", [id])?;
+        Ok(n > 0)
+    }
+
+    pub fn touch_llm_thread(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_llm_messages(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<LlmMessageRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, thread_id, role, content, created_at
+             FROM llm_messages WHERE thread_id=?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([thread_id], |row| {
+            Ok(LlmMessageRow {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn insert_llm_message(
+        &self,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<LlmMessageRow, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO llm_messages(id, thread_id, role, content, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, thread_id, role, content, now],
+        )?;
+        let now2 = now;
+        conn.execute(
+            "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now2, thread_id],
+        )?;
+        Ok(LlmMessageRow {
+            id,
+            thread_id: thread_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub fn list_llm_sources(&self, thread_id: &str) -> Result<Vec<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS}
+             FROM llm_thread_sources WHERE thread_id=?1 ORDER BY sort_order ASC, created_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([thread_id], map_llm_source)?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn get_llm_source(&self, id: &str) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map([id], map_llm_source)?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn insert_llm_source(
+        &self,
+        thread_id: &str,
+        origin: &str,
+        path: &str,
+        title: &str,
+        paragraph_id: &str,
+        body: &str,
+        query: &str,
+    ) -> Result<(LlmSourceRow, bool), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let path = path.trim();
+        let paragraph_id = paragraph_id.trim();
+        let origin = if origin.trim().is_empty() {
+            "attach"
+        } else {
+            origin.trim()
+        };
+        let title = title.trim();
+        let query = query.trim();
+        let mut find = conn.prepare(
+            "SELECT id FROM llm_thread_sources
+             WHERE thread_id=?1 AND path=?2 AND paragraph_id=?3
+               AND injected_user_message_id = ''
+             LIMIT 1",
+        )?;
+        let pending_id: Option<String> = find
+            .query_map(rusqlite::params![thread_id, path, paragraph_id], |row| {
+                row.get(0)
+            })?
+            .flatten()
+            .next();
+        drop(find);
+        if let Some(id) = pending_id {
+            let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
+            let existing = conn.query_row(&sql, [&id], map_llm_source)?;
+            if existing.body.trim() == body.trim()
+                && existing.title == title
+                && existing.query == query
+            {
+                return Ok((existing, false));
+            }
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "UPDATE llm_thread_sources SET body=?1, title=?2, query=?3 WHERE id=?4",
+                rusqlite::params![body, title, query, id],
+            )?;
+            conn.execute(
+                "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+                rusqlite::params![now, thread_id],
+            )?;
+            let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
+            let row = conn.query_row(&sql, [id], map_llm_source)?;
+            return Ok((row, true));
+        }
+        let next_order: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM llm_thread_sources WHERE thread_id=?1",
+                [thread_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO llm_thread_sources(
+                id, thread_id, sort_order, origin, path, title, paragraph_id, body, query,
+                created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'unit', '', '', '', 0)",
+            rusqlite::params![
+                id,
+                thread_id,
+                next_order,
+                origin,
+                path,
+                title,
+                paragraph_id,
+                body,
+                query,
+                now
+            ],
+        )?;
+        conn.execute(
+            "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, thread_id],
+        )?;
+        Ok((
+            LlmSourceRow {
+                id,
+                thread_id: thread_id.to_string(),
+                sort_order: next_order,
+                origin: origin.to_string(),
+                path: path.to_string(),
+                title: title.to_string(),
+                paragraph_id: paragraph_id.to_string(),
+                body: body.to_string(),
+                query: query.to_string(),
+                created_at: now,
+                grain: "unit".into(),
+                unit_body: String::new(),
+                injected_user_message_id: String::new(),
+                cited_assistant_message_id: String::new(),
+                cite_no: 0,
+            },
+            true,
+        ))
+    }
+
+    pub fn max_llm_cite_no(&self, thread_id: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COALESCE(MAX(cite_no), 0) FROM llm_thread_sources WHERE thread_id=?1",
+            [thread_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn find_cited_llm_source(
+        &self,
+        thread_id: &str,
+        path: &str,
+        paragraph_id: &str,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND path=?2 AND paragraph_id=?3
+               AND injected_user_message_id != ''
+             ORDER BY cite_no ASC, created_at ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(
+            rusqlite::params![thread_id, path.trim(), paragraph_id.trim()],
+            map_llm_source,
+        )?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn consume_llm_sources(
+        &self,
+        items: &[(String, i64)],
+        user_message_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        for (id, cite_no) in items {
+            conn.execute(
+                "UPDATE llm_thread_sources
+                 SET injected_user_message_id=?1, cited_assistant_message_id=?2, cite_no=?3
+                 WHERE id=?4",
+                rusqlite::params![user_message_id, assistant_message_id, cite_no, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_uncited_tool_sources(
+        &self,
+        thread_id: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM llm_thread_sources
+             WHERE thread_id=?1 AND origin='tool' AND injected_user_message_id=''",
+            [thread_id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn set_llm_source_cite_no(&self, id: &str, cite_no: i64) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_thread_sources SET cite_no=?1 WHERE id=?2",
+            rusqlite::params![cite_no, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_llm_source_grain(
+        &self,
+        id: &str,
+        grain: &str,
+        body: &str,
+        unit_body: Option<&str>,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let grain = if grain.trim().eq_ignore_ascii_case("file") {
+            "file"
+        } else {
+            "unit"
+        };
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let n = if let Some(saved) = unit_body {
+            conn.execute(
+                "UPDATE llm_thread_sources SET grain=?1, body=?2, unit_body=?3 WHERE id=?4",
+                rusqlite::params![grain, body, saved, id],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE llm_thread_sources SET grain=?1, body=?2 WHERE id=?3",
+                rusqlite::params![grain, body, id],
+            )?
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        let thread_id: String = conn.query_row(
+            "SELECT thread_id FROM llm_thread_sources WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, thread_id],
+        )?;
+        drop(conn);
+        self.get_llm_source(id)
+    }
+
+    pub fn delete_other_llm_sources_for_path(
+        &self,
+        thread_id: &str,
+        keep_id: &str,
+        path: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(0);
+        }
+        let rows = self.list_llm_sources(thread_id)?;
+        let mut n = 0usize;
+        for row in rows {
+            if row.id == keep_id {
+                continue;
+            }
+            if !row.is_pending() {
+                continue;
+            }
+            if !row.path.eq_ignore_ascii_case(path) {
+                continue;
+            }
+            if self.delete_llm_source(&row.id)?.is_some() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn delete_llm_source(&self, id: &str) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let thread_id = match conn.query_row(
+            "SELECT thread_id FROM llm_thread_sources WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(tid) => tid,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        conn.execute("DELETE FROM llm_thread_sources WHERE id=?1", [id])?;
+        Ok(Some(thread_id))
+    }
+
+    pub fn get_active_llm_thread_id(&self) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [ACTIVE_LLM_THREAD_ID_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|s| !s.is_empty())
+    }
+
+    pub fn set_active_llm_thread_id(&self, id: Option<&str>) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        match id {
+            Some(id) if !id.is_empty() => {
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    rusqlite::params![ACTIVE_LLM_THREAD_ID_KEY, id],
+                )?;
+            }
+            _ => {
+                conn.execute(
+                    "DELETE FROM settings WHERE key=?1",
+                    [ACTIVE_LLM_THREAD_ID_KEY],
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1777,6 +2499,7 @@ pub struct NoteItemRow {
 }
 
 const ACTIVE_NOTE_ID_KEY: &str = "active_note_id";
+const ACTIVE_LLM_THREAD_ID_KEY: &str = "active_llm_thread_id";
 
 #[derive(Debug, Clone)]
 pub struct FileMeta {

@@ -22,9 +22,11 @@ import {
 } from "./legalMdFormat";
 import {
   buildNoteExportMarkdown,
+  formatExportBody,
   noteExportFilename,
   saveNoteMarkdown,
 } from "./exportNoteText";
+import ChatDestPicker, { attachToChat } from "../chat/ChatDestPicker";
 import "./notes.css";
 
 const SIDEBAR_MIN = 160;
@@ -324,7 +326,9 @@ export default function Notes() {
   const [legalMdFormat, setLegalMdFormat] = useState(loadLegalMdFormat);
   const [printOpts, setPrintOpts] = useState(loadPrintOpts);
   const [printMenuOpen, setPrintMenuOpen] = useState(false);
+  const [chatNotice, setChatNotice] = useState("");
   const printMenuRef = useRef<HTMLDivElement | null>(null);
+  const chatNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bodyRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const noteMemoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -335,6 +339,12 @@ export default function Notes() {
   const viewMode = active?.viewMode === "grid" ? "grid" : "list";
   const notesReadyRef = useRef(false);
   const bootstrappingRef = useRef(false);
+
+  const showChatNotice = useCallback((text: string) => {
+    setChatNotice(text);
+    if (chatNoticeTimer.current) clearTimeout(chatNoticeTimer.current);
+    chatNoticeTimer.current = setTimeout(() => setChatNotice(""), 2200);
+  }, []);
 
   const loadNotes = useCallback(async () => {
     const list = await invoke<NoteRow[]>("list_notes");
@@ -480,13 +490,15 @@ export default function Notes() {
   useEffect(() => {
     if (!printMenuOpen) return;
     const onDocMouseDown = (e: MouseEvent) => {
-      const el = printMenuRef.current;
-      if (el && !el.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (printMenuRef.current && !printMenuRef.current.contains(target)) {
         setPrintMenuOpen(false);
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setPrintMenuOpen(false);
+      if (e.key === "Escape") {
+        setPrintMenuOpen(false);
+      }
     };
     document.addEventListener("mousedown", onDocMouseDown);
     document.addEventListener("keydown", onKey);
@@ -800,6 +812,83 @@ export default function Notes() {
     [items],
   );
 
+  const noteItemToAttach = useCallback(
+    (row: NoteItemRow, snap: NoteItemSnapshot) => ({
+      path: snap.path,
+      title: snap.title || snap.label || snap.path || "（無題）",
+      paragraphId: snap.paragraphId || row.paragraphId,
+      body: formatExportBody(snap.path, snap.body),
+      query: row.query,
+      origin: "attach",
+    }),
+    [],
+  );
+
+  const attachItemsToChat = useCallback(
+    async (
+      attachItems: ReturnType<typeof noteItemToAttach>[],
+      title: string,
+      threadId: "new" | string,
+    ) => {
+      const items = attachItems.filter((it) => it.body.trim());
+      if (items.length === 0) {
+        setError("添付できる本文がありません。");
+        return;
+      }
+      setError("");
+      try {
+        const result = await attachToChat(items, title, threadId);
+        const dest = result.thread?.title?.trim() || "新しい会話";
+        if (result.added > 0) {
+          showChatNotice(
+            result.createdThread
+              ? result.added === 1
+                ? "新しいチャットに送った"
+                : `${result.added} 件を新しいチャットに送った`
+              : `『${dest}』に追加した`,
+          );
+        } else if (result.skipped > 0) {
+          showChatNotice("同じ出典がすでに読込前にあります");
+        } else {
+          showChatNotice("本文が空のため送れませんでした");
+        }
+      } catch (e) {
+        setError(formatInvokeError(e));
+      }
+    },
+    [showChatNotice],
+  );
+
+  const sendNoteToChat = useCallback(
+    async (threadId: "new" | string) => {
+      if (!active) return;
+      const attachItems = parsedItems.map(({ row, snap }) =>
+        noteItemToAttach(row, snap),
+      );
+      const memo = active.memo.trim();
+      if (memo) {
+        attachItems.unshift({
+          path: "",
+          title: "ノートメモ",
+          paragraphId: `note-memo:${active.id}`,
+          body: memo,
+          query: "",
+          origin: "attach",
+        });
+      }
+      if (attachItems.every((it) => !it.body.trim())) {
+        setError("このノートには添付できる本文がありません。");
+        return;
+      }
+      await attachItemsToChat(
+        attachItems,
+        active.title.trim() || "無題のノート",
+        threadId,
+      );
+    },
+    [active, attachItemsToChat, noteItemToAttach, parsedItems],
+  );
+
   const legalFormattedItems = useMemo(() => {
     if (!legalMdFormat) return [];
     const out: {
@@ -1014,6 +1103,13 @@ export default function Notes() {
                 </p>
               </div>
               <div className="notes-main-head-actions">
+                <ChatDestPicker
+                  buttonClassName="notes-legal-toggle"
+                  title="このノートをチャットに送る"
+                  onPick={(id) => void sendNoteToChat(id)}
+                >
+                  チャット
+                </ChatDestPicker>
                 <button
                   type="button"
                   className="notes-legal-toggle"
@@ -1033,7 +1129,9 @@ export default function Notes() {
                     title="印刷する項目を選んで印刷（PDF 可）"
                     aria-expanded={printMenuOpen}
                     aria-haspopup="menu"
-                    onClick={() => setPrintMenuOpen((v) => !v)}
+                    onClick={() => {
+                      setPrintMenuOpen((v) => !v);
+                    }}
                   >
                     印刷
                   </button>
@@ -1125,6 +1223,7 @@ export default function Notes() {
             </label>
 
             {error ? <p className="notes-error">{error}</p> : null}
+            {chatNotice ? <p className="notes-chat-notice">{chatNotice}</p> : null}
 
             {parsedItems.length === 0 ? (
               <p className="notes-empty-items">

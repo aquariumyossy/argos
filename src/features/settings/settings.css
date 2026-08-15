@@ -81,11 +81,36 @@ label {
 
 .options-form input[type="number"],
 .options-form input[type="text"],
+.options-form input[type="password"],
 .options-form select {
   flex: 0 0 16em;
   width: 16em;
   max-width: 42%;
   justify-self: stretch;
+}
+
+#panel-llm .options-form input[type="text"],
+#panel-llm .options-form input[type="password"] {
+  flex: 1 1 18em;
+  width: auto;
+  max-width: none;
+}
+
+.options-form > label.llm-prompt-label {
+  display: grid;
+  align-items: start;
+  gap: 8px;
+}
+
+.options-form > label.llm-prompt-label textarea {
+  width: 100%;
+  min-height: 6.5em;
+  resize: vertical;
+  border: 1px solid var(--line);
+  background: var(--bg-elevated);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font: inherit;
 }
 
 #panel-remote .options-form input[type="text"] {

@@ -1,3 +1,5 @@
+import { legalRefTextVariants } from "../notes/legalMdFormat";
+
 /** Split query for highlight using the same delimiters as the Rust parser (outside quotes). */
 export function highlightTermsFromQuery(query: string): string[] {
   const chars = Array.from(query.trim());
@@ -156,6 +158,9 @@ export function collectHighlightTerms(
     expanded.push(trimmed);
     for (const part of contentPartsFromTerm(trimmed)) {
       expanded.push(part);
+    }
+    for (const v of legalRefTextVariants(trimmed)) {
+      expanded.push(v);
     }
   }
   const cleaned = Array.from(new Set(expanded.filter(isUsefulHighlightTerm)));

@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 pub mod history;
+pub mod legal_ref;
 pub mod morph;
 pub mod remote_backend;
 pub mod tantivy_backend;
@@ -499,7 +500,7 @@ pub fn run_preview_file(
 ) -> Result<PreviewFile, String> {
     let matches = run_path_matches(settings, local, mail, query, path, user_dict)?;
     let backend = if crate::mail::is_outlook_path(path) {
-        mail.ok_or_else(|| "メール索引がありません".to_string())?
+        mail.ok_or_else(|| "メールインデックスがありません".to_string())?
     } else {
         local
     };

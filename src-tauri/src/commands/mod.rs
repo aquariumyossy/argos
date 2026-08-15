@@ -274,6 +274,24 @@ pub fn update_settings(
     settings.remote_timeout_ms = settings.remote_timeout_ms.clamp(500, 60_000);
     settings.mail_days_back = settings.mail_days_back.clamp(1, 3650);
     settings.mail_sync_interval_secs = settings.mail_sync_interval_secs.min(7 * 24 * 3600);
+    settings.llm_base_url = crate::llm::normalize_base_url(&settings.llm_base_url);
+    if settings.llm_base_url.is_empty() {
+        settings.llm_base_url = crate::db::DEFAULT_LLM_BASE_URL.into();
+    }
+    settings.llm_timeout_ms = settings.llm_timeout_ms.clamp(5_000, 600_000);
+    settings.llm_max_context_chars = settings.llm_max_context_chars.clamp(4_000, 200_000);
+    settings.llm_search_top_k = settings.llm_search_top_k.clamp(1, 8);
+    settings.llm_thinking = match settings.llm_thinking.trim() {
+        "auto" | "brief" | "off" => settings.llm_thinking.trim().to_string(),
+        _ => crate::db::DEFAULT_LLM_THINKING.into(),
+    };
+    settings.llm_thinking_budget = settings.llm_thinking_budget.min(32_000);
+    if settings.llm_thinking == "brief" && settings.llm_thinking_budget == 0 {
+        settings.llm_thinking_budget = crate::db::DEFAULT_LLM_THINKING_BUDGET;
+    }
+    if settings.llm_system_prompt.trim().is_empty() {
+        settings.llm_system_prompt = crate::db::DEFAULT_LLM_SYSTEM_PROMPT.into();
+    }
     search::ensure_server_token(&mut settings);
 
     if settings.notes_shortcut.trim().is_empty() {
@@ -1069,7 +1087,7 @@ pub async fn mail_run_sync(
     state: State<'_, Arc<AppState>>,
 ) -> Result<MailSyncStats, String> {
     if !state.settings.read().mail_enabled {
-        return Err("Outlook メール索引が無効です。設定で有効にしてください。".into());
+        return Err("Outlook メールインデックスが無効です。設定で有効にしてください。".into());
     }
     let mail = state.mail.clone();
     let app2 = app.clone();
@@ -1146,6 +1164,9 @@ pub struct KeepToNotePayload {
     /// When true, do not bring the notes window to the front.
     #[serde(default)]
     pub silent: bool,
+    /// `"new"` creates a note. A note id keeps to that note. Empty uses the active note.
+    #[serde(default)]
+    pub note_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1154,6 +1175,7 @@ pub struct KeepToNoteResult {
     pub note: NoteRow,
     pub item: NoteItemRow,
     pub created: bool,
+    pub created_note: bool,
 }
 
 #[tauri::command]
@@ -1298,28 +1320,61 @@ fn insert_keep_item(
     state: &AppState,
     payload: KeepToNotePayload,
 ) -> Result<KeepToNoteResult, String> {
-    let mut note_id = state.db.get_active_note_id();
-    if let Some(ref id) = note_id {
-        if state.db.get_note(id).map_err(|e| e.to_string())?.is_none() {
-            note_id = None;
+    let specified = payload
+        .note_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (note, created_note) = match specified {
+        Some("new") => {
+            let created = state
+                .db
+                .create_note("無題のノート")
+                .map_err(|e| e.to_string())?;
+            state
+                .db
+                .set_active_note_id(Some(&created.id))
+                .map_err(|e| e.to_string())?;
+            (created, true)
         }
-    }
-    let note = if let Some(id) = note_id {
-        state
-            .db
-            .get_note(&id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?
-    } else {
-        let created = state
-            .db
-            .create_note("無題のノート")
-            .map_err(|e| e.to_string())?;
-        state
-            .db
-            .set_active_note_id(Some(&created.id))
-            .map_err(|e| e.to_string())?;
-        created
+        Some(id) => {
+            let note = state
+                .db
+                .get_note(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "ノートが見つかりません".to_string())?;
+            state
+                .db
+                .set_active_note_id(Some(&note.id))
+                .map_err(|e| e.to_string())?;
+            (note, false)
+        }
+        None => {
+            let mut note_id = state.db.get_active_note_id();
+            if let Some(ref id) = note_id {
+                if state.db.get_note(id).map_err(|e| e.to_string())?.is_none() {
+                    note_id = None;
+                }
+            }
+            if let Some(id) = note_id {
+                let note = state
+                    .db
+                    .get_note(&id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "ノートが見つかりません".to_string())?;
+                (note, false)
+            } else {
+                let created = state
+                    .db
+                    .create_note("無題のノート")
+                    .map_err(|e| e.to_string())?;
+                state
+                    .db
+                    .set_active_note_id(Some(&created.id))
+                    .map_err(|e| e.to_string())?;
+                (created, true)
+            }
+        }
     };
 
     let paragraph_id = if payload.paragraph_id.trim().is_empty() {
@@ -1338,6 +1393,7 @@ fn insert_keep_item(
                 note,
                 item: existing,
                 created: false,
+                created_note,
             });
         }
     }
@@ -1410,6 +1466,7 @@ fn insert_keep_item(
         note,
         item,
         created: true,
+        created_note,
     })
 }
 
@@ -1506,6 +1563,7 @@ pub async fn keep_path_matches(
                             mail_folder.clone()
                         },
                         silent: true,
+                        note_id: None,
                     },
                 )?;
                 if result.created {
