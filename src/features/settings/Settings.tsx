@@ -145,13 +145,15 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.9.2";
+const APP_VERSION = "1.9.3";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
   { name: "Tauri", license: "Apache-2.0 OR MIT" },
   { name: "@tauri-apps/api / plugins", license: "Apache-2.0 OR MIT" },
   { name: "React / React DOM", license: "MIT" },
+  { name: "marked", license: "MIT", note: "Markdown 表示" },
+  { name: "mermaid", license: "MIT", note: "チャット回答の図" },
   { name: "Tantivy", license: "MIT" },
   { name: "Lindera / lindera-tantivy", license: "MIT", note: "形態素解析辞書 IPADIC を埋め込み" },
   { name: "IPADIC（Lindera 経由）", license: "IPADIC 独自ライセンス" },
@@ -239,7 +241,7 @@ function normalizeSettings(s: SettingsData): SettingsData {
   }
   if (typeof s.llmSystemPrompt !== "string" || !s.llmSystemPrompt.trim()) {
     s.llmSystemPrompt =
-      "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。";
+      "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。\n回答はMarkdownで書いてください。見出し・箇条書き・表を使ってよいです。生のHTMLは書かないでください。ユーザーに選ばせるときは ```choices フェンスに選択肢を1行ずつ書いてください。";
   }
   if (s.llmThinking !== "auto" && s.llmThinking !== "brief" && s.llmThinking !== "off") {
     s.llmThinking = "brief";

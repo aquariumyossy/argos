@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::db::Settings;
+use crate::db::{LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, Settings};
 use crate::llm::context::ChatTurn;
 
 pub fn normalize_base_url(raw: &str) -> String {
@@ -201,6 +201,43 @@ fn client_for_stream() -> Result<reqwest::Client, String> {
 pub const THINKING_BRIEF_HINT: &str =
     "内部の検討は短く切り上げ、すぐに結論を書いてください。";
 
+/// Injected only when the user asks for a diagram, not on every turn.
+pub const LLM_DIAGRAM_HINT: &str =
+    "図は mermaid フェンス（言語タグ mermaid）で1本出してください。要件事実は flowchart LR（左が請求原因、右へ抗弁・再抗弁）。請求原因ノードは1つだけ。時系列は flowchart LR または timeline。ノードは短く、出典にない事実は書かない。ラベルは A[\"請求原因 [n]\"] のように二重引用符で囲み、矢印は --> または -.->（途中に空白を入れない）。枠線や矢印のASCIIアート、言語タグなしのコードブロックで図を描かないでください。";
+const LLM_DIAGRAM_SENTINEL: &str = "言語タグ mermaid";
+
+fn user_asks_for_diagram(content: &str) -> bool {
+    [
+        "ダイアグラム",
+        "mermaid",
+        "フローチャート",
+        "flowchart",
+        "構造図",
+        "要件事実図",
+        "時系列図",
+        "図にして",
+        "図を描",
+        "図を作",
+        "図で示",
+        "図で整理",
+    ]
+    .iter()
+    .any(|k| content.contains(k))
+}
+
+pub fn append_diagram_hint(system: &mut String, user_content: &str) {
+    if !user_asks_for_diagram(user_content) {
+        return;
+    }
+    if system.contains(LLM_DIAGRAM_SENTINEL) {
+        return;
+    }
+    if !system.is_empty() {
+        system.push('\n');
+    }
+    system.push_str(LLM_DIAGRAM_HINT);
+}
+
 pub fn system_for_request(settings: &Settings) -> String {
     let mut s = settings.llm_system_prompt.trim().to_string();
     if settings.llm_thinking.trim() == "brief"
@@ -211,6 +248,12 @@ pub fn system_for_request(settings: &Settings) -> String {
             s.push('\n');
         }
         s.push_str(THINKING_BRIEF_HINT);
+    }
+    if !s.contains(LLM_FORMAT_SENTINEL) && !s.contains(LLM_FORMAT_HINT) {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(LLM_FORMAT_HINT);
     }
     s
 }
@@ -992,6 +1035,37 @@ mod tests {
         assert_eq!(body["chat_template_kwargs"]["thinking_budget"], 1024);
         let sys = system_for_request(&s);
         assert!(sys.contains("検討は短く"));
+    }
+
+    #[test]
+    fn format_hint_appended_when_missing() {
+        let mut s = Settings::default();
+        s.llm_thinking = "off".into();
+        s.llm_system_prompt = "custom".into();
+        let sys = system_for_request(&s);
+        assert!(sys.contains("custom"));
+        assert!(sys.contains("生のHTMLは書かないでください"));
+        assert_eq!(sys.matches("生のHTMLは書かないでください").count(), 1);
+    }
+
+    #[test]
+    fn diagram_hint_only_when_user_asks() {
+        let mut sys = String::from("base");
+        append_diagram_hint(&mut sys, "争点を整理して");
+        assert!(!sys.contains("言語タグ mermaid"));
+        append_diagram_hint(&mut sys, "要件事実ダイアグラムを作って");
+        assert!(sys.contains("言語タグ mermaid"));
+        let once = sys.matches("言語タグ mermaid").count();
+        append_diagram_hint(&mut sys, "構造図も出して");
+        assert_eq!(sys.matches("言語タグ mermaid").count(), once);
+    }
+
+    #[test]
+    fn format_hint_not_duplicated_on_default() {
+        let mut s = Settings::default();
+        s.llm_thinking = "off".into();
+        let sys = system_for_request(&s);
+        assert_eq!(sys.matches("生のHTMLは書かないでください").count(), 1);
     }
 
     #[test]

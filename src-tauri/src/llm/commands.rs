@@ -337,6 +337,7 @@ pub async fn llm_send(
     let max_chars = settings.llm_max_context_chars as usize;
     let thread_scope = Some(thread.path_prefix.trim().to_string()).filter(|s| !s.is_empty());
     let mut system = llm::system_for_request(&settings);
+    llm::append_diagram_hint(&mut system, &content);
     // Without this the model reads an empty result as "nothing exists" and keeps
     // rephrasing, instead of reporting that the folder does not contain the answer.
     if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
