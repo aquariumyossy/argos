@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for Argos windows",
-  "windows": ["main", "popup", "notes", "chat"],
+  "windows": ["main", "popup", "notes", "chat", "preview"],
   "permissions": [
     "core:default",
     "core:window:allow-show",
@@ -20,6 +20,7 @@
     "core:window:allow-start-dragging",
     "core:window:allow-start-resize-dragging",
     "core:window:allow-close",
+    "core:window:allow-set-title",
     "core:event:default",
     "opener:default",
     "dialog:allow-open",

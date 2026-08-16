@@ -1,10 +1,41 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import "./chatDestPicker.css";
 
 export type DestItem = {
   id: string;
   title: string;
 };
+
+const MENU_MARGIN = 8;
+/** Matches `.chat-dest-menu { min-width: 14rem }` before the menu is measured. */
+const MENU_MIN_WIDTH = 224;
+
+function placeDestMenu(
+  rect: DOMRect,
+  dropUp: boolean,
+  menuWidth: number,
+): CSSProperties {
+  const vw = window.innerWidth;
+  let left = rect.right - menuWidth;
+  if (left < MENU_MARGIN) left = MENU_MARGIN;
+  if (left + menuWidth > vw - MENU_MARGIN) {
+    left = Math.max(MENU_MARGIN, vw - MENU_MARGIN - menuWidth);
+  }
+  return {
+    position: "fixed",
+    top: dropUp ? undefined : rect.bottom + 6,
+    bottom: dropUp ? window.innerHeight - rect.top + 6 : undefined,
+    left,
+    right: "auto",
+  };
+}
 
 function readLast(key: string): string {
   try {
@@ -56,6 +87,7 @@ export default function DestPicker({
   const [items, setItems] = useState<DestItem[]>([]);
   const [activeId, setActiveId] = useState("");
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
   const load = useCallback(async () => {
     const list = await loadItems();
@@ -85,6 +117,15 @@ export default function DestPicker({
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
+  useLayoutEffect(() => {
+    if (!open || !wrapRef.current) return;
+    const rect = wrapRef.current.getBoundingClientRect();
+    const up = rect.bottom + 260 > window.innerHeight && rect.top > 260;
+    setDropUp(up);
+    const width = menuRef.current?.offsetWidth || MENU_MIN_WIDTH;
+    setMenuStyle(placeDestMenu(rect, up, width));
+  }, [open, items]);
+
   function toggle() {
     if (disabled) return;
     setOpen((v) => {
@@ -93,13 +134,7 @@ export default function DestPicker({
         const rect = wrapRef.current.getBoundingClientRect();
         const up = rect.bottom + 260 > window.innerHeight && rect.top > 260;
         setDropUp(up);
-        setMenuStyle({
-          position: "fixed",
-          top: up ? undefined : rect.bottom + 6,
-          bottom: up ? window.innerHeight - rect.top + 6 : undefined,
-          right: Math.max(8, window.innerWidth - rect.right),
-          left: "auto",
-        });
+        setMenuStyle(placeDestMenu(rect, up, MENU_MIN_WIDTH));
       }
       return next;
     });
@@ -133,6 +168,7 @@ export default function DestPicker({
       </button>
       {open ? (
         <div
+          ref={menuRef}
           className={dropUp ? "chat-dest-menu up" : "chat-dest-menu"}
           role="menu"
           style={menuStyle}

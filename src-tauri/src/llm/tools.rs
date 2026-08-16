@@ -1,5 +1,7 @@
 //! LLM tool-calling: index search and unit preview.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 
 use crate::db::LlmSourceRow;
@@ -18,6 +20,8 @@ const READ_BODY_CAP: usize = 6_000;
 /// Paragraphs of the same file returned per search round. A statute file holds hundreds
 /// of articles and a contract many clauses, so one unit per file loses the rest.
 const UNITS_PER_FILE: usize = 3;
+/// Cap on simultaneous thread folder scopes (each prefix is a separate index search).
+pub const MAX_THREAD_SCOPES: usize = 8;
 
 pub fn tools_schema() -> Value {
     json!([
@@ -36,7 +40,7 @@ pub fn tools_schema() -> Value {
                         "query": { "type": "string", "description": "検索語（単語を空白区切り。\"...\" で完全一致、-語 で除外）" },
                         "path_prefix": {
                             "type": "string",
-                            "description": "フォルダパスで結果を絞る（任意）。スレッドに検索範囲が設定されている場合はそれが優先される。"
+                            "description": "フォルダパスで結果を絞る（任意）。スレッドに検索範囲が設定されている場合、その配下への絞り込みだけが有効。"
                         },
                         "k": { "type": "integer", "description": "件数（1〜8）" }
                     },
@@ -218,13 +222,12 @@ fn run_index_search(
     let user_dict = state.user_dict.read().clone();
     // `k` counts files as far as the model is concerned, but paragraph fan-out means one
     // file can occupy several slots, so widen the unit budget to keep k files reachable.
-    let unit_limit = (k * UNITS_PER_FILE).clamp(k, 24);
     search::run_search_precise(
         &settings,
         state.backend.as_ref(),
         Some(state.mail_backend.as_ref()),
         query,
-        unit_limit,
+        unit_limit_for(k),
         path_prefix,
         None,
         &user_dict,
@@ -232,22 +235,119 @@ fn run_index_search(
     )
 }
 
+fn unit_limit_for(k: usize) -> usize {
+    (k * UNITS_PER_FILE).clamp(k, 24)
+}
+
+fn run_index_search_multi(
+    state: &AppState,
+    query: &str,
+    prefixes: &[String],
+    k: usize,
+) -> Result<Vec<SearchHit>, String> {
+    if prefixes.is_empty() {
+        return run_index_search(state, query, None, k);
+    }
+    if prefixes.len() == 1 {
+        return run_index_search(state, query, Some(&prefixes[0]), k);
+    }
+    let mut all = Vec::new();
+    for p in prefixes {
+        all.extend(run_index_search(state, query, Some(p), k)?);
+    }
+    Ok(merge_hits_by_score(all, unit_limit_for(k)))
+}
+
+fn merge_hits_by_score(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    hits.sort_by(|x, y| y.score.total_cmp(&x.score));
+    let mut seen = HashSet::new();
+    hits.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
+    hits.truncate(limit);
+    hits
+}
+
+/// Split a persisted `path_prefix` (newline-separated) into folder paths.
+pub fn parse_thread_scopes(raw: &str) -> Vec<String> {
+    raw.split('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Drop children when a parent is already selected, then cap the count.
+pub fn join_thread_scopes(prefixes: &[String]) -> String {
+    collapse_thread_scopes(prefixes)
+        .into_iter()
+        .take(MAX_THREAD_SCOPES)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn collapse_thread_scopes(prefixes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in prefixes {
+        let p = raw.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|kept| crate::pathutil::path_starts_with(p, kept))
+        {
+            continue;
+        }
+        out.retain(|kept| !crate::pathutil::path_starts_with(kept, p));
+        out.push(p.to_string());
+    }
+    out
+}
+
+/// System-prompt line so the model does not treat a scoped miss as "nothing exists".
+pub fn format_thread_scope_system_line(raw: &str) -> Option<String> {
+    let scopes = parse_thread_scopes(raw);
+    if scopes.is_empty() {
+        return None;
+    }
+    let quoted = scopes
+        .iter()
+        .map(|s| format!("「{s}」"))
+        .collect::<Vec<_>>()
+        .join("、");
+    Some(format!(
+        "\nインデックス検索は{quoted}配下に限定されています。ここに無いものは索引外として扱ってください。"
+    ))
+}
+
+fn scope_where_clause(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        String::new()
+    } else {
+        format!("（検索範囲: {}）", scopes.join("、"))
+    }
+}
+
 /// Resolve the folder scope for a tool call.
 ///
 /// The thread scope is a user instruction, so a model-supplied `path_prefix` may only
 /// narrow it further. Anything outside is discarded rather than honoured, otherwise the
 /// model could silently search folders the user excluded.
-fn resolve_scope(thread_scope: Option<&str>, requested: Option<&str>) -> Option<String> {
-    let thread = thread_scope.map(str::trim).filter(|s| !s.is_empty());
+fn resolve_scopes(thread_scope: Option<&str>, requested: Option<&str>) -> Vec<String> {
+    let thread = thread_scope
+        .map(parse_thread_scopes)
+        .unwrap_or_default();
     let requested = requested.map(str::trim).filter(|s| !s.is_empty());
-    match (thread, requested) {
-        (None, r) => r.map(|s| s.to_string()),
-        (Some(t), None) => Some(t.to_string()),
-        (Some(t), Some(r)) => {
-            if crate::pathutil::path_starts_with(r, t) {
-                Some(r.to_string())
+    match (thread.is_empty(), requested) {
+        (true, r) => r.map(|s| vec![s.to_string()]).unwrap_or_default(),
+        (false, None) => thread,
+        (false, Some(r)) => {
+            if thread
+                .iter()
+                .any(|t| crate::pathutil::path_starts_with(r, t))
+            {
+                vec![r.to_string()]
             } else {
-                Some(t.to_string())
+                thread
             }
         }
     }
@@ -352,19 +452,16 @@ fn execute_tool_inner(
                 });
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
-            let scope = resolve_scope(thread_scope, requested);
+            let scopes = resolve_scopes(thread_scope, requested);
             let settings_k = state.settings.read().llm_search_top_k.clamp(1, 8) as usize;
             let k = args
                 .get("k")
                 .and_then(|v| v.as_u64())
                 .map(|n| (n as usize).clamp(1, 8))
                 .unwrap_or(settings_k);
-            let hits = run_index_search(state, &query, scope.as_deref(), k)?;
+            let hits = run_index_search_multi(state, &query, &scopes, k)?;
             if hits.is_empty() {
-                let where_ = match scope.as_deref() {
-                    Some(s) => format!("（検索範囲: {s}）"),
-                    None => String::new(),
-                };
+                let where_ = scope_where_clause(&scopes);
                 return Ok(ToolExec {
                     content: format!(
                         "「{query}」に一致する索引ヒットはありません{where_}。語を減らすか別の語で言い換えてください。"
@@ -491,25 +588,76 @@ mod tests {
     fn thread_scope_is_a_hard_boundary() {
         let thread = Some(r"C:\cases\alpha");
         assert_eq!(
-            resolve_scope(thread, Some(r"C:\cases\alpha\pleadings")).as_deref(),
-            Some(r"C:\cases\alpha\pleadings"),
+            resolve_scopes(thread, Some(r"C:\cases\alpha\pleadings")),
+            vec![r"C:\cases\alpha\pleadings".to_string()],
             "a narrower request is honoured"
         );
         assert_eq!(
-            resolve_scope(thread, Some(r"C:\cases\beta")).as_deref(),
-            Some(r"C:\cases\alpha"),
+            resolve_scopes(thread, Some(r"C:\cases\beta")),
+            vec![r"C:\cases\alpha".to_string()],
             "a request outside the thread scope must be discarded, not followed"
         );
         assert_eq!(
-            resolve_scope(thread, None).as_deref(),
-            Some(r"C:\cases\alpha")
+            resolve_scopes(thread, None),
+            vec![r"C:\cases\alpha".to_string()]
         );
-        assert_eq!(resolve_scope(None, None), None, "unscoped stays unscoped");
+        assert!(
+            resolve_scopes(None, None).is_empty(),
+            "unscoped stays unscoped"
+        );
         assert_eq!(
-            resolve_scope(None, Some(r"C:\cases\beta")).as_deref(),
-            Some(r"C:\cases\beta"),
+            resolve_scopes(None, Some(r"C:\cases\beta")),
+            vec![r"C:\cases\beta".to_string()],
             "without a thread scope the model may narrow freely"
         );
+    }
+
+    #[test]
+    fn multi_thread_scope_allows_narrowing_into_any_folder() {
+        let thread = Some("C:\\cases\\alpha\nC:\\cases\\beta");
+        assert_eq!(
+            resolve_scopes(thread, Some(r"C:\cases\beta\exhibits")),
+            vec![r"C:\cases\beta\exhibits".to_string()],
+        );
+        assert_eq!(
+            resolve_scopes(thread, Some(r"C:\cases\gamma")),
+            vec![
+                r"C:\cases\alpha".to_string(),
+                r"C:\cases\beta".to_string()
+            ],
+            "outside the union, keep every thread folder"
+        );
+        assert_eq!(
+            resolve_scopes(thread, None),
+            vec![
+                r"C:\cases\alpha".to_string(),
+                r"C:\cases\beta".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn join_thread_scopes_drops_children_and_caps() {
+        let joined = join_thread_scopes(&[
+            r"C:\cases\alpha".into(),
+            r"C:\cases\alpha\pleadings".into(),
+            r"C:\cases\beta".into(),
+        ]);
+        assert_eq!(joined, "C:\\cases\\alpha\nC:\\cases\\beta");
+        assert!(parse_thread_scopes("").is_empty());
+        assert_eq!(
+            parse_thread_scopes("C:\\a\n\nC:\\b"),
+            vec![r"C:\a".to_string(), r"C:\b".to_string()]
+        );
+        let many: Vec<String> = (0..12).map(|i| format!(r"C:\cases\{i}")).collect();
+        assert_eq!(parse_thread_scopes(&join_thread_scopes(&many)).len(), 8);
+        assert_eq!(
+            format_thread_scope_system_line("C:\\a\nC:\\b").as_deref(),
+            Some(
+                "\nインデックス検索は「C:\\a」、「C:\\b」配下に限定されています。ここに無いものは索引外として扱ってください。"
+            )
+        );
+        assert!(format_thread_scope_system_line("").is_none());
     }
 
     #[test]

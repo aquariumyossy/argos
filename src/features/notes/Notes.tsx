@@ -27,6 +27,7 @@ import {
   saveNoteMarkdown,
 } from "./exportNoteText";
 import ChatDestPicker, { attachToChat } from "../chat/ChatDestPicker";
+import { openPreview } from "../preview/openPreview";
 import "./notes.css";
 
 const SIDEBAR_MIN = 160;
@@ -273,6 +274,15 @@ function IconOpenFile() {
       <path d="M9 2.5h4.5V7" />
       <path d="M13.5 2.5 7 9" />
       <path d="M7.5 3.5H3.75A1.25 1.25 0 0 0 2.5 4.75v7.5A1.25 1.25 0 0 0 3.75 13.5h7.5a1.25 1.25 0 0 0 1.25-1.25V8.5" />
+    </ActionIcon>
+  );
+}
+
+function IconPreview() {
+  return (
+    <ActionIcon>
+      <path d="M1.75 8s2.25-4 6.25-4 6.25 4 6.25 4-2.25 4-6.25 4-6.25-4-6.25-4Z" />
+      <circle cx="8" cy="8" r="1.75" />
     </ActionIcon>
   );
 }
@@ -660,6 +670,29 @@ export default function Notes() {
       setError(String(e));
     }
   }, []);
+
+  const previewItem = useCallback(
+    async (row: NoteItemRow, snap: NoteItemSnapshot) => {
+      const path = snap.path.trim();
+      if (!path) return;
+      try {
+        await openPreview({
+          origin: "notes",
+          path,
+          paragraphId: snap.paragraphId || row.paragraphId,
+          query: row.query,
+          highlightTerms: snap.highlightTerms,
+          title: snap.title,
+          fallbackBody: snap.body,
+          source: snap.source,
+        });
+        setError("");
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [],
+  );
 
   const openFolder = useCallback(async (path: string) => {
     if (!path) return;
@@ -1272,6 +1305,17 @@ export default function Notes() {
                         ) : null}
                       </div>
                       <div className="notes-item-actions">
+                        {snap.path.trim() ? (
+                          <button
+                            type="button"
+                            className="notes-icon-btn"
+                            title="プレビュー"
+                            aria-label="プレビュー"
+                            onClick={() => void previewItem(row, snap)}
+                          >
+                            <IconPreview />
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className="notes-icon-btn"

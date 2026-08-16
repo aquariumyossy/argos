@@ -179,17 +179,18 @@ pub fn llm_rename_thread(
         .ok_or_else(|| "会話が見つかりません".into())
 }
 
-/// Restrict this thread's index searches to one folder (or `mailfolder:<name>`).
-/// An empty `path_prefix` clears the scope.
+/// Restrict this thread's index searches to the given folders (or `mailfolder:<name>`).
+/// An empty list clears the scope. Multiple paths are stored newline-separated.
 #[tauri::command]
 pub fn llm_set_thread_scope(
     state: State<'_, Arc<AppState>>,
     id: String,
-    path_prefix: String,
+    path_prefixes: Vec<String>,
 ) -> Result<LlmThreadRow, String> {
+    let joined = tools::join_thread_scopes(&path_prefixes);
     state
         .db
-        .set_llm_thread_scope(&id, &path_prefix)
+        .set_llm_thread_scope(&id, &joined)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "会話が見つかりません".into())
 }
@@ -338,10 +339,8 @@ pub async fn llm_send(
     let mut system = llm::system_for_request(&settings);
     // Without this the model reads an empty result as "nothing exists" and keeps
     // rephrasing, instead of reporting that the folder does not contain the answer.
-    if let Some(ref scope) = thread_scope {
-        system.push_str(&format!(
-            "\nインデックス検索は「{scope}」配下に限定されています。ここに無いものは索引外として扱ってください。"
-        ));
+    if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
+        system.push_str(&line);
     }
     let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
     let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
