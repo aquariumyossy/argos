@@ -2086,6 +2086,7 @@ impl Db {
     }
 
     /// Folder scope for this thread's index searches. Empty means the whole index.
+    /// Multiple folders are stored as newline-separated paths.
     pub fn set_llm_thread_scope(
         &self,
         id: &str,

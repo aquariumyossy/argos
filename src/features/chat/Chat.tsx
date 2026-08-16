@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import ChatScopePicker from "./ChatScopePicker";
+import { openPreview } from "../preview/openPreview";
 import "./chat.css";
 
 type LlmThreadRow = {
@@ -12,10 +14,6 @@ type LlmThreadRow = {
   createdAt: number;
   updatedAt: number;
 };
-
-type SearchScopeRow = { path: string; label: string; isRoot: boolean };
-
-type SearchScopesResult = { recent: SearchScopeRow[]; scopes: SearchScopeRow[] };
 
 type LlmMessageRow = {
   id: string;
@@ -81,26 +79,6 @@ const TPL_SUMMARY =
   "添付した出典を日本語で要約してください。重要な結論と根拠を短く。";
 const TPL_POINTS =
   "争点、結論、根拠を箇条書きで整理してください。根拠には出典番号 [n] を付けてください。";
-
-function formatMailScopeLabel(raw: string): string {
-  const parts = raw
-    .split(/[\\/]/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-  if (parts.length <= 1) return raw.trim();
-  const store = parts[0];
-  return `${parts.slice(1).join("／")}（${store}）`;
-}
-
-/** Short chip text for a scope path. */
-function scopeChipLabel(path: string, label?: string | null): string {
-  if (label && label.trim()) return label.trim();
-  if (path.startsWith("mailfolder:")) {
-    return formatMailScopeLabel(path.slice("mailfolder:".length));
-  }
-  const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
-  return normalized.split("\\").filter(Boolean).pop() || path;
-}
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -202,9 +180,6 @@ export default function Chat() {
   const [maxContextChars, setMaxContextChars] = useState(80_000);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
-  const [scopePickerOpen, setScopePickerOpen] = useState(false);
-  const [scopeRows, setScopeRows] = useState<SearchScopeRow[]>([]);
-  const [scopeFilter, setScopeFilter] = useState("");
   const listRef = useRef<HTMLDivElement | null>(null);
   const bootstrappingRef = useRef(false);
   const activeIdRef = useRef<string | null>(null);
@@ -453,68 +428,23 @@ export default function Chat() {
     }
   }
 
-  /// Scoping the thread narrows every index search the model runs, which is the most
-  /// reliable way to keep a question about one matter out of unrelated folders.
-  const openScopePicker = useCallback(async () => {
-    try {
-      const result = await invoke<SearchScopesResult>("list_search_scopes", {
-        query: null,
-      });
-      let rows = result.scopes ?? [];
-      try {
-        const mailNames = await invoke<string[]>("mail_list_selected_folder_names");
-        rows = [
-          ...rows,
-          ...(mailNames ?? []).map((name) => ({
-            path: `mailfolder:${name}`,
-            label: formatMailScopeLabel(name),
-            isRoot: true,
-          })),
-        ];
-      } catch {
-        // Outlook mail not configured — file scopes are enough.
-      }
-      setScopeRows(rows);
-      setScopeFilter("");
-      setScopePickerOpen(true);
-    } catch (e) {
-      setError(formatInvokeError(e));
-    }
+  const applyThreadScope = useCallback((t: LlmThreadRow) => {
+    setThreads((prev) => prev.map((x) => (x.id === t.id ? t : x)));
+    setActive((prev) => (prev?.id === t.id ? t : prev));
   }, []);
-
-  const applyScope = useCallback(
-    async (pathPrefix: string) => {
-      setScopePickerOpen(false);
-      const id = activeIdRef.current;
-      if (!id) return;
-      try {
-        const t = await invoke<LlmThreadRow>("llm_set_thread_scope", {
-          id,
-          pathPrefix,
-        });
-        setThreads((prev) => prev.map((x) => (x.id === id ? t : x)));
-        setActive((prev) => (prev?.id === id ? t : prev));
-      } catch (e) {
-        setError(formatInvokeError(e));
-      }
-    },
-    [],
-  );
-
-  const filteredScopeRows = useMemo(() => {
-    const q = scopeFilter.trim().toLowerCase();
-    if (!q) return scopeRows;
-    return scopeRows.filter(
-      (s) =>
-        s.label.toLowerCase().includes(q) || s.path.toLowerCase().includes(q),
-    );
-  }, [scopeRows, scopeFilter]);
 
   async function openSource(s: LlmSourceRow) {
     const path = s.path.trim();
     if (!path) return;
     try {
-      await invoke("open_hit", { path });
+      await openPreview({
+        origin: "chat",
+        path,
+        paragraphId: s.paragraphId,
+        query: s.query,
+        title: s.title,
+        fallbackBody: s.body,
+      });
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -769,21 +699,21 @@ export default function Chat() {
                     <div className="chat-msg-cites" aria-label="出典">
                       {cites.map((s, i) => {
                         const n = citeNoOf(s, i + 1);
-                        const clickable = sourceCanExpand(s);
+                        const path = s.path.trim();
+                        if (!path) {
+                          return (
+                            <span key={s.id} className="chat-cite-badge">
+                              [{n}] {sourceLabel(s)}
+                            </span>
+                          );
+                        }
                         return (
                           <button
                             key={s.id}
                             type="button"
-                            className={
-                              clickable
-                                ? "chat-cite-badge clickable"
-                                : "chat-cite-badge"
-                            }
-                            title={clickable ? "ファイルを開く" : sourceLabel(s)}
-                            disabled={!clickable}
-                            onClick={() => {
-                              if (clickable) void openSource(s);
-                            }}
+                            className="chat-cite-badge clickable"
+                            title="プレビュー"
+                            onClick={() => void openSource(s)}
                           >
                             [{n}] {sourceLabel(s)}
                           </button>
@@ -809,11 +739,28 @@ export default function Chat() {
               </div>
               {liveCites.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
-                  {liveCites.map((s, i) => (
-                    <span key={s.id} className="chat-cite-badge">
-                      [{citeNoOf(s, maxCitedNo + i + 1)}] {sourceLabel(s)}
-                    </span>
-                  ))}
+                  {liveCites.map((s, i) => {
+                    const n = citeNoOf(s, maxCitedNo + i + 1);
+                    const path = s.path.trim();
+                    if (!path) {
+                      return (
+                        <span key={s.id} className="chat-cite-badge">
+                          [{n}] {sourceLabel(s)}
+                        </span>
+                      );
+                    }
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        className="chat-cite-badge clickable"
+                        title="プレビュー"
+                        onClick={() => void openSource(s)}
+                      >
+                        [{n}] {sourceLabel(s)}
+                      </button>
+                    );
+                  })}
                 </div>
               ) : null}
             </article>
@@ -865,13 +812,12 @@ export default function Chat() {
                         [{n}] {sourceLabel(s)}
                       </span>
                     )}
-                    {expandable ? (
+                    {s.path.trim() ? (
                       <button
                         type="button"
                         className="chat-source-openfile"
-                        title="ファイルを開く"
-                        aria-label="ファイルを開く"
-                        disabled={busy}
+                        title="プレビュー"
+                        aria-label="プレビュー"
                         onClick={() => void openSource(s)}
                       >
                         <IconOpenFile />
@@ -893,92 +839,13 @@ export default function Chat() {
             </div>
           ) : null}
           <div className="chat-composer-tools">
-            <div className="chat-scope">
-              <button
-                type="button"
-                className={`chat-tpl${active?.pathPrefix ? " is-active" : ""}`}
-                disabled={busy || !active}
-                title="この会話の検索対象フォルダを絞る"
-                aria-expanded={scopePickerOpen}
-                onClick={() => {
-                  if (scopePickerOpen) setScopePickerOpen(false);
-                  else void openScopePicker();
-                }}
-              >
-                {active?.pathPrefix
-                  ? `範囲: ${scopeChipLabel(active.pathPrefix)}`
-                  : "検索範囲"}
-              </button>
-              {active?.pathPrefix ? (
-                <button
-                  type="button"
-                  className="chat-scope-clear"
-                  title="検索範囲を解除"
-                  aria-label="検索範囲を解除"
-                  disabled={busy}
-                  onClick={() => void applyScope("")}
-                >
-                  ×
-                </button>
-              ) : null}
-              {scopePickerOpen ? (
-                <div
-                  className="chat-scope-picker"
-                  role="listbox"
-                  aria-label="検索対象フォルダ"
-                >
-                  <input
-                    className="chat-scope-filter"
-                    value={scopeFilter}
-                    placeholder="フォルダ名で絞り込み…"
-                    spellCheck={false}
-                    autoFocus
-                    onChange={(e) => setScopeFilter(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape") setScopePickerOpen(false);
-                    }}
-                  />
-                  {filteredScopeRows.length === 0 ? (
-                    <div className="chat-scope-empty">
-                      {scopeRows.length === 0
-                        ? "検索対象フォルダがありません。設定からフォルダを追加してください。"
-                        : "一致するフォルダがありません。"}
-                    </div>
-                  ) : (
-                    <ul>
-                      <li>
-                        <button
-                          type="button"
-                          role="option"
-                          aria-selected={!active?.pathPrefix}
-                          onClick={() => void applyScope("")}
-                        >
-                          <span className="chat-scope-kind">全体</span>
-                          <span className="chat-scope-label">索引全体</span>
-                        </button>
-                      </li>
-                      {filteredScopeRows.map((s) => (
-                        <li key={s.path}>
-                          <button
-                            type="button"
-                            role="option"
-                            aria-selected={active?.pathPrefix === s.path}
-                            className={s.isRoot ? "scope-root" : "scope-sub"}
-                            title={s.path}
-                            onClick={() => void applyScope(s.path)}
-                          >
-                            {s.isRoot ? (
-                              <span className="chat-scope-kind">ルート</span>
-                            ) : null}
-                            <span className="chat-scope-label">{s.label}</span>
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              ) : null}
-            </div>
+            <ChatScopePicker
+              disabled={busy || !active}
+              threadId={active?.id ?? null}
+              pathPrefix={active?.pathPrefix ?? ""}
+              onApplied={applyThreadScope}
+              onError={setError}
+            />
             <button
               type="button"
               className="chat-tpl"

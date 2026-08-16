@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::db::{Db, Settings};
 use crate::indexer::Indexer;
@@ -15,6 +16,25 @@ use crate::watcher::WatcherHandle;
 pub struct LlmJob {
     pub request_id: String,
     pub cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewTarget {
+    pub origin: String,
+    pub path: String,
+    #[serde(default)]
+    pub paragraph_id: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub highlight_terms: Option<Vec<String>>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub fallback_body: Option<String>,
 }
 
 pub struct AppState {
@@ -33,6 +53,7 @@ pub struct AppState {
     /// Outlook Classic COM worker (STA). Always present; errors if Outlook missing.
     pub mail: MailStaHandle,
     pub llm_job: RwLock<Option<LlmJob>>,
+    pub preview_target: RwLock<Option<PreviewTarget>>,
 }
 
 impl AppState {
@@ -88,6 +109,7 @@ impl AppState {
                 user_dict: RwLock::new(user_dict),
                 mail,
                 llm_job: RwLock::new(None),
+                preview_target: RwLock::new(None),
             },
             opened.needs_full_reindex,
         ))

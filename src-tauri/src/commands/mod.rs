@@ -14,8 +14,11 @@ use crate::pathutil;
 use crate::remote_server;
 use crate::search::{self, SearchHit};
 use crate::selection;
-use crate::state::AppState;
-use crate::{hide_popup_window, show_main, show_notes, show_popup};
+use crate::state::{AppState, PreviewTarget};
+use crate::{
+    hide_popup_window, hide_preview_window as do_hide_preview_window, show_main, show_notes,
+    show_popup, show_preview,
+};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -783,6 +786,35 @@ pub fn suggest_search_terms(
 #[tauri::command]
 pub fn hide_popup(app: AppHandle) {
     hide_popup_window(&app);
+}
+
+#[tauri::command]
+pub fn show_popup_window(app: AppHandle) {
+    let _ = show_popup(&app);
+}
+
+#[tauri::command]
+pub fn show_preview_window(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    target: PreviewTarget,
+) -> Result<(), String> {
+    if target.path.trim().is_empty() {
+        return Err("プレビューするパスがありません".into());
+    }
+    *state.preview_target.write() = Some(target);
+    show_preview(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_preview_target(state: State<'_, Arc<AppState>>) -> Option<PreviewTarget> {
+    state.preview_target.read().clone()
+}
+
+#[tauri::command]
+pub fn hide_preview_window(app: AppHandle) {
+    do_hide_preview_window(&app);
 }
 
 #[tauri::command]

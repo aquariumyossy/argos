@@ -383,19 +383,61 @@
   bottom: calc(100% + 6px);
   left: 0;
   z-index: 30;
-  width: min(420px, 80vw);
-  max-height: 320px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  width: min(480px, 90vw);
+  max-height: min(420px, 70vh);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg-elevated);
   box-shadow: 0 8px 24px rgb(0 0 0 / 22%);
-  padding: 6px;
+}
+
+.chat-scope-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+  padding: 6px 8px 5px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-scope-picker-head-label {
+  font-size: 0.75em;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.chat-scope-picker-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chat-scope-picker-close:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .chat-scope-filter {
-  width: 100%;
+  width: calc(100% - 16px);
   box-sizing: border-box;
+  flex: none;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
@@ -403,7 +445,14 @@
   font: inherit;
   font-size: 0.85em;
   padding: 4px 8px;
-  margin-bottom: 6px;
+  margin: 8px;
+}
+
+.chat-scope-picker-list {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 6px 6px;
 }
 
 .chat-scope-picker ul {
@@ -433,9 +482,27 @@
   background: var(--bg-hover, rgb(127 127 127 / 12%));
 }
 
+.chat-scope-picker li > button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .chat-scope-picker li > button.scope-sub .chat-scope-label {
-  padding-left: 12px;
+  padding-left: 4px;
   color: var(--muted);
+}
+
+.chat-scope-picker li > button.scope-recent {
+  font-weight: 600;
+}
+
+.chat-scope-check {
+  width: 14px;
+  flex: none;
+  color: var(--accent);
+  font-size: 0.85em;
+  font-weight: 700;
+  text-align: center;
 }
 
 .chat-scope-kind {
@@ -453,10 +520,44 @@
   white-space: nowrap;
 }
 
+.chat-scope-sep {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--line);
+  list-style: none;
+  pointer-events: none;
+}
+
 .chat-scope-empty {
   color: var(--muted);
   font-size: 0.85em;
   padding: 6px;
+}
+
+.chat-scope-picker-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+  border-top: 1px solid var(--line);
+  padding: 6px 8px 8px;
+}
+
+.chat-scope-picker-count {
+  color: var(--muted);
+  font-size: 0.8em;
+}
+
+.chat-scope-apply {
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 0.85em;
+  padding: 4px 12px;
+  cursor: pointer;
 }
 
 .chat-char-meter {

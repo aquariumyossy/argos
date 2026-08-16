@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -10,30 +9,33 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  applyPreviewHighlights,
-  clearPreviewHighlights,
-  collectPreviewHighlightTerms,
-  findFormattedContentOffset,
-  findJsonHitOffset,
-  formatGenericJsonHtml,
-  formatJsonForPreview,
-  isHtmlPath,
-  isJsonPath,
-  isMarkdownPath,
-  splitProseParagraphs,
-} from "./markdownPreview";
-import { formatLegalDisplayHtml, formatLegalMdHtml } from "../notes/legalMdFormat";
 import { formatExportBody } from "../notes/exportNoteText";
 import ChatDestPicker, { attachToChat } from "../chat/ChatDestPicker";
 import NoteDestPicker, { keepToNote } from "../notes/NoteDestPicker";
 import { highlightText } from "../search/highlightText";
+import {
+  formatMailDateYmd,
+  formatMailFolderMeta,
+  formatMailScopeLabel,
+  isOutlookHit,
+  parentDir,
+  scopeChipLabel,
+} from "../preview/hitMeta";
+import { openPreview } from "../preview/openPreview";
+import { IconPreview } from "../preview/previewIcons";
+import type {
+  ParagraphHit,
+  PreviewRescopePayload,
+  SearchHit,
+} from "../preview/types";
 import {
   dictionaryWordFromSelection,
   selectionIsQuoted,
   toggleAdjacentQuotes,
 } from "./queryEdit";
 import "./popup.css";
+
+export type { ParagraphHit, SearchHit };
 
 function HitActionIcon({ children }: { children: ReactNode }) {
   return (
@@ -60,15 +62,6 @@ function IconOpenFile() {
       <path d="M9 2.5h4.5V7" />
       <path d="M13.5 2.5 7 9" />
       <path d="M7.5 3.5H3.75A1.25 1.25 0 0 0 2.5 4.75v7.5A1.25 1.25 0 0 0 3.75 13.5h7.5a1.25 1.25 0 0 0 1.25-1.25V8.5" />
-    </HitActionIcon>
-  );
-}
-
-function IconPreview() {
-  return (
-    <HitActionIcon>
-      <path d="M1.75 8s2.25-4 6.25-4 6.25 4 6.25 4-2.25 4-6.25 4-6.25-4-6.25-4Z" />
-      <circle cx="8" cy="8" r="1.75" />
     </HitActionIcon>
   );
 }
@@ -134,19 +127,6 @@ function IconSettings() {
       <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
       <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
     </svg>
-  );
-}
-
-function IconList() {
-  return (
-    <HitActionIcon>
-      <path d="M5.5 4h8" />
-      <path d="M5.5 8h8" />
-      <path d="M5.5 12h8" />
-      <circle cx="3.25" cy="4" r="0.75" fill="currentColor" stroke="none" />
-      <circle cx="3.25" cy="8" r="0.75" fill="currentColor" stroke="none" />
-      <circle cx="3.25" cy="12" r="0.75" fill="currentColor" stroke="none" />
-    </HitActionIcon>
   );
 }
 
@@ -283,35 +263,6 @@ type ResizeDirection =
   | "SouthWest"
   | "West";
 
-export type ParagraphHit = {
-  id: string;
-  label: string;
-  snippet: string;
-  score: number;
-  page?: number | null;
-};
-
-export type SearchHit = {
-  id: string;
-  title: string;
-  snippet: string;
-  path: string;
-  page?: number | null;
-  chunkId?: number | null;
-  score: number;
-  source: string;
-  previewText: string;
-  highlightTerms?: string[];
-  matchCount?: number;
-  paragraphs?: ParagraphHit[];
-  unitLabel?: string;
-  mailFrom?: string;
-  mailDate?: string;
-  mailConversationId?: string;
-  mailFolder?: string;
-  docKind?: string;
-};
-
 type SearchPayload = {
   query: string;
   hits: SearchHit[];
@@ -372,34 +323,6 @@ const SEARCH_DEBOUNCE_MS = 450;
 const HINT_HOVER_MS = 500;
 const KEEP_TOAST_MS = 2200;
 
-type PreviewFileResult = {
-  units: SearchHit[];
-  excerpt: boolean;
-  matchIds: string[];
-};
-
-function previewNavIds(file: PreviewFileResult | null): string[] {
-  if (!file) return [];
-  const present = new Set(file.units.map((u) => u.id));
-  const ids = file.matchIds.filter((id) => present.has(id));
-  if (ids.length) return ids;
-  return file.units[0] ? [file.units[0].id] : [];
-}
-
-/** Parent directory of a Windows / UNC file path. Not for outlook: virtual paths. */
-function parentDir(path: string): string | null {
-  if (path.startsWith("outlook:") || path.startsWith("mailfolder:")) {
-    return null;
-  }
-  const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
-  const i = normalized.lastIndexOf("\\");
-  if (i <= 0) return null;
-  const parent = normalized.slice(0, i);
-  if (/^[A-Za-z]:$/.test(parent)) return `${parent}\\`;
-  if (!parent || parent === "\\") return null;
-  return parent;
-}
-
 const SCOPE_CHIP_LABEL_MAX = 36;
 
 /** Shorten long chip labels for display; full value stays in title/tooltip. */
@@ -410,73 +333,6 @@ function truncateChipLabel(label: string, max = SCOPE_CHIP_LABEL_MAX): string {
   const head = Math.ceil((max - 1) * 0.55);
   const tail = Math.max(1, max - 1 - head);
   return `${chars.slice(0, head).join("")}…${chars.slice(-tail).join("")}`;
-}
-
-/** Split Outlook `Store / Folder / …` and drop leading repeats of the store name. */
-function splitMailPathLabel(pathLabel: string): { store: string; folderParts: string[] } {
-  const parts = pathLabel
-    .split("/")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (parts.length === 0) return { store: "", folderParts: [] };
-  const store = parts[0];
-  let i = 1;
-  while (
-    i < parts.length &&
-    parts[i].localeCompare(store, undefined, { sensitivity: "accent" }) === 0
-  ) {
-    i += 1;
-  }
-  return { store, folderParts: parts.slice(i) };
-}
-
-/** Chip text: `メール：Folder／Sub（Store）` — store shown once. */
-function formatMailScopeLabel(pathLabel: string): string {
-  const { store, folderParts } = splitMailPathLabel(pathLabel);
-  if (!store) return "メール";
-  if (folderParts.length === 0) return `メール：${store}`;
-  return `メール：${folderParts.join("／")}（${store}）`;
-}
-
-/** Compact folder meta for hit rows (no メール： prefix). */
-function formatMailFolderMeta(pathLabel: string): string {
-  const { store, folderParts } = splitMailPathLabel(pathLabel);
-  if (!store) return pathLabel.trim();
-  if (folderParts.length === 0) return store;
-  return `${folderParts.join("／")}（${store}）`;
-}
-
-function scopeChipLabel(path: string, label?: string | null): string {
-  if (label && label.trim()) return label.trim();
-  if (path.startsWith("mailfolder:")) {
-    return formatMailScopeLabel(path.slice("mailfolder:".length));
-  }
-  if (path.startsWith("outlook:")) {
-    return "Outlook メール";
-  }
-  const normalized = path.replace(/\//g, "\\").replace(/\\+$/, "");
-  const base = normalized.split("\\").filter(Boolean).pop();
-  return base || path;
-}
-
-function isOutlookHit(hit: SearchHit): boolean {
-  return (
-    hit.source === "outlook" ||
-    hit.docKind === "email" ||
-    hit.path.startsWith("outlook:")
-  );
-}
-
-function formatMailDateYmd(unixStr?: string): string {
-  if (!unixStr) return "";
-  const n = Number(unixStr);
-  if (!Number.isFinite(n) || n <= 0) return "";
-  const d = new Date(n * 1000);
-  if (Number.isNaN(d.getTime())) return "";
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}/${m}/${day}`;
 }
 
 /** Shared highlighter (Popup + Notes). */
@@ -497,238 +353,10 @@ function scoreLevel(score: number, maxScore: number): number {
   return Math.min(5, Math.max(1, Math.ceil(ratio * 5)));
 }
 
-function PreviewBody({
-  hit,
-  query,
-  highlightTerms,
-}: {
-  hit: SearchHit;
-  query: string;
-  highlightTerms?: string[];
-}) {
-  const preRef = useRef<HTMLPreElement>(null);
-  const jsonHtmlRef = useRef<HTMLDivElement>(null);
-  const isMarkdown = isMarkdownPath(hit.path);
-  const isHtml = isHtmlPath(hit.path);
-  const isJson = isJsonPath(hit.path);
-  const [jsonRaw, setJsonRaw] = useState<string | null>(null);
-  const [jsonLoading, setJsonLoading] = useState(false);
-
-  const markdownHtml = useMemo(() => {
-    if (!isMarkdown) return "";
-    return formatLegalMdHtml(hit.previewText);
-  }, [hit.previewText, isMarkdown]);
-  const proseParagraphs = useMemo(() => {
-    if (!isHtml) return [];
-    return splitProseParagraphs(hit.previewText);
-  }, [hit.previewText, isHtml]);
-  const jsonView = useMemo(() => {
-    if (!isJson) return null;
-    const raw = jsonRaw ?? hit.previewText ?? "";
-    if (!raw) return null;
-    const legal = formatLegalDisplayHtml(hit.path, raw);
-    if (legal) {
-      return {
-        mode: "html" as const,
-        html: legal.html,
-        className:
-          legal.kind === "court"
-            ? "preview-body preview-body--court"
-            : "preview-body preview-body--markdown",
-      };
-    }
-    const generic = formatGenericJsonHtml(raw);
-    if (generic) {
-      return {
-        mode: "html" as const,
-        html: generic,
-        className: "preview-body preview-body--json",
-      };
-    }
-    return {
-      mode: "pre" as const,
-      text: formatJsonForPreview(raw),
-    };
-  }, [hit.path, hit.previewText, isJson, jsonRaw]);
-
-  useEffect(() => {
-    if (!isJson) {
-      setJsonRaw(null);
-      setJsonLoading(false);
-    }
-  }, [isJson]);
-
-  useEffect(() => {
-    if (!isJson || hit.source !== "remote") return;
-    setJsonRaw(hit.previewText);
-    setJsonLoading(false);
-  }, [hit.previewText, hit.source, isJson]);
-
-  useEffect(() => {
-    if (!isJson || hit.source === "remote") return;
-    let cancelled = false;
-    setJsonRaw(null);
-    setJsonLoading(true);
-    const fallback = hit.previewText;
-    void invoke<string>("read_text_file", { path: hit.path })
-      .then((raw) => {
-        if (cancelled) return;
-        setJsonRaw(raw);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setJsonRaw(fallback);
-      })
-      .finally(() => {
-        if (!cancelled) setJsonLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [hit.path, hit.source, isJson]);
-
-  useLayoutEffect(() => {
-    if (!isJson || jsonLoading || jsonView == null) return;
-
-    const scrollToOffset = () => {
-      if (jsonView.mode === "html") {
-        const root = jsonHtmlRef.current;
-        if (!root) return;
-        const haystack = root.textContent ?? "";
-        const offset = findFormattedContentOffset(
-          haystack,
-          hit.previewText ?? "",
-          hit.snippet ?? "",
-        );
-        if (offset >= 0) {
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-          let pos = 0;
-          while (walker.nextNode()) {
-            const node = walker.currentNode as Text;
-            const len = node.data.length;
-            if (pos + len > offset) {
-              node.parentElement?.scrollIntoView({
-                block: "center",
-                inline: "nearest",
-              });
-              return;
-            }
-            pos += len;
-          }
-        }
-        root.querySelector("dd, .preview-json-string, p")?.scrollIntoView({
-          block: "center",
-          inline: "nearest",
-        });
-        return;
-      }
-
-      const pre = preRef.current;
-      if (!pre) return;
-      const text = jsonView.text;
-      const offset = findJsonHitOffset(
-        text,
-        hit.previewText ?? "",
-        hit.snippet ?? "",
-      );
-      if (offset >= 0) {
-        const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
-        let pos = 0;
-        while (walker.nextNode()) {
-          const node = walker.currentNode as Text;
-          const len = node.data.length;
-          if (pos + len > offset) {
-            const target =
-              node.parentElement?.closest("mark") ??
-              node.parentElement ??
-              pre;
-            target.scrollIntoView({ block: "center", inline: "nearest" });
-            return;
-          }
-          pos += len;
-        }
-      }
-      pre.querySelector("mark")?.scrollIntoView({
-        block: "center",
-        inline: "nearest",
-      });
-    };
-
-    const frame = requestAnimationFrame(scrollToOffset);
-    return () => cancelAnimationFrame(frame);
-  }, [
-    hit.id,
-    hit.previewText,
-    hit.snippet,
-    isJson,
-    jsonLoading,
-    jsonView,
-  ]);
-
-  useLayoutEffect(() => {
-    if (!isJson || jsonView?.mode !== "html") return;
-    const el = jsonHtmlRef.current;
-    if (!el) return;
-    applyPreviewHighlights([el], highlightTerms ?? []);
-  }, [highlightTerms, isJson, jsonLoading, jsonView]);
-
-  if (isMarkdown) {
-    return (
-      <div
-        className="preview-body preview-body--markdown"
-        dangerouslySetInnerHTML={{ __html: markdownHtml }}
-      />
-    );
-  }
-
-  if (isHtml) {
-    return (
-      <div className="preview-body preview-body--prose">
-        {proseParagraphs.map((para, i) => (
-          <p key={i}>{highlight(para, query, highlightTerms ?? hit.highlightTerms)}</p>
-        ))}
-      </div>
-    );
-  }
-
-  if (isJson) {
-    if (jsonLoading && jsonRaw == null) {
-      return <pre className="preview-body">読み込み中…</pre>;
-    }
-    if (jsonView?.mode === "html") {
-      return (
-        <div
-          ref={jsonHtmlRef}
-          className={jsonView.className}
-          dangerouslySetInnerHTML={{ __html: jsonView.html }}
-        />
-      );
-    }
-    const text = jsonView?.mode === "pre" ? jsonView.text : hit.previewText;
-    return (
-      <pre ref={preRef} className="preview-body">
-        {highlight(text, query, highlightTerms ?? hit.highlightTerms)}
-      </pre>
-    );
-  }
-
-  return (
-    <pre className="preview-body">
-      {highlight(hit.previewText, query, highlightTerms ?? hit.highlightTerms)}
-    </pre>
-  );
-}
-
 export default function Popup() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [index, setIndex] = useState(0);
-  const [preview, setPreview] = useState<SearchHit | null>(null);
-  const [previewFile, setPreviewFile] = useState<PreviewFileResult | null>(
-    null,
-  );
-  const [previewUnitId, setPreviewUnitId] = useState<string | null>(null);
-  const [matchNavIndex, setMatchNavIndex] = useState(0);
   const [maximized, setMaximized] = useState(false);
   const [searching, setSearching] = useState(false);
   const [actionError, setActionError] = useState("");
@@ -756,13 +384,11 @@ export default function Popup() {
   const inputRef = useRef<HTMLInputElement>(null);
   const scopeFilterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
-  const previewScrollRef = useRef<HTMLDivElement>(null);
   const queryRowRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const keepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchSeq = useRef(0);
-  const previewSeq = useRef(0);
   const scopePathRef = useRef<string | null>(null);
   const extFilterRef = useRef<string[]>([]);
   const imeComposingRef = useRef(false);
@@ -806,13 +432,21 @@ export default function Popup() {
     };
   }, []);
 
-  const closePreview = useCallback(() => {
-    previewSeq.current += 1;
-    setPreview(null);
-    setPreviewFile(null);
-    setPreviewUnitId(null);
-    setMatchNavIndex(0);
-  }, []);
+  const openHitPreview = useCallback(
+    (hit: SearchHit, paragraphId?: string) => {
+      void openPreview({
+        origin: "search",
+        path: hit.path,
+        paragraphId: paragraphId ?? hit.id,
+        query: query.trim() || undefined,
+        highlightTerms: hit.highlightTerms,
+        source: hit.source,
+        title: hit.title,
+        fallbackBody: hit.previewText,
+      });
+    },
+    [query],
+  );
 
   const runSearch = useCallback(
     async (q: string, pathPrefix?: string | null, exts?: string[] | null) => {
@@ -839,7 +473,6 @@ export default function Popup() {
         if (seq !== searchSeq.current) return;
         setHits(next);
         setIndex(0);
-        closePreview();
         setExpandedParas({});
         void invoke("record_search_query", { query: trimmed }).catch(console.error);
       } catch (e) {
@@ -850,7 +483,7 @@ export default function Popup() {
         }
       }
     },
-    [closePreview],
+    [],
   );
 
   const scheduleSearch = useCallback(
@@ -921,6 +554,25 @@ export default function Popup() {
     [query, runSearch],
   );
 
+  const applyScopeRef = useRef(applyScope);
+  applyScopeRef.current = applyScope;
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<PreviewRescopePayload>("preview-rescope", (event) => {
+      applyScopeRef.current(event.payload.pathPrefix, event.payload.label);
+      void invoke("show_popup_window").catch(console.error);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const rescopeToHitFolder = useCallback(
     (hit: SearchHit) => {
       if (isOutlookHit(hit)) {
@@ -946,7 +598,6 @@ export default function Popup() {
     listen<SearchPayload>("search-results", (event) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       searchSeq.current += 1;
-      closePreview();
       clearScope();
       clearExtFilter();
       setQuery(event.payload.query);
@@ -971,7 +622,7 @@ export default function Popup() {
       unlisten?.();
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [clearScope, clearExtFilter, closePreview]);
+  }, [clearScope, clearExtFilter]);
 
   useEffect(() => {
     void invoke<SearchWordRow[]>("list_search_words")
@@ -1410,97 +1061,6 @@ export default function Popup() {
     [query, resolveChatBody, showKeepNotice],
   );
 
-  const showPreview = useCallback(
-    async (target?: SearchHit, focusId?: string) => {
-      const hit = target ?? hits[index];
-      if (!hit) return;
-      const seq = ++previewSeq.current;
-      setPreview(hit);
-      setPreviewFile(null);
-      setPreviewUnitId(focusId ?? hit.id);
-      setMatchNavIndex(0);
-      if (hit.source === "remote") {
-        setPreviewFile({
-          units: [hit],
-          excerpt: true,
-          matchIds: [hit.id],
-        });
-        return;
-      }
-      try {
-        const file = await invoke<PreviewFileResult>("preview_file", {
-          query: query.trim(),
-          path: hit.path,
-        });
-        if (seq !== previewSeq.current) return;
-        const units = file.units.length ? file.units : [hit];
-        const rawIds = file.matchIds.length
-          ? file.matchIds
-          : focusId
-            ? [focusId]
-            : [hit.id];
-        const present = new Set(units.map((u) => u.id));
-        const inUnits = rawIds.filter((id) => present.has(id));
-        const matchIds = inUnits.length
-          ? inUnits
-          : units[0]
-            ? [units[0].id]
-            : [hit.id];
-        setPreviewFile({ ...file, units, matchIds });
-        const want = focusId ?? hit.id;
-        const found = matchIds.findIndex((id) => id === want);
-        setMatchNavIndex(found >= 0 ? found : 0);
-        setPreviewUnitId(want);
-        const unit = units.find((u) => u.id === want) ?? units[0];
-        if (unit) setPreview(unit);
-      } catch (e) {
-        if (seq !== previewSeq.current) return;
-        console.error(e);
-        setPreviewFile({
-          units: [hit],
-          excerpt: false,
-          matchIds: [hit.id],
-        });
-      }
-    },
-    [hits, index, query],
-  );
-
-  const previewParagraph = useCallback(
-    async (paraId: string, fileHit: SearchHit) => {
-      await showPreview(fileHit, paraId);
-    },
-    [showPreview],
-  );
-
-  const scrollToMatch = useCallback((unitId: string) => {
-    const root = previewScrollRef.current;
-    if (!root) return;
-    const el = Array.from(
-      root.querySelectorAll<HTMLElement>("[data-preview-unit]"),
-    ).find((node) => node.dataset.previewUnit === unitId);
-    el?.scrollIntoView({ block: "center", inline: "nearest" });
-  }, []);
-
-  const stepMatch = useCallback(
-    (delta: number) => {
-      const ids = previewNavIds(previewFile);
-      if (ids.length === 0) return;
-      setMatchNavIndex((i) => {
-        const next = (i + delta + ids.length) % ids.length;
-        const id = ids[next];
-        if (id) {
-          setPreviewUnitId(id);
-          const unit = previewFile?.units.find((u) => u.id === id);
-          if (unit) setPreview(unit);
-          requestAnimationFrame(() => scrollToMatch(id));
-        }
-        return next;
-      });
-    },
-    [previewFile, scrollToMatch],
-  );
-
   const expandHitParagraphs = useCallback(
     async (hit: SearchHit) => {
       if (expandedParas[hit.path]) return;
@@ -1540,9 +1100,8 @@ export default function Popup() {
     setExtPickerOpen(false);
     setSuggestOpen(false);
     setSelectChip(null);
-    closePreview();
     await invoke("hide_popup");
-  }, [clearScope, closePreview]);
+  }, [clearScope]);
 
   const closeQueryOverlay = useCallback(() => {
     setFolderPickerOpen(false);
@@ -1553,43 +1112,9 @@ export default function Popup() {
   }, []);
 
   useEffect(() => {
-    if (preview) return;
     const active = listRef.current?.querySelector<HTMLElement>(".hit.active");
     active?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [index, hits, preview]);
-
-  useEffect(() => {
-    if (!preview || !previewFile || !previewUnitId) return;
-    requestAnimationFrame(() => scrollToMatch(previewUnitId));
-  }, [preview, previewFile, previewUnitId, scrollToMatch]);
-
-  const previewHighlightTerms = useMemo(() => {
-    if (!preview) return [];
-    const listHit = hits.find((h) => h.path === preview.path);
-    const extra = [
-      ...(listHit?.highlightTerms ?? []),
-      ...(preview.highlightTerms ?? []),
-      ...((previewFile?.units ?? []).flatMap((u) => u.highlightTerms ?? [])),
-    ];
-    return collectPreviewHighlightTerms(query, extra);
-  }, [hits, preview, previewFile, query]);
-
-  useLayoutEffect(() => {
-    if (!preview) {
-      clearPreviewHighlights();
-      return;
-    }
-    const root = previewScrollRef.current;
-    if (!root) {
-      clearPreviewHighlights();
-      return;
-    }
-    const els = Array.from(
-      root.querySelectorAll<HTMLElement>(".preview-body"),
-    );
-    applyPreviewHighlights(els, previewHighlightTerms);
-    return () => clearPreviewHighlights();
-  }, [preview, previewFile, previewHighlightTerms]);
+  }, [index, hits]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1611,10 +1136,6 @@ export default function Popup() {
           setSuggestOpen(false);
           return;
         }
-        if (preview) {
-          closePreview();
-          return;
-        }
         void hidePopup();
         return;
       }
@@ -1623,7 +1144,6 @@ export default function Popup() {
       if (
         suggestOpen &&
         suggestions.length > 0 &&
-        !preview &&
         !imeComposingRef.current
       ) {
         if (e.key === "Tab") {
@@ -1652,29 +1172,6 @@ export default function Popup() {
         }
       }
 
-      if (preview) {
-        if (e.key === "ArrowLeft" || e.key === "[") {
-          e.preventDefault();
-          stepMatch(-1);
-          return;
-        }
-        if (e.key === "ArrowRight" || e.key === "]") {
-          e.preventDefault();
-          stepMatch(1);
-          return;
-        }
-        if (e.key === "Enter" && e.shiftKey) {
-          e.preventDefault();
-          if (!isOutlookHit(preview)) void openFolder();
-          return;
-        }
-        if (e.key === "Enter") {
-          e.preventDefault();
-          void openSelected();
-          return;
-        }
-        return;
-      }
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setIndex((i) => Math.min(i + 1, Math.max(hits.length - 1, 0)));
@@ -1687,7 +1184,8 @@ export default function Popup() {
       }
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
-        void showPreview();
+        const hit = hits[index];
+        if (hit) openHitPreview(hit);
         return;
       }
       if (e.key === "Enter" && e.shiftKey) {
@@ -1705,19 +1203,16 @@ export default function Popup() {
     return () => window.removeEventListener("keydown", onKey);
   }, [
     applySuggestion,
-    closePreview,
     extPickerOpen,
     folderPickerOpen,
     hidePopup,
     hits,
     index,
     openFolder,
+    openHitPreview,
     openSelected,
-    preview,
     query,
     selectChip,
-    showPreview,
-    stepMatch,
     suggestIndex,
     suggestOpen,
     suggestions,
@@ -1787,7 +1282,7 @@ export default function Popup() {
     { dir: "SouthWest", className: "resize-sw" },
   ];
 
-  const currentHit = preview ?? hits[index];
+  const currentHit = hits[index];
   const currentIsMail = currentHit ? isOutlookHit(currentHit) : false;
 
   return (
@@ -2239,196 +1734,7 @@ export default function Popup() {
         ) : null}
       </header>
 
-      {preview ? (
-        <section className="preview">
-          <div className="preview-title">{preview.title}</div>
-          <div
-            className="preview-path"
-            title={preview.path}
-          >
-            {isOutlookHit(preview)
-              ? [
-                  preview.mailFolder
-                    ? formatMailFolderMeta(preview.mailFolder)
-                    : "",
-                  preview.mailFrom,
-                  formatMailDateYmd(preview.mailDate),
-                ]
-                  .filter(Boolean)
-                  .join(" · ") || "Outlook メール"
-              : preview.path}
-          </div>
-          <div className="preview-actions">
-            <button
-              type="button"
-              className="hit-action-btn"
-              title="一覧に戻る (Esc)"
-              aria-label="一覧に戻る"
-              onClick={closePreview}
-            >
-              <IconList />
-            </button>
-            <button
-              type="button"
-              className="hit-action-btn"
-              title={
-                isOutlookHit(preview) ? "メールを開く (Enter)" : "ファイルを開く (Enter)"
-              }
-              aria-label={isOutlookHit(preview) ? "メールを開く" : "ファイルを開く"}
-              onClick={() => void openSelected()}
-            >
-              <IconOpenFile />
-            </button>
-            {!isOutlookHit(preview) ? (
-              <button
-                type="button"
-                className="hit-action-btn"
-                title="フォルダを開く (Shift+Enter)"
-                aria-label="フォルダを開く"
-                onClick={() => void openFolder(preview.path)}
-              >
-                <IconFolder />
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="hit-action-btn"
-              title="このフォルダ内で再検索"
-              aria-label="このフォルダ内で再検索"
-              onClick={() => rescopeToHitFolder(preview)}
-            >
-              <IconRescope />
-            </button>
-            <NoteDestPicker
-              buttonClassName="hit-action-btn"
-              title={
-                isOutlookHit(preview)
-                  ? "このメールをノートにキープ"
-                  : "この段落をノートにキープ"
-              }
-              ariaLabel="ノートにキープ"
-              onPick={(id) => {
-                const unit =
-                  previewFile?.units.find((u) => u.id === previewUnitId) ??
-                  preview;
-                void keepParagraph(
-                  {
-                    paragraphId: unit.id,
-                    label: unit.unitLabel || "",
-                    page: unit.page,
-                    snippet: unit.snippet,
-                    body: unit.previewText,
-                    fileHit: preview,
-                  },
-                  id,
-                );
-              }}
-            >
-              <IconKeep />
-            </NoteDestPicker>
-            <ChatDestPicker
-              buttonClassName="hit-action-btn"
-              title={
-                isOutlookHit(preview)
-                  ? "このメールをチャットに送る"
-                  : "この段落をチャットに送る"
-              }
-              ariaLabel="チャットに送る"
-              onPick={(id) => {
-                const unit =
-                  previewFile?.units.find((u) => u.id === previewUnitId) ??
-                  preview;
-                void sendHitToChat(
-                  {
-                    paragraphId: unit.id,
-                    path: preview.path,
-                    title: preview.title,
-                    previewText: unit.previewText,
-                    snippet: unit.snippet,
-                  },
-                  id,
-                );
-              }}
-            >
-              <IconChat />
-            </ChatDestPicker>
-          </div>
-          {(previewFile?.matchIds.length ?? 0) > 1 ? (
-            <div className="preview-occ-nav" aria-live="polite">
-              <button
-                type="button"
-                title="前のマッチへスクロール (←)"
-                aria-label="前のマッチ"
-                onClick={() => stepMatch(-1)}
-              >
-                ←
-              </button>
-              <span className="preview-occ-label">
-                マッチ {matchNavIndex + 1} / {previewFile?.matchIds.length}
-                {preview.page != null ? ` · p.${preview.page}` : ""}
-              </span>
-              <button
-                type="button"
-                title="次のマッチへスクロール (→)"
-                aria-label="次のマッチ"
-                onClick={() => stepMatch(1)}
-              >
-                →
-              </button>
-            </div>
-          ) : null}
-          {preview.source === "remote" ? (
-            <div className="preview-excerpt-note">リモートのため抜粋のみ</div>
-          ) : null}
-          {previewFile?.excerpt &&
-          preview.source !== "remote" &&
-          !isJsonPath(preview.path) ? (
-            <div className="preview-excerpt-note">
-              長いファイルのため、マッチ周辺の抜粋です
-            </div>
-          ) : null}
-          <div className="preview-scroll" ref={previewScrollRef}>
-            {isJsonPath(preview.path) ? (
-              <PreviewBody
-                hit={preview}
-                query={query}
-                highlightTerms={previewHighlightTerms}
-              />
-            ) : (
-              (previewFile?.units ?? [preview]).map((unit) => {
-                const isMatch = previewFile?.matchIds.includes(unit.id);
-                const isActive = unit.id === previewUnitId;
-                return (
-                  <article
-                    key={unit.id}
-                    data-preview-unit={unit.id}
-                    className={`preview-unit${isMatch ? " is-match" : ""}${isActive ? " is-active" : ""}`}
-                    onClick={() => {
-                      setPreviewUnitId(unit.id);
-                      setPreview(unit);
-                    }}
-                  >
-                    {unit.unitLabel ? (
-                      <div className="preview-unit-label">{unit.unitLabel}</div>
-                    ) : null}
-                    <PreviewBody
-                      hit={unit}
-                      query={query}
-                      highlightTerms={previewHighlightTerms}
-                    />
-                  </article>
-                );
-              })
-            )}
-          </div>
-          <div className="hint">
-            {(previewFile?.matchIds.length ?? 0) > 1
-              ? "←→ マッチへ移動 · Esc で一覧に戻る"
-              : "Esc で一覧に戻る"}
-          </div>
-        </section>
-      ) : (
-        <ul className="hit-list" ref={listRef}>
+      <ul className="hit-list" ref={listRef}>
           {hits.length === 0 ? (
             <li className="empty">
               {searching
@@ -2525,7 +1831,7 @@ export default function Popup() {
                             previewTitle="このメールをプレビュー"
                             onPreview={() => {
                               setIndex(i);
-                              void showPreview(hit);
+                              void openHitPreview(hit);
                             }}
                             onKeep={(id) => {
                               void keepParagraph(
@@ -2567,7 +1873,7 @@ export default function Popup() {
                                 previewTitle="この段落をプレビュー"
                                 onPreview={() => {
                                   setIndex(i);
-                                  void previewParagraph(p.id, hit);
+                                  void openHitPreview(hit, p.id);
                                 }}
                                 onKeep={(id) => {
                                   void keepParagraph(
@@ -2636,7 +1942,7 @@ export default function Popup() {
                         onClick={(e) => {
                           e.stopPropagation();
                           setIndex(i);
-                          void showPreview(hit);
+                          void openHitPreview(hit);
                         }}
                       >
                         <IconPreview />
@@ -2686,7 +1992,6 @@ export default function Popup() {
             })()
           )}
         </ul>
-      )}
 
       {actionError ? (
         <div className="popup-error">
@@ -2704,67 +2009,44 @@ export default function Popup() {
       ) : null}
 
       <footer className="popup-footer">
-        {preview ? (
-          <>
-            <span>←→ マッチへ移動</span>
-            <button
-              type="button"
-              className="popup-footer-action"
-              title={
-                isOutlookHit(preview) ? "メールを開く (Enter)" : "ファイルを開く (Enter)"
-              }
-              onClick={() => void openSelected()}
-            >
-              Enter 開く
-            </button>
-            <button
-              type="button"
-              className="popup-footer-action"
-              title="一覧に戻る (Esc)"
-              onClick={closePreview}
-            >
-              Esc 一覧
-            </button>
-          </>
-        ) : (
-          <>
-            <span>↑↓ 移動</span>
-            <button
-              type="button"
-              className="popup-footer-action"
-              title={currentIsMail ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
-              onClick={() => void openSelected()}
-            >
-              Enter 開く
-            </button>
-            {!currentIsMail ? (
-              <button
-                type="button"
-                className="popup-footer-action"
-                title="フォルダを開く (Shift+Enter)"
-                onClick={() => void openFolder()}
-              >
-                Shift+Enter フォルダ
-              </button>
-            ) : null}
-            <button
-              type="button"
-              className="popup-footer-action"
-              title="プレビュー (Ctrl+Enter)"
-              onClick={() => void showPreview()}
-            >
-              Ctrl+Enter プレビュー
-            </button>
-            <button
-              type="button"
-              className="popup-footer-action"
-              title="閉じる (Esc)"
-              onClick={() => void hidePopup()}
-            >
-              Esc 閉じる
-            </button>
-          </>
-        )}
+        <span>↑↓ 移動</span>
+        <button
+          type="button"
+          className="popup-footer-action"
+          title={currentIsMail ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
+          onClick={() => void openSelected()}
+        >
+          Enter 開く
+        </button>
+        {!currentIsMail ? (
+          <button
+            type="button"
+            className="popup-footer-action"
+            title="フォルダを開く (Shift+Enter)"
+            onClick={() => void openFolder()}
+          >
+            Shift+Enter フォルダ
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="popup-footer-action"
+          title="プレビュー (Ctrl+Enter)"
+          onClick={() => {
+            const hit = hits[index];
+            if (hit) openHitPreview(hit);
+          }}
+        >
+          Ctrl+Enter プレビュー
+        </button>
+        <button
+          type="button"
+          className="popup-footer-action"
+          title="閉じる (Esc)"
+          onClick={() => void hidePopup()}
+        >
+          Esc 閉じる
+        </button>
         <div className="popup-footer-windows">
           <button
             type="button"

@@ -2,7 +2,7 @@ import {
   collectPreviewHighlightTerms,
   isMarkdownPath,
   renderMarkdownHtml,
-} from "../popup/markdownPreview";
+} from "../preview/markdownPreview";
 import {
   formatCourtCaseJsonHtml,
   isCourtCaseJsonTarget,

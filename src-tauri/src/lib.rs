@@ -129,6 +129,10 @@ pub fn run() {
                 let _ = chat.hide();
                 attach_chat_window_handlers(&chat);
             }
+            if let Some(preview) = app.get_webview_window("preview") {
+                let _ = preview.hide();
+                attach_preview_window_handlers(&preview);
+            }
 
             match watcher::start_watcher(folders, indexer.clone(), app.handle().clone()) {
                 Ok(handle) => {
@@ -256,6 +260,10 @@ pub fn run() {
             commands::mail_run_sync,
             commands::mail_indexed_count,
             commands::show_notes_window,
+            commands::show_popup_window,
+            commands::show_preview_window,
+            commands::get_preview_target,
+            commands::hide_preview_window,
             commands::list_notes,
             commands::create_note,
             commands::rename_note,
@@ -402,6 +410,18 @@ fn attach_chat_window_handlers(window: &WebviewWindow) {
     });
 }
 
+fn attach_preview_window_handlers(window: &WebviewWindow) {
+    let handle = window.clone();
+    window.clone().on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            if let Err(e) = handle.hide() {
+                eprintln!("argos: hide preview window failed: {e}");
+            }
+        }
+    });
+}
+
 fn create_notes_window(app: &AppHandle) -> Option<WebviewWindow> {
     let config = app
         .config()
@@ -485,6 +505,79 @@ pub fn show_chat(app: &AppHandle) {
     }
     if let Err(e) = w.set_focus() {
         eprintln!("argos: focus chat window failed: {e}");
+    }
+}
+
+fn create_preview_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "preview")?;
+    let window = WebviewWindowBuilder::from_config(app, config)
+        .ok()?
+        .build()
+        .map_err(|e| {
+            eprintln!("argos: failed to recreate preview window: {e}");
+            e
+        })
+        .ok()?;
+    attach_preview_window_handlers(&window);
+    Some(window)
+}
+
+fn ensure_preview_window(app: &AppHandle) -> Option<WebviewWindow> {
+    if let Some(w) = app.get_webview_window("preview") {
+        return Some(w);
+    }
+    eprintln!("argos: preview window missing; recreating");
+    create_preview_window(app)
+}
+
+fn preview_window_title(target: &crate::state::PreviewTarget) -> String {
+    let title = target.title.as_deref().unwrap_or("").trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    std::path::Path::new(&target.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("プレビュー")
+        .to_string()
+}
+
+pub fn show_preview(app: &AppHandle) {
+    let Some(w) = ensure_preview_window(app) else {
+        eprintln!("argos: preview window unavailable");
+        return;
+    };
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        if let Some(target) = state.preview_target.read().clone() {
+            let title = preview_window_title(&target);
+            if let Err(e) = w.set_title(&title) {
+                eprintln!("argos: set preview title failed: {e}");
+            }
+            if let Err(e) = app.emit("preview-target", &target) {
+                eprintln!("argos: emit preview-target failed: {e}");
+            }
+        }
+    }
+    if let Err(e) = w.unminimize() {
+        eprintln!("argos: unminimize preview window failed: {e}");
+    }
+    if let Err(e) = w.show() {
+        eprintln!("argos: show preview window failed: {e}");
+    }
+    if let Err(e) = w.set_focus() {
+        eprintln!("argos: focus preview window failed: {e}");
+    }
+}
+
+pub fn hide_preview_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("preview") {
+        let _ = w.hide();
     }
 }
 
