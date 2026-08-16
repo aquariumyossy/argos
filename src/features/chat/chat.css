@@ -1,3 +1,5 @@
+@import "../preview/markdownBody.css";
+
 .chat {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
@@ -145,6 +147,200 @@
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.65;
+}
+
+.chat-msg.assistant .chat-msg-body {
+  white-space: normal;
+}
+
+/* Chat prose: keep-all (notes/statutes) and overflow-wrap:anywhere leave gaps at <strong>. */
+.chat-msg.assistant .md-body {
+  word-break: normal;
+  line-break: auto;
+  overflow-wrap: break-word;
+  line-height: 1.85;
+  text-align: start;
+}
+
+.chat-msg.assistant .md-body strong,
+.chat-msg.assistant .md-body b,
+.chat-msg.assistant .md-body em,
+.chat-msg.assistant .md-body i {
+  display: inline;
+  font-weight: 600;
+}
+
+.chat-msg.assistant .md-body em,
+.chat-msg.assistant .md-body i {
+  font-weight: inherit;
+}
+
+.chat-msg.assistant .md-body h1,
+.chat-msg.assistant .md-body h2 {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.chat-msg.assistant .md-body h1 {
+  font-size: 1.28em;
+  margin: 1.15em 0 0.4em;
+}
+
+.chat-msg.assistant .md-body h2 {
+  font-size: 1.14em;
+  margin: 1.2em 0 0.4em;
+}
+
+.chat-msg.assistant .md-body h2::after {
+  content: "";
+  display: block;
+  width: 2.2em;
+  height: 2px;
+  margin-top: 0.28em;
+  background: var(--accent);
+  opacity: 0.4;
+}
+
+.chat-msg.assistant .md-body h3 {
+  font-size: 1.05em;
+  margin: 1em 0 0.35em;
+}
+
+.chat-msg.assistant .md-body p {
+  margin: 0.6em 0;
+  line-height: 1.85;
+}
+
+.chat-msg.assistant .md-body ul,
+.chat-msg.assistant .md-body ol {
+  margin: 0.35em 0 0.75em;
+}
+
+.chat-msg.assistant .md-body ul > li {
+  display: block;
+  padding-left: 1.3em;
+  margin: 0.5em 0;
+  line-height: 1.85;
+}
+
+.chat-msg.assistant .md-body li > p {
+  margin: 0;
+}
+
+.chat-msg.assistant .md-body hr {
+  margin: 1.15em 0;
+}
+
+.chat-msg.assistant .md-body blockquote {
+  line-height: 1.85;
+  padding: 0.55em 0.9em;
+}
+
+.chat-msg.assistant .md-body code {
+  padding: 0.05em 0.28em;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.chat-msg.assistant .md-body table {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.chat-msg.assistant .md-body th,
+.chat-msg.assistant .md-body td {
+  vertical-align: top;
+  padding: 0.5em 0.75em;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+  min-width: 0;
+}
+
+.chat-msg.assistant .md-body table:has(tr > :nth-child(2)) tr > :first-child {
+  width: 28%;
+  color: var(--muted);
+  font-weight: 600;
+  background: rgba(255, 253, 248, 0.75);
+  white-space: normal;
+}
+
+.chat-mermaid {
+  margin: 0.6em 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+
+.chat-mermaid-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-mermaid-view {
+  max-height: min(70vh, 520px);
+  overflow: auto;
+  padding: 8px 10px;
+  font-size: 1em;
+}
+
+.chat-mermaid-view svg {
+  max-width: none;
+  height: auto;
+  font-size: 1em;
+}
+
+.chat-mermaid-view text,
+.chat-mermaid-view tspan,
+.chat-mermaid-view .nodeLabel,
+.chat-mermaid-view .edgeLabel,
+.chat-mermaid-view .label,
+.chat-mermaid-view foreignObject,
+.chat-mermaid-view foreignObject div,
+.chat-mermaid-view foreignObject span,
+.chat-mermaid-view foreignObject p {
+  font-size: 1em !important;
+}
+
+.chat-mermaid-error {
+  color: var(--danger);
+  font-size: 0.85em;
+  margin: 0 0 8px;
+}
+
+.chat-choices {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin: 0.85em 0 0.4em;
+}
+
+.chat-choice {
+  text-align: left;
+  border: 1px solid var(--line);
+  background: var(--bg-elevated);
+  color: inherit;
+  font: inherit;
+  border-radius: 8px;
+  padding: 8px 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.chat-choice:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.chat-choice:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .chat-thinking {

@@ -248,7 +248,7 @@ function isArticleNumber(text: string): boolean {
 }
 
 /** Split list item label (e.g. １) from body so the label stays top-aligned when text wraps. */
-function enhanceArticleListItemsHtml(html: string): string {
+export function enhanceArticleListItemsHtml(html: string): string {
   const doc = new DOMParser().parseFromString(`<div id="root">${html}</div>`, "text/html");
   const root = doc.getElementById("root");
   if (!root) return html;
@@ -273,7 +273,19 @@ function enhanceArticleListItemsHtml(html: string): string {
     row.appendChild(body);
   }
 
+  wrapMarkdownTables(root, doc);
+
   return root.innerHTML;
+}
+
+export function wrapMarkdownTables(root: HTMLElement, doc: Document): void {
+  for (const table of Array.from(root.querySelectorAll("table"))) {
+    if (table.parentElement?.classList.contains("md-table-wrap")) continue;
+    const wrap = doc.createElement("div");
+    wrap.className = "md-table-wrap";
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+  }
 }
 
 export function clearPreviewHighlights(): void {

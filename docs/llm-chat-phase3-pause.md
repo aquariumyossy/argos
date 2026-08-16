@@ -3,7 +3,7 @@
 最終更新: 2026-08-15  
 状態: **プリフェッチ型フェーズ3は破棄した履歴**。現行コードはチャット窓・出典の消費・送信先ピッカー・ツール検索まで入っている。
 
-関連: [llm-chat-phase4-onward.md](llm-chat-phase4-onward.md)（Mermaid 図・書き出しは未実装）  
+関連: [llm-chat-phase4-onward.md](llm-chat-phase4-onward.md)（Mermaid 図の描画は入った。書き出しは未実装）  
 関連計画: Cursor の `local_llm_chat_b3e88272.plan.md`、`llm_chat_next_18226328.plan.md`
 
 ---

@@ -1368,8 +1368,8 @@ export default function Notes() {
                         <div
                           className={
                             legal.kind === "court"
-                              ? "notes-item-body notes-item-body--legal-md notes-item-body--court-case"
-                              : "notes-item-body notes-item-body--legal-md"
+                              ? "notes-item-body notes-item-body--legal-md notes-item-body--court-case md-body md-body--compact"
+                              : "notes-item-body notes-item-body--legal-md md-body md-body--compact"
                           }
                           ref={(node) => {
                             if (node) bodyRefs.current.set(row.id, node);

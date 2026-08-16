@@ -52,7 +52,7 @@ export function PreviewBody({
         className:
           legal.kind === "court"
             ? "preview-body preview-body--court"
-            : "preview-body preview-body--markdown",
+            : "preview-body preview-body--markdown md-body md-body--hierarchy",
       };
     }
     const generic = formatGenericJsonHtml(raw);
@@ -193,7 +193,7 @@ export function PreviewBody({
   if (isMarkdown) {
     return (
       <div
-        className="preview-body preview-body--markdown"
+        className="preview-body preview-body--markdown md-body md-body--hierarchy"
         dangerouslySetInnerHTML={{ __html: markdownHtml }}
       />
     );

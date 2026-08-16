@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import ChatScopePicker from "./ChatScopePicker";
+import { AssistantBody } from "./AssistantBody";
 import { openPreview } from "../preview/openPreview";
 import "./chat.css";
 
@@ -79,6 +80,10 @@ const TPL_SUMMARY =
   "添付した出典を日本語で要約してください。重要な結論と根拠を短く。";
 const TPL_POINTS =
   "争点、結論、根拠を箇条書きで整理してください。根拠には出典番号 [n] を付けてください。";
+const TPL_FACTS =
+  "添付出典だけを根拠に、要件事実の関係を mermaid の flowchart LR でフェンス1本にまとめてください。左から右へ、請求原因 → 抗弁 → 再抗弁。請求原因はノードを1つだけにし、複数の主要事実は同じノード内に番号で書いてください。抗弁は種類ごとに分け、その右に対応する再抗弁を置いてください。ノードは短く。ラベルは A[\"請求原因 [n]\"] のように二重引用符で囲んでください。矢印は --> または -.-> で、途中に空白を入れないでください。添付出典にない事実はノードにしないでください。";
+const TPL_TIMELINE =
+  "添付出典に書かれた出来事だけを時系列で整理してください。図にする場合は mermaid の flowchart LR または timeline をフェンス1本にしてください。ノードラベルは二重引用符で囲み、出典番号 [n] をラベル内に書いてください。出典にない出来事は入れないでください。";
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -138,6 +143,20 @@ function isUncitedToolSource(s: LlmSourceRow): boolean {
 
 function citeNoOf(s: LlmSourceRow, fallback: number): number {
   return s.citeNo && s.citeNo > 0 ? s.citeNo : fallback;
+}
+
+function openableCites(
+  rows: LlmSourceRow[],
+  fallbackStart: number,
+): { nos: Set<number>; byNo: Map<number, LlmSourceRow> } {
+  const nos = new Set<number>();
+  const byNo = new Map<number, LlmSourceRow>();
+  rows.forEach((s, i) => {
+    const n = citeNoOf(s, fallbackStart + i);
+    byNo.set(n, s);
+    if (s.path.trim()) nos.add(n);
+  });
+  return { nos, byNo };
 }
 
 function citedForMessage(
@@ -334,11 +353,15 @@ export default function Chat() {
     };
   }, [loadThreads]);
 
-  useEffect(() => {
+  const scrollLog = useCallback(() => {
     const el = listRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages, stream, thinking, toolHint, busy]);
+  }, []);
+
+  useEffect(() => {
+    scrollLog();
+  }, [messages, stream, thinking, toolHint, busy, scrollLog]);
 
   const estimatedChars = useMemo(() => {
     const src = sources.reduce(
@@ -365,6 +388,11 @@ export default function Chat() {
         .filter((s) => (s.injectedUserMessageId ?? "").trim())
         .reduce((n, s) => Math.max(n, s.citeNo ?? 0), 0),
     [sources],
+  );
+
+  const liveCiteInfo = useMemo(
+    () => openableCites(liveCites, maxCitedNo + 1),
+    [liveCites, maxCitedNo],
   );
 
   const overBudget = estimatedChars > maxContextChars;
@@ -689,12 +717,27 @@ export default function Chat() {
             messages.map((m) => {
               const cites =
                 m.role === "assistant" ? citedForMessage(sources, m.id) : [];
+              const citeInfo = openableCites(cites, 1);
               return (
                 <article
                   key={m.id}
                   className={m.role === "user" ? "chat-msg user" : "chat-msg assistant"}
                 >
-                  <div className="chat-msg-body">{m.content}</div>
+                  {m.role === "assistant" ? (
+                    <AssistantBody
+                      text={m.content}
+                      citeNos={citeInfo.nos}
+                      onCite={(n) => {
+                        const s = citeInfo.byNo.get(n);
+                        if (s) void openSource(s);
+                      }}
+                      onChoice={applyTemplate}
+                      choicesDisabled={busy}
+                      onLayout={scrollLog}
+                    />
+                  ) : (
+                    <div className="chat-msg-body">{m.content}</div>
+                  )}
                   {cites.length > 0 ? (
                     <div className="chat-msg-cites" aria-label="出典">
                       {cites.map((s, i) => {
@@ -734,9 +777,19 @@ export default function Chat() {
                   <div className="chat-thinking-body">{thinking}</div>
                 </details>
               ) : null}
-              <div className="chat-msg-body chat-caret">
-                {stream || (!thinking && !toolHint ? "生成中…" : "")}
-              </div>
+              <AssistantBody
+                text={stream || (!thinking && !toolHint ? "生成中…" : "")}
+                citeNos={liveCiteInfo.nos}
+                onCite={(n) => {
+                  const s = liveCiteInfo.byNo.get(n);
+                  if (s) void openSource(s);
+                }}
+                onChoice={applyTemplate}
+                choicesDisabled
+                streaming={!!stream}
+                showCaret={!!stream || (!thinking && !toolHint)}
+                onLayout={scrollLog}
+              />
               {liveCites.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
                   {liveCites.map((s, i) => {
@@ -861,6 +914,22 @@ export default function Chat() {
               onClick={() => applyTemplate(TPL_POINTS)}
             >
               要点
+            </button>
+            <button
+              type="button"
+              className="chat-tpl"
+              disabled={busy}
+              onClick={() => applyTemplate(TPL_FACTS)}
+            >
+              要件事実
+            </button>
+            <button
+              type="button"
+              className="chat-tpl"
+              disabled={busy}
+              onClick={() => applyTemplate(TPL_TIMELINE)}
+            >
+              時系列
             </button>
             <span
               className={overBudget ? "chat-char-meter warn" : "chat-char-meter"}
