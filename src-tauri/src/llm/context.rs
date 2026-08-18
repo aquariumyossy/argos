@@ -1,6 +1,6 @@
 //! Assemble one LLM request: source bodies once per originating user turn.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::{LlmMessageRow, LlmSourceRow};
 
@@ -65,6 +65,100 @@ fn cite_no_of(s: &LlmSourceRow) -> i64 {
     } else {
         s.sort_order + 1
     }
+}
+
+/// `[n]` in the assistant answer (prose, mermaid labels, code fences).
+/// Markdown links `[1](url)` are not citations.
+pub fn parse_cited_nos(text: &str) -> HashSet<i64> {
+    let mut out = HashSet::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'[' {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && j < b.len() && b[j] == b']' {
+                if b.get(j + 1) != Some(&b'(') {
+                    if let Ok(n) = std::str::from_utf8(&b[start..j])
+                        .unwrap_or("")
+                        .parse::<i64>()
+                    {
+                        if n > 0 {
+                            out.insert(n);
+                        }
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Keep only sources whose cite number appears as `[n]` in `answer`.
+pub fn consumed_cited_in_answer(
+    consumed: &[(String, i64)],
+    answer: &str,
+) -> Vec<(String, i64)> {
+    let nos = parse_cited_nos(answer);
+    consumed
+        .iter()
+        .filter(|(_, n)| nos.contains(n))
+        .cloned()
+        .collect()
+}
+
+pub const FINAL_CITE_HINT: &str =
+    "使った出典にだけ [n] を付けて答えてください。使っていない番号は本文に並べないでください。";
+pub const STOP_TOOLS_HINT: &str =
+    "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。";
+
+/// Rows from this turn's tool/attach consume list, in cite-number order.
+pub fn sources_for_consumed(
+    all: &[LlmSourceRow],
+    consumed: &[(String, i64)],
+) -> Vec<LlmSourceRow> {
+    let mut nos = HashMap::new();
+    for (id, n) in consumed {
+        nos.entry(id.clone()).or_insert(*n);
+    }
+    let mut rows: Vec<LlmSourceRow> = all
+        .iter()
+        .filter(|s| nos.contains_key(&s.id))
+        .cloned()
+        .collect();
+    rows.sort_by_key(|s| {
+        nos.get(&s.id)
+            .copied()
+            .filter(|n| *n > 0)
+            .unwrap_or(s.cite_no)
+    });
+    rows
+}
+
+/// User turn that makes this-turn hits look like an attached 出典 block.
+pub fn final_source_turn(sources: &[LlmSourceRow], stop_tools: bool) -> Option<ChatTurn> {
+    let block = format_sources(sources);
+    if block.is_empty() && !stop_tools {
+        return None;
+    }
+    let mut content = block;
+    if !content.is_empty() {
+        content.push_str(FINAL_CITE_HINT);
+        content.push('\n');
+    }
+    if stop_tools {
+        content.push_str(STOP_TOOLS_HINT);
+    }
+    if content.is_empty() {
+        return None;
+    }
+    Some(ChatTurn::text("user", content))
 }
 
 pub fn format_sources(sources: &[LlmSourceRow]) -> String {
@@ -535,5 +629,85 @@ mod tests {
         assert!(turns[0].role == "system");
         assert!(turns[0].content.contains("[n]"));
         assert!(turns[1].content.contains("【出典】"));
+    }
+
+    #[test]
+    fn parse_cited_nos_from_prose() {
+        let nos = parse_cited_nos("契約は成立している [2]。解除は [5] による。");
+        assert_eq!(nos, HashSet::from([2, 5]));
+    }
+
+    #[test]
+    fn parse_cited_nos_in_mermaid_label() {
+        let nos = parse_cited_nos(
+            "```mermaid\nflowchart LR\n  Kg[\"請求原因：契約成立 [2]\"]\n  K1[\"抗弁 [13]\"]\n```",
+        );
+        assert!(nos.contains(&2), "{nos:?}");
+        assert!(nos.contains(&13), "{nos:?}");
+    }
+
+    #[test]
+    fn parse_cited_nos_skips_markdown_links() {
+        let nos = parse_cited_nos("see [1](https://example.com) and cite [2].");
+        assert_eq!(nos, HashSet::from([2]));
+    }
+
+    #[test]
+    fn parse_cited_nos_ignores_fullwidth_brackets() {
+        let nos = parse_cited_nos("全角［3］と半角[4]");
+        assert_eq!(nos, HashSet::from([4]));
+    }
+
+    #[test]
+    fn consumed_cited_keeps_only_numbers_in_answer() {
+        let consumed = vec![
+            ("tool-a".into(), 1),
+            ("tool-b".into(), 2),
+            ("attach-c".into(), 3),
+        ];
+        let kept = consumed_cited_in_answer(&consumed, "根拠は [2] です。");
+        assert_eq!(kept, vec![("tool-b".to_string(), 2)]);
+    }
+
+    #[test]
+    fn consumed_cited_empty_when_answer_has_no_brackets() {
+        let consumed = vec![("tool-a".into(), 1), ("attach-b".into(), 2)];
+        let kept = consumed_cited_in_answer(&consumed, "検索しましたが該当なし。");
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn sources_for_consumed_keeps_cite_order() {
+        let mut a = src("a", "tool", 0, "A");
+        a.cite_no = 3;
+        let mut b = src("b", "tool", 1, "B");
+        b.cite_no = 1;
+        let kept = sources_for_consumed(&[a, b], &[("b".into(), 1), ("a".into(), 3)]);
+        assert_eq!(
+            kept.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn final_source_turn_is_user_role_with_cite_hint() {
+        let mut s = src("hit", "tool", 0, "民法第936条");
+        s.cite_no = 2;
+        s.title = "民法.md".into();
+        let turn = final_source_turn(&[s], false).expect("block");
+        assert_eq!(turn.role, "user");
+        assert!(turn.content.contains("【出典】"), "{}", turn.content);
+        assert!(turn.content.contains("[2]"), "{}", turn.content);
+        assert!(turn.content.contains("民法第936条"), "{}", turn.content);
+        assert!(turn.content.contains("[n]"), "{}", turn.content);
+        assert!(!turn.content.contains("ツールはこれ以上"), "{}", turn.content);
+    }
+
+    #[test]
+    fn final_source_turn_stop_tools_without_hits() {
+        let turn = final_source_turn(&[], true).expect("stop");
+        assert_eq!(turn.role, "user");
+        assert!(turn.content.contains("ツールはこれ以上"));
+        assert!(!turn.content.contains("【出典】"));
     }
 }

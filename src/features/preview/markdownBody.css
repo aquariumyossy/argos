@@ -63,7 +63,14 @@
 }
 
 .md-body li {
+  display: list-item;
+  justify-content: unset;
+  align-items: unset;
+  gap: unset;
   margin: 0.2em 0;
+  padding: 0;
+  border-bottom: none;
+  word-break: inherit;
 }
 
 .md-body li > p {

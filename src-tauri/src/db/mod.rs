@@ -114,6 +114,7 @@ pub struct LlmThreadRow {
     pub title: String,
     pub search_enabled: bool,
     pub path_prefix: String,
+    pub sort_order: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -171,7 +172,7 @@ const LLM_SOURCE_COLS: &str =
     "id, thread_id, sort_order, origin, path, title, paragraph_id, body, query, created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no";
 
 const LLM_THREAD_COLS: &str =
-    "id, title, search_enabled, path_prefix, created_at, updated_at";
+    "id, title, search_enabled, path_prefix, sort_order, created_at, updated_at";
 
 fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
     Ok(LlmThreadRow {
@@ -179,8 +180,9 @@ fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
         title: row.get(1)?,
         search_enabled: row.get::<_, i64>(2)? != 0,
         path_prefix: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
+        sort_order: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -458,6 +460,7 @@ impl Db {
               title TEXT NOT NULL DEFAULT '',
               search_enabled INTEGER NOT NULL DEFAULT 1,
               path_prefix TEXT NOT NULL DEFAULT '',
+              sort_order INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
@@ -573,6 +576,28 @@ impl Db {
             for (i, id) in ids.iter().enumerate() {
                 conn.execute(
                     "UPDATE notes SET sort_order=?1 WHERE id=?2",
+                    rusqlite::params![i as i64, id],
+                )?;
+            }
+        }
+        // Chat thread list manual ordering (sidebar drag).
+        let threads_sort_added = conn
+            .execute(
+                "ALTER TABLE llm_threads ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok();
+        if threads_sort_added {
+            let ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM llm_threads ORDER BY updated_at DESC, created_at DESC",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.flatten().collect()
+            };
+            for (i, id) in ids.iter().enumerate() {
+                conn.execute(
+                    "UPDATE llm_threads SET sort_order=?1 WHERE id=?2",
                     rusqlite::params![i as i64, id],
                 )?;
             }
@@ -1703,6 +1728,31 @@ impl Db {
         Ok(rows.flatten().collect())
     }
 
+    pub fn search_note_ids(&self, query: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT n.id FROM notes n
+             WHERE instr(lower(n.title), ?1) > 0
+                OR instr(lower(n.memo), ?1) > 0
+                OR EXISTS (
+                     SELECT 1 FROM note_items i
+                     WHERE i.note_id = n.id
+                       AND (
+                         instr(lower(i.query), ?1) > 0
+                         OR instr(lower(i.memo), ?1) > 0
+                         OR instr(lower(i.item_json), ?1) > 0
+                       )
+                   )
+             ORDER BY n.sort_order ASC, n.updated_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![needle], |row| row.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
     pub fn get_note(&self, id: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -2026,11 +2076,51 @@ impl Db {
     pub fn list_llm_threads(&self) -> Result<Vec<LlmThreadRow>, rusqlite::Error> {
         let conn = self.conn.lock();
         let sql = format!(
-            "SELECT {LLM_THREAD_COLS} FROM llm_threads ORDER BY updated_at DESC, created_at DESC"
+            "SELECT {LLM_THREAD_COLS} FROM llm_threads ORDER BY sort_order ASC, updated_at DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_llm_thread)?;
         Ok(rows.flatten().collect())
+    }
+
+    pub fn search_llm_thread_ids(&self, query: &str) -> Result<Vec<String>, rusqlite::Error> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT t.id FROM llm_threads t
+             WHERE instr(lower(t.title), ?1) > 0
+                OR EXISTS (
+                     SELECT 1 FROM llm_messages m
+                     WHERE m.thread_id = t.id AND instr(lower(m.content), ?1) > 0
+                   )
+             ORDER BY t.sort_order ASC, t.updated_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![needle], |row| row.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    fn next_llm_thread_sort_order(conn: &rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+        let min: Option<i64> =
+            conn.query_row("SELECT MIN(sort_order) FROM llm_threads", [], |row| {
+                row.get(0)
+            })?;
+        Ok(min.map(|m| m - 1).unwrap_or(0))
+    }
+
+    pub fn reorder_llm_threads(&self, ordered_ids: &[String]) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        for (i, thread_id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE llm_threads SET sort_order=?1 WHERE id=?2",
+                rusqlite::params![i as i64, thread_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_llm_thread(&self, id: &str) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
@@ -2054,16 +2144,18 @@ impl Db {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         let enabled = if search_enabled { 1 } else { 0 };
+        let sort_order = Self::next_llm_thread_sort_order(&conn)?;
         conn.execute(
-            "INSERT INTO llm_threads(id, title, search_enabled, path_prefix, created_at, updated_at)
-             VALUES(?1, ?2, ?3, '', ?4, ?4)",
-            rusqlite::params![id, title, enabled, now],
+            "INSERT INTO llm_threads(id, title, search_enabled, path_prefix, sort_order, created_at, updated_at)
+             VALUES(?1, ?2, ?3, '', ?4, ?5, ?5)",
+            rusqlite::params![id, title, enabled, sort_order, now],
         )?;
         Ok(LlmThreadRow {
             id,
             title: title.to_string(),
             search_enabled,
             path_prefix: String::new(),
+            sort_order,
             created_at: now,
             updated_at: now,
         })

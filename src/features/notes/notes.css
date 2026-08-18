@@ -67,12 +67,96 @@
   font-weight: 650;
 }
 
+.notes-sidebar-search {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 8px 10px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.notes-sidebar-search:focus-within {
+  border-color: var(--accent);
+}
+
+.notes-sidebar-search-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.notes-sidebar-search-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.85em;
+  padding: 6px 4px;
+  outline: none;
+}
+
+.notes-sidebar-search-clear {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  padding: 2px 6px;
+  border-radius: 6px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.notes-sidebar-search-clear:hover {
+  color: var(--ink);
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.notes-sidebar-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
 .notes-list {
   list-style: none;
   margin: 0;
   padding: 8px;
-  overflow: auto;
-  flex: 1;
+}
+
+.notes-sidebar-foot {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.notes-nav-link {
+  padding: 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0.75;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.notes-nav-link:hover {
+  opacity: 1;
+  color: var(--ink);
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .notes-list-item {
@@ -124,6 +208,23 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.notes-list-title mark {
+  background: var(--highlight);
+  color: inherit;
+  font-weight: 700;
+  padding: 0 1px;
+  border-radius: 2px;
+}
+
+.notes-list-hit {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 6px;
 }
 
 .notes-list-title:hover {
