@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -136,8 +143,8 @@ const SEARCH_MODE_OPTIONS = [
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "howto", label: "操作方法" },
-  { id: "folders", label: "ファイル検索" },
-  { id: "mail", label: "メール検索" },
+  { id: "folders", label: "フォルダ設定" },
+  { id: "mail", label: "メール設定" },
   { id: "words", label: "辞書登録" },
   { id: "options", label: "各種設定" },
   { id: "llm", label: "ローカルLLM" },
@@ -145,7 +152,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.9.3";
+const APP_VERSION = "1.9.4";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -198,6 +205,77 @@ function formatInvokeError(e: unknown): string {
   } catch {
     return String(e);
   }
+}
+
+const SIDEBAR_MIN = 160;
+const SIDEBAR_MAX = 420;
+const SIDEBAR_DEFAULT = 220;
+const SIDEBAR_WIDTH_KEY = "argos.settings.sidebarWidth";
+
+function clampSidebarWidth(w: number, containerWidth?: number): number {
+  const maxByWindow =
+    containerWidth && containerWidth > 0
+      ? Math.max(SIDEBAR_MIN, Math.floor(containerWidth * 0.5))
+      : SIDEBAR_MAX;
+  const max = Math.min(SIDEBAR_MAX, maxByWindow);
+  return Math.min(max, Math.max(SIDEBAR_MIN, Math.round(w)));
+}
+
+function loadSidebarWidth(): number {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    if (!raw) return SIDEBAR_DEFAULT;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return SIDEBAR_DEFAULT;
+    return clampSidebarWidth(n);
+  } catch {
+    return SIDEBAR_DEFAULT;
+  }
+}
+
+function NavIcon({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconSearch() {
+  return (
+    <NavIcon>
+      <circle cx="7" cy="7" r="4" />
+      <path d="m13 13-2.5-2.5" />
+    </NavIcon>
+  );
+}
+
+function IconChat() {
+  return (
+    <NavIcon>
+      <path d="M3.25 3.5h9.5A1.25 1.25 0 0 1 14 4.75v5.25A1.25 1.25 0 0 1 12.75 11.25H8.1L4.75 13.5v-2.25H3.25A1.25 1.25 0 0 1 2 10V4.75A1.25 1.25 0 0 1 3.25 3.5Z" />
+    </NavIcon>
+  );
+}
+
+function IconNotes() {
+  return (
+    <NavIcon>
+      <path d="M3.5 3.25h9A1.25 1.25 0 0 1 13.75 4.5v7A1.25 1.25 0 0 1 12.5 12.75h-9A1.25 1.25 0 0 1 2.25 11.5v-7A1.25 1.25 0 0 1 3.5 3.25Z" />
+      <path d="M5.25 6.25h5.5" />
+      <path d="M5.25 8.75h4" />
+    </NavIcon>
+  );
 }
 
 function normalizeSettings(s: SettingsData): SettingsData {
@@ -297,6 +375,9 @@ export default function Settings() {
     null,
   );
   const [tab, setTab] = useState<TabId>("howto");
+  const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+  const [resizingSidebar, setResizingSidebar] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const [lanIp, setLanIp] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testingLlm, setTestingLlm] = useState(false);
@@ -974,6 +1055,43 @@ export default function Settings() {
     }
   }
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarWidth]);
+
+  const onSidebarResizeStart = useCallback((e: ReactMouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    setResizingSidebar(true);
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const containerW = rootRef.current?.clientWidth ?? 0;
+
+    const onMove = (ev: MouseEvent) => {
+      const next = clampSidebarWidth(startW + (ev.clientX - startX), containerW);
+      setSidebarWidth(next);
+    };
+    const onUp = () => {
+      setResizingSidebar(false);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [sidebarWidth]);
+
+  async function openWindow(cmd: string) {
+    try {
+      await invoke(cmd);
+    } catch (e) {
+      setMessage(formatInvokeError(e));
+    }
+  }
+
   const clientUrlHint =
     lanIp && settings
       ? `http://${lanIp}:${settings.remoteServerPort}`
@@ -1006,33 +1124,90 @@ export default function Settings() {
   }
 
   return (
-    <div className="settings">
-      <nav className="settings-tabs" role="tablist" aria-label="設定グループ">
-        {TABS.map((t) => (
+    <div
+      ref={rootRef}
+      className={["settings", resizingSidebar ? "settings--resizing" : ""]
+        .filter(Boolean)
+        .join(" ")}
+      style={{
+        gridTemplateColumns: `${sidebarWidth}px 5px minmax(0, 1fr)`,
+      }}
+    >
+      <aside className="settings-sidebar">
+        <header className="settings-sidebar-head">
+          <h1>設定</h1>
+        </header>
+        <nav className="settings-sidebar-body" aria-label="設定グループ">
+          <ul className="settings-nav-list">
+            {TABS.map((t) => (
+              <li key={t.id}>
+                <button
+                  type="button"
+                  id={`tab-${t.id}`}
+                  className={
+                    tab === t.id ? "settings-nav-item active" : "settings-nav-item"
+                  }
+                  aria-current={tab === t.id ? "page" : undefined}
+                  onClick={() => {
+                    setTab(t.id);
+                    setMessage("");
+                    setEditingWordId(null);
+                    setEditingWordDraft("");
+                  }}
+                >
+                  {t.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </nav>
+        <footer className="settings-sidebar-foot">
           <button
-            key={t.id}
             type="button"
-            role="tab"
-            id={`tab-${t.id}`}
-            aria-selected={tab === t.id}
-            aria-controls={`panel-${t.id}`}
-            className={tab === t.id ? "active" : undefined}
-            onClick={() => {
-              setTab(t.id);
-              setMessage("");
-              setEditingWordId(null);
-              setEditingWordDraft("");
-            }}
+            className="settings-nav-link"
+            title="検索"
+            aria-label="検索"
+            onClick={() => void openWindow("show_popup_window")}
           >
-            {t.label}
+            <IconSearch />
           </button>
-        ))}
-      </nav>
+          <button
+            type="button"
+            className="settings-nav-link"
+            title="チャット"
+            aria-label="チャット"
+            onClick={() => void openWindow("show_chat_window")}
+          >
+            <IconChat />
+          </button>
+          <button
+            type="button"
+            className="settings-nav-link"
+            title="ノート"
+            aria-label="ノート"
+            onClick={() => void openWindow("show_notes_window")}
+          >
+            <IconNotes />
+          </button>
+        </footer>
+      </aside>
 
+      <div
+        className="settings-splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="設定ナビの幅を変更"
+        aria-valuemin={SIDEBAR_MIN}
+        aria-valuemax={SIDEBAR_MAX}
+        aria-valuenow={sidebarWidth}
+        onMouseDown={onSidebarResizeStart}
+      />
+
+      <main className="settings-main">
       {tab === "howto" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-howto"
           aria-labelledby="tab-howto"
         >
@@ -1040,7 +1215,9 @@ export default function Settings() {
             <h2>Argos とは</h2>
             <p className="muted">
               任意のアプリで文字列を選択しショートカットを押すと、登録フォルダ内の PDF / DOCX / DOC /
-              JTD / XLS / XLSX / TXT / Markdown / HTML / JSON から全文検索し、結果をポップアップで表示します。
+              JTD / XLS / XLSX / TXT / Markdown / HTML / JSON、および Outlook
+              クラシックのメールから全文検索し、結果をポップアップで表示します。ヒットはノートにキープでき、出典としてローカル
+              LLM チャットにも送れます。
             </p>
           </section>
 
@@ -1056,6 +1233,9 @@ export default function Settings() {
               <li>
                 アプリを切り替えずポップアップで結果を確認し、必要ならそのままファイルを開けます
               </li>
+              <li>
+                ヒットをノートに残し、出典としてチャットで質問できます
+              </li>
             </ul>
           </section>
 
@@ -1063,7 +1243,7 @@ export default function Settings() {
             <h2>はじめに</h2>
             <ol className="howto-steps">
               <li>
-                「検索対象フォルダ」タブで検索したいフォルダを追加します
+                左の「フォルダ設定」で検索したいフォルダを追加します
               </li>
               <li>「今すぐインデックス」を実行して全文検索用のインデックスを作成します</li>
               <li>
@@ -1102,8 +1282,40 @@ export default function Settings() {
               </li>
             </ul>
             <p className="muted">
-              検索欄の語をドラッグすると「隣接にする」「辞書に登録」が出せます。入力欄が空のときは最近の検索語が候補になります。
+              検索欄の語をドラッグすると「隣接にする」「辞書に登録」が出せます。入力欄が空のときは最近の検索語が候補になります。ヒットの「キープ」でノートへ、「チャット」で会話へ送れます。
             </p>
+          </section>
+
+          <section>
+            <h2>メール検索</h2>
+            <p className="muted">
+              同一 PC の Outlook クラシックのメールを、ファイルと同じポップアップから検索できます（新しい
+              Outlook のみの環境では使えません。LAN リモート検索にはメールは公開されません）。
+            </p>
+            <ol className="howto-steps">
+              <li>左の「メール設定」で Outlook を検出して設定を保存します</li>
+              <li>フォルダを選んで同期します</li>
+              <li>
+                通常どおり <kbd>{settings.shortcut}</kbd> で検索します
+              </li>
+            </ol>
+          </section>
+
+          <section>
+            <h2>ノート</h2>
+            <p className="muted">
+              検索ヒットの段落やメールをノートにキープし、メモや並べ替えで整理できます。
+            </p>
+            <ol className="howto-steps">
+              <li>ポップアップまたはプレビューの「キープ」から送り先のノートを選びます</li>
+              <li>
+                トレイまたは <kbd>{settings.notesShortcut}</kbd>{" "}
+                でノートを開きます
+              </li>
+              <li>
+                ノート全体を「チャット」から出典として送れます。左下のアイコンから検索・チャット・設定へ移れます
+              </li>
+            </ol>
           </section>
 
           <section>
@@ -1113,13 +1325,13 @@ export default function Settings() {
             </p>
             <h3 className="howto-subhead">インデックスがある PC（ホスト）</h3>
             <ol className="howto-steps">
-              <li>「検索対象フォルダ」でフォルダを追加し、「今すぐインデックス」を実行します</li>
+              <li>左の「フォルダ設定」でフォルダを追加し、「今すぐインデックス」を実行します</li>
               <li>
                 クライアントからもファイルを開けるようにする場合は、フォルダの「公開パス（UNC）」に共有パス（例:{" "}
                 <code>\\192.168.0.8\共有名</code>
                 ）を設定してから再インデックスします。すでに UNC で登録している場合は空のままで構いません
               </li>
-              <li>「リモート」タブで「リモート検索サーバを有効にする」をオンにします</li>
+              <li>左の「リモート」で「リモート検索サーバを有効にする」をオンにします</li>
               <li>
                 共有トークンを控えます（初回有効化時に乱数が自動生成されます。クライアントに同じ値を入れます）
               </li>
@@ -1130,7 +1342,7 @@ export default function Settings() {
             <h3 className="howto-subhead">検索する側の PC（クライアント）</h3>
             <ol className="howto-steps">
               <li>
-                「リモート」タブで検索モードを「リモートのみ」または「ハイブリッド」にします
+                左の「リモート」で検索モードを「リモートのみ」または「ハイブリッド」にします
               </li>
               <li>
                 リモート URL（例: <code>http://192.168.0.8:17890</code>
@@ -1147,14 +1359,14 @@ export default function Settings() {
                 ホストが <code>C:\...</code>{" "}
                 などローカルパスだけをインデックスしていると、クライアントではプレビューはできてもファイルを開けないことがあります
               </li>
-              <li>詳細な項目は「リモート」タブでも設定・確認できます</li>
+              <li>詳細な項目は左の「リモート」でも設定・確認できます</li>
             </ul>
           </section>
 
           <section>
             <h2>ローカルLLM</h2>
             <p className="muted">
-              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（MTPLX / Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります。
+              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（MTPLX / Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります。回答は Markdown で表示し、図や選択肢も出せます。
             </p>
             <ol className="howto-steps">
               <li>MTPLX 等を起動し、使いたいモデルを読み込みます</li>
@@ -1175,14 +1387,15 @@ export default function Settings() {
                 でも、サーバ既定が 4k のままだと長い会話は失敗します
               </li>
               <li>
-                「ローカルLLM」タブで URL を入れ、「接続テスト」するとモデル一覧を取得します
+                左の「ローカルLLM」で URL を入れ、「接続テスト」するとモデル一覧を取得します
               </li>
-              <li>トレイから「チャットを開く」</li>
+              <li>トレイから「チャットを開く」。左下のアイコンから検索・ノート・設定へ移れます</li>
               <li>
                 検索ヒットやノートの「チャット」から、送り先の会話を選べます。ノートは全体が1つの出典セットになります。同じ会話へ追送することもできます。
               </li>
               <li>
-                Qwen の思考が長いときは「ローカルLLM」タブの思考を「短くする」か「オフ」にしてください
+                根拠には出典番号 <code>[n]</code>{" "}
+                が付きます。図は入力上の「要件事実」など。Qwen の思考が長いときは左の「ローカルLLM」の思考を「短くする」か「オフ」にしてください
               </li>
             </ol>
           </section>
@@ -1192,6 +1405,9 @@ export default function Settings() {
             <ul className="howto-tips">
               <li>登録フォルダ内のファイル変更は自動で監視され、インデックスに反映されます</li>
               <li>ショートカットキーの変更は保存後すぐに反映されます</li>
+              <li>
+                チャット・ノート・設定の左下アイコンで、検索と各窓を行き来できます
+              </li>
               <li>
                 データは <code>%APPDATA%\Argos\</code> に保存されます
               </li>
@@ -1203,7 +1419,7 @@ export default function Settings() {
       {tab === "folders" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-folders"
           aria-labelledby="tab-folders"
         >
@@ -1438,7 +1654,7 @@ export default function Settings() {
       {tab === "mail" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-mail"
           aria-labelledby="tab-mail"
         >
@@ -1661,7 +1877,7 @@ export default function Settings() {
       {tab === "words" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-words"
           aria-labelledby="tab-words"
         >
@@ -1787,7 +2003,7 @@ export default function Settings() {
       {tab === "options" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-options"
           aria-labelledby="tab-options"
         >
@@ -1958,7 +2174,7 @@ export default function Settings() {
       {tab === "llm" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-llm"
           aria-labelledby="tab-llm"
         >
@@ -2203,7 +2419,7 @@ export default function Settings() {
       {tab === "remote" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-remote"
           aria-labelledby="tab-remote"
         >
@@ -2373,7 +2589,7 @@ export default function Settings() {
       {tab === "credits" ? (
         <div
           className="tab-panel"
-          role="tabpanel"
+          role="region"
           id="panel-credits"
           aria-labelledby="tab-credits"
         >
@@ -2415,6 +2631,7 @@ export default function Settings() {
           </section>
         </div>
       ) : null}
+      </main>
     </div>
   );
 }

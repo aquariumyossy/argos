@@ -1,10 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import ChatScopePicker from "./ChatScopePicker";
 import { AssistantBody } from "./AssistantBody";
 import { openPreview } from "../preview/openPreview";
+import { highlightText } from "../search/highlightText";
 import "./chat.css";
 
 type LlmThreadRow = {
@@ -12,6 +22,7 @@ type LlmThreadRow = {
   title: string;
   /** Folder scope for index searches in this thread. Empty means the whole index. */
   pathPrefix?: string;
+  sortOrder?: number;
   createdAt: number;
   updatedAt: number;
 };
@@ -179,8 +190,141 @@ function IconOpenFile() {
   );
 }
 
+function NavIcon({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconSearch() {
+  return (
+    <NavIcon>
+      <circle cx="7" cy="7" r="4" />
+      <path d="m13 13-2.5-2.5" />
+    </NavIcon>
+  );
+}
+
+function IconNotes() {
+  return (
+    <NavIcon>
+      <path d="M3.5 3.25h9A1.25 1.25 0 0 1 13.75 4.5v7A1.25 1.25 0 0 1 12.5 12.75h-9A1.25 1.25 0 0 1 2.25 11.5v-7A1.25 1.25 0 0 1 3.5 3.25Z" />
+      <path d="M5.25 6.25h5.5" />
+      <path d="M5.25 8.75h4" />
+    </NavIcon>
+  );
+}
+
+function IconSettings() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
+
+function ActionIcon({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width="14"
+      height="14"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconGrip() {
+  return (
+    <ActionIcon>
+      <circle cx="6" cy="4" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="10" cy="4" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="6" cy="8" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="10" cy="8" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="6" cy="12" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="10" cy="12" r="0.9" fill="currentColor" stroke="none" />
+    </ActionIcon>
+  );
+}
+
+function IconTrash() {
+  return (
+    <ActionIcon>
+      <path d="M3.5 5.5h9" />
+      <path d="M6 5.5V4.25A1.25 1.25 0 0 1 7.25 3h1.5A1.25 1.25 0 0 1 10 4.25V5.5" />
+      <path d="M5 5.5l.5 7h5l.5-7" />
+    </ActionIcon>
+  );
+}
+
 function countChars(s: string): number {
   return [...s].length;
+}
+
+function matchesListQuery(text: string, query: string): boolean {
+  const q = query.trim().normalize("NFKC").toLowerCase();
+  if (!q) return true;
+  return text.normalize("NFKC").toLowerCase().includes(q);
+}
+
+function threadListTitle(t: { title: string }): string {
+  return t.title.trim() || "新しい会話";
+}
+
+const SIDEBAR_MIN = 160;
+const SIDEBAR_MAX = 420;
+const SIDEBAR_DEFAULT = 220;
+const SIDEBAR_WIDTH_KEY = "argos.chat.sidebarWidth";
+
+function clampSidebarWidth(w: number, containerWidth?: number): number {
+  const maxByWindow =
+    containerWidth && containerWidth > 0
+      ? Math.max(SIDEBAR_MIN, Math.floor(containerWidth * 0.5))
+      : SIDEBAR_MAX;
+  const max = Math.min(SIDEBAR_MAX, maxByWindow);
+  return Math.min(max, Math.max(SIDEBAR_MIN, Math.round(w)));
+}
+
+function loadSidebarWidth(): number {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    if (!raw) return SIDEBAR_DEFAULT;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return SIDEBAR_DEFAULT;
+    return clampSidebarWidth(n);
+  } catch {
+    return SIDEBAR_DEFAULT;
+  }
 }
 
 export default function Chat() {
@@ -199,7 +343,14 @@ export default function Chat() {
   const [maxContextChars, setMaxContextChars] = useState(80_000);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+  const [resizingSidebar, setResizingSidebar] = useState(false);
+  const [threadDragId, setThreadDragId] = useState<string | null>(null);
+  const [threadDraggableId, setThreadDraggableId] = useState<string | null>(null);
+  const [listQuery, setListQuery] = useState("");
+  const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const bootstrappingRef = useRef(false);
   const activeIdRef = useRef<string | null>(null);
   const busyRef = useRef(false);
@@ -239,6 +390,39 @@ export default function Chat() {
     setActive(current);
     await loadThreadContent(current);
   }, [loadThreadContent]);
+
+  useEffect(() => {
+    const q = listQuery.trim();
+    if (!q) {
+      setContentHitIds(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void invoke<string[]>("llm_search_threads", { query: q })
+        .then((ids) => {
+          if (!cancelled) setContentHitIds(ids);
+        })
+        .catch(() => {
+          if (!cancelled) setContentHitIds([]);
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [listQuery]);
+
+  const visibleThreads = useMemo(() => {
+    const q = listQuery.trim();
+    if (!q) return threads;
+    const content = new Set(contentHitIds ?? []);
+    return threads.filter(
+      (t) => matchesListQuery(threadListTitle(t), q) || content.has(t.id),
+    );
+  }, [threads, listQuery, contentHitIds]);
+
+  const listSearching = listQuery.trim().length > 0 && contentHitIds === null;
 
   const bootstrap = useCallback(async () => {
     if (bootstrappingRef.current) return;
@@ -576,10 +760,9 @@ export default function Chat() {
         content: text,
       });
       setActive(result.thread);
-      setThreads((prev) => {
-        const rest = prev.filter((x) => x.id !== result.thread.id);
-        return [result.thread, ...rest];
-      });
+      setThreads((prev) =>
+        prev.map((x) => (x.id === result.thread.id ? result.thread : x)),
+      );
       const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
         threadId: result.thread.id,
       });
@@ -639,8 +822,119 @@ export default function Chat() {
     }
   }
 
+  async function openWindow(cmd: string) {
+    try {
+      await invoke(cmd);
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarWidth]);
+
+  const onSidebarResizeStart = useCallback((e: ReactMouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    setResizingSidebar(true);
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const containerW = rootRef.current?.clientWidth ?? 0;
+
+    const onMove = (ev: MouseEvent) => {
+      const next = clampSidebarWidth(startW + (ev.clientX - startX), containerW);
+      setSidebarWidth(next);
+    };
+    const onUp = () => {
+      setResizingSidebar(false);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [sidebarWidth]);
+
+  const onThreadDragOver = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  }, []);
+
+  const onThreadListMouseDown = useCallback((e: ReactMouseEvent, id: string) => {
+    const el = e.target as HTMLElement | null;
+    if (el?.closest(".chat-thread-handle")) {
+      setThreadDraggableId(id);
+      return;
+    }
+    setThreadDraggableId(null);
+  }, []);
+
+  const onThreadDragStart = useCallback(
+    (e: DragEvent, id: string) => {
+      if (threadDraggableId !== id) {
+        e.preventDefault();
+        return;
+      }
+      setThreadDragId(id);
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/thread-id", id);
+      e.dataTransfer.setData("text/plain", id);
+    },
+    [threadDraggableId],
+  );
+
+  const onThreadDrop = useCallback(
+    async (e: DragEvent, targetId: string) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const sourceId =
+        threadDragId ||
+        e.dataTransfer.getData("text/thread-id") ||
+        e.dataTransfer.getData("text/plain");
+      setThreadDragId(null);
+      setThreadDraggableId(null);
+      if (!sourceId || sourceId === targetId) return;
+      const ids = threads.map((t) => t.id);
+      const from = ids.indexOf(sourceId);
+      const to = ids.indexOf(targetId);
+      if (from < 0 || to < 0) return;
+      const next = [...ids];
+      next.splice(from, 1);
+      next.splice(to, 0, sourceId);
+      setThreads((prev) => {
+        const map = new Map(prev.map((t) => [t.id, t]));
+        return next
+          .map((id, i) => {
+            const t = map.get(id);
+            return t ? { ...t, sortOrder: i } : null;
+          })
+          .filter(Boolean) as LlmThreadRow[];
+      });
+      try {
+        await invoke("llm_reorder_threads", { orderedIds: next });
+      } catch (err) {
+        setError(formatInvokeError(err));
+        await loadThreads();
+      }
+    },
+    [threadDragId, threads, loadThreads],
+  );
+
   return (
-    <div className="chat" style={{ fontSize: `${fontSize}px` }}>
+    <div
+      ref={rootRef}
+      className={["chat", resizingSidebar ? "chat--resizing" : ""]
+        .filter(Boolean)
+        .join(" ")}
+      style={{
+        fontSize: `${fontSize}px`,
+        gridTemplateColumns: `${sidebarWidth}px 5px minmax(0, 1fr)`,
+      }}
+    >
       <aside className="chat-sidebar">
         <header className="chat-sidebar-head">
           <h1>チャット</h1>
@@ -653,60 +947,170 @@ export default function Chat() {
             新規
           </button>
         </header>
-        {threads.length === 0 ? (
-          <p className="chat-muted chat-sidebar-empty">会話はまだありません。</p>
-        ) : (
-          <ul className="chat-thread-list">
-            {threads.map((t) => (
-              <li
-                key={t.id}
-                className={
-                  t.id === active?.id ? "chat-thread-item active" : "chat-thread-item"
-                }
-              >
-                {renamingId === t.id ? (
-                  <input
-                    className="chat-rename"
-                    value={renameDraft}
-                    autoFocus
-                    onChange={(e) => setRenameDraft(e.target.value)}
-                    onBlur={() => void commitRename(t.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        void commitRename(t.id);
-                      }
-                      if (e.key === "Escape") setRenamingId(null);
-                    }}
-                  />
-                ) : (
+        <div className="chat-sidebar-search">
+          <span className="chat-sidebar-search-icon" aria-hidden="true">
+            <IconSearch />
+          </span>
+          <input
+            className="chat-sidebar-search-input"
+            type="text"
+            role="searchbox"
+            value={listQuery}
+            placeholder="会話を検索"
+            aria-label="会話を検索"
+            spellCheck={false}
+            autoComplete="off"
+            onChange={(e) => {
+              setListQuery(e.target.value);
+              setContentHitIds(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && listQuery) {
+                e.preventDefault();
+                setListQuery("");
+              }
+            }}
+          />
+          {listQuery ? (
+            <button
+              type="button"
+              className="chat-sidebar-search-clear"
+              title="検索を消す"
+              aria-label="検索を消す"
+              onClick={() => setListQuery("")}
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
+        <div className="chat-sidebar-body">
+          {threads.length === 0 ? (
+            <p className="chat-muted chat-sidebar-empty">会話はまだありません。</p>
+          ) : visibleThreads.length === 0 ? (
+            <p className="chat-muted chat-sidebar-empty">
+              {listSearching ? "検索中…" : "一致する会話がありません。"}
+            </p>
+          ) : (
+            <ul className="chat-thread-list">
+              {visibleThreads.map((t) => {
+                const title = threadListTitle(t);
+                const q = listQuery.trim();
+                const titleHit = q ? matchesListQuery(title, q) : true;
+                return (
+                <li
+                  key={t.id}
+                  className={[
+                    t.id === active?.id ? "chat-thread-item active" : "chat-thread-item",
+                    threadDragId === t.id ? "chat-thread-item--dragging" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  draggable={threadDraggableId === t.id}
+                  onMouseDown={(e) => onThreadListMouseDown(e, t.id)}
+                  onDragStart={(e) => onThreadDragStart(e, t.id)}
+                  onDragOver={onThreadDragOver}
+                  onDrop={(e) => void onThreadDrop(e, t.id)}
+                  onDragEnd={() => {
+                    setThreadDragId(null);
+                    setThreadDraggableId(null);
+                  }}
+                >
+                  <span
+                    className="chat-thread-handle"
+                    title="ドラッグで並べ替え"
+                    aria-hidden="true"
+                  >
+                    <IconGrip />
+                  </span>
+                  {renamingId === t.id ? (
+                    <input
+                      className="chat-rename"
+                      value={renameDraft}
+                      autoFocus
+                      onChange={(e) => setRenameDraft(e.target.value)}
+                      onBlur={() => void commitRename(t.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void commitRename(t.id);
+                        }
+                        if (e.key === "Escape") setRenamingId(null);
+                      }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="chat-thread-title"
+                      onClick={() => void selectThread(t.id)}
+                      onDoubleClick={() => {
+                        setRenamingId(t.id);
+                        setRenameDraft(t.title);
+                      }}
+                    >
+                      {q && titleHit ? highlightText(title, q) : title}
+                    </button>
+                  )}
+                  {q && !titleHit ? (
+                    <span className="chat-thread-hit">内容</span>
+                  ) : null}
                   <button
                     type="button"
-                    className="chat-thread-title"
-                    onClick={() => void selectThread(t.id)}
-                    onDoubleClick={() => {
-                      setRenamingId(t.id);
-                      setRenameDraft(t.title);
-                    }}
+                    className="chat-icon-btn danger"
+                    title="削除"
+                    aria-label="会話を削除"
+                    disabled={busy}
+                    onClick={() => void deleteThread(t.id)}
                   >
-                    {t.title.trim() || "新しい会話"}
+                    <IconTrash />
                   </button>
-                )}
-                <button
-                  type="button"
-                  className="chat-icon-btn danger"
-                  title="削除"
-                  aria-label="会話を削除"
-                  disabled={busy}
-                  onClick={() => void deleteThread(t.id)}
-                >
-                  ×
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+                </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+        <footer className="chat-sidebar-foot">
+          <button
+            type="button"
+            className="chat-nav-link"
+            title="検索"
+            aria-label="検索"
+            onClick={() => void openWindow("show_popup_window")}
+          >
+            <IconSearch />
+          </button>
+          <button
+            type="button"
+            className="chat-nav-link"
+            title="ノート"
+            aria-label="ノート"
+            onClick={() => void openWindow("show_notes_window")}
+          >
+            <IconNotes />
+          </button>
+          <button
+            type="button"
+            className="chat-nav-link"
+            title="設定"
+            aria-label="設定"
+            onClick={() => void openWindow("show_settings_window")}
+          >
+            <IconSettings />
+          </button>
+        </footer>
       </aside>
+
+      <div
+        className="chat-splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="会話リストの幅を変更"
+        aria-valuemin={SIDEBAR_MIN}
+        aria-valuemax={SIDEBAR_MAX}
+        aria-valuenow={sidebarWidth}
+        onMouseDown={onSidebarResizeStart}
+      />
+
       <main className="chat-main">
         <div className="chat-log" ref={listRef}>
           {messages.length === 0 && !stream && !thinking && !toolHint && !busy ? (

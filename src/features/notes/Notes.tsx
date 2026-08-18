@@ -142,6 +142,16 @@ function formatInvokeError(e: unknown): string {
   }
 }
 
+function matchesListQuery(text: string, query: string): boolean {
+  const q = query.trim().normalize("NFKC").toLowerCase();
+  if (!q) return true;
+  return text.normalize("NFKC").toLowerCase().includes(q);
+}
+
+function noteListTitle(n: { title: string }): string {
+  return n.title.trim() || "無題のノート";
+}
+
 type NoteRow = {
   id: string;
   title: string;
@@ -318,6 +328,60 @@ function IconTrash() {
   );
 }
 
+function NavIcon({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function IconSearch() {
+  return (
+    <NavIcon>
+      <circle cx="7" cy="7" r="4" />
+      <path d="m13 13-2.5-2.5" />
+    </NavIcon>
+  );
+}
+
+function IconChat() {
+  return (
+    <NavIcon>
+      <path d="M3.25 3.5h9.5A1.25 1.25 0 0 1 14 4.75v5.25A1.25 1.25 0 0 1 12.75 11.25H8.1L4.75 13.5v-2.25H3.25A1.25 1.25 0 0 1 2 10V4.75A1.25 1.25 0 0 1 3.25 3.5Z" />
+    </NavIcon>
+  );
+}
+
+function IconSettings() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
+
 export default function Notes() {
   const [notes, setNotes] = useState<NoteRow[]>([]);
   const [active, setActive] = useState<NoteRow | null>(null);
@@ -331,6 +395,8 @@ export default function Notes() {
   const [noteDraggableId, setNoteDraggableId] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [resizingSidebar, setResizingSidebar] = useState(false);
+  const [listQuery, setListQuery] = useState("");
+  const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
   const [bodyHeights, setBodyHeights] = useState<Record<string, number>>(loadBodyHeights);
   const [resizingBodyId, setResizingBodyId] = useState<string | null>(null);
   const [legalMdFormat, setLegalMdFormat] = useState(loadLegalMdFormat);
@@ -412,6 +478,42 @@ export default function Notes() {
   useEffect(() => {
     void bootstrapNotes();
   }, [bootstrapNotes]);
+
+  useEffect(() => {
+    const q = listQuery.trim();
+    if (!q) {
+      setContentHitIds(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void invoke<string[]>("search_notes", { query: q })
+        .then((ids) => {
+          if (!cancelled) setContentHitIds(ids);
+        })
+        .catch(() => {
+          if (!cancelled) setContentHitIds([]);
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [listQuery]);
+
+  const visibleNotes = useMemo(() => {
+    const q = listQuery.trim();
+    if (!q) return notes;
+    const content = new Set(contentHitIds ?? []);
+    return notes.filter(
+      (n) =>
+        matchesListQuery(noteListTitle(n), q) ||
+        matchesListQuery(n.memo, q) ||
+        content.has(n.id),
+    );
+  }, [notes, listQuery, contentHitIds]);
+
+  const listSearching = listQuery.trim().length > 0 && contentHitIds === null;
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -1008,6 +1110,14 @@ export default function Notes() {
     setPrintOpts((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
 
+  async function openWindow(cmd: string) {
+    try {
+      await invoke(cmd);
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
   return (
     <div
       ref={rootRef}
@@ -1033,78 +1143,157 @@ export default function Notes() {
             新規
           </button>
         </div>
-        {notes.length === 0 ? (
-          <p className="notes-empty-side">保存済みノートはありません</p>
-        ) : (
-          <ul className="notes-list">
-            {notes.map((n) => (
-              <li
-                key={n.id}
-                className={[
-                  active?.id === n.id ? "notes-list-item active" : "notes-list-item",
-                  noteDragId === n.id ? "notes-list-item--dragging" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-                draggable={noteDraggableId === n.id}
-                onMouseDown={(e) => onNoteListMouseDown(e, n.id)}
-                onDragStart={(e) => onNoteDragStart(e, n.id)}
-                onDragOver={onDragOver}
-                onDrop={(e) => void onNoteDrop(e, n.id)}
-                onDragEnd={() => {
-                  setNoteDragId(null);
-                  setNoteDraggableId(null);
-                }}
-              >
-                <span
-                  className="notes-list-note-handle"
-                  title="ドラッグで並べ替え"
-                  aria-hidden="true"
+        <div className="notes-sidebar-search">
+          <span className="notes-sidebar-search-icon" aria-hidden="true">
+            <IconSearch />
+          </span>
+          <input
+            className="notes-sidebar-search-input"
+            type="text"
+            role="searchbox"
+            value={listQuery}
+            placeholder="ノートを検索"
+            aria-label="ノートを検索"
+            spellCheck={false}
+            autoComplete="off"
+            onChange={(e) => {
+              setListQuery(e.target.value);
+              setContentHitIds(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && listQuery) {
+                e.preventDefault();
+                setListQuery("");
+              }
+            }}
+          />
+          {listQuery ? (
+            <button
+              type="button"
+              className="notes-sidebar-search-clear"
+              title="検索を消す"
+              aria-label="検索を消す"
+              onClick={() => setListQuery("")}
+            >
+              ×
+            </button>
+          ) : null}
+        </div>
+        <div className="notes-sidebar-body">
+          {notes.length === 0 ? (
+            <p className="notes-empty-side">保存済みノートはありません</p>
+          ) : visibleNotes.length === 0 ? (
+            <p className="notes-empty-side">
+              {listSearching ? "検索中…" : "一致するノートがありません"}
+            </p>
+          ) : (
+            <ul className="notes-list">
+              {visibleNotes.map((n) => {
+                const title = noteListTitle(n);
+                const q = listQuery.trim();
+                const titleHit = q ? matchesListQuery(title, q) : true;
+                return (
+                <li
+                  key={n.id}
+                  className={[
+                    active?.id === n.id ? "notes-list-item active" : "notes-list-item",
+                    noteDragId === n.id ? "notes-list-item--dragging" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  draggable={noteDraggableId === n.id}
+                  onMouseDown={(e) => onNoteListMouseDown(e, n.id)}
+                  onDragStart={(e) => onNoteDragStart(e, n.id)}
+                  onDragOver={onDragOver}
+                  onDrop={(e) => void onNoteDrop(e, n.id)}
+                  onDragEnd={() => {
+                    setNoteDragId(null);
+                    setNoteDraggableId(null);
+                  }}
                 >
-                  <IconGrip />
-                </span>
-                {renamingId === n.id ? (
-                  <form
-                    className="notes-rename-form"
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      void commitRename(n.id);
-                    }}
+                  <span
+                    className="notes-list-note-handle"
+                    title="ドラッグで並べ替え"
+                    aria-hidden="true"
                   >
-                    <input
-                      autoFocus
-                      value={renameDraft}
-                      onChange={(e) => setRenameDraft(e.target.value)}
-                      onBlur={() => void commitRename(n.id)}
-                    />
-                  </form>
-                ) : (
+                    <IconGrip />
+                  </span>
+                  {renamingId === n.id ? (
+                    <form
+                      className="notes-rename-form"
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        void commitRename(n.id);
+                      }}
+                    >
+                      <input
+                        autoFocus
+                        value={renameDraft}
+                        onChange={(e) => setRenameDraft(e.target.value)}
+                        onBlur={() => void commitRename(n.id)}
+                      />
+                    </form>
+                  ) : (
+                    <button
+                      type="button"
+                      className="notes-list-title"
+                      onClick={() => void selectNote(n.id)}
+                      onDoubleClick={() => {
+                        setRenamingId(n.id);
+                        setRenameDraft(n.title);
+                      }}
+                      title="ダブルクリックで名前変更"
+                    >
+                      {q && titleHit ? highlightText(title, q) : title}
+                    </button>
+                  )}
+                  {q && !titleHit ? (
+                    <span className="notes-list-hit">内容</span>
+                  ) : null}
                   <button
                     type="button"
-                    className="notes-list-title"
-                    onClick={() => void selectNote(n.id)}
-                    onDoubleClick={() => {
-                      setRenamingId(n.id);
-                      setRenameDraft(n.title);
-                    }}
-                    title="ダブルクリックで名前変更"
+                    className="notes-icon-btn danger"
+                    title="削除"
+                    aria-label="削除"
+                    onClick={() => void deleteNote(n.id)}
                   >
-                    {n.title || "無題のノート"}
+                    <IconTrash />
                   </button>
-                )}
-                <button
-                  type="button"
-                  className="notes-icon-btn danger"
-                  title="削除"
-                  aria-label="削除"
-                  onClick={() => void deleteNote(n.id)}
-                >
-                  <IconTrash />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+                </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+        <footer className="notes-sidebar-foot">
+          <button
+            type="button"
+            className="notes-nav-link"
+            title="検索"
+            aria-label="検索"
+            onClick={() => void openWindow("show_popup_window")}
+          >
+            <IconSearch />
+          </button>
+          <button
+            type="button"
+            className="notes-nav-link"
+            title="チャット"
+            aria-label="チャット"
+            onClick={() => void openWindow("show_chat_window")}
+          >
+            <IconChat />
+          </button>
+          <button
+            type="button"
+            className="notes-nav-link"
+            title="設定"
+            aria-label="設定"
+            onClick={() => void openWindow("show_settings_window")}
+          >
+            <IconSettings />
+          </button>
+        </footer>
       </aside>
 
       <div

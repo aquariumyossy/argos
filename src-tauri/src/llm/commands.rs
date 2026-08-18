@@ -6,7 +6,10 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow};
 use crate::llm::{self, LlmModelInfo};
-use crate::llm::context::{assemble_turns, ChatTurn};
+use crate::llm::context::{
+    assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed,
+    ChatTurn, STOP_TOOLS_HINT,
+};
 use crate::llm::tools::{self, MAX_TOOL_ROUNDS, ToolExec};
 use crate::state::AppState;
 
@@ -137,6 +140,21 @@ fn fit_tool_content(content: String, budget: usize, used: usize) -> String {
     out
 }
 
+/// Put this-turn hits on a user turn so the model sees a real 出典 block (not only `role: tool`).
+fn inject_final_source_turn(
+    turns: &mut Vec<ChatTurn>,
+    sources: &[LlmSourceRow],
+    consumed: &[(String, i64)],
+    stop_tools: bool,
+) -> bool {
+    let rows = sources_for_consumed(sources, consumed);
+    if let Some(turn) = final_source_turn(&rows, stop_tools) {
+        turns.push(turn);
+        return true;
+    }
+    false
+}
+
 #[tauri::command]
 pub fn show_chat_window(app: AppHandle) {
     crate::show_chat(&app);
@@ -147,6 +165,17 @@ pub fn llm_list_threads(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<LlmThreadRow>, String> {
     state.db.list_llm_threads().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn llm_search_threads(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+) -> Result<Vec<String>, String> {
+    state
+        .db
+        .search_llm_thread_ids(&query)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -193,6 +222,17 @@ pub fn llm_set_thread_scope(
         .set_llm_thread_scope(&id, &joined)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "会話が見つかりません".into())
+}
+
+#[tauri::command]
+pub fn llm_reorder_threads(
+    state: State<'_, Arc<AppState>>,
+    ordered_ids: Vec<String>,
+) -> Result<(), String> {
+    state
+        .db
+        .reorder_llm_threads(&ordered_ids)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -370,6 +410,7 @@ pub async fn llm_send(
     let mut warning: Option<String> = None;
     let mut rounds = 0usize;
     let mut current_turns = assembled;
+    let mut source_turn_injected = false;
     // Tool output is appended after the context was already sized, so it needs its own
     // allowance. A quarter of the window leaves room for the history and the answer.
     let tool_budget = (max_chars / 4).max(2_000);
@@ -533,10 +574,22 @@ pub async fn llm_send(
                     if tool_used >= tool_budget {
                         use_tools = false;
                         extra_final = true;
-                        current_turns.push(ChatTurn::text(
-                            "user",
-                            "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。",
-                        ));
+                        if !source_turn_injected {
+                            let all = state
+                                .db
+                                .list_llm_sources(&thread.id)
+                                .unwrap_or_default();
+                            source_turn_injected = inject_final_source_turn(
+                                &mut current_turns,
+                                &all,
+                                &consumed,
+                                true,
+                            );
+                        }
+                        if !source_turn_injected {
+                            current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
+                            source_turn_injected = true;
+                        }
                     }
                     continue;
                 }
@@ -547,11 +600,42 @@ pub async fn llm_send(
                 {
                     extra_final = true;
                     use_tools = false;
-                    current_turns.push(ChatTurn::text(
-                        "user",
-                        "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。",
-                    ));
+                    if !source_turn_injected {
+                        let all = state
+                            .db
+                            .list_llm_sources(&thread.id)
+                            .unwrap_or_default();
+                        source_turn_injected = inject_final_source_turn(
+                            &mut current_turns,
+                            &all,
+                            &consumed,
+                            true,
+                        );
+                    }
+                    if !source_turn_injected {
+                        current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
+                        source_turn_injected = true;
+                    }
                     continue;
+                }
+                // Search hits live in `role: tool`. The citation guide only fires for a
+                // user-turn 出典 block, so inject one before accepting a tool-only answer
+                // that did not copy [n].
+                if rounds > 0 && !consumed.is_empty() && !source_turn_injected {
+                    let already_cited = consumed_cited_in_answer(&consumed, &out.content);
+                    if already_cited.is_empty() {
+                        let all = state
+                            .db
+                            .list_llm_sources(&thread.id)
+                            .unwrap_or_default();
+                        if inject_final_source_turn(&mut current_turns, &all, &consumed, true)
+                        {
+                            source_turn_injected = true;
+                            use_tools = false;
+                            extra_final = true;
+                            continue;
+                        }
+                    }
                 }
                 result_text = out.content;
                 break;
@@ -572,17 +656,16 @@ pub async fn llm_send(
         )
     };
     if let Some(assistant) = assistant_message.as_ref() {
-        if !consumed.is_empty() {
+        let cited = consumed_cited_in_answer(&consumed, &result_text);
+        if !cited.is_empty() {
             state
                 .db
-                .consume_llm_sources(&consumed, &user_message.id, &assistant.id)
+                .consume_llm_sources(&cited, &user_message.id, &assistant.id)
                 .map_err(|e| e.to_string())?;
-            emit_sources_updated(&app, &thread.id);
         }
-    } else {
-        let _ = state.db.delete_uncited_tool_sources(&thread.id);
-        emit_sources_updated(&app, &thread.id);
     }
+    let _ = state.db.delete_uncited_tool_sources(&thread.id);
+    emit_sources_updated(&app, &thread.id);
     let thread = state
         .db
         .get_llm_thread(&thread.id)
@@ -936,6 +1019,48 @@ mod tests {
             "a spent reserve yields a notice, not silence: {exhausted}"
         );
         assert!(exhausted.chars().count() < 40);
+    }
+
+    #[test]
+    fn inject_final_source_turn_appends_user_block() {
+        let mut s = LlmSourceRow {
+            id: "hit".into(),
+            thread_id: "t".into(),
+            sort_order: 0,
+            origin: "tool".into(),
+            path: "C:\\民法.md".into(),
+            title: "民法.md".into(),
+            paragraph_id: "p1".into(),
+            body: "第936条".into(),
+            query: String::new(),
+            created_at: 0,
+            grain: "unit".into(),
+            unit_body: String::new(),
+            injected_user_message_id: String::new(),
+            cited_assistant_message_id: String::new(),
+            cite_no: 2,
+        };
+        let mut turns = Vec::new();
+        assert!(inject_final_source_turn(
+            &mut turns,
+            std::slice::from_ref(&s),
+            &[("hit".into(), 2)],
+            true,
+        ));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "user");
+        assert!(turns[0].content.contains("【出典】"));
+        assert!(turns[0].content.contains("[2]"));
+        assert!(turns[0].content.contains("[n]"));
+        assert!(turns[0].content.contains("ツールはこれ以上"));
+        s.id = "other".into();
+        let mut empty = Vec::new();
+        assert!(!inject_final_source_turn(
+            &mut empty,
+            std::slice::from_ref(&s),
+            &[("hit".into(), 2)],
+            false,
+        ));
     }
 }
 

@@ -1221,6 +1221,11 @@ pub fn list_notes(state: State<'_, Arc<AppState>>) -> Result<Vec<NoteRow>, Strin
 }
 
 #[tauri::command]
+pub fn search_notes(state: State<'_, Arc<AppState>>, query: String) -> Result<Vec<String>, String> {
+    state.db.search_note_ids(&query).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn create_note(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
