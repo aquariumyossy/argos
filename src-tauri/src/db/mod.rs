@@ -696,7 +696,7 @@ impl Db {
                         }
                     }
                     "llm_search_top_k" => {
-                        s.llm_search_top_k = row.1.parse().unwrap_or(4).clamp(1, 8)
+                        s.llm_search_top_k = row.1.parse().unwrap_or(4).clamp(1, 16)
                     }
                     "llm_thinking" => {
                         s.llm_thinking = match row.1.as_str() {
@@ -985,6 +985,30 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT path FROM files WHERE folder_id=?1")?;
         let rows = stmt.query_map([folder_id], |row| row.get(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Indexed files whose `mtime` falls in `[after_unix, before_unix]` (inclusive).
+    /// Unbounded sides are `None`. Status is `ok` (not `indexed`).
+    pub fn list_ok_file_paths_in_range(
+        &self,
+        after_unix: Option<i64>,
+        before_unix: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM files
+             WHERE status='ok' AND mtime > 0
+               AND (?1 IS NULL OR mtime >= ?1)
+               AND (?2 IS NULL OR mtime <= ?2)
+             ORDER BY mtime DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![after_unix, before_unix, limit as i64],
+            |row| row.get(0),
+        )?;
         Ok(rows.flatten().collect())
     }
 
@@ -1644,6 +1668,42 @@ impl Db {
              ORDER BY folder_name COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Indexed emails in `[after_unix, before_unix]` (inclusive). `from_substr` is a
+    /// case-insensitive substring of Outlook `SenderName` (`from_addr`).
+    pub fn list_indexed_email_paths_in_range(
+        &self,
+        after_unix: Option<i64>,
+        before_unix: Option<i64>,
+        from_substr: Option<&str>,
+        folder_name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let from = from_substr
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{s}%"));
+        let folder = folder_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM email_messages
+             WHERE status='indexed' AND date_unix > 0
+               AND (?1 IS NULL OR date_unix >= ?1)
+               AND (?2 IS NULL OR date_unix <= ?2)
+               AND (?3 IS NULL OR from_addr LIKE ?3 COLLATE NOCASE)
+               AND (?4 IS NULL OR folder_name = ?4 COLLATE NOCASE)
+             ORDER BY date_unix DESC
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![after_unix, before_unix, from, folder, limit as i64],
+            |row| row.get(0),
+        )?;
         Ok(rows.flatten().collect())
     }
 
@@ -2622,4 +2682,135 @@ pub struct FileMeta {
     pub size: i64,
     pub mtime: i64,
     pub content_hash: String,
+}
+
+#[cfg(test)]
+mod date_range_tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-date-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db)
+    }
+
+    fn insert_file_status(db: &Db, folder_id: i64, path: &str, mtime: i64, status: &str) {
+        let conn = db.conn.lock();
+        conn.execute(
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status)
+             VALUES(?1, ?2, 'txt', 1, ?3, '', NULL, ?4)",
+            rusqlite::params![folder_id, path, mtime, status],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn file_range_keeps_ok_and_drops_other_status() {
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\docs", "").unwrap();
+        let in_range = 1_700_000_100;
+        let out_range = 1_600_000_000;
+        db.upsert_file(folder.id, r"C:\docs\ok.txt", "txt", 1, in_range, "h")
+            .unwrap();
+        insert_file_status(&db, folder.id, r"C:\docs\pending.txt", in_range, "pending");
+        insert_file_status(&db, folder.id, r"C:\docs\old.txt", out_range, "ok");
+        insert_file_status(&db, folder.id, r"C:\docs\zero.txt", 0, "ok");
+
+        let paths = db
+            .list_ok_file_paths_in_range(Some(1_700_000_000), Some(1_700_000_200), 100)
+            .unwrap();
+        assert_eq!(paths, vec![r"C:\docs\ok.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn email_range_keeps_indexed_and_from_substr() {
+        let (dir, db) = temp_db();
+        let in_range = 1_700_000_100;
+        let out_range = 1_600_000_000;
+        db.upsert_email_message(
+            "outlook:ok",
+            "s",
+            "e1",
+            "",
+            "受信トレイ",
+            "山田太郎",
+            "件名",
+            in_range,
+            "h",
+            "indexed",
+        )
+        .unwrap();
+        db.upsert_email_message(
+            "outlook:pending",
+            "s",
+            "e2",
+            "",
+            "受信トレイ",
+            "山田太郎",
+            "件名",
+            in_range,
+            "h",
+            "pending",
+        )
+        .unwrap();
+        db.upsert_email_message(
+            "outlook:superseded",
+            "s",
+            "e3",
+            "",
+            "受信トレイ",
+            "山田太郎",
+            "件名",
+            in_range,
+            "h",
+            "superseded",
+        )
+        .unwrap();
+        db.upsert_email_message(
+            "outlook:old",
+            "s",
+            "e4",
+            "",
+            "受信トレイ",
+            "山田太郎",
+            "件名",
+            out_range,
+            "h",
+            "indexed",
+        )
+        .unwrap();
+        db.upsert_email_message(
+            "outlook:other",
+            "s",
+            "e5",
+            "",
+            "受信トレイ",
+            "佐藤",
+            "件名",
+            in_range,
+            "h",
+            "indexed",
+        )
+        .unwrap();
+
+        let paths = db
+            .list_indexed_email_paths_in_range(
+                Some(1_700_000_000),
+                Some(1_700_000_200),
+                Some("山田"),
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(paths, vec!["outlook:ok".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

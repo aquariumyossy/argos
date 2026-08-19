@@ -409,6 +409,29 @@
   color: var(--accent);
 }
 
+.popup-date-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--ink);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.popup-date-btn:hover,
+.popup-date-btn[aria-expanded="true"],
+.popup-date-btn.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .popup-ext-picker {
   position: absolute;
   top: calc(100% + 4px);
@@ -487,6 +510,66 @@
   color: var(--accent);
 }
 
+.popup-date-picker {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  box-shadow: 0 8px 20px rgba(40, 36, 28, 0.12);
+}
+
+.popup-date-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 10px 4px;
+}
+
+.popup-date-presets button {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.popup-date-presets button:hover,
+.popup-date-presets button.is-selected {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.popup-date-fields {
+  display: flex;
+  gap: 10px;
+  padding: 8px 10px 10px;
+}
+
+.popup-date-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.popup-date-fields input[type="date"] {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 4px 6px;
+}
+
 .popup-overlay-head {
   display: flex;
   align-items: center;
@@ -511,6 +594,7 @@
 .popup-suggest .popup-overlay-close,
 .popup-folder-picker .popup-overlay-close,
 .popup-ext-picker .popup-overlay-close,
+.popup-date-picker .popup-overlay-close,
 .popup-select-chip .popup-overlay-close {
   display: inline-flex;
   align-items: center;

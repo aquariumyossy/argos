@@ -283,7 +283,7 @@ pub fn update_settings(
     }
     settings.llm_timeout_ms = settings.llm_timeout_ms.clamp(5_000, 600_000);
     settings.llm_max_context_chars = settings.llm_max_context_chars.clamp(4_000, 200_000);
-    settings.llm_search_top_k = settings.llm_search_top_k.clamp(1, 8);
+    settings.llm_search_top_k = settings.llm_search_top_k.clamp(1, 16);
     settings.llm_thinking = match settings.llm_thinking.trim() {
         "auto" | "brief" | "off" => settings.llm_thinking.trim().to_string(),
         _ => crate::db::DEFAULT_LLM_THINKING.into(),
@@ -565,6 +565,8 @@ pub async fn search_query(
     query: String,
     path_prefix: Option<String>,
     exts: Option<Vec<String>>,
+    date_after: Option<String>,
+    date_before: Option<String>,
 ) -> Result<Vec<SearchHit>, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -576,6 +578,15 @@ pub async fn search_query(
             .filter(|s| !s.is_empty());
         let exts = search::normalize_exts(exts);
         let user_dict = state.user_dict.read().clone();
+        let date = search::parse_date_range(date_after.as_deref(), date_before.as_deref())?;
+        let filter = search::build_search_filter(
+            &state.db,
+            date,
+            None,
+            prefix,
+            exts.as_deref(),
+            false,
+        )?;
         search::run_search_with_mail_options(
             &settings,
             state.backend.as_ref(),
@@ -585,6 +596,7 @@ pub async fn search_query(
             prefix,
             exts.as_deref(),
             &user_dict,
+            &filter,
         )
     })
     .await

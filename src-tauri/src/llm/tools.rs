@@ -12,6 +12,7 @@ use crate::state::AppState;
 pub const TOOL_SEARCH: &str = "search_index";
 pub const TOOL_READ: &str = "read_unit";
 pub const MAX_TOOL_ROUNDS: usize = 3;
+pub const LLM_SEARCH_K_MAX: usize = 16;
 /// Body length per search hit. Deliberately small: a search round returns up to `k`
 /// hits, and the model is expected to call `read_unit` on the one it actually needs.
 const TOOL_BODY_CAP: usize = 1_200;
@@ -33,7 +34,9 @@ pub fn tools_schema() -> Value {
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
 条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
-0件のときは語を減らすか言い換えて1回だけ試す。",
+時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
+「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
+送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -42,7 +45,23 @@ pub fn tools_schema() -> Value {
                             "type": "string",
                             "description": "フォルダパスで結果を絞る（任意）。スレッドに検索範囲が設定されている場合、その配下への絞り込みだけが有効。"
                         },
-                        "k": { "type": "integer", "description": "件数（1〜8）" }
+                        "k": { "type": "integer", "description": "件数（1〜16）" },
+                        "after": {
+                            "type": "string",
+                            "description": "この日以降（YYYY-MM-DD、ローカル日付、含む）。直近なら今日の約30日前。"
+                        },
+                        "before": {
+                            "type": "string",
+                            "description": "この日以前（YYYY-MM-DD、ローカル日付、含む）"
+                        },
+                        "from": {
+                            "type": "string",
+                            "description": "メール送信者の表示名（部分一致）。指定時はメールのみを検索する。"
+                        },
+                        "sort": {
+                            "type": "string",
+                            "description": "relevance（既定）または date（新しい順）。直近の一覧では date。"
+                        }
                     },
                     "required": ["query"]
                 }
@@ -182,18 +201,14 @@ fn persist_hit(
     if body.trim().is_empty() {
         return Ok(());
     }
-    let title = if hit.title.trim().is_empty() {
-        hit.path.as_str()
-    } else {
-        hit.title.as_str()
-    };
+    let title = source_title(&hit);
     let (mut row, created) = state
         .db
         .insert_llm_source(
             thread_id,
             "tool",
             &hit.path,
-            title,
+            &title,
             &hit.id,
             &body,
             query,
@@ -212,16 +227,103 @@ fn persist_hit(
     Ok(())
 }
 
+fn source_title(hit: &SearchHit) -> String {
+    let title = if hit.title.trim().is_empty() {
+        hit.path.as_str()
+    } else {
+        hit.title.as_str()
+    };
+    if hit.doc_kind != "email" && !crate::mail::is_outlook_path(&hit.path) {
+        return title.to_string();
+    }
+    let from = hit.mail_from.trim();
+    let ymd = search::format_unix_ymd(&hit.mail_date);
+    match (from.is_empty(), ymd.is_empty()) {
+        (true, true) => title.to_string(),
+        (false, true) => format!("{title}（送信者: {from}）"),
+        (true, false) => format!("{title}（{ymd}）"),
+        (false, false) => format!("{title}（送信者: {from} / {ymd}）"),
+    }
+}
+
+const MAIL_QUERY_NOISE: &[&str] = &[
+    "メール",
+    "メイル",
+    "mail",
+    "email",
+    "e-mail",
+    "直近",
+    "最近",
+    "最新",
+    "件",
+    "通",
+    "送信",
+    "送信者",
+    "差出人",
+    "探す",
+    "探して",
+    "検索",
+    "から",
+    "の",
+    "を",
+    "が",
+    "は",
+];
+
+/// Drop sender name and listing boilerplate so they are not required in the body.
+pub fn topical_query(query: &str, mail_from: Option<&str>) -> String {
+    let from = mail_from.unwrap_or("").trim();
+    let mut parts: Vec<String> = Vec::new();
+    for raw in query.split(|c: char| c.is_whitespace() || matches!(c, ',' | '、' | '・')) {
+        let t = raw
+            .trim()
+            .trim_matches(|c: char| "「」『』。．、,!?！？".contains(c));
+        if t.is_empty() {
+            continue;
+        }
+        if !from.is_empty() && (t == from || from.contains(t) || t.contains(from)) {
+            continue;
+        }
+        if MAIL_QUERY_NOISE
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(t))
+        {
+            continue;
+        }
+        parts.push(t.to_string());
+    }
+    parts.join(" ")
+}
+
+pub fn format_search_date_system_line(mail_days_back: u32) -> String {
+    format!(
+        "\n本日は {}（ローカル日付）です。時期や「直近」「最近」があるときだけ search_index の after / before を YYYY-MM-DD で渡してください。無いときは期間で絞らないでください。送信者は from に表示名を入れてください。「直近」は after を今日の30日前、sort は date にしてください。0件や件数不足なら after を90日前、次に1年前へ広げて再検索してください。新着をスコアで優遇しないでください。メールの同期範囲は過去{}日です。",
+        search::today_ymd(),
+        mail_days_back.max(1)
+    )
+}
+
 fn run_index_search(
     state: &AppState,
     query: &str,
     path_prefix: Option<&str>,
     k: usize,
+    filter: &search::SearchFilter,
+    list_mail: bool,
 ) -> Result<Vec<SearchHit>, String> {
     let settings = state.settings.read().clone();
     let user_dict = state.user_dict.read().clone();
-    // `k` counts files as far as the model is concerned, but paragraph fan-out means one
-    // file can occupy several slots, so widen the unit budget to keep k files reachable.
+    if list_mail {
+        let Some(mail_paths) = filter.mail_paths.as_ref() else {
+            return Ok(Vec::new());
+        };
+        return search::list_mail_hits(
+            state.mail_backend.as_ref(),
+            mail_paths,
+            k,
+            settings.mail_thread_collapse,
+        );
+    }
     search::run_search_precise(
         &settings,
         state.backend.as_ref(),
@@ -232,11 +334,12 @@ fn run_index_search(
         None,
         &user_dict,
         UNITS_PER_FILE,
+        filter,
     )
 }
 
 fn unit_limit_for(k: usize) -> usize {
-    (k * UNITS_PER_FILE).clamp(k, 24)
+    (k * UNITS_PER_FILE).clamp(k, 48)
 }
 
 fn run_index_search_multi(
@@ -244,18 +347,48 @@ fn run_index_search_multi(
     query: &str,
     prefixes: &[String],
     k: usize,
+    date: search::DateFilter,
+    mail_from: Option<&str>,
+    sort_date: bool,
+    list_mail: bool,
 ) -> Result<Vec<SearchHit>, String> {
-    if prefixes.is_empty() {
-        return run_index_search(state, query, None, k);
-    }
-    if prefixes.len() == 1 {
-        return run_index_search(state, query, Some(&prefixes[0]), k);
-    }
+    let prefixes: Vec<Option<&str>> = if prefixes.is_empty() {
+        vec![None]
+    } else {
+        prefixes.iter().map(|p| Some(p.as_str())).collect()
+    };
     let mut all = Vec::new();
-    for p in prefixes {
-        all.extend(run_index_search(state, query, Some(p), k)?);
+    for prefix in prefixes {
+        let filter = search::build_search_filter(
+            &state.db,
+            date,
+            mail_from,
+            prefix,
+            None,
+            sort_date,
+        )?;
+        all.extend(run_index_search(
+            state,
+            query,
+            prefix,
+            k,
+            &filter,
+            list_mail,
+        )?);
     }
-    Ok(merge_hits_by_score(all, unit_limit_for(k)))
+    if sort_date || list_mail {
+        all.sort_by(|a, b| {
+            let da: i64 = a.mail_date.parse().unwrap_or(0);
+            let db: i64 = b.mail_date.parse().unwrap_or(0);
+            db.cmp(&da)
+        });
+        let mut seen = HashSet::new();
+        all.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
+        all.truncate(k);
+        Ok(all)
+    } else {
+        Ok(merge_hits_by_score(all, unit_limit_for(k)))
+    }
 }
 
 fn merge_hits_by_score(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
@@ -324,6 +457,26 @@ fn scope_where_clause(scopes: &[String]) -> String {
         String::new()
     } else {
         format!("（検索範囲: {}）", scopes.join("、"))
+    }
+}
+
+fn date_where_clause(after: Option<&str>, before: Option<&str>) -> String {
+    match (
+        after.map(str::trim).filter(|s| !s.is_empty()),
+        before.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (None, None) => String::new(),
+        (Some(a), None) => format!("（期間: {a}〜）"),
+        (None, Some(b)) => format!("（期間: 〜{b}）"),
+        (Some(a), Some(b)) => format!("（期間: {a}〜{b}）"),
+    }
+}
+
+fn date_reaches_before_sync(date: search::DateFilter, mail_days_back: u32) -> bool {
+    let cutoff = chrono::Local::now().timestamp() - (mail_days_back.max(1) as i64) * 86_400;
+    match date.after_unix {
+        Some(after) => after < cutoff,
+        None => date.is_active(),
     }
 }
 
@@ -453,19 +606,69 @@ fn execute_tool_inner(
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
             let scopes = resolve_scopes(thread_scope, requested);
-            let settings_k = state.settings.read().llm_search_top_k.clamp(1, 8) as usize;
+            let settings_k = state.settings.read().llm_search_top_k.clamp(1, LLM_SEARCH_K_MAX as u32)
+                as usize;
             let k = args
                 .get("k")
                 .and_then(|v| v.as_u64())
-                .map(|n| (n as usize).clamp(1, 8))
+                .map(|n| (n as usize).clamp(1, LLM_SEARCH_K_MAX))
                 .unwrap_or(settings_k);
-            let hits = run_index_search_multi(state, &query, &scopes, k)?;
+            let mail_from = args
+                .get("from")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let after = args.get("after").and_then(|v| v.as_str());
+            let before = args.get("before").and_then(|v| v.as_str());
+            let date = match search::parse_date_range(after, before) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(ToolExec {
+                        content: e,
+                        consumed: Vec::new(),
+                    });
+                }
+            };
+            let sort_date = args
+                .get("sort")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("date"));
+            let topical = topical_query(&query, mail_from);
+            let list_mail = mail_from.is_some() && topical.is_empty();
+            let search_q = if list_mail || topical.is_empty() {
+                query.as_str()
+            } else {
+                topical.as_str()
+            };
+            let hits = run_index_search_multi(
+                state,
+                search_q,
+                &scopes,
+                k,
+                date,
+                mail_from,
+                sort_date,
+                list_mail,
+            )?;
             if hits.is_empty() {
                 let where_ = scope_where_clause(&scopes);
+                let period = date_where_clause(after, before);
+                let mut msg = format!(
+                    "「{query}」に一致する索引ヒットはありません{period}{where_}。"
+                );
+                if date.is_active() {
+                    msg.push_str("この期間にヒットがなければ after を過去へ広げて再検索してください。");
+                    let days = state.settings.read().mail_days_back.max(1);
+                    if date_reaches_before_sync(date, days) {
+                        msg.push_str(&format!(
+                            "メールの同期範囲は過去{days}日です。それより前は索引にありません。"
+                        ));
+                    }
+                } else {
+                    msg.push_str("語を減らすか別の語で言い換えてください。");
+                }
                 return Ok(ToolExec {
-                    content: format!(
-                        "「{query}」に一致する索引ヒットはありません{where_}。語を減らすか別の語で言い換えてください。"
-                    ),
+                    content: msg,
                     consumed: Vec::new(),
                 });
             }
@@ -687,5 +890,67 @@ mod tests {
         assert_eq!(capped.chars().count(), TOOL_BODY_CAP + TRUNCATED_MARK.chars().count());
         let short = "短い本文";
         assert_eq!(cap_chars(short, TOOL_BODY_CAP), short, "no marker when it fits");
+    }
+
+    #[test]
+    fn topical_query_drops_sender_and_mail_noise() {
+        assert_eq!(topical_query("Aさん メール 直近", Some("Aさん")), "");
+        assert_eq!(topical_query("Aさん 契約", Some("Aさん")), "契約");
+        assert_eq!(topical_query("解雇 有効性", None), "解雇 有効性");
+    }
+
+    #[test]
+    fn source_title_includes_from_and_date() {
+        let hit = SearchHit {
+            id: "outlook:x#1".into(),
+            title: "件名".into(),
+            snippet: String::new(),
+            path: "outlook:store/entry".into(),
+            page: None,
+            chunk_id: None,
+            score: 1.0,
+            source: "outlook".into(),
+            preview_text: String::new(),
+            highlight_terms: vec![],
+            match_count: 1,
+            paragraphs: vec![],
+            unit_label: String::new(),
+            mail_from: "山田太郎".into(),
+            mail_date: "1755446400".into(),
+            mail_conversation_id: String::new(),
+            mail_folder: String::new(),
+            doc_kind: "email".into(),
+        };
+        let title = source_title(&hit);
+        assert!(title.contains("件名"));
+        assert!(title.contains("山田太郎"));
+        let ymd = search::format_unix_ymd(&hit.mail_date);
+        assert!(!ymd.is_empty());
+        assert!(title.contains(&ymd), "title={title} ymd={ymd}");
+        assert!(title.contains("送信者"));
+    }
+
+    #[test]
+    fn date_where_clause_and_zero_hit_sync_hint() {
+        assert_eq!(date_where_clause(None, None), "");
+        assert_eq!(date_where_clause(Some("2026-08-01"), None), "（期間: 2026-08-01〜）");
+        assert_eq!(
+            date_where_clause(Some("2026-08-01"), Some("2026-08-18")),
+            "（期間: 2026-08-01〜2026-08-18）"
+        );
+        let recent = search::parse_date_range(Some(&search::today_ymd()), None).unwrap();
+        assert!(!date_reaches_before_sync(recent, 730));
+        let old = search::parse_date_range(Some("2010-01-01"), None).unwrap();
+        assert!(date_reaches_before_sync(old, 730));
+        let line = format_search_date_system_line(730);
+        assert!(line.contains(&search::today_ymd()));
+        assert!(line.contains("730"));
+        assert!(line.contains("after"));
+    }
+
+    #[test]
+    fn topical_query_sender_only_is_empty() {
+        assert_eq!(topical_query("Aさん", Some("Aさん")), "");
+        assert_eq!(topical_query("「Aさん」のメール", Some("Aさん")), "");
     }
 }
