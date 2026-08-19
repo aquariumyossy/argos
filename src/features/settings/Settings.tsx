@@ -152,7 +152,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.9.4";
+const APP_VERSION = "1.9.5";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -330,7 +330,7 @@ function normalizeSettings(s: SettingsData): SettingsData {
   if (typeof s.llmSearchTopK !== "number" || !Number.isFinite(s.llmSearchTopK)) {
     s.llmSearchTopK = 4;
   } else {
-    s.llmSearchTopK = Math.min(8, Math.max(1, Math.round(s.llmSearchTopK)));
+    s.llmSearchTopK = Math.min(16, Math.max(1, Math.round(s.llmSearchTopK)));
   }
   return s;
 }
@@ -1282,7 +1282,7 @@ export default function Settings() {
               </li>
             </ul>
             <p className="muted">
-              検索欄の語をドラッグすると「隣接にする」「辞書に登録」が出せます。入力欄が空のときは最近の検索語が候補になります。ヒットの「キープ」でノートへ、「チャット」で会話へ送れます。
+              検索欄の語をドラッグすると「隣接にする」「辞書に登録」が出せます。入力欄が空のときは最近の検索語が候補になります。種別・フォルダ・時期（1週間／1か月など、または開始・終了日）で絞れます。ヒットの「キープ」でノートへ、「チャット」で会話へ送れます。
             </p>
           </section>
 
@@ -1296,7 +1296,7 @@ export default function Settings() {
               <li>左の「メール設定」で Outlook を検出して設定を保存します</li>
               <li>フォルダを選んで同期します</li>
               <li>
-                通常どおり <kbd>{settings.shortcut}</kbd> で検索します
+                通常どおり <kbd>{settings.shortcut}</kbd> で検索します。時期ボタンで受信日の範囲を指定できます
               </li>
             </ol>
           </section>
@@ -1366,7 +1366,7 @@ export default function Settings() {
           <section>
             <h2>ローカルLLM</h2>
             <p className="muted">
-              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（MTPLX / Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります。回答は Markdown で表示し、図や選択肢も出せます。
+              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（MTPLX / Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります（「Aさんの直近メール」のように時期や送信者を指定できます）。回答は Markdown で表示し、図や表（列幅はドラッグで調整）、選択肢も出せます。
             </p>
             <ol className="howto-steps">
               <li>MTPLX 等を起動し、使いたいモデルを読み込みます</li>
@@ -2364,13 +2364,13 @@ export default function Settings() {
                 <input
                   type="number"
                   min={1}
-                  max={8}
+                  max={16}
                   value={settings.llmSearchTopK}
                   onChange={(e) =>
                     setSettings({
                       ...settings,
                       llmSearchTopK: Math.min(
-                        8,
+                        16,
                         Math.max(1, Number(e.target.value) || 4),
                       ),
                     })
@@ -2378,7 +2378,7 @@ export default function Settings() {
                 />
               </label>
               <p className="field-hint">
-                モデルがインデックス検索ツールを使うときのファイル件数です（1〜8）。1ファイルから最大3段落まで返すため、実際の段落数はこれより多くなります。検索窓から手動で送るときは関係ありません。
+                モデルがインデックス検索ツールを使うときのファイル件数です（1〜16）。1ファイルから最大3段落まで返すため、実際の段落数はこれより多くなります。検索窓から手動で送るときは関係ありません。
               </p>
               <label className="llm-prompt-label">
                 <span className="field-label">システムプロンプト</span>

@@ -5,6 +5,7 @@ import {
   splitAssistantBlocks,
   type AssistantBlock,
 } from "./assistantMd";
+import { attachResizableChatTables } from "./chatTableResize";
 import { sanitizeMermaidSource } from "./mermaidSanitize";
 
 type MermaidApi = {
@@ -133,6 +134,7 @@ function MdHtml({
   citeNos: ReadonlySet<number>;
   onCite: (n: number) => void;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const citeKey = [...citeNos].sort((a, b) => a - b).join(",");
   const html = useMemo(() => {
     const set = new Set(
@@ -143,8 +145,14 @@ function MdHtml({
     );
     return renderAssistantMdHtml(text, set);
   }, [text, citeKey]);
+
+  useEffect(() => {
+    attachResizableChatTables(rootRef.current);
+  }, [html]);
+
   return (
     <div
+      ref={rootRef}
       dangerouslySetInnerHTML={{ __html: html }}
       onClick={(e) => {
         const btn = (e.target as HTMLElement).closest("button.md-cite");

@@ -383,6 +383,7 @@ pub async fn llm_send(
     if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
         system.push_str(&line);
     }
+    system.push_str(&tools::format_search_date_system_line(settings.mail_days_back));
     let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
     let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
     let truncated = stats.truncated;

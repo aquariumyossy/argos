@@ -220,6 +220,17 @@ function IconFileType() {
   );
 }
 
+function IconCalendar() {
+  return (
+    <HitActionIcon>
+      <rect x="2.5" y="3.5" width="11" height="10" rx="1.25" />
+      <path d="M2.5 6.5h11" />
+      <path d="M5.5 2.5v2" />
+      <path d="M10.5 2.5v2" />
+    </HitActionIcon>
+  );
+}
+
 /** 16×16 paw-print pip for match score. */
 function IconScoreDog({ filled }: { filled: boolean }) {
   return (
@@ -319,6 +330,40 @@ function extFilterChipLabel(keys: string[]): string {
     .join(" · ");
 }
 
+function ymd(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function formatYmdSlash(iso: string): string {
+  const [y, m, d] = iso.split("-");
+  if (!y || !m || !d) return iso;
+  return `${y}/${m}/${d}`;
+}
+
+function addMonths(d: Date, n: number): Date {
+  const x = new Date(d.getFullYear(), d.getMonth() + n, d.getDate());
+  return x;
+}
+
+function dateChipLabel(
+  after: string | null,
+  before: string | null,
+  preset: string | null,
+): string {
+  if (preset) return preset;
+  if (after && before) {
+    return after === before
+      ? formatYmdSlash(after)
+      : `${formatYmdSlash(after)} – ${formatYmdSlash(before)}`;
+  }
+  if (after) return `${formatYmdSlash(after)}〜`;
+  if (before) return `〜${formatYmdSlash(before)}`;
+  return "時期";
+}
+
 const SEARCH_DEBOUNCE_MS = 450;
 const HINT_HOVER_MS = 500;
 const KEEP_TOAST_MS = 2200;
@@ -363,6 +408,10 @@ export default function Popup() {
   const [keepNotice, setKeepNotice] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [extPickerOpen, setExtPickerOpen] = useState(false);
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [dateAfter, setDateAfter] = useState<string | null>(null);
+  const [dateBefore, setDateBefore] = useState<string | null>(null);
+  const [datePreset, setDatePreset] = useState<string | null>(null);
   const [hintOpen, setHintOpen] = useState(false);
   const [selectChip, setSelectChip] = useState<{
     start: number;
@@ -391,6 +440,8 @@ export default function Popup() {
   const searchSeq = useRef(0);
   const scopePathRef = useRef<string | null>(null);
   const extFilterRef = useRef<string[]>([]);
+  const dateAfterRef = useRef<string | null>(null);
+  const dateBeforeRef = useRef<string | null>(null);
   const imeComposingRef = useRef(false);
   const skipSelectChipRef = useRef(false);
 
@@ -401,6 +452,14 @@ export default function Popup() {
   useEffect(() => {
     extFilterRef.current = extFilterKeys;
   }, [extFilterKeys]);
+
+  useEffect(() => {
+    dateAfterRef.current = dateAfter;
+  }, [dateAfter]);
+
+  useEffect(() => {
+    dateBeforeRef.current = dateBefore;
+  }, [dateBefore]);
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -469,6 +528,8 @@ export default function Popup() {
           query: trimmed,
           pathPrefix: prefix && prefix.trim() ? prefix.trim() : null,
           exts: extList && extList.length ? extList : null,
+          dateAfter: dateAfterRef.current,
+          dateBefore: dateBeforeRef.current,
         });
         if (seq !== searchSeq.current) return;
         setHits(next);
@@ -600,6 +661,11 @@ export default function Popup() {
       searchSeq.current += 1;
       clearScope();
       clearExtFilter();
+      setDateAfter(null);
+      setDateBefore(null);
+      setDatePreset(null);
+      dateAfterRef.current = null;
+      dateBeforeRef.current = null;
       setQuery(event.payload.query);
       setHits(event.payload.hits);
       setIndex(0);
@@ -607,6 +673,7 @@ export default function Popup() {
       setSearching(Boolean(event.payload.searching));
       setFolderPickerOpen(false);
       setExtPickerOpen(false);
+      setDatePickerOpen(false);
       setSuggestOpen(false);
       setSelectChip(null);
       skipSelectChipRef.current = true;
@@ -631,18 +698,19 @@ export default function Popup() {
   }, []);
 
   useEffect(() => {
-    if (!folderPickerOpen && !extPickerOpen && !suggestOpen) {
+    if (!folderPickerOpen && !extPickerOpen && !datePickerOpen && !suggestOpen) {
       return;
     }
     const onPointerDown = (e: MouseEvent) => {
       if (queryRowRef.current?.contains(e.target as Node)) return;
       setFolderPickerOpen(false);
       setExtPickerOpen(false);
+      setDatePickerOpen(false);
       setSuggestOpen(false);
     };
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [folderPickerOpen, extPickerOpen, suggestOpen]);
+  }, [folderPickerOpen, extPickerOpen, datePickerOpen, suggestOpen]);
 
   const showKeepNotice = useCallback((text: string) => {
     setKeepNotice(text);
@@ -834,6 +902,7 @@ export default function Popup() {
       setRecentScopes(result.recent ?? []);
       setSearchScopes(scopes);
       setExtPickerOpen(false);
+      setDatePickerOpen(false);
       setSuggestOpen(false);
       setScopeFilter("");
       setFolderPickerOpen(true);
@@ -848,9 +917,57 @@ export default function Popup() {
 
   const openExtPicker = useCallback(() => {
     setFolderPickerOpen(false);
+    setDatePickerOpen(false);
     setSuggestOpen(false);
     setExtPickerOpen(true);
   }, []);
+
+  const openDatePicker = useCallback(() => {
+    setFolderPickerOpen(false);
+    setExtPickerOpen(false);
+    setSuggestOpen(false);
+    setDatePickerOpen(true);
+  }, []);
+
+  const applyDateRange = useCallback(
+    (after: string | null, before: string | null, preset: string | null) => {
+      setDateAfter(after);
+      setDateBefore(before);
+      setDatePreset(preset);
+      dateAfterRef.current = after;
+      dateBeforeRef.current = before;
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      void runSearch(query);
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+      });
+    },
+    [query, runSearch],
+  );
+
+  const applyDatePreset = useCallback(
+    (preset: string) => {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const until = ymd(today);
+      if (preset === "1週間") {
+        const from = new Date(today);
+        from.setDate(from.getDate() - 6);
+        applyDateRange(ymd(from), until, preset);
+        return;
+      }
+      if (preset === "1か月") {
+        applyDateRange(ymd(addMonths(today, -1)), until, preset);
+        return;
+      }
+      if (preset === "3か月") {
+        applyDateRange(ymd(addMonths(today, -3)), until, preset);
+        return;
+      }
+      applyDateRange(`${today.getFullYear()}-01-01`, until, "今年");
+    },
+    [applyDateRange],
+  );
 
   const filteredRecentScopes = useMemo(() => {
     const q = scopeFilter.trim().toLowerCase();
@@ -1098,6 +1215,7 @@ export default function Popup() {
     clearScope();
     setFolderPickerOpen(false);
     setExtPickerOpen(false);
+    setDatePickerOpen(false);
     setSuggestOpen(false);
     setSelectChip(null);
     await invoke("hide_popup");
@@ -1106,6 +1224,7 @@ export default function Popup() {
   const closeQueryOverlay = useCallback(() => {
     setFolderPickerOpen(false);
     setExtPickerOpen(false);
+    setDatePickerOpen(false);
     setSuggestOpen(false);
     setSelectChip(null);
     requestAnimationFrame(() => inputRef.current?.focus());
@@ -1132,6 +1251,10 @@ export default function Popup() {
           setExtPickerOpen(false);
           return;
         }
+        if (datePickerOpen) {
+          setDatePickerOpen(false);
+          return;
+        }
         if (suggestOpen) {
           setSuggestOpen(false);
           return;
@@ -1139,7 +1262,7 @@ export default function Popup() {
         void hidePopup();
         return;
       }
-      if (folderPickerOpen || extPickerOpen) return;
+      if (folderPickerOpen || extPickerOpen || datePickerOpen) return;
 
       if (
         suggestOpen &&
@@ -1204,6 +1327,7 @@ export default function Popup() {
   }, [
     applySuggestion,
     extPickerOpen,
+    datePickerOpen,
     folderPickerOpen,
     hidePopup,
     hits,
@@ -1406,14 +1530,14 @@ export default function Popup() {
                 setSelectChip(null);
                 hideHint();
                 scheduleSearch(next);
-                if (!folderPickerOpen && !extPickerOpen) {
+                if (!folderPickerOpen && !extPickerOpen && !datePickerOpen) {
                   void refreshSuggestions(next);
                 } else {
                   setSuggestOpen(false);
                 }
               }}
               onFocus={() => {
-                if (!query.trim() && !folderPickerOpen && !extPickerOpen) {
+                if (!query.trim() && !folderPickerOpen && !extPickerOpen && !datePickerOpen) {
                   void refreshSuggestions("");
                 }
               }}
@@ -1432,7 +1556,7 @@ export default function Popup() {
                 const next = e.currentTarget.value;
                 setQuery(next);
                 scheduleSearch(next);
-                if (!folderPickerOpen && !extPickerOpen) {
+                if (!folderPickerOpen && !extPickerOpen && !datePickerOpen) {
                   void refreshSuggestions(next);
                 }
               }}
@@ -1521,10 +1645,28 @@ export default function Popup() {
           >
             <IconFileType />
           </button>
+          <button
+            type="button"
+            className={`popup-date-btn${dateAfter || dateBefore ? " is-active" : ""}`}
+            title="時期で絞る"
+            aria-label="時期で絞る"
+            aria-expanded={datePickerOpen}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => {
+              if (datePickerOpen) {
+                setDatePickerOpen(false);
+              } else {
+                openDatePicker();
+              }
+            }}
+          >
+            <IconCalendar />
+          </button>
           {suggestOpen &&
           suggestions.length > 0 &&
           !folderPickerOpen &&
           !extPickerOpen &&
+          !datePickerOpen &&
           !selectChip ? (
             <div
               className="popup-suggest"
@@ -1685,8 +1827,65 @@ export default function Popup() {
               ) : null}
             </div>
           ) : null}
+          {datePickerOpen ? (
+            <div className="popup-date-picker" role="dialog" aria-label="時期">
+              <div className="popup-overlay-head">
+                <span className="popup-overlay-head-label">時期</span>
+                <OverlayCloseBtn onClose={closeQueryOverlay} />
+              </div>
+              <div className="popup-date-presets">
+                {["1週間", "1か月", "3か月", "今年"].map((label) => (
+                  <button
+                    key={label}
+                    type="button"
+                    className={datePreset === label ? "is-selected" : undefined}
+                    onClick={() => applyDatePreset(label)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="popup-date-fields">
+                <label>
+                  <span>開始</span>
+                  <input
+                    type="date"
+                    value={dateAfter ?? ""}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      applyDateRange(v, dateBefore, null);
+                    }}
+                  />
+                </label>
+                <label>
+                  <span>終了</span>
+                  <input
+                    type="date"
+                    value={dateBefore ?? ""}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      applyDateRange(dateAfter, v, null);
+                    }}
+                  />
+                </label>
+              </div>
+              {dateAfter || dateBefore ? (
+                <div className="popup-ext-picker-actions">
+                  <button
+                    type="button"
+                    className="popup-ext-clear-btn"
+                    onClick={() => applyDateRange(null, null, null)}
+                  >
+                    時期を解除
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-        {scopePath || extFilterKeys.length > 0 ? (
+        {scopePath || extFilterKeys.length > 0 || dateAfter || dateBefore ? (
           <div className="popup-scope-chip-row">
             {scopePath ? (
               <span
@@ -1725,6 +1924,29 @@ export default function Popup() {
                   aria-label="種別絞り込みを解除"
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={() => applyExtFilter([])}
+                >
+                  ×
+                </button>
+              </span>
+            ) : null}
+            {dateAfter || dateBefore ? (
+              <span
+                className="popup-scope-chip popup-date-chip"
+                title={dateChipLabel(dateAfter, dateBefore, datePreset)}
+              >
+                <span className="popup-scope-chip-at">時期</span>
+                <span className="popup-scope-chip-text">
+                  {truncateChipLabel(
+                    dateChipLabel(dateAfter, dateBefore, datePreset),
+                  )}
+                </span>
+                <button
+                  type="button"
+                  className="popup-scope-chip-clear"
+                  title="時期絞り込みを解除"
+                  aria-label="時期絞り込みを解除"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={() => applyDateRange(null, null, null)}
                 >
                   ×
                 </button>

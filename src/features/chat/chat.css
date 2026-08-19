@@ -411,9 +411,54 @@
   word-break: break-all;
 }
 
+.chat-msg.assistant .md-body .md-table-wrap {
+  overflow-x: hidden;
+}
+
+.chat-msg.assistant .md-body .md-table-wrap.md-table-overflow {
+  overflow-x: auto;
+}
+
 .chat-msg.assistant .md-body table {
   width: 100%;
   table-layout: fixed;
+}
+
+.chat-msg.assistant .md-body .md-col-resize-cell {
+  position: relative;
+}
+
+.chat-msg.assistant .md-body .md-col-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 2;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.chat-msg.assistant .md-body .md-col-resizer::after {
+  content: "";
+  position: absolute;
+  top: 18%;
+  bottom: 18%;
+  left: 3px;
+  width: 1px;
+  background: var(--line);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.chat-msg.assistant .md-body .md-col-resizer:hover::after,
+body.md-col-resizing .chat-msg.assistant .md-body .md-col-resizer::after {
+  opacity: 1;
+}
+
+body.md-col-resizing {
+  cursor: col-resize !important;
+  user-select: none;
 }
 
 .chat-msg.assistant .md-body th,
@@ -427,7 +472,12 @@
   min-width: 0;
 }
 
-.chat-msg.assistant .md-body table:has(tr > :nth-child(2)) tr > :first-child {
+/* Two-column label/value tables only (結論・根拠など). */
+.chat-msg.assistant
+  .md-body
+  table:has(tr > :nth-child(2)):not(:has(tr > :nth-child(3)))
+  tr
+  > :first-child {
   width: 28%;
   color: var(--muted);
   font-weight: 600;

@@ -23,6 +23,10 @@ use super::legal_ref::{
 use super::morph::{is_noise_highlight_term, MorphAnalyzer};
 use super::{ParagraphHit, SearchBackend, SearchHit, SearchOpts};
 
+/// When a date/from allowlist is larger than this, skip the Tantivy path OR and
+/// post-filter instead (recall can drop).
+pub const PATH_OR_CAP: usize = 2048;
+
 /// Bump when Tantivy on-disk schema changes. Triggers wipe + full reindex.
 pub const INDEX_SCHEMA_VERSION: u32 = 5;
 const SCHEMA_VERSION_FILE: &str = "argos_schema_version";
@@ -1383,6 +1387,8 @@ impl TantivyBackend {
     /// Score-ranked chunk hits, optionally scoped by path prefix. Does not dedupe by path.
     /// When `exact_path` is set, AND a path TermQuery so all chunks of that file are retrieved.
     /// When `exts` is set, AND an extension TermQuery (OR across the list).
+    /// When `path_allowlist` is set, results are restricted to those paths (Tantivy OR if
+    /// small, otherwise a post-filter).
     #[allow(clippy::too_many_arguments)]
     fn search_scored(
         &self,
@@ -1393,6 +1399,7 @@ impl TantivyBackend {
         pos_filter_enabled: bool,
         exact_path: Option<&str>,
         opts: SearchOpts,
+        path_allowlist: Option<&[String]>,
     ) -> Result<Vec<(f32, SearchHit)>, String> {
         let q = query.trim();
         if q.is_empty() {
@@ -1431,9 +1438,36 @@ impl TantivyBackend {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let allow_or: Option<Vec<String>> = path_allowlist.and_then(|paths| {
+            let cleaned: Vec<String> = paths
+                .iter()
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+                .collect();
+            if cleaned.is_empty() {
+                None
+            } else if cleaned.len() <= PATH_OR_CAP {
+                Some(cleaned)
+            } else {
+                None
+            }
+        });
+        let allow_set: Option<HashSet<String>> = path_allowlist.map(|paths| {
+            let mut set = HashSet::new();
+            for p in paths {
+                insert_allow_path(&mut set, p);
+            }
+            set
+        });
+        if let Some(ref set) = allow_set {
+            if set.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
         eprintln!(
-            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exts={:?} exact_path={:?} pos_filter={} precision={} require_most={}",
-            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, ext_filter, exact, pos_filter_enabled, opts.precision, require_most
+            "argos: parsed includes={:?} phrases={:?} excludes={:?} exclude_phrases={:?} prox={:?} scope={:?} exts={:?} exact_path={:?} allow_or={} pos_filter={} precision={} require_most={}",
+            parsed.includes, parsed.phrases, parsed.excludes, parsed.exclude_phrases, proximity_tokens, scope, ext_filter, exact, allow_or.as_ref().map(|v| v.len()).unwrap_or(0), pos_filter_enabled, opts.precision, require_most
         );
         eprintln!(
             "argos: highlight_terms={:?} search_units={:?}",
@@ -1446,6 +1480,28 @@ impl TantivyBackend {
                 let path_term = Term::from_field_text(self.fields.path, p);
                 let path_q = TermQuery::new(path_term, IndexRecordOption::Basic);
                 clauses.push((Occur::Must, Box::new(path_q)));
+            }
+            if let Some(ref paths) = allow_or {
+                if paths.len() == 1 {
+                    let term = Term::from_field_text(self.fields.path, &paths[0]);
+                    clauses.push((
+                        Occur::Must,
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                    ));
+                } else {
+                    let shoulds: Vec<(Occur, Box<dyn Query>)> = paths
+                        .iter()
+                        .map(|p| {
+                            let term = Term::from_field_text(self.fields.path, p);
+                            (
+                                Occur::Should,
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                                    as Box<dyn Query>,
+                            )
+                        })
+                        .collect();
+                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(shoulds))));
+                }
             }
             if let Some(ref list) = ext_filter {
                 if list.len() == 1 {
@@ -1481,7 +1537,9 @@ impl TantivyBackend {
         // (Do not multiply by large factors here — callers already size the unit budget.)
         let fetch_n = if exact.is_some() {
             limit.max(50).min(80)
-        } else if scope.is_some() || ext_filter.is_some() {
+        } else if allow_or.is_some() {
+            (limit * 2).max(40).min(400)
+        } else if scope.is_some() || ext_filter.is_some() || allow_set.is_some() {
             (limit * 5).max(80).min(400)
         } else {
             (limit * 2).max(40).min(200)
@@ -1499,6 +1557,11 @@ impl TantivyBackend {
                 let Some(mut hit) = self.hit_from_doc(score, &doc, q, &highlight_terms) else {
                     continue;
                 };
+                if let Some(ref set) = allow_set {
+                    if !path_in_allowlist(&hit.path, set) {
+                        continue;
+                    }
+                }
                 if let Some(ref prefix) = scope {
                     if let Some(folder) = prefix.strip_prefix("mailfolder:") {
                         if self.kind != IndexKind::Mail {
@@ -1668,6 +1731,7 @@ impl TantivyBackend {
             pos_filter_enabled,
             Some(path),
             SearchOpts::default(),
+            None,
         )?;
         // Fallback if TermQuery missed due to path normalization drift: prefix scope.
         if scored.is_empty() {
@@ -1679,6 +1743,7 @@ impl TantivyBackend {
                 pos_filter_enabled,
                 None,
                 SearchOpts::default(),
+                None,
             )?;
             scored.retain(|(_, hit)| {
                 pathutil::simplify_windows_path(&hit.path)
@@ -1814,6 +1879,138 @@ impl TantivyBackend {
             .map_err(|e| e.to_string())?;
         self.hits_from_addrs(addrs)
     }
+
+    /// Same as [`SearchBackend::search_opts`] with an optional path allowlist.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+        exts: Option<&[String]>,
+        pos_filter_enabled: bool,
+        opts: SearchOpts,
+        path_allowlist: Option<&[String]>,
+    ) -> Result<Vec<SearchHit>, String> {
+        if let Some(paths) = path_allowlist {
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        let unit_limit = (limit * 8).max(40);
+        let scored = self.search_scored(
+            query,
+            unit_limit,
+            path_prefix,
+            exts,
+            pos_filter_enabled,
+            None,
+            opts,
+            path_allowlist,
+        )?;
+
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<SearchHit>> =
+            std::collections::HashMap::new();
+        for (_, hit) in scored {
+            let path = hit.path.clone();
+            if !groups.contains_key(&path) {
+                order.push(path.clone());
+            }
+            groups.entry(path).or_default().push(hit);
+        }
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for path in order {
+            let Some(mut units) = groups.remove(&path) else {
+                continue;
+            };
+            if units.is_empty() {
+                continue;
+            }
+            units.sort_by(|a, b| b.score.total_cmp(&a.score));
+            let units = dedupe_path_units(units);
+            let match_count = units.len() as u32;
+            let paragraphs: Vec<ParagraphHit> = units
+                .iter()
+                .take(NESTED_PARAGRAPH_LIMIT)
+                .map(|u| ParagraphHit {
+                    id: u.id.clone(),
+                    label: if u.unit_label.is_empty() {
+                        u.snippet.chars().take(36).collect()
+                    } else {
+                        u.unit_label.clone()
+                    },
+                    snippet: u.snippet.clone(),
+                    score: u.score,
+                    page: u.page,
+                })
+                .collect();
+            let take = opts.per_file_units.unwrap_or(1).max(1);
+            for mut unit in units.into_iter().take(take) {
+                unit.match_count = match_count;
+                unit.paragraphs = paragraphs.clone();
+                hits.push(unit);
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+            if hits.len() >= limit {
+                break;
+            }
+        }
+        if opts.per_file_units.is_some() {
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        }
+        eprintln!(
+            "argos: final_hits={} sample_terms={:?}",
+            hits.len(),
+            hits.first().map(|h| &h.highlight_terms)
+        );
+        Ok(super::filter_hits_by_exts(hits, exts))
+    }
+
+    /// Load stored units for known paths without a text query (mail listing).
+    pub fn hits_for_paths(&self, paths: &[String], limit: usize) -> Result<Vec<SearchHit>, String> {
+        let mut hits = Vec::new();
+        for path in paths {
+            if hits.len() >= limit {
+                break;
+            }
+            let per = if self.kind == IndexKind::Mail { 1 } else { 3 };
+            let units = self.units_for_path(path, per)?;
+            for hit in units {
+                hits.push(hit);
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(hits)
+    }
+}
+
+fn insert_allow_path(set: &mut HashSet<String>, path: &str) {
+    let p = path.trim();
+    if p.is_empty() {
+        return;
+    }
+    set.insert(p.to_string());
+    set.insert(p.to_ascii_lowercase());
+    let simp = pathutil::simplify_windows_path(p);
+    set.insert(simp.clone());
+    set.insert(simp.to_ascii_lowercase());
+}
+
+fn path_in_allowlist(path: &str, set: &HashSet<String>) -> bool {
+    if set.contains(path) {
+        return true;
+    }
+    let lower = path.to_ascii_lowercase();
+    if set.contains(&lower) {
+        return true;
+    }
+    let simp = pathutil::simplify_windows_path(path);
+    set.contains(&simp) || set.contains(&simp.to_ascii_lowercase())
 }
 
 fn sort_units_document_order(hits: &mut [SearchHit]) {
@@ -1954,84 +2151,15 @@ impl SearchBackend for TantivyBackend {
         pos_filter_enabled: bool,
         opts: SearchOpts,
     ) -> Result<Vec<SearchHit>, String> {
-        // Unit budget ≈ pre-paragraph TopDocs size so nesting does not explode fetch_n.
-        // search_scored applies only a mild over-fetch on top of this.
-        let unit_limit = (limit * 8).max(40);
-        let scored = self.search_scored(
+        self.search_filtered(
             query,
-            unit_limit,
+            limit,
             path_prefix,
             exts,
             pos_filter_enabled,
-            None,
             opts,
-        )?;
-
-        // Group by path; scored is already best-score-first.
-        let mut order: Vec<String> = Vec::new();
-        let mut groups: std::collections::HashMap<String, Vec<SearchHit>> =
-            std::collections::HashMap::new();
-        for (_, hit) in scored {
-            let path = hit.path.clone();
-            if !groups.contains_key(&path) {
-                order.push(path.clone());
-            }
-            groups.entry(path).or_default().push(hit);
-        }
-
-        // `per_file_units` returns paragraphs directly. A statute file holds hundreds of
-        // articles and a long contract many clauses, so collapsing to one unit per file
-        // would hide everything but the single best match.
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for path in order {
-            let Some(mut units) = groups.remove(&path) else {
-                continue;
-            };
-            if units.is_empty() {
-                continue;
-            }
-            // units already score-sorted from global sort; keep that order within path.
-            units.sort_by(|a, b| b.score.total_cmp(&a.score));
-            let units = dedupe_path_units(units);
-            let match_count = units.len() as u32;
-            let paragraphs: Vec<ParagraphHit> = units
-                .iter()
-                .take(NESTED_PARAGRAPH_LIMIT)
-                .map(|u| ParagraphHit {
-                    id: u.id.clone(),
-                    label: if u.unit_label.is_empty() {
-                        u.snippet.chars().take(36).collect()
-                    } else {
-                        u.unit_label.clone()
-                    },
-                    snippet: u.snippet.clone(),
-                    score: u.score,
-                    page: u.page,
-                })
-                .collect();
-            let take = opts.per_file_units.unwrap_or(1).max(1);
-            for mut unit in units.into_iter().take(take) {
-                unit.match_count = match_count;
-                unit.paragraphs = paragraphs.clone();
-                hits.push(unit);
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-            if hits.len() >= limit {
-                break;
-            }
-        }
-        // Per-file fan-out can order paragraphs behind a weaker file's best unit.
-        if opts.per_file_units.is_some() {
-            hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-        }
-        eprintln!(
-            "argos: final_hits={} sample_terms={:?}",
-            hits.len(),
-            hits.first().map(|h| &h.highlight_terms)
-        );
-        Ok(super::filter_hits_by_exts(hits, exts))
+            None,
+        )
     }
 
     fn preview(&self, hit_id: &str) -> Result<Option<SearchHit>, String> {
@@ -2971,5 +3099,73 @@ mod tests {
             "excluded term must still remove the document: {:?}",
             hits.iter().map(|h| &h.path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn path_allowlist_keeps_low_bm25_in_range_and_drops_out_of_range() {
+        let idx = TestIndex::new("date-allow");
+        let hot = format!(
+            "{} これは高頻度で契約という語が並ぶ文書です。",
+            "契約 ".repeat(40)
+        );
+        let cold =
+            "契約について一度だけ触れる。期間内の古いメモであり、関連語は多くない。".to_string();
+        idx.add("hot", &hot);
+        idx.add("cold", &cold);
+        let hot_path = idx.dir.join("hot.txt").to_str().unwrap().to_string();
+        let cold_path = idx.dir.join("cold.txt").to_str().unwrap().to_string();
+
+        let unfiltered = idx
+            .backend
+            .search("契約", 10, None, None, false)
+            .expect("search");
+        assert!(
+            unfiltered.iter().any(|h| h.path == hot_path),
+            "hot doc should rank without allowlist: {:?}",
+            unfiltered.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+
+        let filtered = idx
+            .backend
+            .search_filtered(
+                "契約",
+                10,
+                None,
+                None,
+                false,
+                super::SearchOpts::default(),
+                Some(&[cold_path.clone()]),
+            )
+            .expect("filtered");
+        assert_eq!(filtered.len(), 1, "{:?}", filtered.iter().map(|h| &h.path).collect::<Vec<_>>());
+        assert_eq!(filtered[0].path, cold_path);
+        assert!(!filtered.iter().any(|h| h.path == hot_path));
+    }
+
+    #[test]
+    fn empty_path_allowlist_returns_no_hits() {
+        let idx = TestIndex::new("empty-allow");
+        idx.add("doc", "契約についての短いメモです。追加の本文を足して長さを確保する。");
+        let hits = idx
+            .backend
+            .search_filtered(
+                "契約",
+                10,
+                None,
+                None,
+                false,
+                super::SearchOpts::default(),
+                Some(&[]),
+            )
+            .expect("filtered");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn allowlist_matches_simplified_and_lowercased_paths() {
+        let mut set = std::collections::HashSet::new();
+        insert_allow_path(&mut set, r"C:\Docs\A.txt");
+        assert!(path_in_allowlist(r"C:\Docs\A.txt", &set));
+        assert!(path_in_allowlist(r"c:\docs\a.txt", &set));
     }
 }

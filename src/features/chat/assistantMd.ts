@@ -497,5 +497,21 @@ export function renderAssistantMdHtml(
   unwrapCjkBreaksInLists(root);
   tightenCjkInlineGaps(root);
   linkCiteNumbers(root, doc, citeNos);
+  markResizableTables(root);
   return root.innerHTML;
+}
+
+/** Multi-column data tables get draggable column handles in the chat UI. */
+function markResizableTables(root: HTMLElement): void {
+  for (const table of Array.from(root.querySelectorAll("table"))) {
+    const rows = Array.from(table.querySelectorAll("tr"));
+    if (rows.length === 0) continue;
+    const colCount = Math.max(
+      ...rows.map((r) => r.querySelectorAll("th, td").length),
+      0,
+    );
+    if (colCount >= 2) {
+      table.classList.add("md-table-resizable");
+    }
+  }
 }
