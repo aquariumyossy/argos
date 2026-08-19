@@ -5,7 +5,7 @@ const RESIZE_READY = "data-md-resize-ready";
 
 function headerCells(table: HTMLTableElement): HTMLTableCellElement[] {
   const th = table.querySelectorAll("thead th");
-  if (th.length > 0) return Array.from(th);
+  if (th.length > 0) return Array.from(th) as HTMLTableCellElement[];
   const row = table.rows[0];
   if (!row) return [];
   return Array.from(row.cells);
@@ -172,7 +172,9 @@ function setupTable(table: HTMLTableElement): void {
 /** Attach drag handles to multi-column tables inside a chat message body. */
 export function attachResizableChatTables(root: HTMLElement | null): void {
   if (!root) return;
-  for (const table of Array.from(root.querySelectorAll("table.md-table-resizable"))) {
+  for (const table of Array.from(
+    root.querySelectorAll<HTMLTableElement>("table.md-table-resizable"),
+  )) {
     setupTable(table);
   }
 }
