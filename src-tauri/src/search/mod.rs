@@ -7,12 +7,16 @@ pub mod history;
 pub mod legal_ref;
 pub mod morph;
 pub mod remote_backend;
+pub mod remote_share;
 pub mod tantivy_backend;
 
 pub use date::{format_unix_ymd, parse_date_range, today_ymd, DateFilter};
 pub use history::{extract_search_terms, suggest_from_history, SearchTermSuggestion};
 pub use morph::{apply_user_dictionary, is_noise_highlight_term, MorphAnalyzer, UserDictMatcher};
 pub use remote_backend::{hybrid_search, RemoteArgosBackend};
+pub use remote_share::{
+    filter_hits_by_share, path_is_remotely_shared, RemoteShareSnapshot,
+};
 pub use tantivy_backend::{parse_query_syntax, TantivyBackend};
 
 use crate::db::{Db, Settings};

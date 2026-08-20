@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::search::{
-    filter_hits_by_exts, filter_hits_by_path_prefix, SearchBackend, SearchHit, TantivyBackend,
+    filter_hits_by_exts, filter_hits_by_path_prefix, filter_out_email_hits, RemoteShareSnapshot,
+    SearchBackend, SearchHit, TantivyBackend,
 };
 
 #[derive(Clone)]
@@ -17,6 +18,7 @@ struct ServerState {
     backend: Arc<TantivyBackend>,
     token: Arc<String>,
     pos_filter_enabled: Arc<std::sync::atomic::AtomicBool>,
+    share: Arc<Mutex<RemoteShareSnapshot>>,
 }
 
 #[derive(Serialize)]
@@ -83,6 +85,10 @@ async fn search(
     Json(body): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     check_bearer(&headers, &state.token)?;
+    let share = state.share.lock().clone();
+    if !share.has_shared_folders() {
+        return Ok(Json(SearchResponse { hits: Vec::new() }));
+    }
     let limit = body.limit.unwrap_or(10).clamp(1, 50);
     let backend = state.backend.clone();
     let query = body.query;
@@ -93,33 +99,31 @@ async fn search(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let exts = crate::search::normalize_exts(body.exts);
-    // Over-fetch when scoped so post-filter can still fill limit.
-    let fetch_limit = if path_prefix.is_some() || exts.is_some() {
-        (limit * 4).clamp(1, 50)
-    } else {
-        limit
-    };
+    // Over-fetch so share / scope post-filters can still fill limit.
+    let fetch_limit = (limit * 4).clamp(1, 50);
     let prefix_for_filter = path_prefix.clone();
     let exts_for_filter = exts.clone();
     let pos_filter = state
         .pos_filter_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
+    let share_for_search = share.clone();
     let mut hits = tauri::async_runtime::spawn_blocking(move || {
-        backend.search(
+        backend.search_for_remote(
             &query,
             fetch_limit,
             path_prefix.as_deref(),
             exts.as_deref(),
             pos_filter,
+            &share_for_search,
         )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    // Safety net if backend ignored scope (should not happen for local Tantivy).
     hits = filter_hits_by_path_prefix(hits, prefix_for_filter.as_deref());
     hits = filter_hits_by_exts(hits, exts_for_filter.as_deref());
-    hits = crate::search::filter_out_email_hits(hits);
+    hits = filter_out_email_hits(hits);
+    hits = share.filter_hits(hits);
     hits.truncate(limit);
     for hit in &mut hits {
         hit.source = "remote".into();
@@ -133,6 +137,7 @@ async fn preview(
     Json(body): Json<PreviewRequest>,
 ) -> Result<Json<PreviewResponse>, (StatusCode, String)> {
     check_bearer(&headers, &state.token)?;
+    let share = state.share.lock().clone();
     let backend = state.backend.clone();
     let id = body.id;
     let mut hit = tauri::async_runtime::spawn_blocking(move || backend.preview(&id))
@@ -140,7 +145,10 @@ async fn preview(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if let Some(ref mut h) = hit {
-        if h.doc_kind == "email" || crate::mail::is_outlook_path(&h.path) {
+        if h.doc_kind == "email"
+            || crate::mail::is_outlook_path(&h.path)
+            || !share.path_is_shared(&h.path)
+        {
             return Ok(Json(PreviewResponse { hit: None }));
         }
         h.source = "remote".into();
@@ -169,6 +177,10 @@ async fn path_matches(
     if crate::mail::is_outlook_path(&path) {
         return Ok(Json(SearchResponse { hits: Vec::new() }));
     }
+    let share = state.share.lock().clone();
+    if !share.path_is_shared(&path) {
+        return Ok(Json(SearchResponse { hits: Vec::new() }));
+    }
     let limit = body.limit.unwrap_or(50).clamp(1, 50);
     let backend = state.backend.clone();
     let query = body.query;
@@ -181,7 +193,8 @@ async fn path_matches(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    hits = crate::search::filter_out_email_hits(hits);
+    hits = filter_out_email_hits(hits);
+    hits = share.filter_hits(hits);
     for hit in &mut hits {
         hit.source = "remote".into();
     }
@@ -193,6 +206,7 @@ pub struct RemoteServerHandle {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     /// Active server identity so unrelated settings saves do not bounce the bind.
     running: Arc<Mutex<Option<RunningServer>>>,
+    share: Arc<Mutex<RemoteShareSnapshot>>,
 }
 
 struct RunningServer {
@@ -206,7 +220,12 @@ impl RemoteServerHandle {
         Self {
             shutdown: Mutex::new(None),
             running: Arc::new(Mutex::new(None)),
+            share: Arc::new(Mutex::new(RemoteShareSnapshot::default())),
         }
+    }
+
+    pub fn set_share(&self, snap: RemoteShareSnapshot) {
+        *self.share.lock() = snap;
     }
 
     pub fn stop(&self) {
@@ -267,6 +286,7 @@ impl RemoteServerHandle {
             backend,
             token: Arc::new(token.to_string()),
             pos_filter_enabled: pos_filter,
+            share: self.share.clone(),
         };
         let app = Router::new()
             .route("/health", get(health))

@@ -221,6 +221,7 @@ pub fn run() {
             commands::update_folder_public_path,
             commands::update_folder_path,
             commands::remove_folder,
+            commands::set_folder_share_remote,
             commands::list_exclude_paths,
             commands::add_exclude_path,
             commands::remove_exclude_path,

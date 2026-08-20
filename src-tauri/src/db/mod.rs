@@ -259,6 +259,25 @@ pub struct FolderRow {
     /// Live filesystem check (not persisted). True when `path` is an existing directory.
     #[serde(default)]
     pub exists: bool,
+    /// LAN remote share (from settings KV, not a folders column).
+    #[serde(default)]
+    pub share_remote: bool,
+}
+
+fn parse_remote_share_folder_ids(raw: Option<&str>) -> Vec<i64> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(ids) = serde_json::from_str::<Vec<i64>>(raw) else {
+        return Vec::new();
+    };
+    let mut out: Vec<i64> = Vec::new();
+    for id in ids {
+        if id > 0 && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 fn folder_path_exists(path: &str) -> bool {
@@ -270,6 +289,18 @@ impl FolderRow {
         self.exists = folder_path_exists(&self.path);
         self
     }
+}
+
+fn folder_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRow> {
+    Ok(FolderRow {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        public_path: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        indexed_count: row.get::<_, i64>(4)? as u32,
+        exists: false,
+        share_remote: false,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +349,7 @@ pub struct RecentSearchScope {
 
 pub const MAX_RECENT_SEARCH_SCOPES: usize = 3;
 const RECENT_SEARCH_SCOPES_KEY: &str = "recent_search_scopes";
+const REMOTE_SHARE_FOLDER_IDS_KEY: &str = "remote_share_folder_ids";
 
 /// Cap on remembered search events (co-occurrence source).
 pub const MAX_SEARCH_TERM_EVENTS: usize = 30;
@@ -796,17 +828,11 @@ impl Db {
              FROM folders f
              ORDER BY f.id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(FolderRow {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                public_path: row.get(2)?,
-                enabled: row.get::<_, i64>(3)? != 0,
-                indexed_count: row.get::<_, i64>(4)? as u32,
-                exists: false,
-            })
-        })?;
-        Ok(rows.flatten().map(FolderRow::with_exists).collect())
+        let rows = stmt.query_map([], folder_row_from_sql)?;
+        let folders: Vec<FolderRow> = rows.flatten().map(FolderRow::with_exists).collect();
+        drop(stmt);
+        drop(conn);
+        Ok(self.overlay_share_remote_all(folders))
     }
 
     pub fn add_folder(
@@ -830,15 +856,17 @@ impl Db {
             [id],
             |r| r.get(0),
         )?;
-        Ok(FolderRow {
+        drop(conn);
+        Ok(self.overlay_share_remote_one(FolderRow {
             id,
             path: path.to_string(),
             public_path,
             enabled: true,
             indexed_count: 0,
             exists: false,
+            share_remote: false,
         }
-        .with_exists())
+        .with_exists()))
     }
 
     pub fn update_folder_public_path(
@@ -930,6 +958,8 @@ impl Db {
         // Explicitly remove file rows (CASCADE may be off on older sessions)
         conn.execute("DELETE FROM files WHERE folder_id=?1", [id])?;
         conn.execute("DELETE FROM folders WHERE id=?1", [id])?;
+        drop(conn);
+        self.prune_remote_share_folder_id(id)?;
         Ok(path)
     }
 
@@ -941,20 +971,12 @@ impl Db {
              FROM folders f
              WHERE f.id=?1",
         )?;
-        let mut rows = stmt.query_map([id], |row| {
-            Ok(FolderRow {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                public_path: row.get(2)?,
-                enabled: row.get::<_, i64>(3)? != 0,
-                indexed_count: row.get::<_, i64>(4)? as u32,
-                exists: false,
-            })
-        })?;
-        if let Some(Ok(row)) = rows.next() {
-            return Ok(Some(row.with_exists()));
-        }
-        Ok(None)
+        let mut rows = stmt.query_map([id], folder_row_from_sql)?;
+        let row = rows.next().transpose()?;
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+        Ok(row.map(|r| self.overlay_share_remote_one(r.with_exists())))
     }
 
     pub fn get_folder_by_path(&self, path: &str) -> Result<Option<FolderRow>, rusqlite::Error> {
@@ -965,20 +987,12 @@ impl Db {
              FROM folders f
              WHERE f.path=?1",
         )?;
-        let mut rows = stmt.query_map([path], |row| {
-            Ok(FolderRow {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                public_path: row.get(2)?,
-                enabled: row.get::<_, i64>(3)? != 0,
-                indexed_count: row.get::<_, i64>(4)? as u32,
-                exists: false,
-            })
-        })?;
-        if let Some(Ok(row)) = rows.next() {
-            return Ok(Some(row.with_exists()));
-        }
-        Ok(None)
+        let mut rows = stmt.query_map([path], folder_row_from_sql)?;
+        let row = rows.next().transpose()?;
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+        Ok(row.map(|r| self.overlay_share_remote_one(r.with_exists())))
     }
 
     pub fn list_file_paths_by_folder(&self, folder_id: i64) -> Result<Vec<String>, rusqlite::Error> {
@@ -986,6 +1000,71 @@ impl Db {
         let mut stmt = conn.prepare("SELECT path FROM files WHERE folder_id=?1")?;
         let rows = stmt.query_map([folder_id], |row| row.get(0))?;
         Ok(rows.flatten().collect())
+    }
+
+    pub fn list_remote_share_folder_ids(&self) -> Vec<i64> {
+        let conn = self.conn.lock();
+        let value: Result<String, _> = conn.query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [REMOTE_SHARE_FOLDER_IDS_KEY],
+            |r| r.get(0),
+        );
+        drop(conn);
+        parse_remote_share_folder_ids(value.ok().as_deref())
+    }
+
+    fn save_remote_share_folder_ids(&self, ids: &[i64]) -> Result<(), rusqlite::Error> {
+        let raw = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![REMOTE_SHARE_FOLDER_IDS_KEY, raw],
+        )?;
+        Ok(())
+    }
+
+    fn overlay_share_remote_one(&self, mut row: FolderRow) -> FolderRow {
+        row.share_remote = self.list_remote_share_folder_ids().contains(&row.id);
+        row
+    }
+
+    fn overlay_share_remote_all(&self, mut folders: Vec<FolderRow>) -> Vec<FolderRow> {
+        let ids: std::collections::HashSet<i64> =
+            self.list_remote_share_folder_ids().into_iter().collect();
+        for folder in &mut folders {
+            folder.share_remote = ids.contains(&folder.id);
+        }
+        folders
+    }
+
+    pub fn set_folder_share_remote(
+        &self,
+        id: i64,
+        share_remote: bool,
+    ) -> Result<Option<FolderRow>, rusqlite::Error> {
+        let Some(_) = self.get_folder(id)? else {
+            return Ok(None);
+        };
+        let mut ids = self.list_remote_share_folder_ids();
+        if share_remote {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        } else {
+            ids.retain(|&existing| existing != id);
+        }
+        self.save_remote_share_folder_ids(&ids)?;
+        self.get_folder(id)
+    }
+
+    fn prune_remote_share_folder_id(&self, id: i64) -> Result<(), rusqlite::Error> {
+        let ids = self.list_remote_share_folder_ids();
+        if !ids.contains(&id) {
+            return Ok(());
+        }
+        let next: Vec<i64> = ids.into_iter().filter(|&existing| existing != id).collect();
+        self.save_remote_share_folder_ids(&next)
     }
 
     /// Indexed files whose `mtime` falls in `[after_unix, before_unix]` (inclusive).
@@ -2811,6 +2890,77 @@ mod date_range_tests {
             )
             .unwrap();
         assert_eq!(paths, vec!["outlook:ok".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod remote_share_ids_tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-share-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn missing_and_broken_json_are_empty() {
+        assert!(parse_remote_share_folder_ids(None).is_empty());
+        assert!(parse_remote_share_folder_ids(Some("")).is_empty());
+        assert!(parse_remote_share_folder_ids(Some("not-json")).is_empty());
+        assert!(parse_remote_share_folder_ids(Some("{}")).is_empty());
+    }
+
+    #[test]
+    fn default_folder_is_not_shared() {
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\docs", "").unwrap();
+        assert!(!folder.share_remote);
+        assert!(db.list_remote_share_folder_ids().is_empty());
+        let listed = db.list_folders().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].share_remote);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_and_list_overlay() {
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\docs", "").unwrap();
+        let on = db.set_folder_share_remote(folder.id, true).unwrap().unwrap();
+        assert!(on.share_remote);
+        assert_eq!(db.list_remote_share_folder_ids(), vec![folder.id]);
+        let listed = db.list_folders().unwrap();
+        assert!(listed[0].share_remote);
+        let off = db.set_folder_share_remote(folder.id, false).unwrap().unwrap();
+        assert!(!off.share_remote);
+        assert!(db.list_remote_share_folder_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_folder_prunes_share_ids() {
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\docs", "").unwrap();
+        db.set_folder_share_remote(folder.id, true).unwrap();
+        db.remove_folder(folder.id).unwrap();
+        assert!(db.list_remote_share_folder_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_folder_toggle_is_none() {
+        let (dir, db) = temp_db();
+        assert!(db.set_folder_share_remote(99, true).unwrap().is_none());
+        assert!(db.list_remote_share_folder_ids().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -56,10 +56,10 @@ impl RemoteArgosBackend {
     pub fn from_settings(settings: &Settings) -> Result<Self, String> {
         let base = settings.remote_url.trim().trim_end_matches('/').to_string();
         if base.is_empty() {
-            return Err("リモート URL が未設定です".into());
+            return Err("ホスト URL が未設定です".into());
         }
         if settings.remote_token.trim().is_empty() {
-            return Err("リモートトークンが未設定です".into());
+            return Err("接続トークンが未設定です".into());
         }
         let timeout = Duration::from_millis(settings.remote_timeout_ms.max(500) as u64);
         let client = Client::builder()

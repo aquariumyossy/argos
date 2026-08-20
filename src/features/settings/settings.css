@@ -289,6 +289,58 @@
   color: var(--danger);
 }
 
+#panel-folders button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  padding: 6px 12px;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1.2;
+}
+
+#panel-folders button.primary {
+  background: var(--accent);
+  color: #f7faf8;
+  border-color: var(--accent);
+}
+
+#panel-folders button.danger,
+#panel-folders .folder-rebind {
+  color: var(--danger);
+}
+
+.folder-share-toggle {
+  display: inline-flex;
+  flex-shrink: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #cfc7b8;
+}
+
+#panel-folders .folder-share-toggle button {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 6px 12px;
+  color: #fff;
+  font-weight: 400;
+}
+
+#panel-folders .folder-share-toggle button.active {
+  background: #fff;
+  color: var(--ink);
+  font-weight: 700;
+}
+
+#panel-folders .folder-share-toggle button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
 .settings-main ul {
   list-style: none;
   padding: 0;
@@ -366,6 +418,141 @@
   display: flex;
   gap: 8px;
   flex-shrink: 0;
+  align-items: center;
+}
+
+.settings-main .options-form > label.ui-switch {
+  position: relative;
+  display: flex;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  gap: 10px;
+  font-size: inherit;
+  color: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.settings-main .options-form > label.ui-switch.is-on {
+  color: inherit;
+}
+
+.settings-main .ui-switch-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  appearance: none;
+  background: transparent;
+  outline: none;
+}
+
+.ui-switch-track {
+  position: relative;
+  flex-shrink: 0;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: #cfc7b8;
+  box-shadow: inset 0 1px 2px rgba(40, 36, 28, 0.14);
+  transition: background 0.16s ease;
+}
+
+.ui-switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+  box-shadow: 0 1px 2px rgba(40, 36, 28, 0.2);
+  transition: transform 0.16s ease;
+}
+
+.ui-switch.is-on {
+  color: var(--accent);
+}
+
+.ui-switch.is-on .ui-switch-track {
+  background: var(--accent);
+}
+
+.ui-switch.is-on .ui-switch-track::after {
+  transform: translateX(14px);
+}
+
+.ui-switch:hover .ui-switch-track {
+  filter: brightness(0.96);
+}
+
+.ui-switch:focus-within .ui-switch-track {
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 2px;
+}
+
+.ui-switch:has(.ui-switch-input:disabled) {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.folder-more {
+  min-width: 2.2em;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+}
+
+#panel-folders .folder-more.is-open,
+.folder-more.is-open {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  border-color: var(--accent);
+}
+
+.folder-more-menu {
+  z-index: 40;
+  min-width: 10rem;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-elevated, #fffdf8);
+  box-shadow: 0 8px 24px rgba(40, 36, 28, 0.12);
+}
+
+#panel-folders .folder-more-menu button,
+.folder-more-menu button {
+  display: block;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: inherit;
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.folder-more-menu button:hover,
+.folder-more-menu button.is-active {
+  background: rgba(40, 36, 28, 0.06);
+}
+
+.folder-more-menu button.danger {
+  color: var(--danger);
 }
 
 .folder-busy {
@@ -417,6 +604,36 @@
   background: var(--bg-elevated);
   border: 1px solid var(--line);
   border-radius: 4px;
+}
+
+.folder-public-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.folder-public-head .field-label {
+  flex: 1;
+  min-width: 0;
+}
+
+#panel-folders .folder-public-close {
+  flex-shrink: 0;
+  margin: -4px -6px 0 0;
+  border: none;
+  background: transparent;
+  padding: 2px 8px;
+  color: var(--muted);
+  font-size: 1.15rem;
+  font-weight: 500;
+  line-height: 1;
+  border-radius: 6px;
+}
+
+#panel-folders .folder-public-close:hover {
+  background: rgba(40, 36, 28, 0.06);
+  color: var(--ink);
 }
 
 .folder-public-row {
