@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::db::{LlmMessageRow, LlmSourceRow};
 
-const PER_SOURCE_CAP: usize = 40_000;
+pub const PER_SOURCE_CAP: usize = 40_000;
 const MIN_KEEP_TURNS: usize = 4;
 
 pub const CITATION_GUIDE: &str = "\n\n出典ブロックがあるときは、その本文だけを根拠にしてください。出典にない事実は推測だと明示し、根拠箇所には [n]（出典番号）を付けてください。";
+pub const IMAGE_TRANSCRIPT_NOTE: &str = "（画像の書き起こし。原本の画素ではない）";
 
 #[derive(Debug, Clone)]
 pub struct ChatTurn {
@@ -101,10 +102,7 @@ pub fn parse_cited_nos(text: &str) -> HashSet<i64> {
 }
 
 /// Keep only sources whose cite number appears as `[n]` in `answer`.
-pub fn consumed_cited_in_answer(
-    consumed: &[(String, i64)],
-    answer: &str,
-) -> Vec<(String, i64)> {
+pub fn consumed_cited_in_answer(consumed: &[(String, i64)], answer: &str) -> Vec<(String, i64)> {
     let nos = parse_cited_nos(answer);
     consumed
         .iter()
@@ -119,10 +117,7 @@ pub const STOP_TOOLS_HINT: &str =
     "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。";
 
 /// Rows from this turn's tool/attach consume list, in cite-number order.
-pub fn sources_for_consumed(
-    all: &[LlmSourceRow],
-    consumed: &[(String, i64)],
-) -> Vec<LlmSourceRow> {
+pub fn sources_for_consumed(all: &[LlmSourceRow], consumed: &[(String, i64)]) -> Vec<LlmSourceRow> {
     let mut nos = HashMap::new();
     for (id, n) in consumed {
         nos.entry(id.clone()).or_insert(*n);
@@ -185,6 +180,10 @@ pub fn format_sources(sources: &[LlmSourceRow]) -> String {
             out.push_str(&format!(" (paragraph_id: {pid})"));
         }
         out.push('\n');
+        if s.is_image() {
+            out.push_str(IMAGE_TRANSCRIPT_NOTE);
+            out.push('\n');
+        }
         out.push_str(s.body.trim());
         out.push_str("\n\n");
     }
@@ -305,6 +304,12 @@ pub fn assemble_turns(
     history: &[LlmMessageRow],
     max_chars: usize,
 ) -> (Vec<ChatTurn>, AssembleStats) {
+    let injectable: Vec<LlmSourceRow> = sources
+        .iter()
+        .filter(|s| s.is_injectable())
+        .cloned()
+        .collect();
+    let sources = &injectable;
     let max_chars = max_chars.max(4_000);
     let pending_ids: HashSet<String> = sources
         .iter()
@@ -442,8 +447,8 @@ fn trim_history(built: &mut Vec<BuiltTurn>, max_chars: usize, truncated: &mut bo
         let Some(i) = drop_idx else {
             break;
         };
-        let drop_following_assistant =
-            built[i].turn.role == "user" && built.get(i + 1).is_some_and(|t| t.turn.role == "assistant");
+        let drop_following_assistant = built[i].turn.role == "user"
+            && built.get(i + 1).is_some_and(|t| t.turn.role == "assistant");
         built.remove(i);
         if drop_following_assistant && i < built.len() && built[i].turn.role == "assistant" {
             built.remove(i);
@@ -473,6 +478,9 @@ mod tests {
             injected_user_message_id: String::new(),
             cited_assistant_message_id: String::new(),
             cite_no: 0,
+            kind: "text".into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
         }
     }
 
@@ -499,7 +507,14 @@ mod tests {
         );
     }
 
-    fn consumed(id: &str, origin: &str, sort: i64, body: &str, user_id: &str, cite: i64) -> LlmSourceRow {
+    fn consumed(
+        id: &str,
+        origin: &str,
+        sort: i64,
+        body: &str,
+        user_id: &str,
+        cite: i64,
+    ) -> LlmSourceRow {
         let mut s = src(id, origin, sort, body);
         s.injected_user_message_id = user_id.into();
         s.cited_assistant_message_id = "a1".into();
@@ -700,7 +715,11 @@ mod tests {
         assert!(turn.content.contains("[2]"), "{}", turn.content);
         assert!(turn.content.contains("民法第936条"), "{}", turn.content);
         assert!(turn.content.contains("[n]"), "{}", turn.content);
-        assert!(!turn.content.contains("ツールはこれ以上"), "{}", turn.content);
+        assert!(
+            !turn.content.contains("ツールはこれ以上"),
+            "{}",
+            turn.content
+        );
     }
 
     #[test]
@@ -709,5 +728,28 @@ mod tests {
         assert_eq!(turn.role, "user");
         assert!(turn.content.contains("ツールはこれ以上"));
         assert!(!turn.content.contains("【出典】"));
+    }
+
+    #[test]
+    fn pending_ocr_is_not_injected() {
+        let mut pending = src("img", "attach", 0, "");
+        pending.kind = "image".into();
+        pending.ocr_status = "pending".into();
+        pending.grain = "file".into();
+        let history = vec![msg("u1", "user", "要約して")];
+        let (turns, stats) = assemble_turns("役割", &[pending], &history, 80_000);
+        let user = turns.iter().find(|t| t.role == "user").unwrap();
+        assert!(!user.content.contains("【出典】"), "{}", user.content);
+        assert_eq!(stats.consumed.len(), 0);
+    }
+
+    #[test]
+    fn image_transcript_note_in_block() {
+        let mut img = src("img", "attach", 0, "契約書の写真");
+        img.kind = "image".into();
+        img.grain = "file".into();
+        let out = format_sources(&[img]);
+        assert!(out.contains(IMAGE_TRANSCRIPT_NOTE), "{out}");
+        assert!(out.contains("契約書の写真"), "{out}");
     }
 }

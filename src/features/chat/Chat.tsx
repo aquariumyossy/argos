@@ -11,6 +11,8 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import ChatScopePicker from "./ChatScopePicker";
 import { AssistantBody } from "./AssistantBody";
 import { openPreview } from "../preview/openPreview";
@@ -50,6 +52,9 @@ type LlmSourceRow = {
   injectedUserMessageId?: string;
   citedAssistantMessageId?: string;
   citeNo?: number;
+  kind?: string;
+  storedRelpath?: string;
+  ocrStatus?: string;
 };
 
 type LlmFilePreview = {
@@ -62,6 +67,18 @@ type LlmGrainResult = {
   source: LlmSourceRow;
   sources: LlmSourceRow[];
   removed: number;
+};
+
+type LlmAttachFilesResult = {
+  thread: LlmThreadRow;
+  sources: LlmSourceRow[];
+  added: number;
+  skipped: number;
+  createdThread: boolean;
+  errors: { path: string; message: string }[];
+  remoteOcr: boolean;
+  ocrStarted: boolean;
+  warnings?: string[];
 };
 
 type SettingsData = {
@@ -95,6 +112,26 @@ const TPL_FACTS =
   "添付出典だけを根拠に、要件事実の関係を mermaid の flowchart LR でフェンス1本にまとめてください。左から右へ、請求原因 → 抗弁 → 再抗弁。請求原因はノードを1つだけにし、複数の主要事実は同じノード内に番号で書いてください。抗弁は種類ごとに分け、その右に対応する再抗弁を置いてください。ノードは短く。ラベルは A[\"請求原因 [n]\"] のように二重引用符で囲んでください。矢印は --> または -.-> で、途中に空白を入れないでください。添付出典にない事実はノードにしないでください。";
 const TPL_TIMELINE =
   "添付出典に書かれた出来事だけを時系列で整理してください。図にする場合は mermaid の flowchart LR または timeline をフェンス1本にしてください。ノードラベルは二重引用符で囲み、出典番号 [n] をラベル内に書いてください。出典にない出来事は入れないでください。";
+
+const ATTACH_EXTENSIONS = [
+  "pdf",
+  "docx",
+  "doc",
+  "xlsx",
+  "xls",
+  "txt",
+  "md",
+  "markdown",
+  "json",
+  "html",
+  "htm",
+  "jtd",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+];
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -137,8 +174,21 @@ function isFileGrain(s: LlmSourceRow): boolean {
   return (s.grain ?? "unit").toLowerCase() === "file";
 }
 
+function isImageSource(s: LlmSourceRow): boolean {
+  return (s.kind ?? "text").toLowerCase() === "image";
+}
+
+function ocrIncomplete(s: LlmSourceRow): boolean {
+  const st = (s.ocrStatus ?? "").trim().toLowerCase();
+  if (st === "pending" || st === "error") return true;
+  return isImageSource(s) && !(s.body ?? "").trim();
+}
+
 function sourceCanExpand(s: LlmSourceRow): boolean {
-  return s.path.trim().length > 0;
+  if (isImageSource(s)) return false;
+  if (!s.path.trim()) return false;
+  if (isFileGrain(s) && !(s.paragraphId ?? "").trim()) return false;
+  return true;
 }
 
 function isPendingSource(s: LlmSourceRow): boolean {
@@ -177,6 +227,24 @@ function citedForMessage(
   return sources
     .filter((s) => (s.citedAssistantMessageId ?? "") === messageId)
     .sort((a, b) => (a.citeNo ?? 0) - (b.citeNo ?? 0) || a.sortOrder - b.sortOrder);
+}
+
+function IconAttach() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </svg>
+  );
 }
 
 function IconOpenFile() {
@@ -336,6 +404,9 @@ export default function Chat() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [attaching, setAttaching] = useState(false);
+  const [dropActive, setDropActive] = useState(false);
   const [stream, setStream] = useState("");
   const [thinking, setThinking] = useState("");
   const [toolHint, setToolHint] = useState("");
@@ -354,6 +425,8 @@ export default function Chat() {
   const bootstrappingRef = useRef(false);
   const activeIdRef = useRef<string | null>(null);
   const busyRef = useRef(false);
+  const ocrBusyRef = useRef(false);
+  const attachingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -363,6 +436,14 @@ export default function Chat() {
   useEffect(() => {
     busyRef.current = busy;
   }, [busy]);
+
+  useEffect(() => {
+    ocrBusyRef.current = ocrBusy;
+  }, [ocrBusy]);
+
+  useEffect(() => {
+    attachingRef.current = attaching;
+  }, [attaching]);
 
   const loadThreadContent = useCallback(async (thread: LlmThreadRow | null) => {
     if (!thread) {
@@ -463,7 +544,7 @@ export default function Chat() {
     let unlistenReady: (() => void) | undefined;
     void win
       .onFocusChanged((event) => {
-        if (event.payload && !busyRef.current) void bootstrap();
+        if (event.payload && !busyRef.current && !ocrBusyRef.current && !attachingRef.current) void bootstrap();
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -486,6 +567,7 @@ export default function Chat() {
     let unlistenDelta: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
     let unlistenSources: (() => void) | undefined;
+    let unlistenOcr: (() => void) | undefined;
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
       if (event.payload.threadId !== activeIdRef.current) return;
       const kind = event.payload.kind ?? "content";
@@ -507,7 +589,7 @@ export default function Chat() {
     });
     void listen<{ threadId: string }>("llm-sources-updated", (event) => {
       const tid = event.payload.threadId;
-      if (busyRef.current) {
+      if (busyRef.current || ocrBusyRef.current || attachingRef.current) {
         if (tid === activeIdRef.current) {
           void invoke<LlmSourceRow[]>("llm_list_sources", { threadId: tid })
             .then(setSources)
@@ -530,10 +612,16 @@ export default function Chat() {
     }).then((fn) => {
       unlistenSources = fn;
     });
+    void listen<{ threadId: string; active: boolean }>("llm-ocr-status", (event) => {
+      setOcrBusy(event.payload.active);
+    }).then((fn) => {
+      unlistenOcr = fn;
+    });
     return () => {
       unlistenDelta?.();
       unlistenError?.();
       unlistenSources?.();
+      unlistenOcr?.();
     };
   }, [loadThreads]);
 
@@ -562,8 +650,9 @@ export default function Chat() {
   );
 
   const liveCites = useMemo(() => {
+    const ready = pendingSources.filter((s) => !ocrIncomplete(s));
     const tools = sources.filter(isUncitedToolSource);
-    return [...pendingSources, ...tools];
+    return [...ready, ...tools];
   }, [pendingSources, sources]);
 
   const maxCitedNo = useMemo(
@@ -580,9 +669,10 @@ export default function Chat() {
   );
 
   const overBudget = estimatedChars > maxContextChars;
+  const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
-    if (busy) return;
+    if (blocked) return;
     try {
       const t = await invoke<LlmThreadRow>("llm_set_active_thread", { id });
       setActive(t);
@@ -598,7 +688,7 @@ export default function Chat() {
   }
 
   async function createThread() {
-    if (busy) return;
+    if (blocked) return;
     try {
       const t = await invoke<LlmThreadRow>("llm_create_thread", { title: "" });
       setThreads((prev) => [t, ...prev.filter((x) => x.id !== t.id)]);
@@ -617,7 +707,7 @@ export default function Chat() {
   }
 
   async function deleteThread(id: string) {
-    if (busy) return;
+    if (blocked) return;
     try {
       await invoke("llm_delete_thread", { id });
       await loadThreads();
@@ -656,6 +746,8 @@ export default function Chat() {
         query: s.query,
         title: s.title,
         fallbackBody: s.body,
+        kind: s.kind,
+        sourceId: s.id,
       });
     } catch (e) {
       setError(formatInvokeError(e));
@@ -672,7 +764,7 @@ export default function Chat() {
   }
 
   async function toggleSourceGrain(s: LlmSourceRow) {
-    if (busy || !sourceCanExpand(s)) return;
+    if (blocked || !sourceCanExpand(s)) return;
     setError("");
     setNotice("");
     try {
@@ -720,9 +812,102 @@ export default function Chat() {
     });
   }
 
+  const attachFiles = useCallback(async (paths: string[]) => {
+    const cleaned = paths.map((p) => p.trim()).filter(Boolean);
+    if (
+      !cleaned.length ||
+      busyRef.current ||
+      ocrBusyRef.current ||
+      attachingRef.current
+    ) {
+      return;
+    }
+    setError("");
+    setNotice("");
+    setAttaching(true);
+    try {
+      const result = await invoke<LlmAttachFilesResult>("llm_attach_files", {
+        paths: cleaned,
+        threadId: activeIdRef.current ?? undefined,
+      });
+      setActive(result.thread);
+      activeIdRef.current = result.thread.id;
+      setThreads((prev) => {
+        const rest = prev.filter((x) => x.id !== result.thread.id);
+        return [result.thread, ...rest];
+      });
+      setSources(result.sources);
+      if (result.errors.length) {
+        setError(result.errors.map((e) => `${e.message}`).join("\n"));
+      }
+      const bits: string[] = [];
+      if (result.skipped > 0) {
+        bits.push("同じ出典がすでに読込前にあります");
+      }
+      if (result.remoteOcr) {
+        bits.push("画像は設定中の LLM サーバへ送られます");
+      }
+      if (result.warnings?.length) {
+        bits.push(...result.warnings);
+      }
+      if (bits.length) setNotice(bits.join(" · "));
+    } catch (e) {
+      setError(formatInvokeError(e));
+    } finally {
+      setAttaching(false);
+    }
+  }, []);
+
+  async function pickFiles() {
+    if (blocked) return;
+    const selected = await openDialog({
+      multiple: true,
+      title: "会話に添付するファイル",
+      filters: [{ name: "文書と画像", extensions: ATTACH_EXTENSIONS }],
+    });
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    await attachFiles(paths);
+  }
+
+  async function retryOcr(id: string) {
+    setError("");
+    try {
+      const srcs = await invoke<LlmSourceRow[]>("llm_retry_ocr", { id });
+      setSources(srcs);
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          if (!busyRef.current && !ocrBusyRef.current && !attachingRef.current) setDropActive(true);
+          return;
+        }
+        setDropActive(false);
+        if (event.payload.type !== "drop") return;
+        if (busyRef.current || ocrBusyRef.current || attachingRef.current) return;
+        const paths = event.payload.paths ?? [];
+        if (paths.length) void attachFiles(paths);
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [attachFiles]);
+
   async function send() {
     const text = draft.trim();
-    if (!text || busy) return;
+    if (!text || blocked) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -942,7 +1127,7 @@ export default function Chat() {
             type="button"
             className="chat-btn primary"
             onClick={() => void createThread()}
-            disabled={busy}
+            disabled={blocked}
           >
             新規
           </button>
@@ -1058,7 +1243,7 @@ export default function Chat() {
                     className="chat-icon-btn danger"
                     title="削除"
                     aria-label="会話を削除"
-                    disabled={busy}
+                    disabled={blocked}
                     onClick={() => void deleteThread(t.id)}
                   >
                     <IconTrash />
@@ -1115,7 +1300,7 @@ export default function Chat() {
         <div className="chat-log" ref={listRef}>
           {messages.length === 0 && !stream && !thinking && !toolHint && !busy ? (
             <p className="chat-muted chat-empty">
-              検索やノートの「チャット」から出典を送り、会話を選べます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
+              検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
             </p>
           ) : (
             messages.map((m) => {
@@ -1136,7 +1321,7 @@ export default function Chat() {
                         if (s) void openSource(s);
                       }}
                       onChoice={applyTemplate}
-                      choicesDisabled={busy}
+                      choicesDisabled={blocked}
                       onLayout={scrollLog}
                     />
                   ) : (
@@ -1222,11 +1407,14 @@ export default function Chat() {
               ) : null}
             </article>
           ) : null}
+          {ocrBusy && !busy ? (
+            <p className="chat-tool-hint">画像を読み取っています…</p>
+          ) : null}
         </div>
         {error ? <p className="chat-error">{error}</p> : null}
         {notice ? <p className="chat-notice">{notice}</p> : null}
         <form
-          className="chat-composer"
+          className={dropActive ? "chat-composer drop-active" : "chat-composer"}
           onSubmit={(e) => {
             e.preventDefault();
             void send();
@@ -1237,21 +1425,37 @@ export default function Chat() {
               {pendingSources.map((s, i) => {
                 const expandable = sourceCanExpand(s);
                 const fileGrain = isFileGrain(s);
+                const image = isImageSource(s);
+                const ocr = (s.ocrStatus ?? "").trim().toLowerCase();
+                const reading = ocr === "pending" && ocrBusy;
+                const interrupted =
+                  ocr === "error" || (ocr === "pending" && !ocrBusy);
                 const n = citeNoOf(s, maxCitedNo + i + 1);
+                const chipClass = [
+                  "chat-source-chip",
+                  fileGrain || image ? "file" : "",
+                  interrupted ? "ocr-error" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ");
+                const badge = reading
+                  ? "読み取り中"
+                  : interrupted
+                    ? ocr === "error"
+                      ? "失敗"
+                      : "中断"
+                    : image
+                      ? "画像"
+                      : fileGrain
+                        ? "全文"
+                        : null;
                 return (
-                  <span
-                    key={s.id}
-                    className={
-                      fileGrain
-                        ? "chat-source-chip file"
-                        : "chat-source-chip"
-                    }
-                  >
+                  <span key={s.id} className={chipClass}>
                     {expandable ? (
                       <button
                         type="button"
                         className="chat-source-grain"
-                        disabled={busy}
+                        disabled={blocked}
                         title={
                           fileGrain
                             ? "クリックで段落に戻す"
@@ -1260,15 +1464,35 @@ export default function Chat() {
                         onClick={() => void toggleSourceGrain(s)}
                       >
                         [{n}] {sourceLabel(s)}
-                        {fileGrain ? (
-                          <span className="chat-source-badge">全文</span>
+                        {badge ? (
+                          <span className="chat-source-badge">{badge}</span>
                         ) : null}
                       </button>
                     ) : (
-                      <span className="chat-source-grain static">
+                      <button
+                        type="button"
+                        className="chat-source-grain"
+                        title="プレビュー"
+                        onClick={() => void openSource(s)}
+                      >
                         [{n}] {sourceLabel(s)}
-                      </span>
+                        {badge ? (
+                          <span className="chat-source-badge">{badge}</span>
+                        ) : null}
+                      </button>
                     )}
+                    {interrupted ? (
+                      <button
+                        type="button"
+                        className="chat-source-retry"
+                        title="再読み取り"
+                        aria-label="再読み取り"
+                        disabled={blocked}
+                        onClick={() => void retryOcr(s.id)}
+                      >
+                        再試行
+                      </button>
+                    ) : null}
                     {s.path.trim() ? (
                       <button
                         type="button"
@@ -1285,7 +1509,7 @@ export default function Chat() {
                       className="chat-source-remove"
                       title="出典を外す"
                       aria-label={`${sourceLabel(s)}を外す`}
-                      disabled={busy}
+                      disabled={blocked}
                       onClick={() => void removeSource(s.id)}
                     >
                       ×
@@ -1297,7 +1521,7 @@ export default function Chat() {
           ) : null}
           <div className="chat-composer-tools">
             <ChatScopePicker
-              disabled={busy || !active}
+              disabled={blocked || !active}
               threadId={active?.id ?? null}
               pathPrefix={active?.pathPrefix ?? ""}
               onApplied={applyThreadScope}
@@ -1350,7 +1574,7 @@ export default function Chat() {
               rows={3}
               value={draft}
               placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"
-              disabled={busy}
+              disabled={busy || attaching}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -1360,7 +1584,17 @@ export default function Chat() {
               }}
             />
             <div className="chat-composer-actions">
-              {busy ? (
+              <button
+                type="button"
+                className="chat-btn icon"
+                title="ファイルを添付"
+                aria-label="ファイルを添付"
+                disabled={blocked}
+                onClick={() => void pickFiles()}
+              >
+                <IconAttach />
+              </button>
+              {busy || ocrBusy ? (
                 <button type="button" className="chat-btn" onClick={() => void stop()}>
                   停止
                 </button>
@@ -1368,7 +1602,7 @@ export default function Chat() {
                 <button
                   type="submit"
                   className="chat-btn primary"
-                  disabled={!draft.trim()}
+                  disabled={!draft.trim() || attaching}
                 >
                   送信
                 </button>

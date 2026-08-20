@@ -84,6 +84,7 @@ export default function PreviewView({
   const [actionError, setActionError] = useState("");
   const [keepNotice, setKeepNotice] = useState("");
   const [fontSize, setFontSize] = useState(14);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
   const previewScrollRef = useRef<HTMLDivElement>(null);
   const previewSeq = useRef(0);
   const keepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -107,6 +108,7 @@ export default function PreviewView({
       setMatchNavIndex(0);
       setLoading(false);
       setActionError("");
+      setImageUrl(null);
       return;
     }
     const seq = ++previewSeq.current;
@@ -116,6 +118,34 @@ export default function PreviewView({
     setPreviewUnitId(target.paragraphId || seed.id);
     setMatchNavIndex(0);
     setActionError("");
+    setImageUrl(null);
+    if ((target.kind ?? "").toLowerCase() === "image") {
+      setPreviewFile({
+        units: [seed],
+        excerpt: false,
+        matchIds: [seed.id],
+      });
+      const sourceId = (target.sourceId ?? "").trim();
+      if (!sourceId) {
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
+      void invoke<{ mime: string; dataUrl: string }>("llm_source_image", {
+        id: sourceId,
+      })
+        .then((img) => {
+          if (seq !== previewSeq.current) return;
+          setImageUrl(img.dataUrl);
+          setLoading(false);
+        })
+        .catch((e) => {
+          if (seq !== previewSeq.current) return;
+          setActionError(String(e));
+          setLoading(false);
+        });
+      return;
+    }
     if ((target.source || "").toLowerCase() === "remote") {
       setPreviewFile({
         units: [seed],
@@ -265,24 +295,34 @@ export default function PreviewView({
   }, []);
 
   const openFile = useCallback(async () => {
-    if (!preview) return;
+    if (!preview || !target) return;
     setActionError("");
     try {
-      await invoke("open_hit", { path: preview.path });
+      let path = preview.path;
+      const sourceId = (target.sourceId ?? "").trim();
+      if (sourceId) {
+        path = await invoke<string>("llm_attached_file_path", { id: sourceId });
+      }
+      await invoke("open_hit", { path });
     } catch (e) {
       setActionError(String(e));
     }
-  }, [preview]);
+  }, [preview, target]);
 
   const openFolder = useCallback(async () => {
-    if (!preview || isOutlookHit(preview)) return;
+    if (!preview || !target || isOutlookHit(preview)) return;
     setActionError("");
     try {
-      await invoke("open_containing_folder", { path: preview.path });
+      let path = preview.path;
+      const sourceId = (target.sourceId ?? "").trim();
+      if (sourceId) {
+        path = await invoke<string>("llm_attached_file_path", { id: sourceId });
+      }
+      await invoke("open_containing_folder", { path });
     } catch (e) {
       setActionError(String(e));
     }
-  }, [preview]);
+  }, [preview, target]);
 
   const rescopeToHitFolder = useCallback(async () => {
     if (!preview) return;
@@ -465,6 +505,7 @@ export default function PreviewView({
 
   const mail = preview ? isOutlookHit(preview) : false;
   const fromSearch = target.origin === "search";
+  const isImage = (target.kind ?? "").toLowerCase() === "image";
 
   return (
     <div className="preview-window" style={{ fontSize: `${fontSize}px` }}>
@@ -549,7 +590,7 @@ export default function PreviewView({
         </div>
         {keepNotice ? <div className="preview-notice">{keepNotice}</div> : null}
         {actionError ? <div className="preview-error">{actionError}</div> : null}
-        {(previewFile?.matchIds.length ?? 0) > 1 ? (
+        {(previewFile?.matchIds.length ?? 0) > 1 && !isImage ? (
           <div className="preview-occ-nav" aria-live="polite">
             <button
               type="button"
@@ -579,13 +620,37 @@ export default function PreviewView({
         {previewFile?.excerpt &&
         preview?.source !== "remote" &&
         preview &&
+        !isImage &&
         !isJsonPath(preview.path) ? (
           <div className="preview-excerpt-note">
             長いファイルのため、マッチ周辺の抜粋です
           </div>
         ) : null}
         <div className="preview-scroll" ref={previewScrollRef}>
-          {loading && !previewFile ? (
+          {isImage ? (
+            <div className="preview-image-wrap">
+              {loading && !imageUrl ? (
+                <div className="preview-empty">読み込み中…</div>
+              ) : imageUrl ? (
+                <img
+                  className="preview-image"
+                  src={imageUrl}
+                  alt={preview?.title || target.title || "添付画像"}
+                />
+              ) : (
+                <div className="preview-empty">画像を表示できませんでした</div>
+              )}
+              {preview?.previewText?.trim() ? (
+                <pre className="preview-body preview-image-transcript">
+                  {preview.previewText}
+                </pre>
+              ) : (
+                <div className="preview-excerpt-note">
+                  書き起こしがまだありません
+                </div>
+              )}
+            </div>
+          ) : loading && !previewFile ? (
             <div className="preview-empty">読み込み中…</div>
           ) : preview && isJsonPath(preview.path) ? (
             <PreviewBody

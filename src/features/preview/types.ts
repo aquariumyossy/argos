@@ -44,6 +44,8 @@ export type PreviewTarget = {
   source?: string;
   title?: string;
   fallbackBody?: string;
+  kind?: string;
+  sourceId?: string;
 };
 
 export type PreviewRescopePayload = {

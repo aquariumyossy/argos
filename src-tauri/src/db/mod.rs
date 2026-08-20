@@ -152,6 +152,12 @@ pub struct LlmSourceRow {
     pub cited_assistant_message_id: String,
     #[serde(default)]
     pub cite_no: i64,
+    #[serde(default = "default_llm_source_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub stored_relpath: String,
+    #[serde(default)]
+    pub ocr_status: String,
 }
 
 impl LlmSourceRow {
@@ -162,14 +168,34 @@ impl LlmSourceRow {
     pub fn is_tool_origin(&self) -> bool {
         self.origin.eq_ignore_ascii_case("tool")
     }
+
+    pub fn is_image(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("image")
+    }
+
+    /// Ready to put into an LLM 出典 block (OCR finished, body present).
+    pub fn is_injectable(&self) -> bool {
+        let st = self.ocr_status.trim();
+        if st.eq_ignore_ascii_case("pending") || st.eq_ignore_ascii_case("error") {
+            return false;
+        }
+        if self.is_image() && self.body.trim().is_empty() {
+            return false;
+        }
+        true
+    }
 }
 
 fn default_llm_source_grain() -> String {
     "unit".into()
 }
 
+fn default_llm_source_kind() -> String {
+    "text".into()
+}
+
 const LLM_SOURCE_COLS: &str =
-    "id, thread_id, sort_order, origin, path, title, paragraph_id, body, query, created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no";
+    "id, thread_id, sort_order, origin, path, title, paragraph_id, body, query, created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no, kind, stored_relpath, ocr_status";
 
 const LLM_THREAD_COLS: &str =
     "id, title, search_enabled, path_prefix, sort_order, created_at, updated_at";
@@ -203,6 +229,9 @@ fn map_llm_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmSourceRow> {
         injected_user_message_id: row.get::<_, String>(12).unwrap_or_default(),
         cited_assistant_message_id: row.get::<_, String>(13).unwrap_or_default(),
         cite_no: row.get::<_, i64>(14).unwrap_or(0),
+        kind: row.get::<_, String>(15).unwrap_or_else(|_| "text".into()),
+        stored_relpath: row.get::<_, String>(16).unwrap_or_default(),
+        ocr_status: row.get::<_, String>(17).unwrap_or_default(),
     })
 }
 
@@ -521,6 +550,9 @@ impl Db {
               injected_user_message_id TEXT NOT NULL DEFAULT '',
               cited_assistant_message_id TEXT NOT NULL DEFAULT '',
               cite_no INTEGER NOT NULL DEFAULT 0,
+              kind TEXT NOT NULL DEFAULT 'text',
+              stored_relpath TEXT NOT NULL DEFAULT '',
+              ocr_status TEXT NOT NULL DEFAULT '',
               created_at INTEGER NOT NULL,
               FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE
             );
@@ -568,6 +600,18 @@ impl Db {
             "ALTER TABLE llm_thread_sources ADD COLUMN cite_no INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN stored_relpath TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_thread_sources ADD COLUMN ocr_status TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         if consume_cols_added {
             conn.execute_batch(
                 "UPDATE llm_thread_sources
@@ -599,9 +643,8 @@ impl Db {
             .is_ok();
         if notes_sort_added {
             let ids: Vec<String> = {
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM notes ORDER BY updated_at DESC, created_at DESC",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT id FROM notes ORDER BY updated_at DESC, created_at DESC")?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 rows.flatten().collect()
             };
@@ -671,9 +714,7 @@ impl Db {
                     "remote_server_enabled" => {
                         s.remote_server_enabled = row.1 == "1" || row.1 == "true"
                     }
-                    "remote_server_port" => {
-                        s.remote_server_port = row.1.parse().unwrap_or(17890)
-                    }
+                    "remote_server_port" => s.remote_server_port = row.1.parse().unwrap_or(17890),
                     "remote_server_token" => s.remote_server_token = row.1,
                     "search_mode" => {
                         s.search_mode = match row.1.as_str() {
@@ -683,20 +724,14 @@ impl Db {
                     }
                     "remote_url" => s.remote_url = row.1,
                     "remote_token" => s.remote_token = row.1,
-                    "remote_timeout_ms" => {
-                        s.remote_timeout_ms = row.1.parse().unwrap_or(3000)
-                    }
-                    "pos_filter_enabled" => {
-                        s.pos_filter_enabled = row.1 == "1" || row.1 == "true"
-                    }
+                    "remote_timeout_ms" => s.remote_timeout_ms = row.1.parse().unwrap_or(3000),
+                    "pos_filter_enabled" => s.pos_filter_enabled = row.1 == "1" || row.1 == "true",
                     "mail_enabled" => s.mail_enabled = row.1 == "1" || row.1 == "true",
                     "mail_days_back" => s.mail_days_back = row.1.parse().unwrap_or(730),
                     "mail_sync_interval_secs" => {
                         s.mail_sync_interval_secs = row.1.parse().unwrap_or(3600)
                     }
-                    "mail_latest_only" => {
-                        s.mail_latest_only = row.1 == "1" || row.1 == "true"
-                    }
+                    "mail_latest_only" => s.mail_latest_only = row.1 == "1" || row.1 == "true",
                     "mail_thread_collapse" => {
                         s.mail_thread_collapse = !(row.1 == "0" || row.1 == "false")
                     }
@@ -798,16 +833,10 @@ impl Db {
             ("llm_api_key", s.llm_api_key.clone()),
             ("llm_model", s.llm_model.clone()),
             ("llm_timeout_ms", s.llm_timeout_ms.to_string()),
-            (
-                "llm_max_context_chars",
-                s.llm_max_context_chars.to_string(),
-            ),
+            ("llm_max_context_chars", s.llm_max_context_chars.to_string()),
             ("llm_system_prompt", s.llm_system_prompt.clone()),
             ("llm_thinking", s.llm_thinking.clone()),
-            (
-                "llm_thinking_budget",
-                s.llm_thinking_budget.to_string(),
-            ),
+            ("llm_thinking_budget", s.llm_thinking_budget.to_string()),
             ("llm_search_top_k", s.llm_search_top_k.to_string()),
         ];
         for (k, v) in pairs {
@@ -835,38 +864,33 @@ impl Db {
         Ok(self.overlay_share_remote_all(folders))
     }
 
-    pub fn add_folder(
-        &self,
-        path: &str,
-        public_path: &str,
-    ) -> Result<FolderRow, rusqlite::Error> {
+    pub fn add_folder(&self, path: &str, public_path: &str) -> Result<FolderRow, rusqlite::Error> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT OR IGNORE INTO folders(path, public_path, enabled, created_at) VALUES(?1, ?2, 1, ?3)",
             rusqlite::params![path, public_path, now],
         )?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM folders WHERE path=?1",
-            [path],
-            |r| r.get(0),
-        )?;
+        let id: i64 =
+            conn.query_row("SELECT id FROM folders WHERE path=?1", [path], |r| r.get(0))?;
         let public_path: String = conn.query_row(
             "SELECT COALESCE(public_path, '') FROM folders WHERE id=?1",
             [id],
             |r| r.get(0),
         )?;
         drop(conn);
-        Ok(self.overlay_share_remote_one(FolderRow {
-            id,
-            path: path.to_string(),
-            public_path,
-            enabled: true,
-            indexed_count: 0,
-            exists: false,
-            share_remote: false,
-        }
-        .with_exists()))
+        Ok(self.overlay_share_remote_one(
+            FolderRow {
+                id,
+                path: path.to_string(),
+                public_path,
+                enabled: true,
+                indexed_count: 0,
+                exists: false,
+                share_remote: false,
+            }
+            .with_exists(),
+        ))
     }
 
     pub fn update_folder_public_path(
@@ -995,7 +1019,10 @@ impl Db {
         Ok(row.map(|r| self.overlay_share_remote_one(r.with_exists())))
     }
 
-    pub fn list_file_paths_by_folder(&self, folder_id: i64) -> Result<Vec<String>, rusqlite::Error> {
+    pub fn list_file_paths_by_folder(
+        &self,
+        folder_id: i64,
+    ) -> Result<Vec<String>, rusqlite::Error> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT path FROM files WHERE folder_id=?1")?;
         let rows = stmt.query_map([folder_id], |row| row.get(0))?;
@@ -1109,11 +1136,10 @@ impl Db {
             "INSERT OR IGNORE INTO exclude_paths(path) VALUES(?1)",
             [path],
         )?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM exclude_paths WHERE path=?1",
-            [path],
-            |r| r.get(0),
-        )?;
+        let id: i64 =
+            conn.query_row("SELECT id FROM exclude_paths WHERE path=?1", [path], |r| {
+                r.get(0)
+            })?;
         Ok(ExcludePathRow {
             id,
             path: path.to_string(),
@@ -1165,11 +1191,9 @@ impl Db {
                pos_label=excluded.pos_label",
             rusqlite::params![word, reading, pos_label, now],
         )?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM search_words WHERE word=?1",
-            [word],
-            |r| r.get(0),
-        )?;
+        let id: i64 = conn.query_row("SELECT id FROM search_words WHERE word=?1", [word], |r| {
+            r.get(0)
+        })?;
         Ok(SearchWordRow {
             id,
             word: word.to_string(),
@@ -1247,11 +1271,9 @@ impl Db {
             }
             let existed: bool = {
                 let conn = self.conn.lock();
-                conn.query_row(
-                    "SELECT 1 FROM search_words WHERE word=?1",
-                    [word],
-                    |_| Ok(true),
-                )
+                conn.query_row("SELECT 1 FROM search_words WHERE word=?1", [word], |_| {
+                    Ok(true)
+                })
                 .unwrap_or(false)
             };
             self.add_search_word(word, &entry.reading, &entry.pos_label)?;
@@ -1329,9 +1351,7 @@ impl Db {
         Ok(next)
     }
 
-    fn load_search_term_history_locked(
-        conn: &rusqlite::Connection,
-    ) -> SearchTermHistory {
+    fn load_search_term_history_locked(conn: &rusqlite::Connection) -> SearchTermHistory {
         let value: Result<String, _> = conn.query_row(
             "SELECT value FROM settings WHERE key=?1",
             [SEARCH_TERM_HISTORY_KEY],
@@ -1414,10 +1434,10 @@ impl Db {
         history.events.truncate(MAX_SEARCH_TERM_EVENTS);
 
         for term in &cleaned {
-            let entry = history.stats.entry(term.clone()).or_insert(SearchTermStat {
-                count: 0,
-                last: 0,
-            });
+            let entry = history
+                .stats
+                .entry(term.clone())
+                .or_insert(SearchTermStat { count: 0, last: 0 });
             entry.count = entry.count.saturating_add(1);
             entry.last = now;
         }
@@ -1455,9 +1475,7 @@ impl Db {
 
     pub fn get_file_meta(&self, path: &str) -> Result<Option<FileMeta>, rusqlite::Error> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT size, mtime, content_hash FROM files WHERE path=?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT size, mtime, content_hash FROM files WHERE path=?1")?;
         let mut rows = stmt.query_map([path], |row| {
             Ok(FileMeta {
                 size: row.get(0)?,
@@ -1524,9 +1542,8 @@ impl Db {
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock();
         let selected: std::collections::HashSet<(String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT store_id, entry_id FROM email_folders WHERE selected=1",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT store_id, entry_id FROM email_folders WHERE selected=1")?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.flatten().collect()
         };
@@ -1838,10 +1855,7 @@ impl Db {
                 )?;
             }
             _ => {
-                conn.execute(
-                    "DELETE FROM settings WHERE key=?1",
-                    [ACTIVE_NOTE_ID_KEY],
-                )?;
+                conn.execute("DELETE FROM settings WHERE key=?1", [ACTIVE_NOTE_ID_KEY])?;
             }
         }
         Ok(())
@@ -1967,7 +1981,11 @@ impl Db {
         self.get_note(id)
     }
 
-    pub fn update_note_memo(&self, id: &str, memo: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
+    pub fn update_note_memo(
+        &self,
+        id: &str,
+        memo: &str,
+    ) -> Result<Option<NoteRow>, rusqlite::Error> {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock();
         let n = conn.execute(
@@ -2125,11 +2143,10 @@ impl Db {
         if n == 0 {
             return Ok(None);
         }
-        let note_id: String = conn.query_row(
-            "SELECT note_id FROM note_items WHERE id=?1",
-            [id],
-            |r| r.get(0),
-        )?;
+        let note_id: String =
+            conn.query_row("SELECT note_id FROM note_items WHERE id=?1", [id], |r| {
+                r.get(0)
+            })?;
         drop(conn);
         self.touch_note(&note_id)?;
         self.get_note_item(id)
@@ -2163,11 +2180,9 @@ impl Db {
     pub fn remove_note_item(&self, id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock();
         let note_id: Option<String> = conn
-            .query_row(
-                "SELECT note_id FROM note_items WHERE id=?1",
-                [id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT note_id FROM note_items WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
             .ok();
         let n = conn.execute("DELETE FROM note_items WHERE id=?1", [id])?;
         drop(conn);
@@ -2531,9 +2546,284 @@ impl Db {
                 injected_user_message_id: String::new(),
                 cited_assistant_message_id: String::new(),
                 cite_no: 0,
+                kind: "text".into(),
+                stored_relpath: String::new(),
+                ocr_status: String::new(),
             },
             true,
         ))
+    }
+
+    pub fn insert_llm_source_full(
+        &self,
+        thread_id: &str,
+        origin: &str,
+        path: &str,
+        title: &str,
+        paragraph_id: &str,
+        body: &str,
+        query: &str,
+        grain: &str,
+        kind: &str,
+        stored_relpath: &str,
+        ocr_status: &str,
+        id: Option<&str>,
+    ) -> Result<(LlmSourceRow, bool), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let path = path.trim();
+        let paragraph_id = paragraph_id.trim();
+        let origin = if origin.trim().is_empty() {
+            "attach"
+        } else {
+            origin.trim()
+        };
+        let title = title.trim();
+        let query = query.trim();
+        let grain = if grain.trim().eq_ignore_ascii_case("file") {
+            "file"
+        } else {
+            "unit"
+        };
+        let kind = if kind.trim().eq_ignore_ascii_case("image") {
+            "image"
+        } else {
+            "text"
+        };
+        let stored_relpath = stored_relpath.trim();
+        let ocr_status = ocr_status.trim();
+        let mut find = conn.prepare(
+            "SELECT id FROM llm_thread_sources
+             WHERE thread_id=?1 AND lower(path)=lower(?2) AND paragraph_id=?3
+               AND injected_user_message_id = ''
+             LIMIT 1",
+        )?;
+        let pending_id: Option<String> = find
+            .query_map(rusqlite::params![thread_id, path, paragraph_id], |row| {
+                row.get(0)
+            })?
+            .flatten()
+            .next();
+        drop(find);
+        if let Some(existing_id) = pending_id {
+            let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
+            let existing = conn.query_row(&sql, [&existing_id], map_llm_source)?;
+            if existing.body.trim() == body.trim()
+                && existing.title == title
+                && existing.query == query
+                && existing.grain == grain
+                && existing.kind == kind
+                && existing.ocr_status == ocr_status
+                && existing.stored_relpath == stored_relpath
+            {
+                return Ok((existing, false));
+            }
+            let now = chrono::Utc::now().timestamp();
+            conn.execute(
+                "UPDATE llm_thread_sources
+                 SET body=?1, title=?2, query=?3, grain=?4, kind=?5,
+                     stored_relpath=?6, ocr_status=?7
+                 WHERE id=?8",
+                rusqlite::params![
+                    body,
+                    title,
+                    query,
+                    grain,
+                    kind,
+                    stored_relpath,
+                    ocr_status,
+                    existing_id
+                ],
+            )?;
+            conn.execute(
+                "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+                rusqlite::params![now, thread_id],
+            )?;
+            let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
+            let row = conn.query_row(&sql, [existing_id], map_llm_source)?;
+            return Ok((row, true));
+        }
+        let next_order: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM llm_thread_sources WHERE thread_id=?1",
+                [thread_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let id = id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO llm_thread_sources(
+                id, thread_id, sort_order, origin, path, title, paragraph_id, body, query,
+                created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id,
+                cite_no, kind, stored_relpath, ocr_status
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '', '', '', 0, ?12, ?13, ?14)",
+            rusqlite::params![
+                id,
+                thread_id,
+                next_order,
+                origin,
+                path,
+                title,
+                paragraph_id,
+                body,
+                query,
+                now,
+                grain,
+                kind,
+                stored_relpath,
+                ocr_status
+            ],
+        )?;
+        conn.execute(
+            "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, thread_id],
+        )?;
+        Ok((
+            LlmSourceRow {
+                id,
+                thread_id: thread_id.to_string(),
+                sort_order: next_order,
+                origin: origin.to_string(),
+                path: path.to_string(),
+                title: title.to_string(),
+                paragraph_id: paragraph_id.to_string(),
+                body: body.to_string(),
+                query: query.to_string(),
+                created_at: now,
+                grain: grain.into(),
+                unit_body: String::new(),
+                injected_user_message_id: String::new(),
+                cited_assistant_message_id: String::new(),
+                cite_no: 0,
+                kind: kind.into(),
+                stored_relpath: stored_relpath.to_string(),
+                ocr_status: ocr_status.to_string(),
+            },
+            true,
+        ))
+    }
+
+    pub fn find_pending_llm_source(
+        &self,
+        thread_id: &str,
+        path: &str,
+        paragraph_id: &str,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND lower(path)=lower(?2) AND paragraph_id=?3
+               AND injected_user_message_id = ''
+             LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(
+            rusqlite::params![thread_id, path.trim(), paragraph_id.trim()],
+            map_llm_source,
+        )?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn find_any_pending_llm_source_by_path(
+        &self,
+        thread_id: &str,
+        path: &str,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND lower(path)=lower(?2)
+               AND injected_user_message_id = ''
+             ORDER BY sort_order ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(rusqlite::params![thread_id, path.trim()], map_llm_source)?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn next_pending_ocr_source(&self) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE kind='image' AND ocr_status='pending'
+             ORDER BY created_at ASC, sort_order ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map([], map_llm_source)?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn next_pending_ocr_in_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND kind='image' AND ocr_status='pending'
+             ORDER BY created_at ASC, sort_order ASC LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map([thread_id], map_llm_source)?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn fail_pending_ocr(&self, thread_id: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE llm_thread_sources SET ocr_status='error'
+             WHERE thread_id=?1 AND kind='image' AND ocr_status='pending'",
+            [thread_id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn update_llm_source_ocr(
+        &self,
+        id: &str,
+        body: &str,
+        ocr_status: &str,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE llm_thread_sources SET body=?1, ocr_status=?2 WHERE id=?3",
+            rusqlite::params![body, ocr_status.trim(), id],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let thread_id: String = conn.query_row(
+            "SELECT thread_id FROM llm_thread_sources WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "UPDATE llm_threads SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![now, thread_id],
+        )?;
+        drop(conn);
+        self.get_llm_source(id)
     }
 
     pub fn max_llm_cite_no(&self, thread_id: &str) -> Result<i64, rusqlite::Error> {
@@ -2588,10 +2878,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_uncited_tool_sources(
-        &self,
-        thread_id: &str,
-    ) -> Result<usize, rusqlite::Error> {
+    pub fn delete_uncited_tool_sources(&self, thread_id: &str) -> Result<usize, rusqlite::Error> {
         let conn = self.conn.lock();
         let n = conn.execute(
             "DELETE FROM llm_thread_sources
@@ -2935,12 +3222,18 @@ mod remote_share_ids_tests {
     fn toggle_and_list_overlay() {
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\docs", "").unwrap();
-        let on = db.set_folder_share_remote(folder.id, true).unwrap().unwrap();
+        let on = db
+            .set_folder_share_remote(folder.id, true)
+            .unwrap()
+            .unwrap();
         assert!(on.share_remote);
         assert_eq!(db.list_remote_share_folder_ids(), vec![folder.id]);
         let listed = db.list_folders().unwrap();
         assert!(listed[0].share_remote);
-        let off = db.set_folder_share_remote(folder.id, false).unwrap().unwrap();
+        let off = db
+            .set_folder_share_remote(folder.id, false)
+            .unwrap()
+            .unwrap();
         assert!(!off.share_remote);
         assert!(db.list_remote_share_folder_ids().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2961,6 +3254,55 @@ mod remote_share_ids_tests {
         let (dir, db) = temp_db();
         assert!(db.set_folder_share_remote(99, true).unwrap().is_none());
         assert!(db.list_remote_share_folder_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod llm_source_pending_tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-src-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn pending_by_path_finds_pdf_pages() {
+        let (dir, db) = temp_db();
+        let thread = db.create_llm_thread("t", false).unwrap();
+        db.insert_llm_source_full(
+            &thread.id,
+            "attach",
+            r"C:\scan.pdf",
+            "scan.pdf（1ページ目）",
+            "pdf-page:1",
+            "",
+            "",
+            "file",
+            "image",
+            "chat-files/t/a.jpg",
+            "pending",
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .find_pending_llm_source(&thread.id, r"C:\scan.pdf", "")
+            .unwrap()
+            .is_none());
+        let found = db
+            .find_any_pending_llm_source_by_path(&thread.id, r"C:\scan.pdf")
+            .unwrap()
+            .expect("page source");
+        assert_eq!(found.paragraph_id, "pdf-page:1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,7 +2,9 @@
 
 pub mod commands;
 pub mod context;
+pub mod files;
 pub mod grain;
+pub mod pdf_win;
 pub mod tools;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +15,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::db::{LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, Settings};
+use crate::db::{Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL};
 use crate::llm::context::ChatTurn;
 
 pub fn normalize_base_url(raw: &str) -> String {
@@ -146,7 +148,8 @@ fn map_llm_error(raw: &str) -> String {
         || (l.contains("max_tokens") && l.contains("exceed"))
         || l.contains("prompt is too long")
     {
-        return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。".into();
+        return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。"
+            .into();
     }
     if is_transport_error(&l) {
         if looks_non_loopback_http(raw) {
@@ -157,7 +160,8 @@ fn map_llm_error(raw: &str) -> String {
     if l.contains("unauthorized") || l.contains("401") || l.contains("invalid api key") {
         return "API キーが拒否されました。MTPLX を 0.0.0.0 で起動している場合は、同じキーを Argos の API キー欄に入れてください。".into();
     }
-    if l.contains("model") && (l.contains("not found") || l.contains("does not exist") || l.contains("404"))
+    if l.contains("model")
+        && (l.contains("not found") || l.contains("does not exist") || l.contains("404"))
     {
         return "指定したモデルが見つかりません。モデル名を確認してください。".into();
     }
@@ -198,8 +202,7 @@ fn client_for_stream() -> Result<reqwest::Client, String> {
         .map_err(|e| map_reqwest_error(&e))
 }
 
-pub const THINKING_BRIEF_HINT: &str =
-    "内部の検討は短く切り上げ、すぐに結論を書いてください。";
+pub const THINKING_BRIEF_HINT: &str = "内部の検討は短く切り上げ、すぐに結論を書いてください。";
 
 /// Injected only when the user asks for a diagram, not on every turn.
 pub const LLM_DIAGRAM_HINT: &str =
@@ -398,7 +401,10 @@ pub async fn test_connection(settings: &Settings) -> Result<(String, Vec<LlmMode
                 return Err(e);
             }
             ping_chat(settings).await?;
-            Ok((format!("接続できました（/models は失敗: {e}）。"), Vec::new()))
+            Ok((
+                format!("接続できました（/models は失敗: {e}）。"),
+                Vec::new(),
+            ))
         }
     }
 }
@@ -410,7 +416,10 @@ async fn ping_chat(settings: &Settings) -> Result<(), String> {
     }
     let model = settings.llm_model.trim();
     if model.is_empty() {
-        return Err("モデル名が空です。接続テストでモデル一覧を取得するか、モデル名を入力してください。".into());
+        return Err(
+            "モデル名が空です。接続テストでモデル一覧を取得するか、モデル名を入力してください。"
+                .into(),
+        );
     }
     let url = join_url(&base, "chat/completions");
     let client = client_for(settings.llm_timeout_ms.min(20_000).max(5_000))?;
@@ -617,7 +626,10 @@ pub async fn stream_chat(
         return Err("モデル名が空です。設定の「ローカルLLM」でモデルを指定してください。".into());
     }
     let messages: Vec<Value> = turns.iter().filter_map(turn_to_message).collect();
-    if !messages.iter().any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user")) {
+    if !messages
+        .iter()
+        .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    {
         return Err("送信するユーザーメッセージがありません。".into());
     }
 
@@ -739,9 +751,10 @@ fn take_sse_data_line(
 
 fn merge_tool_calls(parse: &mut StreamParse, arr: &[Value]) {
     for item in arr {
-        let index = item.get("index").and_then(|v| v.as_i64()).unwrap_or_else(|| {
-            parse.tool_calls.last().map(|c| c.index).unwrap_or(0)
-        });
+        let index = item
+            .get("index")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| parse.tool_calls.last().map(|c| c.index).unwrap_or(0));
         if let Some(slot) = parse.tool_calls.iter_mut().find(|c| c.index == index) {
             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                 if !id.is_empty() {
@@ -792,9 +805,8 @@ fn ingest_payload(
     parse: &mut StreamParse,
     on_delta: &mut impl FnMut(&str, &str),
 ) -> Result<(), String> {
-    let v: Value = serde_json::from_str(data).map_err(|_| {
-        map_llm_error(&format!("ストリームの解釈に失敗しました: {data}"))
-    })?;
+    let v: Value = serde_json::from_str(data)
+        .map_err(|_| map_llm_error(&format!("ストリームの解釈に失敗しました: {data}")))?;
     if let Some(err) = v.get("error") {
         let msg = err
             .get("message")
@@ -896,6 +908,114 @@ pub fn is_cancelled_error(e: &str) -> bool {
     e == "cancelled"
 }
 
+const OCR_PROMPT: &str =
+    "この画像に書かれている文字を、見えるとおり書き起こしてください。表や図は簡潔に説明してください。読み取れない箇所は「（判読不能）」としてください。画像にない条文・事実・日付を推測で補わないでください。";
+
+async fn wait_cancel_flag(cancel: Arc<AtomicBool>) {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// One-shot vision call: transcribe an image to text. Does not use tools or history.
+pub async fn transcribe_image(
+    settings: &Settings,
+    mime: &str,
+    bytes: &[u8],
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
+    let base = normalize_base_url(&settings.llm_base_url);
+    if base.is_empty() {
+        return Err("LLM の URL が空です。".into());
+    }
+    let model = settings.llm_model.trim();
+    if model.is_empty() {
+        return Err("モデル名が空です。設定の「ローカルLLM」でモデルを指定してください。".into());
+    }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let data_url = format!("data:{mime};base64,{b64}");
+    let url = join_url(&base, "chat/completions");
+    let timeout_ms = settings.llm_timeout_ms.max(120_000);
+    let client = client_for(timeout_ms)?;
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": OCR_PROMPT },
+                { "type": "image_url", "image_url": { "url": data_url } }
+            ]
+        }]
+    });
+    let mut off = settings.clone();
+    off.llm_thinking = "off".into();
+    apply_thinking_params(&mut body, &off);
+
+    let req = apply_auth(client.post(&url).json(&body), &settings.llm_api_key);
+    let resp = tokio::select! {
+        _ = wait_cancel_flag(cancel.clone()) => {
+            return Err("cancelled".into());
+        }
+        sent = req.send() => sent.map_err(|e| map_reqwest_error(&e))?,
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
+    if !status.is_success() {
+        return Err(map_vision_error(&map_llm_error(&format!(
+            "{status} {text}"
+        ))));
+    }
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|_| map_llm_error(&format!("応答の解釈に失敗しました: {text}")))?;
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_else(|| err.as_str().unwrap_or("error"));
+        return Err(map_vision_error(&map_llm_error(msg)));
+    }
+    let content = first_text(&[
+        v.pointer("/choices/0/message/content"),
+        v.pointer("/choices/0/text"),
+        v.pointer("/choices/0/delta/content"),
+    ]);
+    let content = content.trim();
+    if content.is_empty() {
+        return Err(
+            "モデルが書き起こしを返しませんでした。画像に対応したモデルか確認してください。".into(),
+        );
+    }
+    let capped: String = content
+        .chars()
+        .take(crate::llm::context::PER_SOURCE_CAP)
+        .collect();
+    Ok(capped)
+}
+
+fn map_vision_error(msg: &str) -> String {
+    let l = msg.to_lowercase();
+    if l.contains("image")
+        || l.contains("vision")
+        || l.contains("multimodal")
+        || l.contains("does not support")
+        || l.contains("unsupported")
+    {
+        return "このモデルは画像を読めません。vision 対応のモデルを設定してください。".into();
+    }
+    msg.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,9 +1053,8 @@ mod tests {
         assert!(msg.contains("コンテキスト長"));
         let conn = map_llm_error("error sending request for url: connection refused");
         assert!(conn.contains("接続できません"));
-        let lan = map_llm_error(
-            "error sending request for url (http://100.65.231.111:8000/v1/models)",
-        );
+        let lan =
+            map_llm_error("error sending request for url (http://100.65.231.111:8000/v1/models)");
         assert!(lan.contains("127.0.0.1") || lan.contains("届きません"));
     }
 
@@ -957,8 +1076,7 @@ mod tests {
 
     #[test]
     fn drains_sse_content() {
-        let mut buf =
-            "data: {\"choices\":[{\"delta\":{\"content\":\"あ\"}}]}\n".to_string();
+        let mut buf = "data: {\"choices\":[{\"delta\":{\"content\":\"あ\"}}]}\n".to_string();
         let mut parse = StreamParse::default();
         let mut got = String::new();
         drain_sse_lines(&mut buf, &mut parse, &mut |kind, d| {
@@ -1074,10 +1192,7 @@ mod tests {
         let mut body = serde_json::json!({});
         apply_thinking_params(&mut body, &s);
         assert_eq!(body["enable_thinking"], false);
-        let turns = apply_thinking_to_turns(
-            vec![ChatTurn::text("user", "要約して")],
-            &s,
-        );
+        let turns = apply_thinking_to_turns(vec![ChatTurn::text("user", "要約して")], &s);
         assert!(turns[0].content.ends_with("/no_think"));
     }
 

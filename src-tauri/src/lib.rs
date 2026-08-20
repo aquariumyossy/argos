@@ -17,8 +17,8 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewWindow, WebviewWindowBuilder,
-    WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewWindow,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -294,6 +294,10 @@ pub fn run() {
             llm::commands::llm_list_messages,
             llm::commands::llm_list_sources,
             llm::commands::llm_attach_sources,
+            llm::commands::llm_attach_files,
+            llm::commands::llm_retry_ocr,
+            llm::commands::llm_source_image,
+            llm::commands::llm_attached_file_path,
             llm::commands::llm_remove_source,
             llm::commands::llm_preview_source_file,
             llm::commands::llm_set_source_grain,
@@ -592,9 +596,8 @@ pub fn register_app_shortcuts(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Unregister known previous combos best-effort, then register both.
     let _ = app.global_shortcut().unregister_all();
-    let search_parsed = parse_shortcut(search).unwrap_or_else(|| {
-        Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyA)
-    });
+    let search_parsed = parse_shortcut(search)
+        .unwrap_or_else(|| Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyA));
     app.global_shortcut().register(search_parsed)?;
     if let Some(notes_parsed) = parse_shortcut(notes) {
         if notes_parsed != search_parsed {
@@ -727,8 +730,7 @@ pub fn apply_popup_initial_position(app: &AppHandle, w: &WebviewWindow) {
         return;
     };
     let margin = (20.0 * monitor.scale_factor()).round() as i32;
-    let y = work.position.y
-        + ((work.size.height as i32 - size.height as i32) / 2).max(margin);
+    let y = work.position.y + ((work.size.height as i32 - size.height as i32) / 2).max(margin);
     let x = if position == "left" {
         work.position.x + margin
     } else {
@@ -768,15 +770,7 @@ fn parse_shortcut(s: &str) -> Option<Shortcut> {
         .filter(|p| {
             !matches!(
                 *p,
-                "ctrl"
-                    | "control"
-                    | "shift"
-                    | "alt"
-                    | "super"
-                    | "meta"
-                    | "win"
-                    | "windows"
-                    | ""
+                "ctrl" | "control" | "shift" | "alt" | "super" | "meta" | "win" | "windows" | ""
             )
         })
         .next_back()?;
