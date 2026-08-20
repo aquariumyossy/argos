@@ -99,6 +99,26 @@
   color: var(--muted);
 }
 
+.preview-image-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 12px;
+}
+
+.preview-image {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.preview-image-transcript {
+  white-space: pre-wrap;
+  margin: 0;
+}
+
 .preview-scroll {
   flex: 1;
   min-width: 0;

@@ -15,6 +15,8 @@ use crate::watcher::WatcherHandle;
 
 pub struct LlmJob {
     pub request_id: String,
+    pub thread_id: String,
+    pub kind: String,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -35,6 +37,10 @@ pub struct PreviewTarget {
     pub title: Option<String>,
     #[serde(default)]
     pub fallback_body: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 pub struct AppState {
@@ -79,8 +85,8 @@ impl AppState {
         // Schema wipe, or migration to a fresh empty index-mail while SQLite still
         // thinks messages are indexed (would cause sync to skip everything).
         let mail_db_indexed = db.count_indexed_emails().unwrap_or(0);
-        let mail_needs_resync = mail_opened.needs_full_reindex
-            || (mail_db_indexed > 0 && mail_backend.num_docs() == 0);
+        let mail_needs_resync =
+            mail_opened.needs_full_reindex || (mail_db_indexed > 0 && mail_backend.num_docs() == 0);
         if mail_needs_resync {
             eprintln!(
                 "argos: mail index needs rebuild (schema_wipe={}, sqlite_indexed={}, tantivy_docs={}); clearing mail sqlite",
@@ -170,8 +176,24 @@ impl AppState {
         self.llm_job.read().is_some()
     }
 
-    pub fn start_llm(&self, request_id: String, _thread_id: String, cancel: Arc<AtomicBool>) {
-        *self.llm_job.write() = Some(LlmJob { request_id, cancel });
+    pub fn start_llm(
+        &self,
+        request_id: String,
+        thread_id: String,
+        kind: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> bool {
+        let mut job = self.llm_job.write();
+        if job.is_some() {
+            return false;
+        }
+        *job = Some(LlmJob {
+            request_id,
+            thread_id,
+            kind: kind.to_string(),
+            cancel,
+        });
+        true
     }
 
     pub fn finish_llm(&self, request_id: &str) {
@@ -181,9 +203,12 @@ impl AppState {
         }
     }
 
-    pub fn cancel_llm(&self) {
+    pub fn cancel_llm(&self) -> Option<LlmJob> {
         if let Some(job) = self.llm_job.write().take() {
             job.cancel.store(true, Ordering::SeqCst);
+            Some(job)
+        } else {
+            None
         }
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   parseChoiceLines,
   renderAssistantMdHtml,
@@ -145,15 +145,19 @@ function MdHtml({
     );
     return renderAssistantMdHtml(text, set);
   }, [text, citeKey]);
+  // React 19 compares dangerouslySetInnerHTML by object identity. A fresh
+  // `{ __html }` on each Chat re-render (draft, dialog, preview focus)
+  // resets innerHTML and wipes colgroup widths → equal columns.
+  const htmlProp = useMemo(() => ({ __html: html }), [html]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     attachResizableChatTables(rootRef.current);
   }, [html]);
 
   return (
     <div
       ref={rootRef}
-      dangerouslySetInnerHTML={{ __html: html }}
+      dangerouslySetInnerHTML={htmlProp}
       onClick={(e) => {
         const btn = (e.target as HTMLElement).closest("button.md-cite");
         if (!(btn instanceof HTMLButtonElement)) return;

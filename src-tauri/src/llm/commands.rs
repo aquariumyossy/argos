@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -5,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow};
-use crate::llm::{self, LlmModelInfo};
 use crate::llm::context::{
-    assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed,
-    ChatTurn, STOP_TOOLS_HINT,
+    assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed, ChatTurn,
+    STOP_TOOLS_HINT,
 };
-use crate::llm::tools::{self, MAX_TOOL_ROUNDS, ToolExec};
+use crate::llm::tools::{self, ToolExec, MAX_TOOL_ROUNDS};
+use crate::llm::{self, files, LlmModelInfo};
 use crate::state::AppState;
 
 #[derive(Clone, Serialize)]
@@ -28,6 +29,13 @@ pub struct LlmChatError {
     pub request_id: String,
     pub thread_id: String,
     pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmOcrStatus {
+    pub thread_id: String,
+    pub active: bool,
 }
 
 #[derive(Serialize)]
@@ -161,9 +169,7 @@ pub fn show_chat_window(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn llm_list_threads(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<LlmThreadRow>, String> {
+pub fn llm_list_threads(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmThreadRow>, String> {
     state.db.list_llm_threads().map_err(|e| e.to_string())
 }
 
@@ -240,6 +246,7 @@ pub fn llm_delete_thread(state: State<'_, Arc<AppState>>, id: String) -> Result<
     if !state.db.delete_llm_thread(&id).map_err(|e| e.to_string())? {
         return Err("会話が見つかりません".into());
     }
+    files::remove_thread_store(&state.data_dir, &id);
     if state.db.get_active_llm_thread_id().as_deref() == Some(id.as_str()) {
         let next = state
             .db
@@ -294,9 +301,7 @@ pub fn llm_list_messages(
 }
 
 #[tauri::command]
-pub async fn llm_test_connection(
-    state: State<'_, Arc<AppState>>,
-) -> Result<LlmTestResult, String> {
+pub async fn llm_test_connection(state: State<'_, Arc<AppState>>) -> Result<LlmTestResult, String> {
     let settings = state.settings.read().clone();
     let loopback = llm::is_loopback_url(&settings.llm_base_url);
     let (message, models) = llm::test_connection(&settings).await?;
@@ -308,16 +313,20 @@ pub async fn llm_test_connection(
 }
 
 #[tauri::command]
-pub async fn llm_list_models(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<LlmModelInfo>, String> {
+pub async fn llm_list_models(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmModelInfo>, String> {
     let settings = state.settings.read().clone();
     llm::list_models(&settings).await
 }
 
 #[tauri::command]
-pub fn llm_cancel(state: State<'_, Arc<AppState>>) {
-    state.cancel_llm();
+pub fn llm_cancel(app: AppHandle, state: State<'_, Arc<AppState>>) {
+    if let Some(job) = state.cancel_llm() {
+        if job.kind == "ocr" {
+            let _ = state.db.fail_pending_ocr(&job.thread_id);
+            emit_sources_updated(&app, &job.thread_id);
+            emit_ocr_status(&app, &job.thread_id, false);
+        }
+    }
 }
 
 #[tauri::command]
@@ -383,7 +392,9 @@ pub async fn llm_send(
     if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
         system.push_str(&line);
     }
-    system.push_str(&tools::format_search_date_system_line(settings.mail_days_back));
+    system.push_str(&tools::format_search_date_system_line(
+        settings.mail_days_back,
+    ));
     let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
     let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
     let truncated = stats.truncated;
@@ -401,7 +412,14 @@ pub async fn llm_send(
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let state_arc = state.inner().clone();
-    state.start_llm(request_id.clone(), thread.id.clone(), cancel.clone());
+    if !state.start_llm(
+        request_id.clone(),
+        thread.id.clone(),
+        "send",
+        cancel.clone(),
+    ) {
+        return Err("生成中です。停止してから送信してください。".into());
+    }
     let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
 
     let tools_schema = tools::tools_schema();
@@ -458,6 +476,7 @@ pub async fn llm_send(
         match outcome {
             Err(e) if llm::is_cancelled_error(&e) => {
                 busy.finish();
+                kick_pending_ocr(&app, state_arc.clone());
                 let _ = state.db.delete_uncited_tool_sources(&thread.id);
                 emit_sources_updated(&app, &thread.id);
                 let thread = state
@@ -476,7 +495,9 @@ pub async fn llm_send(
                     warning,
                 });
             }
-            Err(e) if use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&e) => {
+            Err(e)
+                if use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&e) =>
+            {
                 use_tools = false;
                 retried_without_tools = true;
                 warning = Some(
@@ -488,6 +509,7 @@ pub async fn llm_send(
             }
             Err(e) => {
                 busy.finish();
+                kick_pending_ocr(&app, state_arc.clone());
                 let _ = state.db.delete_uncited_tool_sources(&thread.id);
                 emit_sources_updated(&app, &thread.id);
                 let _ = app.emit(
@@ -576,16 +598,9 @@ pub async fn llm_send(
                         use_tools = false;
                         extra_final = true;
                         if !source_turn_injected {
-                            let all = state
-                                .db
-                                .list_llm_sources(&thread.id)
-                                .unwrap_or_default();
-                            source_turn_injected = inject_final_source_turn(
-                                &mut current_turns,
-                                &all,
-                                &consumed,
-                                true,
-                            );
+                            let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                            source_turn_injected =
+                                inject_final_source_turn(&mut current_turns, &all, &consumed, true);
                         }
                         if !source_turn_injected {
                             current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
@@ -602,16 +617,9 @@ pub async fn llm_send(
                     extra_final = true;
                     use_tools = false;
                     if !source_turn_injected {
-                        let all = state
-                            .db
-                            .list_llm_sources(&thread.id)
-                            .unwrap_or_default();
-                        source_turn_injected = inject_final_source_turn(
-                            &mut current_turns,
-                            &all,
-                            &consumed,
-                            true,
-                        );
+                        let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                        source_turn_injected =
+                            inject_final_source_turn(&mut current_turns, &all, &consumed, true);
                     }
                     if !source_turn_injected {
                         current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
@@ -625,12 +633,8 @@ pub async fn llm_send(
                 if rounds > 0 && !consumed.is_empty() && !source_turn_injected {
                     let already_cited = consumed_cited_in_answer(&consumed, &out.content);
                     if already_cited.is_empty() {
-                        let all = state
-                            .db
-                            .list_llm_sources(&thread.id)
-                            .unwrap_or_default();
-                        if inject_final_source_turn(&mut current_turns, &all, &consumed, true)
-                        {
+                        let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                        if inject_final_source_turn(&mut current_turns, &all, &consumed, true) {
                             source_turn_injected = true;
                             use_tools = false;
                             extra_final = true;
@@ -645,6 +649,7 @@ pub async fn llm_send(
     }
 
     busy.finish();
+    kick_pending_ocr(&app, state_arc.clone());
 
     let assistant_message = if result_text.is_empty() {
         None
@@ -727,13 +732,115 @@ fn emit_sources_updated(app: &AppHandle, thread_id: &str) {
     );
 }
 
+fn emit_ocr_status(app: &AppHandle, thread_id: &str, active: bool) {
+    let _ = app.emit(
+        "llm-ocr-status",
+        LlmOcrStatus {
+            thread_id: thread_id.to_string(),
+            active,
+        },
+    );
+}
+
+fn kick_pending_ocr(app: &AppHandle, state: Arc<AppState>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        run_ocr_queue(app, state).await;
+    });
+}
+
+async fn run_ocr_queue(app: AppHandle, state: Arc<AppState>) {
+    loop {
+        if state.is_llm_busy() {
+            return;
+        }
+        let next = match state.db.next_pending_ocr_source() {
+            Ok(row) => row,
+            Err(_) => return,
+        };
+        let Some(first) = next else {
+            return;
+        };
+        run_ocr_for_thread(&app, state.clone(), first.thread_id.clone()).await;
+    }
+}
+
+async fn run_ocr_for_thread(app: &AppHandle, state: Arc<AppState>, thread_id: String) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    if !state.start_llm(request_id.clone(), thread_id.clone(), "ocr", cancel.clone()) {
+        return;
+    }
+    emit_ocr_status(app, &thread_id, true);
+    let mut guard = LlmBusyGuard::new(state.clone(), request_id.clone());
+
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let next = match state.db.next_pending_ocr_in_thread(&thread_id) {
+            Ok(row) => row,
+            Err(_) => break,
+        };
+        let Some(row) = next else {
+            break;
+        };
+        let result = transcribe_source(&state, &row, cancel.clone()).await;
+        if cancel.load(std::sync::atomic::Ordering::SeqCst)
+            || matches!(&result, Err(e) if llm::is_cancelled_error(e))
+        {
+            let _ = state.db.fail_pending_ocr(&thread_id);
+            break;
+        }
+        match result {
+            Ok(text) => {
+                let _ = state.db.update_llm_source_ocr(&row.id, &text, "");
+            }
+            Err(e) => {
+                let _ = state.db.update_llm_source_ocr(&row.id, "", "error");
+                let _ = app.emit(
+                    "llm-chat-error",
+                    LlmChatError {
+                        request_id: request_id.clone(),
+                        thread_id: thread_id.clone(),
+                        message: e,
+                    },
+                );
+            }
+        }
+        emit_sources_updated(app, &thread_id);
+    }
+
+    guard.finish();
+    emit_ocr_status(app, &thread_id, false);
+    emit_sources_updated(app, &thread_id);
+}
+
+async fn transcribe_source(
+    state: &AppState,
+    row: &LlmSourceRow,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let path = files::resolve_stored(&state.data_dir, &row.stored_relpath)?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("画像を読めません（{e}）。"))?;
+    let ext = files::file_ext(&path);
+    let mime = files::mime_for_ext(&ext);
+    let settings = state.settings.read().clone();
+    llm::transcribe_image(&settings, mime, &bytes, cancel).await
+}
+
 fn attach_thread_title(explicit: Option<&str>, items: &[LlmAttachItem]) -> String {
     let from_arg = explicit.map(str::trim).filter(|s| !s.is_empty());
     if let Some(t) = from_arg {
         return t.to_string();
     }
     for item in items {
-        if let Some(t) = item.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(t) = item
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             return t.to_string();
         }
     }
@@ -773,11 +880,18 @@ pub fn llm_remove_source(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<(), String> {
+    let row = state
+        .db
+        .get_llm_source(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    let stored = row.stored_relpath.clone();
     let thread_id = state
         .db
         .delete_llm_source(&id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "出典が見つかりません".to_string())?;
+    files::remove_stored(&state.data_dir, &stored);
     emit_sources_updated(&app, &thread_id);
     Ok(())
 }
@@ -823,6 +937,9 @@ pub fn llm_set_source_grain(
         .get_llm_source(&id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "出典が見つかりません".to_string())?;
+    if row.is_image() {
+        return Err("画像出典は段落／全文を切り替えられません。".into());
+    }
     if !row.is_pending() {
         return Err("読み込み済みの出典は段落／全文を切り替えられません。".into());
     }
@@ -992,6 +1109,443 @@ pub fn llm_attach_sources(
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmAttachFileError {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmAttachFilesResult {
+    pub thread: LlmThreadRow,
+    pub sources: Vec<LlmSourceRow>,
+    pub added: usize,
+    pub skipped: usize,
+    pub created_thread: bool,
+    pub errors: Vec<LlmAttachFileError>,
+    pub remote_ocr: bool,
+    pub ocr_started: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSourceImage {
+    pub mime: String,
+    pub data_url: String,
+}
+
+fn resolve_attach_thread(
+    state: &AppState,
+    thread_id: Option<&str>,
+    title: &str,
+) -> Result<(LlmThreadRow, bool), String> {
+    let want_new = match thread_id.map(str::trim) {
+        None | Some("") | Some("new") => true,
+        Some(_) => false,
+    };
+    if want_new {
+        let t = if title.trim().is_empty() {
+            "新しい会話"
+        } else {
+            title.trim()
+        };
+        let thread = state
+            .db
+            .create_llm_thread(t, false)
+            .map_err(|e| e.to_string())?;
+        Ok((thread, true))
+    } else {
+        let id = thread_id.unwrap_or("").trim();
+        let thread = state
+            .db
+            .get_llm_thread(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "会話が見つかりません".to_string())?;
+        Ok((thread, false))
+    }
+}
+
+struct AttachOutcome {
+    created: usize,
+    skipped: usize,
+    needs_ocr: bool,
+    warning: Option<String>,
+}
+
+fn attach_one_os_file(
+    state: &AppState,
+    thread_id: &str,
+    raw_path: &str,
+) -> Result<AttachOutcome, String> {
+    let path = files::normalize_os_path(raw_path);
+    if path.is_empty() {
+        return Err("パスが空です。".into());
+    }
+    let p = Path::new(&path);
+    let kind = files::classify_path(p)?;
+    if let Some(existing) = state
+        .db
+        .find_any_pending_llm_source_by_path(thread_id, &path)
+        .map_err(|e| e.to_string())?
+    {
+        let needs_ocr = existing.is_image() && !existing.is_injectable();
+        return Ok(AttachOutcome {
+            created: 0,
+            skipped: 1,
+            needs_ocr,
+            warning: None,
+        });
+    }
+    let title = files::file_title(p);
+    match kind {
+        files::AttachKind::Text => {
+            if files::file_ext(p) == "pdf" {
+                match files::extract_attach_doc(p)? {
+                    files::AttachDoc::Text { title, body } => {
+                        insert_text_source(state, thread_id, &path, &title, &body)
+                    }
+                    files::AttachDoc::EmptyPdf => {
+                        attach_scanned_pdf(state, thread_id, p, &path, &title)
+                    }
+                }
+            } else {
+                let (title, body) = files::extract_text_body(p)?;
+                insert_text_source(state, thread_id, &path, &title, &body)
+            }
+        }
+        files::AttachKind::Image => attach_image_file(state, thread_id, p, &path, &title),
+    }
+}
+
+fn insert_text_source(
+    state: &AppState,
+    thread_id: &str,
+    path: &str,
+    title: &str,
+    body: &str,
+) -> Result<AttachOutcome, String> {
+    let (_row, created) = state
+        .db
+        .insert_llm_source_full(
+            thread_id, "attach", path, title, "", body, "", "file", "text", "", "", None,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(AttachOutcome {
+        created: if created { 1 } else { 0 },
+        skipped: if created { 0 } else { 1 },
+        needs_ocr: false,
+        warning: None,
+    })
+}
+
+fn attach_image_file(
+    state: &AppState,
+    thread_id: &str,
+    p: &Path,
+    path: &str,
+    title: &str,
+) -> Result<AttachOutcome, String> {
+    files::check_image_size(p)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let ext = files::file_ext(p);
+    let rel = files::stored_relpath(thread_id, &id, &ext);
+    if let Err(e) = files::copy_into_store(&state.data_dir, p, &rel) {
+        return Err(e);
+    }
+    match state.db.insert_llm_source_full(
+        thread_id,
+        "attach",
+        path,
+        title,
+        "",
+        "",
+        "",
+        "file",
+        "image",
+        &rel,
+        "pending",
+        Some(&id),
+    ) {
+        Ok((row, created)) => {
+            if row.id != id {
+                files::remove_stored(&state.data_dir, &rel);
+            }
+            Ok(AttachOutcome {
+                created: if created { 1 } else { 0 },
+                skipped: if created { 0 } else { 1 },
+                needs_ocr: row.is_image() && !row.is_injectable(),
+                warning: None,
+            })
+        }
+        Err(e) => {
+            files::remove_stored(&state.data_dir, &rel);
+            Err(e.to_string())
+        }
+    }
+}
+
+fn attach_scanned_pdf(
+    state: &AppState,
+    thread_id: &str,
+    p: &Path,
+    path: &str,
+    filename: &str,
+) -> Result<AttachOutcome, String> {
+    let raster = llm::pdf_win::rasterize_pdf(p)?;
+    if raster.pages.is_empty() {
+        return Err("ページがありません。".into());
+    }
+    let mut rels: Vec<String> = Vec::new();
+    let mut created = 0usize;
+    let mut needs_ocr = false;
+    for page in &raster.pages {
+        let id = uuid::Uuid::new_v4().to_string();
+        let rel = files::stored_relpath(thread_id, &id, "jpg");
+        if let Err(e) = files::write_bytes_into_store(&state.data_dir, &rel, &page.jpeg) {
+            for r in &rels {
+                files::remove_stored(&state.data_dir, r);
+            }
+            return Err(e);
+        }
+        rels.push(rel.clone());
+        let title = llm::pdf_win::pdf_page_title(filename, page.page_no);
+        let pid = llm::pdf_win::pdf_page_paragraph_id(page.page_no);
+        match state.db.insert_llm_source_full(
+            thread_id,
+            "attach",
+            path,
+            &title,
+            &pid,
+            "",
+            "",
+            "file",
+            "image",
+            &rel,
+            "pending",
+            Some(&id),
+        ) {
+            Ok((row, was_created)) => {
+                if row.id != id {
+                    files::remove_stored(&state.data_dir, &rel);
+                }
+                if was_created {
+                    created += 1;
+                }
+                if row.is_image() && !row.is_injectable() {
+                    needs_ocr = true;
+                }
+            }
+            Err(e) => {
+                for r in &rels {
+                    files::remove_stored(&state.data_dir, r);
+                }
+                return Err(e.to_string());
+            }
+        }
+    }
+    let warning = if raster.truncated {
+        Some(llm::pdf_win::truncation_warning(
+            raster.pages.len() as u32,
+            raster.total_pages,
+        ))
+    } else {
+        None
+    };
+    Ok(AttachOutcome {
+        created,
+        skipped: 0,
+        needs_ocr,
+        warning,
+    })
+}
+
+#[tauri::command]
+pub fn llm_attach_files(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    paths: Vec<String>,
+    thread_id: Option<String>,
+) -> Result<LlmAttachFilesResult, String> {
+    if paths.iter().all(|p| p.trim().is_empty()) {
+        return Err("添付するファイルがありません。".into());
+    }
+    let first_title = paths
+        .iter()
+        .map(|p| files::file_title(Path::new(p.trim())))
+        .find(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| "新しい会話".into());
+    let (thread, created_thread) =
+        resolve_attach_thread(state.inner(), thread_id.as_deref(), &first_title)?;
+
+    if !state.is_llm_busy() {
+        state
+            .db
+            .set_active_llm_thread_id(Some(&thread.id))
+            .map_err(|e| e.to_string())?;
+    }
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut wants_ocr = false;
+    for raw in &paths {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match attach_one_os_file(state.inner(), &thread.id, raw) {
+            Ok(outcome) => {
+                added += outcome.created;
+                skipped += outcome.skipped;
+                if outcome.needs_ocr {
+                    wants_ocr = true;
+                }
+                if let Some(w) = outcome.warning {
+                    warnings.push(w);
+                }
+            }
+            Err(message) => {
+                errors.push(LlmAttachFileError {
+                    path: raw.to_string(),
+                    message,
+                });
+            }
+        }
+    }
+
+    if created_thread && added == 0 {
+        let _ = state.db.delete_llm_thread(&thread.id);
+        files::remove_thread_store(&state.data_dir, &thread.id);
+        if errors.is_empty() && skipped > 0 {
+            return Err("同じ出典がすでに読込前にあります。".into());
+        }
+        let msg = errors
+            .first()
+            .map(|e| e.message.clone())
+            .unwrap_or_else(|| "添付するファイルがありません。".into());
+        return Err(msg);
+    }
+
+    let sources = state
+        .db
+        .list_llm_sources(&thread.id)
+        .map_err(|e| e.to_string())?;
+    let thread = state
+        .db
+        .get_llm_thread(&thread.id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(thread);
+
+    crate::show_chat(&app);
+    emit_sources_updated(&app, &thread.id);
+
+    let settings = state.settings.read().clone();
+    let remote_ocr = wants_ocr && !llm::is_loopback_url(&settings.llm_base_url);
+    let ocr_started = wants_ocr && !state.is_llm_busy();
+    if ocr_started {
+        kick_pending_ocr(&app, state.inner().clone());
+    }
+
+    Ok(LlmAttachFilesResult {
+        thread,
+        sources,
+        added,
+        skipped,
+        created_thread,
+        errors,
+        remote_ocr,
+        ocr_started,
+        warnings,
+    })
+}
+
+#[tauri::command]
+pub fn llm_retry_ocr(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Vec<LlmSourceRow>, String> {
+    let row = state
+        .db
+        .get_llm_source(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    if !row.is_image() {
+        return Err("画像出典ではありません。".into());
+    }
+    if !row.is_pending() {
+        return Err("読み込み済みの出典は再読み取りできません。".into());
+    }
+    state
+        .db
+        .update_llm_source_ocr(&id, "", "pending")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    let sources = state
+        .db
+        .list_llm_sources(&row.thread_id)
+        .map_err(|e| e.to_string())?;
+    emit_sources_updated(&app, &row.thread_id);
+    if !state.is_llm_busy() {
+        kick_pending_ocr(&app, state.inner().clone());
+    }
+    Ok(sources)
+}
+
+#[tauri::command]
+pub fn llm_source_image(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<LlmSourceImage, String> {
+    let row = state
+        .db
+        .get_llm_source(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    if !row.is_image() {
+        return Err("画像出典ではありません。".into());
+    }
+    let path = files::resolve_stored(&state.data_dir, &row.stored_relpath)?;
+    if !path.is_file() {
+        return Err("保存した画像が見つかりません。".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mime = files::mime_for_ext(&files::file_ext(&path)).to_string();
+    Ok(LlmSourceImage {
+        mime: mime.clone(),
+        data_url: format!("data:{mime};base64,{b64}"),
+    })
+}
+
+#[tauri::command]
+pub fn llm_attached_file_path(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<String, String> {
+    let row = state
+        .db
+        .get_llm_source(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    let orig = Path::new(row.path.trim());
+    if orig.is_file() {
+        return Ok(row.path.trim().to_string());
+    }
+    if !row.stored_relpath.trim().is_empty() {
+        let stored = files::resolve_stored(&state.data_dir, &row.stored_relpath)?;
+        if stored.is_file() {
+            return Ok(stored.to_string_lossy().into_owned());
+        }
+    }
+    Err("ファイルが見つかりません。".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,6 +1594,9 @@ mod tests {
             injected_user_message_id: String::new(),
             cited_assistant_message_id: String::new(),
             cite_no: 2,
+            kind: "text".into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
         };
         let mut turns = Vec::new();
         assert!(inject_final_source_turn(
@@ -1064,4 +1621,3 @@ mod tests {
         ));
     }
 }
-

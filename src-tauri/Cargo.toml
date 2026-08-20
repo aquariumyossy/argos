@@ -1,6 +1,6 @@
 [package]
 name = "argos"
-version = "1.9.6"
+version = "1.9.7"
 description = "Argos  Elocal desktop instant search"
 authors = ["Shuhei Yoshida"]
 license = "Apache-2.0"
@@ -46,8 +46,9 @@ walkdir = "2"
 lindera-tantivy = { version = "4.0.0", features = ["embed-ipadic"] }
 lindera = { version = "4.0.1", features = ["embed-ipadic"] }
 tauri-plugin-autostart = "2.5.1"
-windows = { version = "0.62.2", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_Foundation", "Win32_NetworkManagement_WNet", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Variant"] }
+windows = { version = "0.62.2", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_Foundation", "Win32_NetworkManagement_WNet", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_WinRT", "Data_Pdf", "Foundation", "Storage_Streams", "Graphics_Imaging"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
+base64 = "0.22"
 futures-util = "0.3"
 axum = "0.8"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
