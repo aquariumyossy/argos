@@ -353,6 +353,7 @@ pub fn add_folder(state: State<'_, Arc<AppState>>, path: String) -> Result<Folde
         .add_folder(&path, &public_path)
         .map_err(|e| e.to_string())?;
     state.watch_folder(&row.path);
+    state.refresh_remote_share();
     Ok(row)
 }
 
@@ -363,11 +364,13 @@ pub fn update_folder_public_path(
     public_path: String,
 ) -> Result<FolderRow, String> {
     let public_path = crate::pathutil::simplify_windows_path(public_path.trim());
-    state
+    let row = state
         .db
         .update_folder_public_path(id, &public_path)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "フォルダが見つかりません".to_string())
+        .ok_or_else(|| "フォルダが見つかりません".to_string())?;
+    state.refresh_remote_share();
+    Ok(row)
 }
 
 /// Rebind a registered folder to a new path and remap the index (no content re-extract).
@@ -412,6 +415,7 @@ pub fn update_folder_path(
         Ok(row) => {
             state.watch_folder(&row.path);
             let _ = app.emit("folders-updated", ());
+            state.refresh_remote_share();
             Ok(row)
         }
         Err(e) => {
@@ -443,12 +447,28 @@ pub fn remove_folder(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), Str
     state.backend.delete_paths(&file_paths)?;
 
     state.db.remove_folder(id).map_err(|e| e.to_string())?;
+    state.refresh_remote_share();
     eprintln!(
         "argos: removed folder '{}' (purged {} file paths from index)",
         folder.path,
         file_paths.len()
     );
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_folder_share_remote(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    share_remote: bool,
+) -> Result<FolderRow, String> {
+    let row = state
+        .db
+        .set_folder_share_remote(id, share_remote)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "フォルダが見つかりません".to_string())?;
+    state.refresh_remote_share();
+    Ok(row)
 }
 
 #[tauri::command]

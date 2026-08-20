@@ -21,7 +21,7 @@ use super::legal_ref::{
     has_legal_ref, legal_ref_cite_variants, mask_legal_refs, normalize_legal_refs,
 };
 use super::morph::{is_noise_highlight_term, MorphAnalyzer};
-use super::{ParagraphHit, SearchBackend, SearchHit, SearchOpts};
+use super::{ParagraphHit, RemoteShareSnapshot, SearchBackend, SearchHit, SearchOpts};
 
 /// When a date/from allowlist is larger than this, skip the Tantivy path OR and
 /// post-filter instead (recall can drop).
@@ -1400,6 +1400,7 @@ impl TantivyBackend {
         exact_path: Option<&str>,
         opts: SearchOpts,
         path_allowlist: Option<&[String]>,
+        share: Option<&RemoteShareSnapshot>,
     ) -> Result<Vec<(f32, SearchHit)>, String> {
         let q = query.trim();
         if q.is_empty() {
@@ -1539,7 +1540,7 @@ impl TantivyBackend {
             limit.max(50).min(80)
         } else if allow_or.is_some() {
             (limit * 2).max(40).min(400)
-        } else if scope.is_some() || ext_filter.is_some() || allow_set.is_some() {
+        } else if scope.is_some() || ext_filter.is_some() || allow_set.is_some() || share.is_some() {
             (limit * 5).max(80).min(400)
         } else {
             (limit * 2).max(40).min(200)
@@ -1559,6 +1560,11 @@ impl TantivyBackend {
                 };
                 if let Some(ref set) = allow_set {
                     if !path_in_allowlist(&hit.path, set) {
+                        continue;
+                    }
+                }
+                if let Some(snap) = share {
+                    if !snap.path_is_shared(&hit.path) {
                         continue;
                     }
                 }
@@ -1732,6 +1738,7 @@ impl TantivyBackend {
             Some(path),
             SearchOpts::default(),
             None,
+            None,
         )?;
         // Fallback if TermQuery missed due to path normalization drift: prefix scope.
         if scored.is_empty() {
@@ -1743,6 +1750,7 @@ impl TantivyBackend {
                 pos_filter_enabled,
                 None,
                 SearchOpts::default(),
+                None,
                 None,
             )?;
             scored.retain(|(_, hit)| {
@@ -1891,6 +1899,55 @@ impl TantivyBackend {
         opts: SearchOpts,
         path_allowlist: Option<&[String]>,
     ) -> Result<Vec<SearchHit>, String> {
+        self.search_filtered_share(
+            query,
+            limit,
+            path_prefix,
+            exts,
+            pos_filter_enabled,
+            opts,
+            path_allowlist,
+            None,
+        )
+    }
+
+    /// LAN remote search: same retrieval as [`Self::search_filtered`], plus share gating.
+    pub fn search_for_remote(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+        exts: Option<&[String]>,
+        pos_filter_enabled: bool,
+        share: &RemoteShareSnapshot,
+    ) -> Result<Vec<SearchHit>, String> {
+        if !share.has_shared_folders() {
+            return Ok(Vec::new());
+        }
+        self.search_filtered_share(
+            query,
+            limit,
+            path_prefix,
+            exts,
+            pos_filter_enabled,
+            SearchOpts::default(),
+            None,
+            Some(share),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_filtered_share(
+        &self,
+        query: &str,
+        limit: usize,
+        path_prefix: Option<&str>,
+        exts: Option<&[String]>,
+        pos_filter_enabled: bool,
+        opts: SearchOpts,
+        path_allowlist: Option<&[String]>,
+        share: Option<&RemoteShareSnapshot>,
+    ) -> Result<Vec<SearchHit>, String> {
         if let Some(paths) = path_allowlist {
             if paths.is_empty() {
                 return Ok(Vec::new());
@@ -1906,6 +1963,7 @@ impl TantivyBackend {
             None,
             opts,
             path_allowlist,
+            share,
         )?;
 
         let mut order: Vec<String> = Vec::new();

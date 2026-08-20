@@ -145,7 +145,14 @@ impl AppState {
         }
     }
 
+    pub fn refresh_remote_share(&self) {
+        let folders = self.db.list_folders().unwrap_or_default();
+        self.remote_server
+            .set_share(crate::search::RemoteShareSnapshot::from_folders(&folders));
+    }
+
     pub fn sync_remote_server(&self) {
+        self.refresh_remote_share();
         let (enabled, port, token, pos_filter) = {
             let s = self.settings.read();
             (

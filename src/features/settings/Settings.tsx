@@ -1,8 +1,10 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
+  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
@@ -54,6 +56,7 @@ type FolderRow = {
   enabled: boolean;
   indexedCount: number;
   exists?: boolean;
+  shareRemote?: boolean;
 };
 type ExcludePathRow = { id: number; path: string };
 type SearchWordRow = {
@@ -137,8 +140,8 @@ const POPUP_POSITION_OPTIONS = [
 
 const SEARCH_MODE_OPTIONS = [
   { value: "local", label: "ローカルのみ" },
-  { value: "remote", label: "リモートのみ" },
-  { value: "hybrid", label: "ハイブリッド（ローカル＋リモート）" },
+  { value: "remote", label: "ホストのみ" },
+  { value: "hybrid", label: "ハイブリッド（ローカル＋ホスト）" },
 ] as const;
 
 const TABS: { id: TabId; label: string }[] = [
@@ -148,11 +151,11 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "words", label: "辞書登録" },
   { id: "options", label: "各種設定" },
   { id: "llm", label: "ローカルLLM" },
-  { id: "remote", label: "リモート" },
+  { id: "remote", label: "インデックス共有" },
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.9.5";
+const APP_VERSION = "1.9.6";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -368,6 +371,10 @@ export default function Settings() {
   const [editingWordDraft, setEditingWordDraft] = useState("");
   const [publicPathDrafts, setPublicPathDrafts] = useState<Record<number, string>>({});
   const [publicPathOpenId, setPublicPathOpenId] = useState<number | null>(null);
+  const [folderMenuId, setFolderMenuId] = useState<number | null>(null);
+  const [folderMenuStyle, setFolderMenuStyle] = useState<CSSProperties>({});
+  const folderMenuBtnRef = useRef<HTMLButtonElement | null>(null);
+  const folderMenuRef = useRef<HTMLDivElement | null>(null);
   const [message, setMessage] = useState("");
   const [indexing, setIndexing] = useState(false);
   const [busyFolderId, setBusyFolderId] = useState<number | null>(null);
@@ -395,6 +402,59 @@ export default function Settings() {
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
+
+  useEffect(() => {
+    if (folderMenuId == null) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target;
+      if (!(t instanceof Node)) return;
+      if (folderMenuRef.current?.contains(t)) return;
+      if (folderMenuBtnRef.current?.contains(t)) return;
+      setFolderMenuId(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFolderMenuId(null);
+    };
+    document.addEventListener("mousedown", onDoc);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [folderMenuId]);
+
+  useEffect(() => {
+    if (publicPathOpenId == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPublicPathOpenId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [publicPathOpenId]);
+
+  useLayoutEffect(() => {
+    if (folderMenuId == null || !folderMenuBtnRef.current) return;
+    const rect = folderMenuBtnRef.current.getBoundingClientRect();
+    const menuW = folderMenuRef.current?.offsetWidth || 168;
+    const menuH = folderMenuRef.current?.offsetHeight || 140;
+    const margin = 8;
+    let left = rect.right - menuW;
+    if (left < margin) left = margin;
+    if (left + menuW > window.innerWidth - margin) {
+      left = Math.max(margin, window.innerWidth - margin - menuW);
+    }
+    const dropUp = rect.bottom + menuH + 6 > window.innerHeight && rect.top > menuH + 6;
+    setFolderMenuStyle({
+      position: "fixed",
+      left,
+      top: dropUp ? undefined : rect.bottom + 6,
+      bottom: dropUp ? window.innerHeight - rect.top + 6 : undefined,
+    });
+  }, [folderMenuId]);
+
+  useEffect(() => {
+    setFolderMenuId(null);
+  }, [tab]);
 
   async function reload(opts?: { retry?: boolean }) {
     const raw = opts?.retry
@@ -805,6 +865,20 @@ export default function Settings() {
       setBusyFolderId(null);
       setIndexProgress(null);
       setIndexing(false);
+    }
+  }
+
+  async function setFolderShareRemote(id: number, shareRemote: boolean) {
+    try {
+      const row = await invoke<FolderRow>("set_folder_share_remote", {
+        id,
+        shareRemote,
+      });
+      setFolders((prev) =>
+        prev.map((f) => (f.id === row.id ? { ...f, ...row } : f)),
+      );
+    } catch (e) {
+      setMessage(`失敗: ${String(e)}`);
     }
   }
 
@@ -1325,13 +1399,15 @@ export default function Settings() {
             </p>
             <h3 className="howto-subhead">インデックスがある PC（ホスト）</h3>
             <ol className="howto-steps">
-              <li>左の「フォルダ設定」でフォルダを追加し、「今すぐインデックス」を実行します</li>
+              <li>左の「フォルダ設定」でフォルダを追加し、必要なフォルダの「LAN共有」をオンにします（未選択ならサーバをオンにしてもファイルは出ません。入れ子なら内側のトグルが勝ちます）</li>
               <li>
                 クライアントからもファイルを開けるようにする場合は、フォルダの「公開パス（UNC）」に共有パス（例:{" "}
                 <code>\\192.168.0.8\共有名</code>
                 ）を設定してから再インデックスします。すでに UNC で登録している場合は空のままで構いません
               </li>
-              <li>左の「リモート」で「リモート検索サーバを有効にする」をオンにします</li>
+              <li>
+                左の「インデックス共有」で「このPCのインデックスを共有する」をオンにします
+              </li>
               <li>
                 共有トークンを控えます（初回有効化時に乱数が自動生成されます。クライアントに同じ値を入れます）
               </li>
@@ -1342,11 +1418,11 @@ export default function Settings() {
             <h3 className="howto-subhead">検索する側の PC（クライアント）</h3>
             <ol className="howto-steps">
               <li>
-                左の「リモート」で検索モードを「リモートのみ」または「ハイブリッド」にします
+                左の「インデックス共有」で検索モードを「ホストのみ」または「ハイブリッド」にします
               </li>
               <li>
-                リモート URL（例: <code>http://192.168.0.8:17890</code>
-                ）とホストと同じトークンを入力します
+                ホスト URL（例: <code>http://192.168.0.8:17890</code>
+                ）と接続トークンを入力します
               </li>
               <li>「接続テスト」で確認してから設定を保存します</li>
             </ol>
@@ -1359,7 +1435,7 @@ export default function Settings() {
                 ホストが <code>C:\...</code>{" "}
                 などローカルパスだけをインデックスしていると、クライアントではプレビューはできてもファイルを開けないことがあります
               </li>
-              <li>詳細な項目は左の「リモート」でも設定・確認できます</li>
+              <li>詳細な項目は左の「インデックス共有」でも設定・確認できます</li>
             </ul>
           </section>
 
@@ -1426,8 +1502,11 @@ export default function Settings() {
           <section>
             <h2>検索対象フォルダ</h2>
             <p className="muted">
-              ここに追加したフォルダ内の文書が検索対象になります。LAN
-              公開が必要な場合のみ、各フォルダの「UNC」から共有パスを設定できます。
+              ここに追加したフォルダ内の文書がこの PC
+              の検索対象になります。
+              {settings.remoteServerEnabled
+                ? " LAN 上の他の Argos に出すフォルダだけ「共有」にしてください（再インデックスは不要）。入れ子の登録フォルダがあるときは、内側の切替が勝ちます。"
+                : ""}
             </p>
             <div className="row">
               <input
@@ -1457,6 +1536,9 @@ export default function Settings() {
                   const hasPublicPath = publicDraft.trim().length > 0;
                   const isBusy = busyFolderId === f.id;
                   const isMissing = f.exists === false;
+                  const shareHint = f.shareRemote
+                    ? "このフォルダは共有中です"
+                    : "このフォルダは共有オフです。";
                   return (
                     <li
                       key={f.id}
@@ -1489,6 +1571,42 @@ export default function Settings() {
                           </span>
                         ) : (
                           <span className="folder-actions">
+                            {settings.remoteServerEnabled ? (
+                            <div
+                              className="folder-share-toggle"
+                              role="group"
+                              aria-label="LAN共有"
+                            >
+                              <button
+                                type="button"
+                                className={f.shareRemote ? "active" : ""}
+                                disabled={indexing}
+                                aria-pressed={!!f.shareRemote}
+                                title={shareHint}
+                                onClick={() => {
+                                  if (!f.shareRemote) {
+                                    void setFolderShareRemote(f.id, true);
+                                  }
+                                }}
+                              >
+                                共有
+                              </button>
+                              <button
+                                type="button"
+                                className={f.shareRemote ? "" : "active"}
+                                disabled={indexing}
+                                aria-pressed={!f.shareRemote}
+                                title={shareHint}
+                                onClick={() => {
+                                  if (f.shareRemote) {
+                                    void setFolderShareRemote(f.id, false);
+                                  }
+                                }}
+                              >
+                                オフ
+                              </button>
+                            </div>
+                            ) : null}
                             {isMissing ? (
                               <button
                                 type="button"
@@ -1499,36 +1617,7 @@ export default function Settings() {
                               >
                                 場所を指定
                               </button>
-                            ) : (
-                              <button
-                                type="button"
-                                disabled={indexing}
-                                title="エクスプローラーなどでフォルダ名を変更・移動したときに使います。新しい場所を選び、既存の検索インデックスを紐づけ直します（本文の再読み込みはしません）"
-                                onClick={() => void rebindFolder(f.id)}
-                              >
-                                パス変更
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              className={
-                                publicOpen || hasPublicPath
-                                  ? "folder-public-toggle is-active"
-                                  : "folder-public-toggle"
-                              }
-                              aria-expanded={publicOpen}
-                              title={
-                                hasPublicPath
-                                  ? `LAN公開用のUNCパスを表示・編集（設定済: ${publicDraft}）`
-                                  : "LAN公開用のUNCパスを表示・編集"
-                              }
-                              onClick={() =>
-                                setPublicPathOpenId(publicOpen ? null : f.id)
-                              }
-                            >
-                              UNC
-                              {hasPublicPath && !publicOpen ? " ✓" : ""}
-                            </button>
+                            ) : null}
                             <button
                               type="button"
                               disabled={indexing}
@@ -1539,13 +1628,85 @@ export default function Settings() {
                             </button>
                             <button
                               type="button"
-                              className="danger"
+                              className={
+                                folderMenuId === f.id
+                                  ? "folder-more is-open"
+                                  : "folder-more"
+                              }
+                              aria-label="その他の操作"
+                              aria-haspopup="menu"
+                              aria-expanded={folderMenuId === f.id}
                               disabled={indexing}
-                              title="このフォルダを検索対象から削除する"
-                              onClick={() => void removeFolder(f.id)}
+                              ref={
+                                folderMenuId === f.id
+                                  ? folderMenuBtnRef
+                                  : undefined
+                              }
+                              onClick={() =>
+                                setFolderMenuId((cur) =>
+                                  cur === f.id ? null : f.id,
+                                )
+                              }
                             >
-                              削除
+                              ⋯
                             </button>
+                            {folderMenuId === f.id ? (
+                              <div
+                                ref={folderMenuRef}
+                                className="folder-more-menu"
+                                role="menu"
+                                style={folderMenuStyle}
+                              >
+                                {isMissing ? null : (
+                                  <button
+                                    type="button"
+                                    role="menuitem"
+                                    disabled={indexing}
+                                    title="エクスプローラーなどでフォルダ名を変更・移動したときに使います。新しい場所を選び、既存の検索インデックスを紐づけ直します（本文の再読み込みはしません）"
+                                    onClick={() => {
+                                      setFolderMenuId(null);
+                                      void rebindFolder(f.id);
+                                    }}
+                                  >
+                                    パス変更
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  className={
+                                    hasPublicPath ? "is-active" : undefined
+                                  }
+                                  aria-expanded={publicOpen}
+                                  title={
+                                    hasPublicPath
+                                      ? `LAN公開用のUNCパスを表示・編集（設定済: ${publicDraft}）`
+                                      : "LAN公開用のUNCパスを表示・編集"
+                                  }
+                                  onClick={() => {
+                                    setFolderMenuId(null);
+                                    setPublicPathOpenId(
+                                      publicOpen ? null : f.id,
+                                    );
+                                  }}
+                                >
+                                  UNC{hasPublicPath ? " ✓" : ""}
+                                </button>
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  className="danger"
+                                  disabled={indexing}
+                                  title="このフォルダを検索対象から削除する"
+                                  onClick={() => {
+                                    setFolderMenuId(null);
+                                    void removeFolder(f.id);
+                                  }}
+                                >
+                                  削除
+                                </button>
+                              </div>
+                            ) : null}
                           </span>
                         )}
                       </div>
@@ -1555,10 +1716,21 @@ export default function Settings() {
                         </p>
                       ) : null}
                       {publicOpen && !isBusy ? (
-                        <label className="folder-public">
-                          <span className="field-label">
-                            公開パス（UNC）— LAN 上の別 PC から開く場合に設定
-                          </span>
+                        <div className="folder-public">
+                          <div className="folder-public-head">
+                            <span className="field-label">
+                              公開パス（UNC）— LAN 上の別 PC から開く場合に設定
+                            </span>
+                            <button
+                              type="button"
+                              className="folder-public-close"
+                              title="閉じる"
+                              aria-label="閉じる"
+                              onClick={() => setPublicPathOpenId(null)}
+                            >
+                              ×
+                            </button>
+                          </div>
                           <span className="folder-public-row">
                             <input
                               placeholder="例: \\このPC名\共有名（空なら上記パスをそのまま使用）"
@@ -1569,6 +1741,12 @@ export default function Settings() {
                                   [f.id]: e.target.value,
                                 }))
                               }
+                              onKeyDown={(e) => {
+                                if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  setPublicPathOpenId(null);
+                                }
+                              }}
                             />
                             <button
                               type="button"
@@ -1579,7 +1757,7 @@ export default function Settings() {
                               保存
                             </button>
                           </span>
-                        </label>
+                        </div>
                       ) : null}
                     </li>
                   );
@@ -1587,8 +1765,13 @@ export default function Settings() {
               )}
             </ul>
             <p className="field-hint">
-              フォルダ追加時はこのフォルダだけ自動でインデックスされます。UNC
-              は必要なときだけ「UNC」から設定してください。
+              フォルダを追加すると、そのフォルダだけが自動でインデックスされます。ほかの登録フォルダは対象外です。
+              {settings.remoteServerEnabled
+                ? " 追加したフォルダの共有はオフです。"
+                : ""}{" "}
+              LAN 上の別 PC からファイルを開きたいときだけ、各フォルダ右端の ⋯
+              →「UNC」で公開パス（例: \\PC名\共有名）を設定してください。この PC
+              だけで使うなら不要です。
             </p>
           </section>
 
@@ -2426,28 +2609,37 @@ export default function Settings() {
           <section>
             <h2>この PC を検索ホストにする</h2>
             <p className="muted">
-              有効にすると、ローカルインデックスを LAN 上の他の Argos から検索できるようになります（既定ポート
-              17890）。Windows ファイアウォールで当該ポートの受信を許可してください。
+              有効にすると、フォルダ設定で「LAN共有」を付けた登録フォルダのインデックスだけを、LAN
+              上の他の Argos から検索できるようになります（既定ポート
+              17890）。共有フォルダがゼロ件なら、サーバをオンにしてもファイルは出ません。Windows
+              ファイアウォールで当該ポートの受信を許可してください。
             </p>
-            <label className="row-check">
-              <input
-                type="checkbox"
-                checked={settings.remoteServerEnabled}
-                onChange={(e) => {
-                  const enabled = e.target.checked;
-                  setSettings({
-                    ...settings,
-                    remoteServerEnabled: enabled,
-                    remoteServerToken:
-                      enabled && !settings.remoteServerToken.trim()
-                        ? newToken()
-                        : settings.remoteServerToken,
-                  });
-                }}
-              />
-              リモート検索サーバを有効にする
-            </label>
             <div className="options-form">
+              <label
+                className={
+                  settings.remoteServerEnabled ? "ui-switch is-on" : "ui-switch"
+                }
+              >
+                <span className="field-label">このPCのインデックスを共有する</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  className="ui-switch-input"
+                  type="checkbox"
+                  checked={settings.remoteServerEnabled}
+                  onChange={(e) => {
+                    const enabled = e.target.checked;
+                    setSettings({
+                      ...settings,
+                      remoteServerEnabled: enabled,
+                      remoteServerToken:
+                        enabled && !settings.remoteServerToken.trim()
+                          ? newToken()
+                          : settings.remoteServerToken,
+                    });
+                  }}
+                />
+                <span className="ui-switch-track" aria-hidden="true" />
+              </label>
               <label>
                 <span className="field-label">ポート</span>
                 <span className="field-leader" aria-hidden="true" />
@@ -2489,11 +2681,17 @@ export default function Settings() {
             <p className="field-hint">
               初回有効化時に UUID 乱数が自動生成されます。任意の文字列への変更や「トークンを再生成」も可能です。トークンは{" "}
               <code>%APPDATA%\Argos\argos.db</code>{" "}
-              に保存されます。漏洩時は再生成のうえ、全クライアントのリモートトークンを更新してください。
+              に保存されます。漏洩時は再生成のうえ、全クライアントの接続トークンを更新してください。
             </p>
             <p className="field-hint">
               クライアント用 URL の例: <code>{clientUrlHint}</code>
               （トークンもクライアントに同じものを設定）
+            </p>
+            <p className="field-hint">
+              いま LAN 共有している登録フォルダ:{" "}
+              {folders.filter((f) => f.shareRemote).length.toLocaleString()} /{" "}
+              {folders.length.toLocaleString()}{" "}
+              （変更は「フォルダ設定」）
             </p>
           </section>
 
@@ -2523,7 +2721,7 @@ export default function Settings() {
                 </select>
               </label>
               <label>
-                <span className="field-label">リモート URL</span>
+                <span className="field-label">ホスト URL</span>
                 <span className="field-leader" aria-hidden="true" />
                 <input
                   type="text"
@@ -2535,7 +2733,7 @@ export default function Settings() {
                 />
               </label>
               <label>
-                <span className="field-label">リモートトークン</span>
+                <span className="field-label">接続トークン</span>
                 <span className="field-leader" aria-hidden="true" />
                 <input
                   type="text"
