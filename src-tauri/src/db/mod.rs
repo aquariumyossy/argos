@@ -2897,6 +2897,116 @@ impl Db {
         Ok(())
     }
 
+    /// Image rows in this thread that share `path` (case-insensitive). Empty path → none.
+    pub fn list_llm_image_group(
+        &self,
+        thread_id: &str,
+        path: &str,
+    ) -> Result<Vec<LlmSourceRow>, rusqlite::Error> {
+        let want = crate::pathutil::simplify_windows_path(path.trim());
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows: Vec<LlmSourceRow> = self
+            .list_llm_sources(thread_id)?
+            .into_iter()
+            .filter(|s| {
+                s.is_image()
+                    && crate::pathutil::simplify_windows_path(s.path.trim())
+                        .eq_ignore_ascii_case(&want)
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            fn page(s: &LlmSourceRow) -> Option<u32> {
+                s.paragraph_id
+                    .trim()
+                    .strip_prefix("pdf-page:")
+                    .and_then(|r| r.parse().ok())
+            }
+            match (page(a), page(b)) {
+                (Some(x), Some(y)) => x.cmp(&y).then(a.sort_order.cmp(&b.sort_order)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a
+                    .sort_order
+                    .cmp(&b.sort_order)
+                    .then(a.created_at.cmp(&b.created_at)),
+            }
+        });
+        Ok(rows)
+    }
+
+    /// Write `cite_no` onto siblings that still have none, so the next send does not mint a new [n].
+    pub fn apply_image_group_cite(
+        &self,
+        thread_id: &str,
+        path: &str,
+        cite_no: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        if cite_no <= 0 {
+            return Ok(0);
+        }
+        let rows = self.list_llm_image_group(thread_id, path)?;
+        let conn = self.conn.lock();
+        let mut n = 0usize;
+        for row in rows {
+            if row.cite_no > 0 {
+                continue;
+            }
+            conn.execute(
+                "UPDATE llm_thread_sources SET cite_no=?1 WHERE id=?2 AND cite_no=0",
+                rusqlite::params![cite_no, row.id],
+            )?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// After OCR finishes, copy cite / injected ids from a sibling so the page stays on the same turn.
+    pub fn inherit_image_group_meta(&self, id: &str) -> Result<(), rusqlite::Error> {
+        let Some(row) = self.get_llm_source(id)? else {
+            return Ok(());
+        };
+        if !row.is_image() {
+            return Ok(());
+        }
+        let want = crate::pathutil::simplify_windows_path(row.path.trim());
+        if want.is_empty() {
+            return Ok(());
+        }
+        let siblings = self.list_llm_image_group(&row.thread_id, &row.path)?;
+        let donor = siblings
+            .iter()
+            .filter(|s| s.id != row.id)
+            .find(|s| s.cite_no > 0 || !s.injected_user_message_id.trim().is_empty());
+        let Some(d) = donor else {
+            return Ok(());
+        };
+        let cite = if row.cite_no > 0 {
+            row.cite_no
+        } else {
+            d.cite_no
+        };
+        let injected = if row.injected_user_message_id.trim().is_empty() {
+            d.injected_user_message_id.as_str()
+        } else {
+            row.injected_user_message_id.as_str()
+        };
+        let cited = if row.cited_assistant_message_id.trim().is_empty() {
+            d.cited_assistant_message_id.as_str()
+        } else {
+            row.cited_assistant_message_id.as_str()
+        };
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_thread_sources
+             SET cite_no=?1, injected_user_message_id=?2, cited_assistant_message_id=?3
+             WHERE id=?4",
+            rusqlite::params![cite, injected, cited, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_llm_source_grain(
         &self,
         id: &str,
@@ -3303,6 +3413,167 @@ mod llm_source_pending_tests {
             .unwrap()
             .expect("page source");
         assert_eq!(found.paragraph_id, "pdf-page:1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_group_cite_fills_zero_only() {
+        let (dir, db) = temp_db();
+        let thread = db.create_llm_thread("t", false).unwrap();
+        let (p1, _) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                r"C:\scan.pdf",
+                "scan.pdf（1ページ目）",
+                "pdf-page:1",
+                "a",
+                "",
+                "file",
+                "image",
+                "a.jpg",
+                "",
+                Some("p1"),
+            )
+            .unwrap();
+        let (p2, _) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                r"C:\SCAN.PDF",
+                "scan.pdf（2ページ目）",
+                "pdf-page:2",
+                "b",
+                "",
+                "file",
+                "image",
+                "b.jpg",
+                "",
+                Some("p2"),
+            )
+            .unwrap();
+        db.set_llm_source_cite_no(&p1.id, 3).unwrap();
+        db.apply_image_group_cite(&thread.id, r"C:\scan.pdf", 3)
+            .unwrap();
+        let g = db.list_llm_image_group(&thread.id, r"C:\scan.pdf").unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].id, p1.id);
+        assert_eq!(g[0].cite_no, 3);
+        assert_eq!(g[1].id, p2.id);
+        assert_eq!(g[1].cite_no, 3);
+        db.set_llm_source_cite_no(&p2.id, 5).unwrap();
+        db.apply_image_group_cite(&thread.id, r"C:\scan.pdf", 3)
+            .unwrap();
+        let p2b = db.get_llm_source(&p2.id).unwrap().unwrap();
+        assert_eq!(p2b.cite_no, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inherit_image_group_meta_copies_injected() {
+        let (dir, db) = temp_db();
+        let thread = db.create_llm_thread("t", false).unwrap();
+        let (p1, _) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                r"C:\scan.pdf",
+                "scan.pdf（1ページ目）",
+                "pdf-page:1",
+                "a",
+                "",
+                "file",
+                "image",
+                "a.jpg",
+                "",
+                Some("p1"),
+            )
+            .unwrap();
+        let (p2, _) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                r"C:\scan.pdf",
+                "scan.pdf（2ページ目）",
+                "pdf-page:2",
+                "b",
+                "",
+                "file",
+                "image",
+                "b.jpg",
+                "",
+                Some("p2"),
+            )
+            .unwrap();
+        db.consume_llm_sources(&[(p1.id.clone(), 4)], "u1", "a1")
+            .unwrap();
+        db.inherit_image_group_meta(&p2.id).unwrap();
+        let p2b = db.get_llm_source(&p2.id).unwrap().unwrap();
+        assert_eq!(p2b.cite_no, 4);
+        assert_eq!(p2b.injected_user_message_id, "u1");
+        assert_eq!(p2b.cited_assistant_message_id, "a1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_image_group_removes_all_pages() {
+        let (dir, db) = temp_db();
+        let thread = db.create_llm_thread("t", false).unwrap();
+        db.insert_llm_source_full(
+            &thread.id,
+            "attach",
+            r"C:\scan.pdf",
+            "scan.pdf（1ページ目）",
+            "pdf-page:1",
+            "a",
+            "",
+            "file",
+            "image",
+            "a.jpg",
+            "",
+            Some("p1"),
+        )
+        .unwrap();
+        db.insert_llm_source_full(
+            &thread.id,
+            "attach",
+            r"C:\scan.pdf",
+            "scan.pdf（2ページ目）",
+            "pdf-page:2",
+            "b",
+            "",
+            "file",
+            "image",
+            "b.jpg",
+            "",
+            Some("p2"),
+        )
+        .unwrap();
+        db.insert_llm_source_full(
+            &thread.id,
+            "tool",
+            r"C:\scan.pdf",
+            "scan.pdf",
+            "p99",
+            "hit",
+            "q",
+            "unit",
+            "text",
+            "",
+            "",
+            Some("t1"),
+        )
+        .unwrap();
+        let g = db.list_llm_image_group(&thread.id, r"C:\scan.pdf").unwrap();
+        assert_eq!(g.len(), 2);
+        for row in g {
+            db.delete_llm_source(&row.id).unwrap();
+        }
+        assert!(db
+            .list_llm_image_group(&thread.id, r"C:\scan.pdf")
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.list_llm_sources(&thread.id).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

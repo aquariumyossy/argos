@@ -114,9 +114,21 @@
   background: #fff;
 }
 
-.preview-image-transcript {
-  white-space: pre-wrap;
-  margin: 0;
+.preview-image-page {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.preview-image-page:last-child {
+  margin-bottom: 0;
+}
+
+.preview-image-page-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
 }
 
 .preview-scroll {

@@ -79,3 +79,13 @@ export function IconClose() {
     </HitActionIcon>
   );
 }
+
+export function IconSave() {
+  return (
+    <HitActionIcon>
+      <path d="M3.5 3.5h7.2L12.5 5.3V12.5H3.5V3.5Z" />
+      <path d="M5.25 3.5v3.2h4.3V3.5" />
+      <path d="M5.5 9.5h5" />
+    </HitActionIcon>
+  );
+}

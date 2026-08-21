@@ -17,6 +17,15 @@ import ChatScopePicker from "./ChatScopePicker";
 import { AssistantBody } from "./AssistantBody";
 import { openPreview } from "../preview/openPreview";
 import { highlightText } from "../search/highlightText";
+import {
+  fileLabel,
+  groupOcrState,
+  groupSources,
+  imageGroupKey,
+  isImageSource,
+  ocrIncomplete,
+  openableCitesFromGroups,
+} from "./sourceGroups";
 import "./chat.css";
 
 type LlmThreadRow = {
@@ -174,16 +183,6 @@ function isFileGrain(s: LlmSourceRow): boolean {
   return (s.grain ?? "unit").toLowerCase() === "file";
 }
 
-function isImageSource(s: LlmSourceRow): boolean {
-  return (s.kind ?? "text").toLowerCase() === "image";
-}
-
-function ocrIncomplete(s: LlmSourceRow): boolean {
-  const st = (s.ocrStatus ?? "").trim().toLowerCase();
-  if (st === "pending" || st === "error") return true;
-  return isImageSource(s) && !(s.body ?? "").trim();
-}
-
 function sourceCanExpand(s: LlmSourceRow): boolean {
   if (isImageSource(s)) return false;
   if (!s.path.trim()) return false;
@@ -202,24 +201,6 @@ function isUncitedToolSource(s: LlmSourceRow): boolean {
   return !injected && (s.origin ?? "").toLowerCase() === "tool";
 }
 
-function citeNoOf(s: LlmSourceRow, fallback: number): number {
-  return s.citeNo && s.citeNo > 0 ? s.citeNo : fallback;
-}
-
-function openableCites(
-  rows: LlmSourceRow[],
-  fallbackStart: number,
-): { nos: Set<number>; byNo: Map<number, LlmSourceRow> } {
-  const nos = new Set<number>();
-  const byNo = new Map<number, LlmSourceRow>();
-  rows.forEach((s, i) => {
-    const n = citeNoOf(s, fallbackStart + i);
-    byNo.set(n, s);
-    if (s.path.trim()) nos.add(n);
-  });
-  return { nos, byNo };
-}
-
 function citedForMessage(
   sources: LlmSourceRow[],
   messageId: string,
@@ -227,6 +208,10 @@ function citedForMessage(
   return sources
     .filter((s) => (s.citedAssistantMessageId ?? "") === messageId)
     .sort((a, b) => (a.citeNo ?? 0) - (b.citeNo ?? 0) || a.sortOrder - b.sortOrder);
+}
+
+function chipLabel(s: LlmSourceRow): string {
+  return imageGroupKey(s) ? fileLabel(s) : sourceLabel(s);
 }
 
 function IconAttach() {
@@ -663,9 +648,19 @@ export default function Chat() {
     [sources],
   );
 
-  const liveCiteInfo = useMemo(
-    () => openableCites(liveCites, maxCitedNo + 1),
+  const pendingGroups = useMemo(
+    () => groupSources(pendingSources, maxCitedNo + 1),
+    [pendingSources, maxCitedNo],
+  );
+
+  const liveCiteGroups = useMemo(
+    () => groupSources(liveCites, maxCitedNo + 1),
     [liveCites, maxCitedNo],
+  );
+
+  const liveCiteInfo = useMemo(
+    () => openableCitesFromGroups(liveCiteGroups),
+    [liveCiteGroups],
   );
 
   const overBudget = estimatedChars > maxContextChars;
@@ -744,7 +739,7 @@ export default function Chat() {
         path,
         paragraphId: s.paragraphId,
         query: s.query,
-        title: s.title,
+        title: imageGroupKey(s) ? fileLabel(s) : s.title,
         fallbackBody: s.body,
         kind: s.kind,
         sourceId: s.id,
@@ -755,9 +750,15 @@ export default function Chat() {
   }
 
   async function removeSource(id: string) {
+    const seed = sources.find((s) => s.id === id);
+    const key = seed ? imageGroupKey(seed) : null;
     try {
       await invoke("llm_remove_source", { id });
-      setSources((prev) => prev.filter((s) => s.id !== id));
+      setSources((prev) =>
+        key
+          ? prev.filter((s) => imageGroupKey(s) !== key)
+          : prev.filter((s) => s.id !== id),
+      );
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1306,7 +1307,8 @@ export default function Chat() {
             messages.map((m) => {
               const cites =
                 m.role === "assistant" ? citedForMessage(sources, m.id) : [];
-              const citeInfo = openableCites(cites, 1);
+              const citeGroups = groupSources(cites, 1);
+              const citeInfo = openableCitesFromGroups(citeGroups);
               return (
                 <article
                   key={m.id}
@@ -1327,27 +1329,27 @@ export default function Chat() {
                   ) : (
                     <div className="chat-msg-body">{m.content}</div>
                   )}
-                  {cites.length > 0 ? (
+                  {citeGroups.length > 0 ? (
                     <div className="chat-msg-cites" aria-label="出典">
-                      {cites.map((s, i) => {
-                        const n = citeNoOf(s, i + 1);
+                      {citeGroups.map((g) => {
+                        const s = g.representative;
                         const path = s.path.trim();
                         if (!path) {
                           return (
-                            <span key={s.id} className="chat-cite-badge">
-                              [{n}] {sourceLabel(s)}
+                            <span key={g.key} className="chat-cite-badge">
+                              [{g.citeNo}] {chipLabel(s)}
                             </span>
                           );
                         }
                         return (
                           <button
-                            key={s.id}
+                            key={g.key}
                             type="button"
                             className="chat-cite-badge clickable"
                             title="プレビュー"
                             onClick={() => void openSource(s)}
                           >
-                            [{n}] {sourceLabel(s)}
+                            [{g.citeNo}] {chipLabel(s)}
                           </button>
                         );
                       })}
@@ -1379,27 +1381,27 @@ export default function Chat() {
                 showCaret={!!stream || (!thinking && !toolHint)}
                 onLayout={scrollLog}
               />
-              {liveCites.length > 0 ? (
+              {liveCiteGroups.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
-                  {liveCites.map((s, i) => {
-                    const n = citeNoOf(s, maxCitedNo + i + 1);
+                  {liveCiteGroups.map((g) => {
+                    const s = g.representative;
                     const path = s.path.trim();
                     if (!path) {
                       return (
-                        <span key={s.id} className="chat-cite-badge">
-                          [{n}] {sourceLabel(s)}
+                        <span key={g.key} className="chat-cite-badge">
+                          [{g.citeNo}] {chipLabel(s)}
                         </span>
                       );
                     }
                     return (
                       <button
-                        key={s.id}
+                        key={g.key}
                         type="button"
                         className="chat-cite-badge clickable"
                         title="プレビュー"
                         onClick={() => void openSource(s)}
                       >
-                        [{n}] {sourceLabel(s)}
+                        [{g.citeNo}] {chipLabel(s)}
                       </button>
                     );
                   })}
@@ -1420,37 +1422,30 @@ export default function Chat() {
             void send();
           }}
         >
-          {pendingSources.length > 0 ? (
+          {pendingGroups.length > 0 ? (
             <div className="chat-sources" aria-label="これから読む出典">
-              {pendingSources.map((s, i) => {
+              {pendingGroups.map((g) => {
+                const s = g.representative;
                 const expandable = sourceCanExpand(s);
                 const fileGrain = isFileGrain(s);
                 const image = isImageSource(s);
-                const ocr = (s.ocrStatus ?? "").trim().toLowerCase();
-                const reading = ocr === "pending" && ocrBusy;
-                const interrupted =
-                  ocr === "error" || (ocr === "pending" && !ocrBusy);
-                const n = citeNoOf(s, maxCitedNo + i + 1);
+                const ocr = groupOcrState(g, ocrBusy);
+                const n = g.citeNo;
                 const chipClass = [
                   "chat-source-chip",
                   fileGrain || image ? "file" : "",
-                  interrupted ? "ocr-error" : "",
+                  ocr.interrupted ? "ocr-error" : "",
                 ]
                   .filter(Boolean)
                   .join(" ");
-                const badge = reading
-                  ? "読み取り中"
-                  : interrupted
-                    ? ocr === "error"
-                      ? "失敗"
-                      : "中断"
-                    : image
-                      ? "画像"
-                      : fileGrain
-                        ? "全文"
-                        : null;
+                const badge = ocr.badge
+                  ? ocr.badge
+                  : fileGrain && !image
+                    ? "全文"
+                    : null;
+                const label = chipLabel(s);
                 return (
-                  <span key={s.id} className={chipClass}>
+                  <span key={g.key} className={chipClass}>
                     {expandable ? (
                       <button
                         type="button"
@@ -1463,7 +1458,7 @@ export default function Chat() {
                         }
                         onClick={() => void toggleSourceGrain(s)}
                       >
-                        [{n}] {sourceLabel(s)}
+                        [{n}] {label}
                         {badge ? (
                           <span className="chat-source-badge">{badge}</span>
                         ) : null}
@@ -1475,13 +1470,13 @@ export default function Chat() {
                         title="プレビュー"
                         onClick={() => void openSource(s)}
                       >
-                        [{n}] {sourceLabel(s)}
+                        [{n}] {label}
                         {badge ? (
                           <span className="chat-source-badge">{badge}</span>
                         ) : null}
                       </button>
                     )}
-                    {interrupted ? (
+                    {ocr.interrupted ? (
                       <button
                         type="button"
                         className="chat-source-retry"
@@ -1508,7 +1503,7 @@ export default function Chat() {
                       type="button"
                       className="chat-source-remove"
                       title="出典を外す"
-                      aria-label={`${sourceLabel(s)}を外す`}
+                      aria-label={`${label}を外す`}
                       disabled={blocked}
                       onClick={() => void removeSource(s.id)}
                     >

@@ -404,6 +404,7 @@ pub async fn llm_send(
         .iter()
         .map(|c| (c.id.clone(), c.cite_no))
         .collect();
+    persist_image_group_cites(&state.db, &sources, &consumed);
     let mut next_cite = state
         .db
         .max_llm_cite_no(&thread.id)
@@ -795,6 +796,7 @@ async fn run_ocr_for_thread(app: &AppHandle, state: Arc<AppState>, thread_id: St
         match result {
             Ok(text) => {
                 let _ = state.db.update_llm_source_ocr(&row.id, &text, "");
+                let _ = state.db.inherit_image_group_meta(&row.id);
             }
             Err(e) => {
                 let _ = state.db.update_llm_source_ocr(&row.id, "", "error");
@@ -874,6 +876,28 @@ pub struct LlmGrainResult {
     pub removed: usize,
 }
 
+fn persist_image_group_cites(db: &crate::db::Db, all: &[LlmSourceRow], consumed: &[(String, i64)]) {
+    let mut seen = std::collections::HashSet::new();
+    for (id, n) in consumed {
+        let Some(row) = all.iter().find(|s| s.id == *id) else {
+            continue;
+        };
+        let Some(key) = crate::llm::transcript::image_group_key(row) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        let _ = db.apply_image_group_cite(&row.thread_id, &row.path, *n);
+    }
+}
+
+fn delete_image_group_files(data_dir: &Path, members: &[LlmSourceRow]) {
+    for m in members {
+        files::remove_stored(data_dir, &m.stored_relpath);
+    }
+}
+
 #[tauri::command]
 pub fn llm_remove_source(
     app: AppHandle,
@@ -885,8 +909,21 @@ pub fn llm_remove_source(
         .get_llm_source(&id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "出典が見つかりません".to_string())?;
+    let thread_id = row.thread_id.clone();
+    if crate::llm::transcript::image_group_key(&row).is_some() {
+        let members = state
+            .db
+            .list_llm_image_group(&thread_id, &row.path)
+            .map_err(|e| e.to_string())?;
+        delete_image_group_files(&state.data_dir, &members);
+        for m in members {
+            let _ = state.db.delete_llm_source(&m.id);
+        }
+        emit_sources_updated(&app, &thread_id);
+        return Ok(());
+    }
     let stored = row.stored_relpath.clone();
-    let thread_id = state
+    state
         .db
         .delete_llm_source(&id)
         .map_err(|e| e.to_string())?
@@ -1135,6 +1172,23 @@ pub struct LlmAttachFilesResult {
 pub struct LlmSourceImage {
     pub mime: String,
     pub data_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmImageSourceGroup {
+    pub title: String,
+    pub path: String,
+    pub pages: Vec<LlmSourceRow>,
+    pub can_save: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmSaveTranscript {
+    pub path: String,
+    pub existed: bool,
+    pub written: bool,
 }
 
 fn resolve_attach_thread(
@@ -1477,14 +1531,32 @@ pub fn llm_retry_ocr(
     if !row.is_image() {
         return Err("画像出典ではありません。".into());
     }
-    if !row.is_pending() {
-        return Err("読み込み済みの出典は再読み取りできません。".into());
+    let members = if crate::llm::transcript::image_group_key(&row).is_some() {
+        state
+            .db
+            .list_llm_image_group(&row.thread_id, &row.path)
+            .map_err(|e| e.to_string())?
+    } else {
+        vec![row.clone()]
+    };
+    let mut reset = 0usize;
+    for m in &members {
+        if !m.is_pending() {
+            continue;
+        }
+        if !m.ocr_status.eq_ignore_ascii_case("error") {
+            continue;
+        }
+        state
+            .db
+            .update_llm_source_ocr(&m.id, "", "pending")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "出典が見つかりません".to_string())?;
+        reset += 1;
     }
-    state
-        .db
-        .update_llm_source_ocr(&id, "", "pending")
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    if reset == 0 && row.is_pending() && row.ocr_status.eq_ignore_ascii_case("error") {
+        return Err("再読み取りできるページがありません。".into());
+    }
     let sources = state
         .db
         .list_llm_sources(&row.thread_id)
@@ -1494,6 +1566,77 @@ pub fn llm_retry_ocr(
         kick_pending_ocr(&app, state.inner().clone());
     }
     Ok(sources)
+}
+
+#[tauri::command]
+pub fn llm_image_source_group(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<LlmImageSourceGroup, String> {
+    let row = state
+        .db
+        .get_llm_source(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    if !row.is_image() {
+        return Err("画像出典ではありません。".into());
+    }
+    let mut pages = if crate::llm::transcript::image_group_key(&row).is_some() {
+        state
+            .db
+            .list_llm_image_group(&row.thread_id, &row.path)
+            .map_err(|e| e.to_string())?
+    } else {
+        vec![row.clone()]
+    };
+    if pages.is_empty() {
+        pages.push(row.clone());
+    }
+    crate::llm::transcript::sort_image_pages(&mut pages);
+    let title = crate::llm::transcript::file_label(&row.path, &row.title);
+    let can_save = pages.iter().any(|s| s.is_injectable());
+    Ok(LlmImageSourceGroup {
+        title,
+        path: row.path.clone(),
+        pages,
+        can_save,
+    })
+}
+
+#[tauri::command]
+pub fn llm_save_source_transcript(
+    state: State<'_, Arc<AppState>>,
+    source_id: String,
+    overwrite: bool,
+) -> Result<LlmSaveTranscript, String> {
+    let row = state
+        .db
+        .get_llm_source(&source_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    if !row.is_image() {
+        return Err("画像出典ではありません。".into());
+    }
+    let mut members = if crate::llm::transcript::image_group_key(&row).is_some() {
+        state
+            .db
+            .list_llm_image_group(&row.thread_id, &row.path)
+            .map_err(|e| e.to_string())?
+    } else {
+        vec![row.clone()]
+    };
+    if members.is_empty() {
+        members.push(row);
+    }
+    crate::llm::transcript::sort_image_pages(&mut members);
+    let plan = crate::llm::transcript::prepare_transcript_save(&members)?;
+    let (existed, written) =
+        crate::llm::transcript::write_md_file(&plan.dest, &plan.markdown, overwrite)?;
+    Ok(LlmSaveTranscript {
+        path: plan.dest.to_string_lossy().into_owned(),
+        existed,
+        written,
+    })
 }
 
 #[tauri::command]

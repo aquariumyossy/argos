@@ -157,34 +157,59 @@ pub fn final_source_turn(sources: &[LlmSourceRow], stop_tools: bool) -> Option<C
 }
 
 pub fn format_sources(sources: &[LlmSourceRow]) -> String {
-    if sources.is_empty() {
+    format_sources_with_pool(sources, sources)
+}
+
+/// Like [`format_sources`], but `pool` is the pre-trim set used to detect omitted pages.
+pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -> String {
+    if shown.is_empty() {
         return String::new();
     }
     let mut out = String::from("【出典】\n");
-    for s in sources {
-        let n = cite_no_of(s);
-        let title = if s.title.trim().is_empty() {
-            s.path.as_str()
+    for unit in crate::llm::transcript::walk_format_units(shown) {
+        let seed = unit[0];
+        if seed.is_image() && crate::llm::transcript::image_group_key(seed).is_some() {
+            let n = crate::llm::transcript::group_cite_no(&unit);
+            let title = crate::llm::transcript::file_label(&seed.path, &seed.title);
+            out.push_str(&format!("[{n}] {title}"));
+            if !seed.path.trim().is_empty() && seed.path.trim() != title {
+                out.push_str(" — ");
+                out.push_str(seed.path.trim());
+            }
+            out.push('\n');
+            out.push_str(IMAGE_TRANSCRIPT_NOTE);
+            out.push('\n');
+            if let Some(note) = crate::llm::transcript::omission_note(&unit, pool) {
+                out.push_str(&note);
+                out.push('\n');
+            }
+            let multi = unit.len() > 1;
+            out.push_str(&crate::llm::transcript::transcript_body(&unit, multi));
+            out.push_str("\n\n");
+            continue;
+        }
+
+        let n = cite_no_of(seed);
+        let title = if seed.title.trim().is_empty() {
+            seed.path.as_str()
         } else {
-            s.title.as_str()
+            seed.title.as_str()
         };
         out.push_str(&format!("[{n}] {title}"));
-        if !s.path.trim().is_empty() && s.path.trim() != title.trim() {
+        if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
             out.push_str(" — ");
-            out.push_str(s.path.trim());
+            out.push_str(seed.path.trim());
         }
-        // Without the id the model cannot call read_unit, so a shortened tool hit would
-        // be a dead end. Only shown where it is actionable: paragraph grain with an id.
-        let pid = s.paragraph_id.trim();
-        if !pid.is_empty() && !crate::llm::grain::is_file_grain(&s.grain) {
+        let pid = seed.paragraph_id.trim();
+        if !pid.is_empty() && !crate::llm::grain::is_file_grain(&seed.grain) {
             out.push_str(&format!(" (paragraph_id: {pid})"));
         }
         out.push('\n');
-        if s.is_image() {
+        if seed.is_image() {
             out.push_str(IMAGE_TRANSCRIPT_NOTE);
             out.push('\n');
         }
-        out.push_str(s.body.trim());
+        out.push_str(seed.body.trim());
         out.push_str("\n\n");
     }
     out
@@ -341,12 +366,7 @@ pub fn assemble_turns(
         select_sources(sources, source_budget, &pending_ids);
 
     let mut next_cite = sources.iter().map(|s| s.cite_no).max().unwrap_or(0);
-    for s in &mut kept {
-        if pending_ids.contains(&s.id) && s.cite_no <= 0 {
-            next_cite += 1;
-            s.cite_no = next_cite;
-        }
-    }
+    crate::llm::transcript::assign_group_cites(&mut kept, sources, &pending_ids, &mut next_cite);
 
     let consumed: Vec<ConsumedSource> = kept
         .iter()
@@ -357,7 +377,7 @@ pub fn assemble_turns(
         })
         .collect();
 
-    let source_chars = char_len(&format_sources(&kept));
+    let source_chars = char_len(&format_sources_with_pool(&kept, sources));
     let latest_user_id = hist
         .iter()
         .rev()
@@ -389,7 +409,7 @@ pub fn assemble_turns(
                 .collect();
             if !for_turn.is_empty() {
                 has_sources = true;
-                content = wrap_user(&format_sources(&for_turn), &content);
+                content = wrap_user(&format_sources_with_pool(&for_turn, sources), &content);
             }
         }
         built.push(BuiltTurn {
@@ -751,5 +771,123 @@ mod tests {
         let out = format_sources(&[img]);
         assert!(out.contains(IMAGE_TRANSCRIPT_NOTE), "{out}");
         assert!(out.contains("契約書の写真"), "{out}");
+    }
+
+    fn img_page(id: &str, page: u32, body: &str) -> LlmSourceRow {
+        let mut s = src(id, "attach", page as i64, body);
+        s.path = r"C:\docs\契約.pdf".into();
+        s.title = format!("契約.pdf（{page}ページ目）");
+        s.paragraph_id = format!("pdf-page:{page}");
+        s.kind = "image".into();
+        s.grain = "file".into();
+        s
+    }
+
+    #[test]
+    fn format_sources_merges_scan_pdf_pages() {
+        let mut a = img_page("p1", 1, "一枚目");
+        a.cite_no = 2;
+        let mut b = img_page("p2", 2, "二枚目");
+        b.cite_no = 3;
+        let mut c = img_page("p3", 3, "三枚目");
+        c.cite_no = 4;
+        let out = format_sources(&[a, b, c]);
+        assert_eq!(out.matches("[2]").count(), 1, "{out}");
+        assert!(!out.contains("[3]"), "{out}");
+        assert!(out.contains("契約.pdf"), "{out}");
+        assert!(!out.contains("（1ページ目）"), "{out}");
+        assert!(out.contains("## 1ページ目"), "{out}");
+        assert!(out.contains("## 2ページ目"), "{out}");
+        assert!(out.contains("一枚目"), "{out}");
+        assert!(!out.contains("paragraph_id"), "{out}");
+        assert_eq!(out.matches(IMAGE_TRANSCRIPT_NOTE).count(), 1, "{out}");
+    }
+
+    #[test]
+    fn format_sources_skips_pending_page_body() {
+        let a = img_page("p1", 1, "一枚目");
+        let mut pending = img_page("p2", 2, "");
+        pending.ocr_status = "pending".into();
+        let out = format_sources(&[a, pending]);
+        assert!(out.contains("一枚目"), "{out}");
+        assert!(out.contains("## 1ページ目"), "{out}");
+        assert!(!out.contains("## 2ページ目"), "{out}");
+    }
+
+    #[test]
+    fn format_sources_omits_dropped_pages() {
+        let pages = vec![
+            img_page("p1", 1, "一枚目"),
+            img_page("p2", 2, "二枚目"),
+            img_page("p3", 3, "三枚目"),
+        ];
+        let shown = vec![pages[0].clone(), pages[1].clone()];
+        let out = format_sources_with_pool(&shown, &pages);
+        assert!(out.contains("（3ページ以降は文字数のため省略）"), "{out}");
+        assert!(!out.contains("三枚目"), "{out}");
+    }
+
+    #[test]
+    fn format_sources_single_image_has_no_page_heading() {
+        let mut photo = src("pic", "attach", 0, "写真");
+        photo.kind = "image".into();
+        photo.grain = "file".into();
+        photo.path = r"C:\img\写真.jpg".into();
+        photo.title = "写真.jpg".into();
+        photo.paragraph_id.clear();
+        let out = format_sources(&[photo]);
+        assert!(!out.contains("ページ目"), "{out}");
+        assert!(out.contains("写真"), "{out}");
+    }
+
+    #[test]
+    fn format_sources_does_not_merge_text_hit_with_image() {
+        let mut img = img_page("p1", 1, "書き起こし");
+        img.cite_no = 1;
+        let mut hit = src("hit", "tool", 1, "検索ヒット");
+        hit.path = r"C:\docs\契約.pdf".into();
+        hit.title = "契約.pdf".into();
+        hit.cite_no = 5;
+        let out = format_sources(&[img, hit]);
+        assert!(out.contains("[1]"), "{out}");
+        assert!(out.contains("[5]"), "{out}");
+        assert!(out.contains("検索ヒット"), "{out}");
+        assert!(out.contains("書き起こし"), "{out}");
+        assert_eq!(out.matches("【出典】").count(), 1);
+        assert!(out.contains("paragraph_id: hit"), "{out}");
+    }
+
+    #[test]
+    fn assemble_consumes_all_pages_same_cite() {
+        let pages = vec![
+            img_page("p1", 1, "一枚目"),
+            img_page("p2", 2, "二枚目"),
+            img_page("p3", 3, "三枚目"),
+        ];
+        let history = vec![msg("u1", "user", "要約して")];
+        let (turns, stats) = assemble_turns("役割", &pages, &history, 80_000);
+        assert_eq!(stats.consumed.len(), 3);
+        assert!(stats.consumed.iter().all(|c| c.cite_no == 1));
+        let user = turns.iter().find(|t| t.role == "user").unwrap();
+        assert_eq!(user.content.matches("[1]").count(), 1, "{}", user.content);
+        assert!(user.content.contains("## 1ページ目"), "{}", user.content);
+        assert!(user.content.contains("三枚目"), "{}", user.content);
+    }
+
+    #[test]
+    fn assemble_inherits_sibling_cite_no() {
+        let mut first = img_page("p1", 1, "一枚目");
+        first.cite_no = 7;
+        first.injected_user_message_id = "u1".into();
+        let second = img_page("p2", 2, "二枚目");
+        let history = vec![
+            msg("u1", "user", "要約して"),
+            msg("a1", "assistant", "要約です"),
+            msg("u2", "user", "続き"),
+        ];
+        let (_, stats) = assemble_turns("役割", &[first, second], &history, 80_000);
+        assert_eq!(stats.consumed.len(), 1);
+        assert_eq!(stats.consumed[0].id, "p2");
+        assert_eq!(stats.consumed[0].cite_no, 7);
     }
 }

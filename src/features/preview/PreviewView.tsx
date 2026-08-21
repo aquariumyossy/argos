@@ -35,11 +35,49 @@ import {
   IconKeep,
   IconOpenFile,
   IconRescope,
+  IconSave,
 } from "./previewIcons";
 import type { PreviewFileResult, PreviewTarget, SearchHit } from "./types";
 import "./preview.css";
 
 const KEEP_TOAST_MS = 2200;
+
+type LlmImageGroupPage = {
+  id: string;
+  path: string;
+  title: string;
+  paragraphId?: string;
+  body: string;
+  ocrStatus?: string;
+};
+
+type LlmImageSourceGroup = {
+  title: string;
+  path: string;
+  pages: LlmImageGroupPage[];
+  canSave: boolean;
+};
+
+type LlmSaveTranscript = {
+  path: string;
+  existed: boolean;
+  written: boolean;
+};
+
+type ImagePageView = {
+  id: string;
+  pageNo: number | null;
+  body: string;
+  url: string | null;
+  imageError: boolean;
+};
+
+function pdfPageNo(paragraphId: string | undefined): number | null {
+  const m = /^(?:pdf-page:)(\d+)$/.exec((paragraphId ?? "").trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
 
 function destMenuOpen(): boolean {
   return Boolean(document.querySelector('[aria-expanded="true"]'));
@@ -85,6 +123,8 @@ export default function PreviewView({
   const [keepNotice, setKeepNotice] = useState("");
   const [fontSize, setFontSize] = useState(14);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [imagePages, setImagePages] = useState<ImagePageView[]>([]);
+  const [canSaveTranscript, setCanSaveTranscript] = useState(false);
   const previewScrollRef = useRef<HTMLDivElement>(null);
   const previewSeq = useRef(0);
   const keepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -109,6 +149,8 @@ export default function PreviewView({
       setLoading(false);
       setActionError("");
       setImageUrl(null);
+      setImagePages([]);
+      setCanSaveTranscript(false);
       return;
     }
     const seq = ++previewSeq.current;
@@ -119,6 +161,8 @@ export default function PreviewView({
     setMatchNavIndex(0);
     setActionError("");
     setImageUrl(null);
+    setImagePages([]);
+    setCanSaveTranscript(false);
     if ((target.kind ?? "").toLowerCase() === "image") {
       setPreviewFile({
         units: [seed],
@@ -131,19 +175,81 @@ export default function PreviewView({
         return;
       }
       setLoading(true);
-      void invoke<{ mime: string; dataUrl: string }>("llm_source_image", {
-        id: sourceId,
-      })
-        .then((img) => {
+      void (async () => {
+        try {
+          const group = await invoke<LlmImageSourceGroup>(
+            "llm_image_source_group",
+            { id: sourceId },
+          );
           if (seq !== previewSeq.current) return;
-          setImageUrl(img.dataUrl);
+          const pages = group.pages ?? [];
+          const first = pages[0];
+          const title = group.title || seed.title;
+          const path = group.path || seed.path;
+          setCanSaveTranscript(!!group.canSave);
+          setPreview({
+            ...seed,
+            title,
+            path,
+            previewText: first?.body || seed.previewText,
+            id: first?.paragraphId || first?.id || seed.id,
+          });
+          setPreviewUnitId(first?.paragraphId || first?.id || seed.id);
+          setPreviewFile({
+            units: pages.map((p) => ({
+              ...seed,
+              id: p.paragraphId || p.id,
+              title,
+              path,
+              previewText: p.body,
+              snippet: "",
+              unitLabel:
+                pages.length > 1 && pdfPageNo(p.paragraphId) != null
+                  ? `${pdfPageNo(p.paragraphId)}ページ目`
+                  : "",
+            })),
+            excerpt: false,
+            matchIds: pages.map((p) => p.paragraphId || p.id),
+          });
+          setImagePages(
+            pages.map((p) => ({
+              id: p.id,
+              pageNo: pdfPageNo(p.paragraphId),
+              body: p.body ?? "",
+              url: null,
+              imageError: false,
+            })),
+          );
+          for (const p of pages) {
+            if (seq !== previewSeq.current) return;
+            try {
+              const img = await invoke<{ mime: string; dataUrl: string }>(
+                "llm_source_image",
+                { id: p.id },
+              );
+              if (seq !== previewSeq.current) return;
+              setImagePages((prev) =>
+                prev.map((row) =>
+                  row.id === p.id ? { ...row, url: img.dataUrl } : row,
+                ),
+              );
+            } catch {
+              if (seq !== previewSeq.current) return;
+              setImagePages((prev) =>
+                prev.map((row) =>
+                  row.id === p.id ? { ...row, imageError: true } : row,
+                ),
+              );
+            }
+          }
+          if (seq !== previewSeq.current) return;
           setLoading(false);
-        })
-        .catch((e) => {
+        } catch (e) {
           if (seq !== previewSeq.current) return;
           setActionError(String(e));
           setLoading(false);
-        });
+        }
+      })();
       return;
     }
     if ((target.source || "").toLowerCase() === "remote") {
@@ -460,6 +566,33 @@ export default function PreviewView({
     [preview, previewFile, previewUnitId, query, showKeepNotice],
   );
 
+  const saveTranscript = useCallback(async () => {
+    const sourceId = (target?.sourceId ?? "").trim();
+    if (!sourceId) return;
+    setActionError("");
+    try {
+      let result = await invoke<LlmSaveTranscript>("llm_save_source_transcript", {
+        sourceId,
+        overwrite: false,
+      });
+      if (result.existed && !result.written) {
+        const ok = window.confirm(
+          `${result.path}\n既に同名のファイルがあります。上書きしますか？`,
+        );
+        if (!ok) return;
+        result = await invoke<LlmSaveTranscript>("llm_save_source_transcript", {
+          sourceId,
+          overwrite: true,
+        });
+      }
+      if (result.written) {
+        showKeepNotice(`書き起こしを保存した`);
+      }
+    } catch (e) {
+      setActionError(String(e));
+    }
+  }, [target?.sourceId, showKeepNotice]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -578,6 +711,17 @@ export default function PreviewView({
           >
             <IconChat />
           </ChatDestPicker>
+          {isImage && canSaveTranscript ? (
+            <button
+              type="button"
+              className="hit-action-btn"
+              title="書き起こしを Markdown で保存"
+              aria-label="書き起こしを保存"
+              onClick={() => void saveTranscript()}
+            >
+              <IconSave />
+            </button>
+          ) : null}
           <button
             type="button"
             className="hit-action-btn"
@@ -629,8 +773,44 @@ export default function PreviewView({
         <div className="preview-scroll" ref={previewScrollRef}>
           {isImage ? (
             <div className="preview-image-wrap">
-              {loading && !imageUrl ? (
+              {loading && imagePages.length === 0 && !imageUrl ? (
                 <div className="preview-empty">読み込み中…</div>
+              ) : imagePages.length > 0 ? (
+                imagePages.map((page) => (
+                  <div key={page.id} className="preview-image-page">
+                    {imagePages.length > 1 && page.pageNo != null ? (
+                      <div className="preview-image-page-label">
+                        {page.pageNo}ページ目
+                      </div>
+                    ) : null}
+                    {page.url ? (
+                      <img
+                        className="preview-image"
+                        src={page.url}
+                        alt={
+                          page.pageNo != null
+                            ? `${preview?.title || target.title || "添付画像"} ${page.pageNo}ページ目`
+                            : preview?.title || target.title || "添付画像"
+                        }
+                      />
+                    ) : page.imageError ? (
+                      <div className="preview-empty">画像を表示できませんでした</div>
+                    ) : loading ? (
+                      <div className="preview-empty">読み込み中…</div>
+                    ) : (
+                      <div className="preview-empty">画像を表示できませんでした</div>
+                    )}
+                    {page.body.trim() ? (
+                      <pre className="preview-body preview-image-transcript">
+                        {page.body}
+                      </pre>
+                    ) : (
+                      <div className="preview-excerpt-note">
+                        書き起こしがまだありません
+                      </div>
+                    )}
+                  </div>
+                ))
               ) : imageUrl ? (
                 <img
                   className="preview-image"
@@ -639,15 +819,6 @@ export default function PreviewView({
                 />
               ) : (
                 <div className="preview-empty">画像を表示できませんでした</div>
-              )}
-              {preview?.previewText?.trim() ? (
-                <pre className="preview-body preview-image-transcript">
-                  {preview.previewText}
-                </pre>
-              ) : (
-                <div className="preview-excerpt-note">
-                  書き起こしがまだありません
-                </div>
               )}
             </div>
           ) : loading && !previewFile ? (
