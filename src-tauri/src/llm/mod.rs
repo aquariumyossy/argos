@@ -6,6 +6,7 @@ pub mod files;
 pub mod grain;
 pub mod pdf_win;
 pub mod tools;
+pub mod transcript;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

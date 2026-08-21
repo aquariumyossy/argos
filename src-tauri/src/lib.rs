@@ -297,6 +297,8 @@ pub fn run() {
             llm::commands::llm_attach_files,
             llm::commands::llm_retry_ocr,
             llm::commands::llm_source_image,
+            llm::commands::llm_image_source_group,
+            llm::commands::llm_save_source_transcript,
             llm::commands::llm_attached_file_path,
             llm::commands::llm_remove_source,
             llm::commands::llm_preview_source_file,

@@ -45,7 +45,6 @@ pub struct SearchScopesResult {
     pub scopes: Vec<SearchScopeRow>,
 }
 
-const MAX_SUBFOLDERS_PER_ROOT: usize = 400;
 /// Wider than typical UI `max_results` so scope picker can see more matching folders.
 const SCOPE_QUERY_HIT_LIMIT: usize = 200;
 
@@ -113,7 +112,8 @@ fn collect_search_scopes(
         });
 
         let paths = list_paths(folder.id)?;
-        // BTreeMap keeps labels sorted for stable UI.
+        // BTreeMap keeps labels sorted for stable UI. Do not cap: a silent
+        // per-root limit dropped newer indexed folders from the picker.
         let mut subdirs: BTreeMap<String, String> = BTreeMap::new();
         for file_path in paths {
             let mut current = parent_dir(&file_path);
@@ -126,13 +126,7 @@ fn collect_search_scopes(
                 }
                 let key = dir.to_ascii_lowercase();
                 subdirs.entry(key).or_insert_with(|| dir.clone());
-                if subdirs.len() >= MAX_SUBFOLDERS_PER_ROOT {
-                    break;
-                }
                 current = parent_dir(&dir);
-            }
-            if subdirs.len() >= MAX_SUBFOLDERS_PER_ROOT {
-                break;
             }
         }
 
@@ -599,14 +593,8 @@ pub async fn search_query(
         let exts = search::normalize_exts(exts);
         let user_dict = state.user_dict.read().clone();
         let date = search::parse_date_range(date_after.as_deref(), date_before.as_deref())?;
-        let filter = search::build_search_filter(
-            &state.db,
-            date,
-            None,
-            prefix,
-            exts.as_deref(),
-            false,
-        )?;
+        let filter =
+            search::build_search_filter(&state.db, date, None, prefix, exts.as_deref(), false)?;
         search::run_search_with_mail_options(
             &settings,
             state.backend.as_ref(),
@@ -856,11 +844,10 @@ pub async fn open_hit(app: AppHandle, path: String) -> Result<(), String> {
             .ok_or_else(|| "Outlook メールのパスが不正です".to_string())?;
         let state = app.state::<Arc<AppState>>();
         let mail_h = state.mail.clone();
-        let opened = tauri::async_runtime::spawn_blocking(move || {
-            mail_h.open_item(&store_id, &entry_id)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        let opened =
+            tauri::async_runtime::spawn_blocking(move || mail_h.open_item(&store_id, &entry_id))
+                .await
+                .map_err(|e| e.to_string())?;
         opened?;
         hide_popup_window(&app);
         return Ok(());
@@ -1705,4 +1692,73 @@ pub fn reorder_notes(
         .map_err(|e| e.to_string())?;
     let _ = app.emit("note-updated", ());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::FolderRow;
+
+    fn folder(id: i64, path: &str, enabled: bool) -> FolderRow {
+        FolderRow {
+            id,
+            path: path.to_string(),
+            public_path: String::new(),
+            enabled,
+            indexed_count: 0,
+            exists: false,
+            share_remote: false,
+        }
+    }
+
+    #[test]
+    fn collect_search_scopes_keeps_more_than_400_unique_subdirs() {
+        let root = r"C:\docs";
+        let folders = vec![folder(1, root, true)];
+        let mut paths: Vec<String> = (0..449)
+            .map(|i| format!(r"{root}\case{i:04}\file.md"))
+            .collect();
+        paths.push(format!(r"{root}\20260817借地権相談3\note.md"));
+
+        let rows = collect_search_scopes(&folders, |id| {
+            assert_eq!(id, 1);
+            Ok(paths.clone())
+        })
+        .expect("scopes");
+
+        let subs: Vec<_> = rows.iter().filter(|r| !r.is_root).collect();
+        assert_eq!(subs.len(), 450);
+        assert!(rows
+            .iter()
+            .any(|r| r.is_root && r.path.eq_ignore_ascii_case(root)));
+        assert!(
+            rows.iter().any(|r| r.path.ends_with("20260817借地権相談3")),
+            "newest folder must remain in the picker"
+        );
+        assert!(
+            rows.iter().any(|r| r.label.contains("20260817借地権相談3")),
+            "filter by folder name should match the relative label"
+        );
+    }
+
+    #[test]
+    fn collect_search_scopes_includes_nested_parents() {
+        let root = r"C:\docs";
+        let folders = vec![folder(1, root, true)];
+        let paths = vec![format!(r"{root}\a\b\file.md")];
+        let rows = collect_search_scopes(&folders, |_| Ok(paths.clone())).expect("scopes");
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(root)));
+        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(r"C:\docs\a")));
+        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(r"C:\docs\a\b")));
+    }
+
+    #[test]
+    fn collect_search_scopes_skips_disabled_folders() {
+        let folders = vec![folder(1, r"C:\docs", false)];
+        let rows =
+            collect_search_scopes(&folders, |_| panic!("disabled folders must not list files"))
+                .expect("scopes");
+        assert!(rows.is_empty());
+    }
 }
