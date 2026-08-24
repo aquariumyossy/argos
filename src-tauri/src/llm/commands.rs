@@ -10,7 +10,7 @@ use crate::llm::context::{
     assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed, ChatTurn,
     STOP_TOOLS_HINT,
 };
-use crate::llm::tools::{self, ToolExec, MAX_TOOL_ROUNDS};
+use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
 use crate::state::AppState;
 
@@ -107,6 +107,7 @@ async fn execute_tool_off_runtime(
     arguments: String,
     thread_scope: Option<String>,
     next_cite: i64,
+    web_search: bool,
 ) -> (ToolExec, i64) {
     match tokio::task::spawn_blocking(move || {
         let mut n = next_cite;
@@ -117,6 +118,7 @@ async fn execute_tool_off_runtime(
             &arguments,
             thread_scope.as_deref(),
             &mut n,
+            web_search,
         );
         (exec, n)
     })
@@ -335,7 +337,9 @@ pub async fn llm_send(
     state: State<'_, Arc<AppState>>,
     thread_id: Option<String>,
     content: String,
+    web_search: Option<bool>,
 ) -> Result<LlmSendResult, String> {
+    let web_search = web_search.unwrap_or(false);
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err("メッセージが空です。".into());
@@ -374,6 +378,23 @@ pub async fn llm_send(
         .insert_llm_message(&thread.id, "user", &content)
         .map_err(|e| e.to_string())?;
 
+    let paste = if crate::llm::fetch_url::message_may_contain_url(&content) {
+        let state_for_fetch = state.inner().clone();
+        let tid = thread.id.clone();
+        let msg = content.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::llm::fetch_url::attach_pasted_urls(&state_for_fetch, &tid, &msg)
+        })
+        .await
+        .unwrap_or_else(|_| crate::llm::fetch_url::PasteAttachResult::default())
+    } else {
+        crate::llm::fetch_url::PasteAttachResult::default()
+    };
+    if paste.attached > 0 || !paste.failures.is_empty() {
+        emit_sources_updated(&app, &thread.id);
+    }
+    let mut warning = paste.warning_line();
+
     let history = state
         .db
         .list_llm_messages(&thread.id)
@@ -395,6 +416,13 @@ pub async fn llm_send(
     system.push_str(&tools::format_search_date_system_line(
         settings.mail_days_back,
     ));
+    let web_search = web_search && !settings.searxng_url.trim().is_empty();
+    if web_search {
+        system.push_str(&tools::format_web_search_system_line());
+    }
+    if let Some(line) = paste.system_line() {
+        system.push_str(&line);
+    }
     let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
     let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
     let truncated = stats.truncated;
@@ -423,12 +451,12 @@ pub async fn llm_send(
     }
     let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
 
-    let tools_schema = tools::tools_schema();
+    let tools_schema = tools::tools_schema(web_search);
     let mut use_tools = true;
     let mut retried_without_tools = false;
     let mut extra_final = false;
-    let mut warning: Option<String> = None;
     let mut rounds = 0usize;
+    let max_rounds = tools::max_tool_rounds(web_search);
     let mut current_turns = assembled;
     let mut source_turn_injected = false;
     // Tool output is appended after the context was already sized, so it needs its own
@@ -501,10 +529,15 @@ pub async fn llm_send(
             {
                 use_tools = false;
                 retried_without_tools = true;
-                warning = Some(
-                    "このモデルはインデックス検索ツールに対応していません。検索窓から出典を送ってください。"
-                        .into(),
-                );
+                warning = Some(match warning.take() {
+                    Some(prev) => format!(
+                        "{prev} このモデルはインデックス検索ツールに対応していません。検索窓から出典を送ってください。"
+                    ),
+                    None => {
+                        "このモデルはインデックス検索ツールに対応していません。検索窓から出典を送ってください。"
+                            .into()
+                    }
+                });
                 current_turns = turns_for_plain.clone();
                 continue;
             }
@@ -538,7 +571,7 @@ pub async fn llm_send(
                 });
             }
             Ok(out) => {
-                if use_tools && !out.tool_calls.is_empty() && rounds < MAX_TOOL_ROUNDS {
+                if use_tools && !out.tool_calls.is_empty() && rounds < max_rounds {
                     rounds += 1;
                     let tool_calls_json = serde_json::json!(out
                         .tool_calls
@@ -558,16 +591,44 @@ pub async fn llm_send(
                         tool_call_id: None,
                         tool_calls: Some(tool_calls_json),
                     });
+                    let mut read_url_in_round = 0usize;
                     for tc in out.tool_calls {
+                        let hint = if web_search && tc.name == tools::TOOL_SEARCH {
+                            "search_index / search_web…".to_string()
+                        } else {
+                            format!("{}…", tc.name)
+                        };
                         let _ = app.emit(
                             "llm-chat-delta",
                             LlmChatDelta {
                                 request_id: request_id.clone(),
                                 thread_id: thread.id.clone(),
-                                text: format!("{}…", tc.name),
+                                text: hint,
                                 kind: "tool".into(),
                             },
                         );
+                        if tc.name == tools::TOOL_READ_URL
+                            && read_url_in_round >= tools::MAX_READ_URL_PER_ROUND
+                        {
+                            let content = fit_tool_content(
+                                "一度に読める URL は 2 件までです。必要なものから順に read_url してください。"
+                                    .into(),
+                                tool_budget,
+                                tool_used,
+                            );
+                            tool_used += content.chars().count();
+                            current_turns.push(ChatTurn {
+                                role: "tool".into(),
+                                content,
+                                name: Some(tc.name),
+                                tool_call_id: Some(tc.id),
+                                tool_calls: None,
+                            });
+                            continue;
+                        }
+                        if tc.name == tools::TOOL_READ_URL {
+                            read_url_in_round += 1;
+                        }
                         let (exec, new_cite) = execute_tool_off_runtime(
                             state_arc.clone(),
                             thread.id.clone(),
@@ -575,6 +636,7 @@ pub async fn llm_send(
                             tc.arguments.clone(),
                             thread_scope.clone(),
                             next_cite,
+                            web_search,
                         )
                         .await;
                         next_cite = new_cite;
@@ -612,7 +674,7 @@ pub async fn llm_send(
                 }
                 if use_tools
                     && !out.tool_calls.is_empty()
-                    && rounds >= MAX_TOOL_ROUNDS
+                    && rounds >= max_rounds
                     && !extra_final
                 {
                     extra_final = true;
@@ -976,6 +1038,9 @@ pub fn llm_set_source_grain(
         .ok_or_else(|| "出典が見つかりません".to_string())?;
     if row.is_image() {
         return Err("画像出典は段落／全文を切り替えられません。".into());
+    }
+    if row.is_web() {
+        return Err("ウェブ出典は段落／全文を切り替えられません。".into());
     }
     if !row.is_pending() {
         return Err("読み込み済みの出典は段落／全文を切り替えられません。".into());

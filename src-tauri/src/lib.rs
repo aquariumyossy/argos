@@ -28,6 +28,11 @@ use crate::state::AppState;
 static POPUP_DRAGGING: AtomicBool = AtomicBool::new(false);
 /// Set after `AppState` is managed so frontends can poll without needing State.
 static APP_READY: AtomicBool = AtomicBool::new(false);
+/// Set when setup has finished hiding windows. Second-instance clicks before this
+/// are remembered and applied at the end of setup.
+static SETUP_DONE: AtomicBool = AtomicBool::new(false);
+/// Show the settings window once setup can do so (user launch or a second instance).
+static OPEN_SETTINGS: AtomicBool = AtomicBool::new(false);
 
 pub fn set_popup_dragging(dragging: bool) {
     POPUP_DRAGGING.store(dragging, Ordering::SeqCst);
@@ -37,15 +42,30 @@ pub fn is_app_ready() -> bool {
     APP_READY.load(Ordering::SeqCst)
 }
 
+fn launched_via_autostart() -> bool {
+    args_indicate_autostart(std::env::args())
+}
+
+fn args_indicate_autostart<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| a.as_ref() == "--autostart")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_autostart::Builder::new().arg("--autostart").build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main(app);
+            OPEN_SETTINGS.store(true, Ordering::SeqCst);
+            if SETUP_DONE.load(Ordering::SeqCst) {
+                show_main(app);
+            }
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -210,6 +230,21 @@ pub fn run() {
                 });
             }
 
+            // User double-clicked the Start Menu / desktop shortcut: show settings.
+            // Windows logon autostart stays in the tray unless a second instance asked
+            // to open settings while this process was still starting.
+            if !launched_via_autostart() {
+                OPEN_SETTINGS.store(true, Ordering::SeqCst);
+            }
+            if app.state::<Arc<AppState>>().settings.read().autostart {
+                use tauri_plugin_autostart::ManagerExt;
+                let _ = app.autolaunch().enable();
+            }
+            SETUP_DONE.store(true, Ordering::SeqCst);
+            if OPEN_SETTINGS.load(Ordering::SeqCst) {
+                show_main(app.handle());
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -247,6 +282,8 @@ pub fn run() {
             commands::read_text_file,
             commands::write_text_file,
             commands::test_remote_connection,
+            commands::test_searxng_connection,
+            commands::open_web_url,
             commands::get_lan_ip_hint,
             commands::show_settings_window,
             commands::run_reindex,
@@ -316,10 +353,14 @@ pub fn run() {
 
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let show_settings = MenuItem::with_id(app, "settings", "設定を開く", true, None::<&str>)?;
+    let search_item = MenuItem::with_id(app, "search", "検索を開く", true, None::<&str>)?;
+    let notes_item = MenuItem::with_id(app, "notes", "ノートを開く", true, None::<&str>)?;
     let chat_item = MenuItem::with_id(app, "chat", "チャットを開く", true, None::<&str>)?;
-    let reindex = MenuItem::with_id(app, "reindex", "インデックス再構築", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_settings, &chat_item, &reindex, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_settings, &search_item, &notes_item, &chat_item, &quit],
+    )?;
 
     let icon = app
         .default_window_icon()
@@ -333,24 +374,14 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             "settings" => {
                 show_main(app);
             }
+            "search" => {
+                let _ = show_popup(app);
+            }
+            "notes" => {
+                show_notes(app);
+            }
             "chat" => {
                 show_chat(app);
-            }
-            "reindex" => {
-                let state = app.state::<Arc<AppState>>();
-                let indexer = state.indexer.clone();
-                tauri::async_runtime::spawn(async move {
-                    match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all(|_| {}))
-                        .await
-                    {
-                        Ok(Ok(stats)) => eprintln!(
-                            "reindex done: indexed={} skipped={} errors={}",
-                            stats.indexed, stats.skipped, stats.errors
-                        ),
-                        Ok(Err(e)) => eprintln!("reindex failed: {e}"),
-                        Err(e) => eprintln!("reindex join failed: {e}"),
-                    }
-                });
             }
             "quit" => {
                 app.exit(0);
@@ -807,4 +838,16 @@ fn parse_shortcut(s: &str) -> Option<Shortcut> {
         _ => return None,
     };
     Some(Shortcut::new(Some(mods), code))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::args_indicate_autostart;
+
+    #[test]
+    fn autostart_flag_is_detected() {
+        assert!(args_indicate_autostart(["argos.exe", "--autostart"]));
+        assert!(!args_indicate_autostart(["argos.exe"]));
+        assert!(!args_indicate_autostart(["argos.exe", "--foo"]));
+    }
 }

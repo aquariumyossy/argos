@@ -23,6 +23,7 @@ import {
   groupSources,
   imageGroupKey,
   isImageSource,
+  isWebSource,
   ocrIncomplete,
   openableCitesFromGroups,
 } from "./sourceGroups";
@@ -93,6 +94,7 @@ type LlmAttachFilesResult = {
 type SettingsData = {
   fontSize: number;
   llmMaxContextChars?: number;
+  searxngUrl?: string;
 };
 
 type LlmSendResult = {
@@ -185,9 +187,14 @@ function isFileGrain(s: LlmSourceRow): boolean {
 
 function sourceCanExpand(s: LlmSourceRow): boolean {
   if (isImageSource(s)) return false;
+  if (isWebSource(s)) return false;
   if (!s.path.trim()) return false;
   if (isFileGrain(s) && !(s.paragraphId ?? "").trim()) return false;
   return true;
+}
+
+function sourceOpenTitle(s: LlmSourceRow): string {
+  return isWebSource(s) ? "ブラウザで開く" : "プレビュー";
 }
 
 function isPendingSource(s: LlmSourceRow): boolean {
@@ -212,24 +219,6 @@ function citedForMessage(
 
 function chipLabel(s: LlmSourceRow): string {
   return imageGroupKey(s) ? fileLabel(s) : sourceLabel(s);
-}
-
-function IconAttach() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="16"
-      height="16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-    </svg>
-  );
 }
 
 function IconOpenFile() {
@@ -397,6 +386,8 @@ export default function Chat() {
   const [toolHint, setToolHint] = useState("");
   const [fontSize, setFontSize] = useState(14);
   const [maxContextChars, setMaxContextChars] = useState(80_000);
+  const [searxngUrl, setSearxngUrl] = useState("");
+  const [webSearch, setWebSearch] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
@@ -490,6 +481,18 @@ export default function Chat() {
 
   const listSearching = listQuery.trim().length > 0 && contentHitIds === null;
 
+  const applySettings = useCallback((s: SettingsData) => {
+    if (typeof s.fontSize === "number" && s.fontSize > 0) {
+      setFontSize(s.fontSize);
+    }
+    if (typeof s.llmMaxContextChars === "number" && s.llmMaxContextChars > 0) {
+      setMaxContextChars(s.llmMaxContextChars);
+    }
+    const url = typeof s.searxngUrl === "string" ? s.searxngUrl.trim() : "";
+    setSearxngUrl(url);
+    if (!url) setWebSearch(false);
+  }, []);
+
   const bootstrap = useCallback(async () => {
     if (bootstrappingRef.current) return;
     bootstrappingRef.current = true;
@@ -497,15 +500,7 @@ export default function Chat() {
       await waitReady();
       try {
         const s = await invoke<SettingsData>("get_settings");
-        if (typeof s.fontSize === "number" && s.fontSize > 0) {
-          setFontSize(s.fontSize);
-        }
-        if (
-          typeof s.llmMaxContextChars === "number" &&
-          s.llmMaxContextChars > 0
-        ) {
-          setMaxContextChars(s.llmMaxContextChars);
-        }
+        applySettings(s);
       } catch {
         /* keep default */
       }
@@ -516,7 +511,7 @@ export default function Chat() {
     } finally {
       bootstrappingRef.current = false;
     }
-  }, [loadThreads]);
+  }, [applySettings, loadThreads]);
 
   useEffect(() => {
     void bootstrap();
@@ -527,6 +522,7 @@ export default function Chat() {
     let cancelled = false;
     let unlistenFocus: (() => void) | undefined;
     let unlistenReady: (() => void) | undefined;
+    let unlistenSettings: (() => void) | undefined;
     void win
       .onFocusChanged((event) => {
         if (event.payload && !busyRef.current && !ocrBusyRef.current && !attachingRef.current) void bootstrap();
@@ -541,12 +537,23 @@ export default function Chat() {
       if (cancelled) fn();
       else unlistenReady = fn;
     });
+    void listen("settings-updated", () => {
+      void invoke<SettingsData>("get_settings")
+        .then(applySettings)
+        .catch(() => {
+          /* keep current */
+        });
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenSettings = fn;
+    });
     return () => {
       cancelled = true;
       unlistenFocus?.();
       unlistenReady?.();
+      unlistenSettings?.();
     };
-  }, [bootstrap]);
+  }, [applySettings, bootstrap]);
 
   useEffect(() => {
     let unlistenDelta: (() => void) | undefined;
@@ -734,6 +741,10 @@ export default function Chat() {
     const path = s.path.trim();
     if (!path) return;
     try {
+      if (isWebSource(s)) {
+        await invoke("open_web_url", { url: path });
+        return;
+      }
       await openPreview({
         origin: "chat",
         path,
@@ -944,6 +955,7 @@ export default function Chat() {
       const result = await invoke<LlmSendResult>("llm_send", {
         threadId: thread.id,
         content: text,
+        webSearch: webSearch && !!searxngUrl,
       });
       setActive(result.thread);
       setThreads((prev) =>
@@ -1346,7 +1358,7 @@ export default function Chat() {
                             key={g.key}
                             type="button"
                             className="chat-cite-badge clickable"
-                            title="プレビュー"
+                            title={sourceOpenTitle(s)}
                             onClick={() => void openSource(s)}
                           >
                             [{g.citeNo}] {chipLabel(s)}
@@ -1398,7 +1410,7 @@ export default function Chat() {
                         key={g.key}
                         type="button"
                         className="chat-cite-badge clickable"
-                        title="プレビュー"
+                        title={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
                         [{g.citeNo}] {chipLabel(s)}
@@ -1431,6 +1443,7 @@ export default function Chat() {
                 const image = isImageSource(s);
                 const ocr = groupOcrState(g, ocrBusy);
                 const n = g.citeNo;
+                const web = isWebSource(s);
                 const chipClass = [
                   "chat-source-chip",
                   fileGrain || image ? "file" : "",
@@ -1440,9 +1453,11 @@ export default function Chat() {
                   .join(" ");
                 const badge = ocr.badge
                   ? ocr.badge
-                  : fileGrain && !image
-                    ? "全文"
-                    : null;
+                  : web
+                    ? "ウェブ"
+                    : fileGrain && !image
+                      ? "全文"
+                      : null;
                 const label = chipLabel(s);
                 return (
                   <span key={g.key} className={chipClass}>
@@ -1467,7 +1482,7 @@ export default function Chat() {
                       <button
                         type="button"
                         className="chat-source-grain"
-                        title="プレビュー"
+                        title={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
                         [{n}] {label}
@@ -1492,8 +1507,8 @@ export default function Chat() {
                       <button
                         type="button"
                         className="chat-source-openfile"
-                        title="プレビュー"
-                        aria-label="プレビュー"
+                        title={sourceOpenTitle(s)}
+                        aria-label={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
                         <IconOpenFile />
@@ -1522,6 +1537,34 @@ export default function Chat() {
               onApplied={applyThreadScope}
               onError={setError}
             />
+            <button
+              type="button"
+              className="chat-tpl"
+              title="ファイルを会話に添付"
+              disabled={blocked}
+              onClick={() => void pickFiles()}
+            >
+              ファイル添付
+            </button>
+            <button
+              type="button"
+              className={`chat-tpl chat-web-toggle${webSearch ? " is-active" : ""}`}
+              disabled={busy || !searxngUrl}
+              title={
+                searxngUrl
+                  ? webSearch
+                    ? "インデックス検索時に公開ウェブも使う"
+                    : "オフ。クリックでウェブ検索を足す"
+                  : "設定のローカルLLMで SearXNG の URL を入れてください"
+              }
+              aria-pressed={webSearch}
+              onClick={() => {
+                if (!searxngUrl) return;
+                setWebSearch((v) => !v);
+              }}
+            >
+              {webSearch ? "ウェブ検索オン" : "ウェブ検索オフ"}
+            </button>
             <button
               type="button"
               className="chat-tpl"
@@ -1579,16 +1622,6 @@ export default function Chat() {
               }}
             />
             <div className="chat-composer-actions">
-              <button
-                type="button"
-                className="chat-btn icon"
-                title="ファイルを添付"
-                aria-label="ファイルを添付"
-                disabled={blocked}
-                onClick={() => void pickFiles()}
-              >
-                <IconAttach />
-              </button>
               {busy || ocrBusy ? (
                 <button type="button" className="chat-btn" onClick={() => void stop()}>
                   停止

@@ -801,6 +801,19 @@ body.md-col-resizing {
   color: var(--accent);
 }
 
+.chat-web-toggle.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.chat-web-toggle.is-active:hover:not(:disabled) {
+  background: #cddcd5;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .chat-scope {
   position: relative;
   display: flex;
@@ -1038,13 +1051,6 @@ body.md-col-resizing {
   justify-content: flex-end;
   gap: 6px;
   min-width: 4.5em;
-}
-
-.chat-btn.icon {
-  padding: 6px 8px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
 }
 
 .chat-btn {

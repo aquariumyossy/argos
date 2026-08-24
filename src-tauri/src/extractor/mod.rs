@@ -7,7 +7,7 @@ use std::path::Path;
 
 use zip::ZipArchive;
 
-pub use html::{html_to_text, decode_html_bytes};
+pub use html::{decode_html_bytes, decode_html_bytes_with_charset, html_to_text};
 pub use segment::{
     segment_mail_body, segment_pages, SearchUnit, MAIL_UNIT_MAX_CHARS, UNIT_MAX_CHARS,
     UNIT_MIN_CHARS,
@@ -84,9 +84,19 @@ fn extract_html(path: &Path) -> Result<ExtractedDoc, String> {
 
 fn extract_pdf(path: &Path) -> Result<ExtractedDoc, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    // pdf-extract panics on some encodings (e.g. StandardEncoding); isolate so indexing continues.
+    let pages = extract_pdf_pages_from_bytes(&bytes)?;
+    let title = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("untitled")
+        .to_string();
+    Ok(ExtractedDoc { title, pages })
+}
+
+/// PDF text from in-memory bytes (chat URL fetch). Panics in pdf-extract are isolated.
+pub fn extract_pdf_pages_from_bytes(bytes: &[u8]) -> Result<Vec<String>, String> {
     let extract_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pdf_extract::extract_text_from_mem(&bytes)
+        pdf_extract::extract_text_from_mem(bytes)
     }));
     let text = match extract_result {
         Ok(Ok(t)) => t,
@@ -97,13 +107,6 @@ fn extract_pdf(path: &Path) -> Result<ExtractedDoc, String> {
             );
         }
     };
-
-    let title = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("untitled")
-        .to_string();
-    // pdf-extract may join pages with form feeds
     let pages: Vec<String> = if text.contains('\u{c}') {
         text.split('\u{c}')
             .map(|s| s.trim().to_string())
@@ -114,12 +117,10 @@ fn extract_pdf(path: &Path) -> Result<ExtractedDoc, String> {
     } else {
         Vec::new()
     };
-
     if pages.is_empty() || pages.iter().all(|p| !p.chars().any(|c| !c.is_whitespace())) {
         return Err(SKIP_NO_TEXT.into());
     }
-
-    Ok(ExtractedDoc { title, pages })
+    Ok(pages)
 }
 
 /// Extract errors that should count as skipped (not hard failures).

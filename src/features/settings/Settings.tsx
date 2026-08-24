@@ -47,6 +47,9 @@ type SettingsData = {
   llmThinking: "auto" | "brief" | "off";
   llmThinkingBudget: number;
   llmSearchTopK: number;
+  searxngUrl: string;
+  searxngTimeoutMs: number;
+  llmWebSearchTopK: number;
 };
 
 type FolderRow = {
@@ -155,7 +158,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.9.8";
+const APP_VERSION = "1.10.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -171,6 +174,7 @@ const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] =
   { name: "axum / tower-http", license: "MIT" },
   { name: "tokio", license: "MIT" },
   { name: "reqwest", license: "Apache-2.0 OR MIT" },
+  { name: "SearXNG", license: "AGPL-3.0", note: "接続先（任意）。アプリには同梱しない" },
   { name: "serde / serde_json", license: "Apache-2.0 OR MIT" },
   { name: "notify", license: "CC0-1.0" },
   { name: "walkdir", license: "MIT OR Unlicense" },
@@ -335,6 +339,17 @@ function normalizeSettings(s: SettingsData): SettingsData {
   } else {
     s.llmSearchTopK = Math.min(16, Math.max(1, Math.round(s.llmSearchTopK)));
   }
+  if (typeof s.searxngUrl !== "string") s.searxngUrl = "";
+  if (typeof s.searxngTimeoutMs !== "number" || !Number.isFinite(s.searxngTimeoutMs)) {
+    s.searxngTimeoutMs = 8000;
+  } else {
+    s.searxngTimeoutMs = Math.min(30000, Math.max(5000, Math.round(s.searxngTimeoutMs)));
+  }
+  if (typeof s.llmWebSearchTopK !== "number" || !Number.isFinite(s.llmWebSearchTopK)) {
+    s.llmWebSearchTopK = 5;
+  } else {
+    s.llmWebSearchTopK = Math.min(8, Math.max(1, Math.round(s.llmWebSearchTopK)));
+  }
   return s;
 }
 
@@ -388,6 +403,7 @@ export default function Settings() {
   const [lanIp, setLanIp] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testingLlm, setTestingLlm] = useState(false);
+  const [testingSearxng, setTestingSearxng] = useState(false);
   const [llmModels, setLlmModels] = useState<string[]>([]);
   const [mailFolders, setMailFolders] = useState<EmailFolderRow[]>([]);
   const [mailDetect, setMailDetect] = useState<string>("");
@@ -1112,6 +1128,22 @@ export default function Settings() {
     }
   }
 
+  async function testSearxng() {
+    if (!settings) return;
+    setTestingSearxng(true);
+    setMessage("SearXNG 接続テスト中…");
+    try {
+      const saved = await invoke<SettingsData>("update_settings", { settings });
+      setSettings(saved);
+      const msg = await invoke<string>("test_searxng_connection");
+      setMessage(msg);
+    } catch (e) {
+      setMessage(`SearXNG 接続テスト失敗: ${formatInvokeError(e)}`);
+    } finally {
+      setTestingSearxng(false);
+    }
+  }
+
   async function testRemote() {
     if (!settings) return;
     setTesting(true);
@@ -1472,6 +1504,13 @@ export default function Settings() {
               <li>
                 根拠には出典番号 <code>[n]</code>{" "}
                 が付きます。図は入力上の「要件事実」など。Qwen の思考が長いときは左の「ローカルLLM」の思考を「短くする」か「オフ」にしてください
+              </li>
+              <li>
+                入力欄上の「ウェブ検索オフ／オン」でウェブ検索を足せます。オンのとき、モデルがインデックスを検索すると同じ語で
+                SearXNG も検索します（スニペット）。本文が必要なヒットはモデルが read_url します。メッセージに貼った
+                http(s) の URL は、トグルがオフでも送信時に本文を取ります（最大3件）。JavaScript
+                だけで描画されるページやログインが必要なページは読めないことがあります。検索語は接続先の検索エンジンへ送られるので、依頼者名などはオンにしないでください。左の「ローカルLLM」で
+                SearXNG の URL を入れてからウェブ検索を使います
               </li>
             </ol>
           </section>
@@ -2321,7 +2360,7 @@ export default function Settings() {
               ポップアップを開き直すときにサイズ・位置が適用されます。表示中の手動移動・リサイズは、閉じるまで維持されます。
             </p>
             <p className="field-hint">
-              ファイルインデックスは登録フォルダの変更監視と、設定画面／トレイからの手動再構築で更新されます（定期フル再インデックスの間隔設定はありません）。
+              ファイルインデックスは登録フォルダの変更監視と、設定画面からの手動再構築で更新されます（定期フル再インデックスの間隔設定はありません）。
             </p>
             <label className="row-check">
               <input
@@ -2563,6 +2602,62 @@ export default function Settings() {
               <p className="field-hint">
                 モデルがインデックス検索ツールを使うときのファイル件数です（1〜16）。1ファイルから最大3段落まで返すため、実際の段落数はこれより多くなります。検索窓から手動で送るときは関係ありません。
               </p>
+              <label>
+                <span className="field-label">SearXNG URL</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  value={settings.searxngUrl}
+                  onChange={(e) =>
+                    setSettings({ ...settings, searxngUrl: e.target.value })
+                  }
+                  placeholder="http://192.168.0.1:8080"
+                  autoComplete="off"
+                />
+              </label>
+              <p className="field-hint">
+                別 PC の SearXNG のベース URL です（<code>/search</code> は不要）。空ならチャットのウェブ検索は使えません。検索語は接続先へ送られます。プリセットはありません。
+              </p>
+              <label>
+                <span className="field-label">SearXNG タイムアウト（ミリ秒）</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  type="number"
+                  min={5000}
+                  max={30000}
+                  value={settings.searxngTimeoutMs}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      searxngTimeoutMs: Number(e.target.value) || 8000,
+                    })
+                  }
+                />
+              </label>
+              <p className="field-hint">
+                SearXNG と、メッセージに貼った URL や read_url のページ取得の待ち時間です。
+              </p>
+              <label>
+                <span className="field-label">ウェブ検索の件数</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  type="number"
+                  min={1}
+                  max={8}
+                  value={settings.llmWebSearchTopK}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      llmWebSearchTopK: Math.min(
+                        8,
+                        Math.max(1, Number(e.target.value) || 5),
+                      ),
+                    })
+                  }
+                />
+              </label>
+              <p className="field-hint">
+                チャットでウェブ検索がオンのとき、インデックス検索に添える公開ウェブの件数です（1〜8）。ヒットはスニペットです。本文が必要ならモデルが read_url します。メッセージに貼った URL はトグルなしで本文を取ります。
+              </p>
               <label className="llm-prompt-label">
                 <span className="field-label">システムプロンプト</span>
                 <textarea
@@ -2581,6 +2676,13 @@ export default function Settings() {
                 onClick={() => void testLlm()}
               >
                 {testingLlm ? "テスト中…" : "接続テスト"}
+              </button>
+              <button
+                type="button"
+                disabled={testingSearxng}
+                onClick={() => void testSearxng()}
+              >
+                {testingSearxng ? "テスト中…" : "SearXNG 接続テスト"}
               </button>
               <button
                 type="button"

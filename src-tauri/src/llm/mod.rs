@@ -2,9 +2,11 @@
 
 pub mod commands;
 pub mod context;
+pub mod fetch_url;
 pub mod files;
 pub mod grain;
 pub mod pdf_win;
+pub mod searxng;
 pub mod tools;
 pub mod transcript;
 

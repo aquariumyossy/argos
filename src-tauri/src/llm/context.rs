@@ -200,6 +200,9 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
             out.push_str(" — ");
             out.push_str(seed.path.trim());
         }
+        if seed.is_web() {
+            out.push_str("（ウェブ）");
+        }
         let pid = seed.paragraph_id.trim();
         if !pid.is_empty() && !crate::llm::grain::is_file_grain(&seed.grain) {
             out.push_str(&format!(" (paragraph_id: {pid})"));
@@ -525,6 +528,19 @@ mod tests {
             !file.contains("paragraph_id"),
             "file grain must not advertise a paragraph id: {file}"
         );
+    }
+
+    #[test]
+    fn web_sources_are_labeled_and_have_no_paragraph_id() {
+        let mut w = src("w1", "tool", 0, "スニペット");
+        w.kind = "web".into();
+        w.path = "https://example.com/case".into();
+        w.title = "裁判例".into();
+        w.paragraph_id.clear();
+        let out = format_sources(&[w]);
+        assert!(out.contains("（ウェブ）"), "{out}");
+        assert!(out.contains("https://example.com/case"), "{out}");
+        assert!(!out.contains("paragraph_id"), "{out}");
     }
 
     fn consumed(
