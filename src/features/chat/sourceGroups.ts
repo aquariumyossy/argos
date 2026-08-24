@@ -27,6 +27,12 @@ export function isImageSource(s: { kind?: string }): boolean {
   return (s.kind ?? "text").toLowerCase() === "image";
 }
 
+export function isWebSource(s: { kind?: string; path?: string }): boolean {
+  if ((s.kind ?? "").toLowerCase() === "web") return true;
+  const p = (s.path ?? "").trim().toLowerCase();
+  return p.startsWith("http://") || p.startsWith("https://");
+}
+
 export function imageGroupKey(s: { kind?: string; path: string }): string | null {
   if (!isImageSource(s)) return null;
   const p = s.path.trim().replace(/\//g, "\\").toLowerCase();

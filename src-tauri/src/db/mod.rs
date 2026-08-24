@@ -50,6 +50,10 @@ pub struct Settings {
     /// Token cap for thinking when mode is brief (also sent if auto and > 0).
     pub llm_thinking_budget: u32,
     pub llm_search_top_k: u32,
+    /// SearXNG base URL (no /search). Empty = web search disabled.
+    pub searxng_url: String,
+    pub searxng_timeout_ms: u32,
+    pub llm_web_search_top_k: u32,
 }
 
 pub const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:11434/v1";
@@ -67,6 +71,8 @@ pub const DEFAULT_LLM_TIMEOUT_MS: u32 = 120_000;
 pub const DEFAULT_LLM_MAX_CONTEXT_CHARS: u32 = 80_000;
 pub const DEFAULT_LLM_THINKING: &str = "brief";
 pub const DEFAULT_LLM_THINKING_BUDGET: u32 = 2_048;
+pub const DEFAULT_SEARXNG_TIMEOUT_MS: u32 = 8_000;
+pub const DEFAULT_LLM_WEB_SEARCH_TOP_K: u32 = 5;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -103,6 +109,9 @@ impl Default for Settings {
             llm_thinking: DEFAULT_LLM_THINKING.into(),
             llm_thinking_budget: DEFAULT_LLM_THINKING_BUDGET,
             llm_search_top_k: 4,
+            searxng_url: String::new(),
+            searxng_timeout_ms: DEFAULT_SEARXNG_TIMEOUT_MS,
+            llm_web_search_top_k: DEFAULT_LLM_WEB_SEARCH_TOP_K,
         }
     }
 }
@@ -173,6 +182,10 @@ impl LlmSourceRow {
         self.kind.eq_ignore_ascii_case("image")
     }
 
+    pub fn is_web(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("web") || looks_like_http_url(&self.path)
+    }
+
     /// Ready to put into an LLM 出典 block (OCR finished, body present).
     pub fn is_injectable(&self) -> bool {
         let st = self.ocr_status.trim();
@@ -192,6 +205,15 @@ fn default_llm_source_grain() -> String {
 
 fn default_llm_source_kind() -> String {
     "text".into()
+}
+
+fn looks_like_http_url(raw: &str) -> bool {
+    let t = raw.trim();
+    if t.is_empty() || t.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 const LLM_SOURCE_COLS: &str =
@@ -778,6 +800,21 @@ impl Db {
                             .unwrap_or(DEFAULT_LLM_THINKING_BUDGET)
                             .min(32_000)
                     }
+                    "searxng_url" => s.searxng_url = row.1,
+                    "searxng_timeout_ms" => {
+                        s.searxng_timeout_ms = row
+                            .1
+                            .parse()
+                            .unwrap_or(DEFAULT_SEARXNG_TIMEOUT_MS)
+                            .clamp(5_000, 30_000)
+                    }
+                    "llm_web_search_top_k" => {
+                        s.llm_web_search_top_k = row
+                            .1
+                            .parse()
+                            .unwrap_or(DEFAULT_LLM_WEB_SEARCH_TOP_K)
+                            .clamp(1, 8)
+                    }
                     _ => {}
                 }
             }
@@ -838,6 +875,9 @@ impl Db {
             ("llm_thinking", s.llm_thinking.clone()),
             ("llm_thinking_budget", s.llm_thinking_budget.to_string()),
             ("llm_search_top_k", s.llm_search_top_k.to_string()),
+            ("searxng_url", s.searxng_url.clone()),
+            ("searxng_timeout_ms", s.searxng_timeout_ms.to_string()),
+            ("llm_web_search_top_k", s.llm_web_search_top_k.to_string()),
         ];
         for (k, v) in pairs {
             conn.execute(
@@ -2584,10 +2624,10 @@ impl Db {
         } else {
             "unit"
         };
-        let kind = if kind.trim().eq_ignore_ascii_case("image") {
-            "image"
-        } else {
-            "text"
+        let kind = match kind.trim().to_ascii_lowercase().as_str() {
+            "image" => "image",
+            "web" => "web",
+            _ => "text",
         };
         let stored_relpath = stored_relpath.trim();
         let ocr_status = ocr_status.trim();
@@ -2853,6 +2893,29 @@ impl Db {
             rusqlite::params![thread_id, path.trim(), paragraph_id.trim()],
             map_llm_source,
         )?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Any web/file source with this path (pending first, then cited). Case-insensitive.
+    pub fn find_llm_source_by_path(
+        &self,
+        thread_id: &str,
+        path: &str,
+    ) -> Result<Option<LlmSourceRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND lower(path)=lower(?2) AND paragraph_id=''
+             ORDER BY CASE WHEN injected_user_message_id = '' THEN 0 ELSE 1 END,
+                      created_at DESC
+             LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map(rusqlite::params![thread_id, path.trim()], map_llm_source)?;
         match rows.next() {
             Some(Ok(n)) => Ok(Some(n)),
             Some(Err(e)) => Err(e),
@@ -3574,6 +3637,60 @@ mod llm_source_pending_tests {
             .unwrap()
             .is_empty());
         assert_eq!(db.list_llm_sources(&thread.id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_full_keeps_web_kind() {
+        let (dir, db) = temp_db();
+        let thread = db.create_llm_thread("t", false).unwrap();
+        let (row, created) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "tool",
+                "https://example.com/a",
+                "例",
+                "",
+                "スニペット",
+                "解雇",
+                "unit",
+                "web",
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(row.kind, "web");
+        assert!(row.is_web());
+        let loaded = db.list_llm_sources(&thread.id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, "web");
+        let found = db
+            .find_llm_source_by_path(&thread.id, "HTTPS://EXAMPLE.COM/a")
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().kind, "web");
+        let (updated, _) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "tool",
+                "https://example.com/a",
+                "例",
+                "",
+                "短い",
+                "解雇",
+                "unit",
+                "web",
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            updated.body, "短い",
+            "pending は上書きされるので、スニペット保存は既存行を避ける"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,7 +11,10 @@ use crate::state::AppState;
 
 pub const TOOL_SEARCH: &str = "search_index";
 pub const TOOL_READ: &str = "read_unit";
+pub const TOOL_READ_URL: &str = "read_url";
 pub const MAX_TOOL_ROUNDS: usize = 3;
+pub const MAX_TOOL_ROUNDS_WEB: usize = 4;
+pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
 /// Body length per search hit. Deliberately small: a search round returns up to `k`
 /// hits, and the model is expected to call `read_unit` on the one it actually needs.
@@ -24,19 +27,31 @@ const UNITS_PER_FILE: usize = 3;
 /// Cap on simultaneous thread folder scopes (each prefix is a separate index search).
 pub const MAX_THREAD_SCOPES: usize = 8;
 
-pub fn tools_schema() -> Value {
-    json!([
-        {
-            "type": "function",
-            "function": {
-                "name": TOOL_SEARCH,
-                "description": "Argosの索引を検索する（ファイルとメール）。添付出典で足りるときは呼ばない。\
+pub fn tools_schema(web_search: bool) -> Value {
+    let search_desc = if web_search {
+        "Argosの索引を検索する（ファイルとメール）。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
 条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
 時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
 「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
-送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。",
+送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。\
+公開情報が必要な質問ではこのツールを呼ぶ。ウェブ結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。"
+    } else {
+        "Argosの索引を検索する（ファイルとメール）。添付出典で足りるときは呼ばない。\
+クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
+「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
+条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
+「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
+送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
+    };
+    let mut tools = vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_SEARCH,
+                "description": search_desc,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -66,8 +81,8 @@ pub fn tools_schema() -> Value {
                     "required": ["query"]
                 }
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "function": {
                 "name": TOOL_READ,
@@ -85,8 +100,34 @@ pub fn tools_schema() -> Value {
                     "required": ["paragraph_id"]
                 }
             }
-        }
-    ])
+        }),
+    ];
+    if web_search {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_READ_URL,
+                "description": "公開ウェブの1件の URL の本文を読む。search_index の（ウェブ）スニペットでは足りないときだけ使う。\
+ユーザーがメッセージに貼った URL は既に出典に付いているので呼ばない。一度に複数呼ぶときは重要なものから最大2件。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "http(s) の URL" }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }));
+    }
+    Value::Array(tools)
+}
+
+pub fn max_tool_rounds(web_search: bool) -> usize {
+    if web_search {
+        MAX_TOOL_ROUNDS_WEB
+    } else {
+        MAX_TOOL_ROUNDS
+    }
 }
 
 /// Marker the tool description points at, so the model knows `read_unit` can fetch the
@@ -227,6 +268,132 @@ fn persist_hit(
     Ok(())
 }
 
+const WEB_EMPTY_SNIPPET: &str = "（スニペットなし）";
+
+fn web_body_looks_full(body: &str) -> bool {
+    body.chars().count() > TOOL_BODY_CAP + TRUNCATED_MARK.chars().count()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_web_hit(
+    state: &AppState,
+    thread_id: &str,
+    hit: &crate::llm::searxng::WebHit,
+    query: &str,
+    next_cite: &mut i64,
+    new_rows: &mut Vec<LlmSourceRow>,
+    already: &mut Vec<String>,
+    consumed: &mut Vec<(String, i64)>,
+) -> Result<(), String> {
+    if let Some(existing) = state
+        .db
+        .find_llm_source_by_path(thread_id, &hit.url)
+        .map_err(|e| e.to_string())?
+    {
+        already.push(already_line(&existing));
+        return Ok(());
+    }
+    let body = {
+        let raw = hit.content.trim();
+        if raw.is_empty() {
+            WEB_EMPTY_SNIPPET.to_string()
+        } else {
+            cap_chars(raw, TOOL_BODY_CAP)
+        }
+    };
+    let (mut row, created) = state
+        .db
+        .insert_llm_source_full(
+            thread_id,
+            "tool",
+            &hit.url,
+            &hit.title,
+            "",
+            &body,
+            query,
+            "unit",
+            "web",
+            "",
+            "",
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    if created || row.cite_no <= 0 {
+        *next_cite += 1;
+        row.cite_no = *next_cite;
+        state
+            .db
+            .set_llm_source_cite_no(&row.id, row.cite_no)
+            .map_err(|e| e.to_string())?;
+    }
+    consumed.push((row.id.clone(), row.cite_no));
+    new_rows.push(row);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_web_page(
+    state: &AppState,
+    thread_id: &str,
+    url: &str,
+    title: &str,
+    body: &str,
+    origin: &str,
+    next_cite: &mut i64,
+    new_rows: &mut Vec<LlmSourceRow>,
+    already: &mut Vec<String>,
+    consumed: &mut Vec<(String, i64)>,
+) -> Result<(), String> {
+    if let Some(existing) = state
+        .db
+        .find_llm_source_by_path(thread_id, url)
+        .map_err(|e| e.to_string())?
+    {
+        if web_body_looks_full(&existing.body)
+            && existing.body.chars().count() >= body.chars().count()
+        {
+            already.push(already_line(&existing));
+            if existing.cite_no > 0 {
+                consumed.push((existing.id.clone(), existing.cite_no));
+            }
+            return Ok(());
+        }
+    }
+    let body = cap_chars(body.trim(), crate::llm::fetch_url::FETCH_BODY_CAP);
+    if body.is_empty() {
+        return Ok(());
+    }
+    let title = if title.trim().is_empty() { url } else { title };
+    let (mut row, created) = state
+        .db
+        .insert_llm_source_full(
+            thread_id,
+            origin,
+            url,
+            title,
+            "",
+            &body,
+            "",
+            "unit",
+            "web",
+            "",
+            "",
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    if created || row.cite_no <= 0 {
+        *next_cite += 1;
+        row.cite_no = *next_cite;
+        state
+            .db
+            .set_llm_source_cite_no(&row.id, row.cite_no)
+            .map_err(|e| e.to_string())?;
+    }
+    consumed.push((row.id.clone(), row.cite_no));
+    new_rows.push(row);
+    Ok(())
+}
+
 fn source_title(hit: &SearchHit) -> String {
     let title = if hit.title.trim().is_empty() {
         hit.path.as_str()
@@ -301,6 +468,14 @@ pub fn format_search_date_system_line(mail_days_back: u32) -> String {
         search::today_ymd(),
         mail_days_back.max(1)
     )
+}
+
+pub fn format_web_search_system_line() -> String {
+    "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。添付出典とインデックスを優先してください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_index を呼んでください。".into()
+}
+
+pub fn should_run_web_sidecar(web_search: bool, list_mail: bool, search_q: &str) -> bool {
+    web_search && !list_mail && !search_q.trim().is_empty()
 }
 
 fn run_index_search(
@@ -571,8 +746,17 @@ pub fn execute_tool(
     arguments: &str,
     thread_scope: Option<&str>,
     next_cite: &mut i64,
+    web_search: bool,
 ) -> ToolExec {
-    match execute_tool_inner(state, thread_id, name, arguments, thread_scope, next_cite) {
+    match execute_tool_inner(
+        state,
+        thread_id,
+        name,
+        arguments,
+        thread_scope,
+        next_cite,
+        web_search,
+    ) {
         Ok(exec) => exec,
         Err(e) => ToolExec {
             content: format!("ツールエラー: {e}"),
@@ -588,6 +772,7 @@ fn execute_tool_inner(
     arguments: &str,
     thread_scope: Option<&str>,
     next_cite: &mut i64,
+    web_search: bool,
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     match name {
@@ -640,6 +825,14 @@ fn execute_tool_inner(
             } else {
                 topical.as_str()
             };
+            let run_web = should_run_web_sidecar(web_search, list_mail, search_q);
+            let web_job = if run_web {
+                let settings = state.settings.read().clone();
+                let q = search_q.to_string();
+                Some(std::thread::spawn(move || crate::llm::searxng::search(&settings, &q)))
+            } else {
+                None
+            };
             let hits = run_index_search_multi(
                 state,
                 search_q,
@@ -650,6 +843,55 @@ fn execute_tool_inner(
                 sort_date,
                 list_mail,
             )?;
+            let web_outcome = match web_job {
+                Some(job) => match job.join() {
+                    Ok(r) => Some(r),
+                    Err(_) => Some(Err("ウェブ検索スレッドが失敗しました。".into())),
+                },
+                None => None,
+            };
+            let mut new_rows = Vec::new();
+            let mut already = Vec::new();
+            let mut consumed = Vec::new();
+            for hit in &hits {
+                persist_hit(
+                    state,
+                    thread_id,
+                    hit,
+                    &query,
+                    TOOL_BODY_CAP,
+                    next_cite,
+                    &mut new_rows,
+                    &mut already,
+                    &mut consumed,
+                )?;
+            }
+            let mut web_note = String::new();
+            match web_outcome {
+                Some(Ok(web_hits)) => {
+                    if web_hits.is_empty() {
+                        web_note = "ウェブ検索のヒットはありませんでした。".into();
+                    } else {
+                        for hit in &web_hits {
+                            persist_web_hit(
+                                state,
+                                thread_id,
+                                hit,
+                                &query,
+                                next_cite,
+                                &mut new_rows,
+                                &mut already,
+                                &mut consumed,
+                            )?;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    web_note = format!("ウェブ検索に失敗: {e}");
+                }
+                None => {}
+            }
+            let mut content = String::new();
             if hits.is_empty() {
                 let where_ = scope_where_clause(&scopes);
                 let period = date_where_clause(after, before);
@@ -667,29 +909,12 @@ fn execute_tool_inner(
                 } else {
                     msg.push_str("語を減らすか別の語で言い換えてください。");
                 }
-                return Ok(ToolExec {
-                    content: msg,
-                    consumed: Vec::new(),
-                });
+                content.push_str(&msg);
             }
-            let mut new_rows = Vec::new();
-            let mut already = Vec::new();
-            let mut consumed = Vec::new();
-            for hit in &hits {
-                persist_hit(
-                    state,
-                    thread_id,
-                    hit,
-                    &query,
-                    TOOL_BODY_CAP,
-                    next_cite,
-                    &mut new_rows,
-                    &mut already,
-                    &mut consumed,
-                )?;
-            }
-            let mut content = String::new();
             if !new_rows.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
                 content.push_str(&format_sources(&new_rows));
             }
             if !already.is_empty() {
@@ -701,6 +926,12 @@ fn execute_tool_inner(
             if let Some(note) = more_matches_note(&hits) {
                 content.push('\n');
                 content.push_str(&note);
+            }
+            if !web_note.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&web_note);
             }
             if content.trim().is_empty() {
                 content = "使える本文のあるヒットはありませんでした。".into();
@@ -769,6 +1000,91 @@ fn execute_tool_inner(
                 content.push_str(&format_sources(&new_rows));
             }
             if !already.is_empty() {
+                content.push_str(&already.join("\n"));
+            }
+            if content.trim().is_empty() {
+                content = "本文が空です。".into();
+            }
+            Ok(ToolExec { content, consumed })
+        }
+        TOOL_READ_URL => {
+            if !web_search {
+                return Ok(ToolExec {
+                    content: "ウェブ検索がオフです。".into(),
+                    consumed: Vec::new(),
+                });
+            }
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if url.is_empty() {
+                return Ok(ToolExec {
+                    content: "url が空です。".into(),
+                    consumed: Vec::new(),
+                });
+            }
+            if let Some(existing) = state
+                .db
+                .find_llm_source_by_path(thread_id, &url)
+                .map_err(|e| e.to_string())?
+            {
+                if web_body_looks_full(&existing.body) {
+                    let mut consumed = Vec::new();
+                    if existing.cite_no > 0 {
+                        consumed.push((existing.id.clone(), existing.cite_no));
+                    }
+                    return Ok(ToolExec {
+                        content: already_line(&existing),
+                        consumed,
+                    });
+                }
+            }
+            let settings = state.settings.read().clone();
+            let page = match crate::llm::fetch_url::fetch_page(
+                &settings,
+                &url,
+                crate::llm::fetch_url::FetchAccess::Tool,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(ToolExec {
+                        content: format!("URL を読めません: {e}"),
+                        consumed: Vec::new(),
+                    });
+                }
+            };
+            let mut body = page.body;
+            if page.thin {
+                body.push_str(
+                    "\n（本文がほとんど取れませんでした。JavaScript で描画されている可能性があります。）",
+                );
+            }
+            let mut new_rows = Vec::new();
+            let mut already = Vec::new();
+            let mut consumed = Vec::new();
+            persist_web_page(
+                state,
+                thread_id,
+                &url,
+                &page.title,
+                &body,
+                "tool",
+                next_cite,
+                &mut new_rows,
+                &mut already,
+                &mut consumed,
+            )?;
+            let mut content = String::new();
+            if !new_rows.is_empty() {
+                content.push_str(&format_sources(&new_rows));
+            }
+            if !already.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
                 content.push_str(&already.join("\n"));
             }
             if content.trim().is_empty() {
@@ -897,6 +1213,38 @@ mod tests {
         assert_eq!(topical_query("Aさん メール 直近", Some("Aさん")), "");
         assert_eq!(topical_query("Aさん 契約", Some("Aさん")), "契約");
         assert_eq!(topical_query("解雇 有効性", None), "解雇 有効性");
+    }
+
+    #[test]
+    fn web_sidecar_skips_mail_listing() {
+        assert!(should_run_web_sidecar(true, false, "解雇 有効性"));
+        assert!(
+            !should_run_web_sidecar(true, true, "Aさん"),
+            "mail listing must not hit the web"
+        );
+        assert!(!should_run_web_sidecar(true, false, "  "));
+        assert!(!should_run_web_sidecar(false, false, "解雇"));
+    }
+
+    #[test]
+    fn tools_schema_mentions_web_only_when_enabled() {
+        let off = tools_schema(false).to_string();
+        assert!(!off.contains("公開ウェブも同時に検索"));
+        assert!(!off.contains(TOOL_READ_URL));
+        let on = tools_schema(true).to_string();
+        assert!(on.contains("公開ウェブも同時に検索"));
+        assert!(on.contains(TOOL_READ_URL));
+        assert!(on.contains("read_url"));
+        assert_eq!(max_tool_rounds(false), MAX_TOOL_ROUNDS);
+        assert_eq!(max_tool_rounds(true), MAX_TOOL_ROUNDS_WEB);
+    }
+
+    #[test]
+    fn web_snippet_is_not_treated_as_full_body() {
+        let snippet = cap_chars(&"あ".repeat(5_000), TOOL_BODY_CAP);
+        assert!(!web_body_looks_full(&snippet));
+        assert!(!web_body_looks_full(WEB_EMPTY_SNIPPET));
+        assert!(web_body_looks_full(&"あ".repeat(2_000)));
     }
 
     #[test]

@@ -278,6 +278,9 @@ pub fn update_settings(
     settings.llm_timeout_ms = settings.llm_timeout_ms.clamp(5_000, 600_000);
     settings.llm_max_context_chars = settings.llm_max_context_chars.clamp(4_000, 200_000);
     settings.llm_search_top_k = settings.llm_search_top_k.clamp(1, 16);
+    settings.searxng_url = crate::llm::searxng::normalize_base_url(&settings.searxng_url);
+    settings.searxng_timeout_ms = settings.searxng_timeout_ms.clamp(5_000, 30_000);
+    settings.llm_web_search_top_k = settings.llm_web_search_top_k.clamp(1, 8);
     settings.llm_thinking = match settings.llm_thinking.trim() {
         "auto" | "brief" | "off" => settings.llm_thinking.trim().to_string(),
         _ => crate::db::DEFAULT_LLM_THINKING.into(),
@@ -327,6 +330,7 @@ pub fn update_settings(
             crate::apply_popup_initial_position(&app, &w);
         }
     }
+    let _ = app.emit("settings-updated", ());
     Ok(settings)
 }
 
@@ -995,6 +999,23 @@ pub fn write_text_file(path: String, contents: String) -> Result<(), String> {
 pub fn test_remote_connection(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let settings = state.settings.read().clone();
     search::RemoteArgosBackend::test_connection(&settings)
+}
+
+#[tauri::command]
+pub fn test_searxng_connection(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let settings = state.settings.read().clone();
+    crate::llm::searxng::test_connection(&settings)
+}
+
+#[tauri::command]
+pub fn open_web_url(app: AppHandle, url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !crate::llm::searxng::is_http_url(url) {
+        return Err("http(s) の URL だけ開けます。".into());
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("URL を開けません（{e}）。"))
 }
 
 #[tauri::command]

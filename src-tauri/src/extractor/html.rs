@@ -11,6 +11,25 @@ use encoding_rs::{Encoding, SHIFT_JIS, UTF_8, WINDOWS_1252};
 
 /// Decode HTML bytes to Unicode text using BOM, meta charset, and Japanese-friendly fallbacks.
 pub fn decode_html_bytes(bytes: &[u8]) -> String {
+    decode_html_bytes_with_charset(bytes, None)
+}
+
+/// Like [`decode_html_bytes`], but an HTTP `charset` hint wins over meta / sniffing.
+pub fn decode_html_bytes_with_charset(bytes: &[u8], charset: Option<&str>) -> String {
+    if let Some(label) = charset.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(enc) = Encoding::for_label(label.as_bytes()) {
+            let (cow, _, _) = enc.decode(bytes);
+            return cow.into_owned();
+        }
+        let lower = label.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "shift_jis" | "shift-jis" | "sjis" | "x-sjis" | "windows-31j" | "cp932" | "ms932"
+        ) {
+            let (cow, _, _) = SHIFT_JIS.decode(bytes);
+            return cow.into_owned();
+        }
+    }
     let (enc, offset) = detect_encoding(bytes);
     let payload = &bytes[offset..];
     let (cow, _, _) = enc.decode(payload);
@@ -491,6 +510,17 @@ mod tests {
         let (title, text) = html_to_text(&decoded);
         assert_eq!(title.as_deref(), Some("日本語タイトル"));
         assert!(text.contains("検索対象の本文です"));
+    }
+
+    #[test]
+    fn http_charset_hint_wins_over_utf8_bytes() {
+        let (body, _, _) = SHIFT_JIS.encode(
+            "<html><head><title>指定</title></head><body>シフトJIS本文</body></html>",
+        );
+        let decoded = decode_html_bytes_with_charset(&body, Some("Shift_JIS"));
+        let (title, text) = html_to_text(&decoded);
+        assert_eq!(title.as_deref(), Some("指定"));
+        assert!(text.contains("シフトJIS本文"));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 - **Outlook メール検索**（v1.6.0〜）— Outlook クラシックのメール本文を索引し、ファイルと同じポップアップから横断検索
 - **キープ／ノート**（v1.7.0〜）— 検索ヒットの段落をノートに保存し、メモや並べ替えで整理（`Ctrl+Alt+N`）
 - **ローカル LLM チャット**（v1.9.0〜）— この PC 上の OpenAI 互換サーバ（Ollama / LM Studio / llama.cpp / MTPLX など）と会話。検索・ノートから出典を送れる
+- **ウェブ検索・URL 本文**（v1.10.0〜）— チャットから SearXNG で公開ウェブを検索し、貼った URL の本文も読める
 
 対応形式: PDF / Word（DOCX・DOC） / 一太郎（JTD） / Excel（XLS・XLSX） / テキスト / Markdown / HTML / JSON / Outlook クラシックメール
 
