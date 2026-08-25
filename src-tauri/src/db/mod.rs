@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::notes_md;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -65,6 +67,9 @@ pub const LEGACY_TOOL_LLM_SYSTEM_PROMPT: &str =
 pub const LLM_FORMAT_HINT: &str =
     "回答はMarkdownで書いてください。見出し・箇条書き・表を使ってよいです。生のHTMLは書かないでください。ユーザーに選ばせるときは ```choices フェンスに選択肢を1行ずつ書いてください。";
 pub const LLM_FORMAT_SENTINEL: &str = "生のHTMLは書かないでください";
+pub const LLM_NOTE_HINT: &str =
+    "ノートのメモを変えるツールは提案だけを作ります。採用までメモは変わりません。書いたと嘘をつかないでください。対象ノートが無いときは一覧だけ使えます。";
+pub const LLM_NOTE_SENTINEL: &str = "採用までメモは変わりません";
 pub const DEFAULT_LLM_SYSTEM_PROMPT: &str =
     "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。\n回答はMarkdownで書いてください。見出し・箇条書き・表を使ってよいです。生のHTMLは書かないでください。ユーザーに選ばせるときは ```choices フェンスに選択肢を1行ずつ書いてください。";
 pub const DEFAULT_LLM_TIMEOUT_MS: u32 = 120_000;
@@ -123,6 +128,8 @@ pub struct LlmThreadRow {
     pub title: String,
     pub search_enabled: bool,
     pub path_prefix: String,
+    #[serde(default)]
+    pub note_id: String,
     pub sort_order: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -220,7 +227,7 @@ const LLM_SOURCE_COLS: &str =
     "id, thread_id, sort_order, origin, path, title, paragraph_id, body, query, created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no, kind, stored_relpath, ocr_status";
 
 const LLM_THREAD_COLS: &str =
-    "id, title, search_enabled, path_prefix, sort_order, created_at, updated_at";
+    "id, title, search_enabled, path_prefix, note_id, sort_order, created_at, updated_at";
 
 fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
     Ok(LlmThreadRow {
@@ -228,9 +235,10 @@ fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
         title: row.get(1)?,
         search_enabled: row.get::<_, i64>(2)? != 0,
         path_prefix: row.get(3)?,
-        sort_order: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        note_id: row.get::<_, String>(4).unwrap_or_default(),
+        sort_order: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -712,6 +720,37 @@ impl Db {
                 )?;
             }
         }
+        let _ = conn.execute(
+            "ALTER TABLE llm_threads ADD COLUMN note_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS llm_note_proposals (
+              id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL,
+              note_id TEXT NOT NULL,
+              request_id TEXT NOT NULL DEFAULT '',
+              assistant_message_id TEXT NOT NULL DEFAULT '',
+              kind TEXT NOT NULL,
+              heading TEXT NOT NULL DEFAULT '',
+              old_text TEXT NOT NULL DEFAULT '',
+              new_text TEXT NOT NULL DEFAULT '',
+              chunk TEXT NOT NULL DEFAULT '',
+              note_updated_at INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at INTEGER NOT NULL,
+              applied_at INTEGER,
+              FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE,
+              FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_note_proposals_thread
+              ON llm_note_proposals(thread_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_llm_note_proposals_note
+              ON llm_note_proposals(note_id, status);
+            CREATE INDEX IF NOT EXISTS idx_llm_note_proposals_request
+              ON llm_note_proposals(request_id);
+            ",
+        )?;
         // Ensure FK is on for this connection (WAL batch may not stick across all cases)
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(Self {
@@ -2384,8 +2423,8 @@ impl Db {
         let enabled = if search_enabled { 1 } else { 0 };
         let sort_order = Self::next_llm_thread_sort_order(&conn)?;
         conn.execute(
-            "INSERT INTO llm_threads(id, title, search_enabled, path_prefix, sort_order, created_at, updated_at)
-             VALUES(?1, ?2, ?3, '', ?4, ?5, ?5)",
+            "INSERT INTO llm_threads(id, title, search_enabled, path_prefix, note_id, sort_order, created_at, updated_at)
+             VALUES(?1, ?2, ?3, '', '', ?4, ?5, ?5)",
             rusqlite::params![id, title, enabled, sort_order, now],
         )?;
         Ok(LlmThreadRow {
@@ -2393,6 +2432,7 @@ impl Db {
             title: title.to_string(),
             search_enabled,
             path_prefix: String::new(),
+            note_id: String::new(),
             sort_order,
             created_at: now,
             updated_at: now,
@@ -2430,6 +2470,27 @@ impl Db {
         let n = conn.execute(
             "UPDATE llm_threads SET path_prefix=?1, updated_at=?2 WHERE id=?3",
             rusqlite::params![path_prefix.trim(), now, id],
+        )?;
+        drop(conn);
+        if n == 0 {
+            Ok(None)
+        } else {
+            self.get_llm_thread(id)
+        }
+    }
+
+    /// Bind this thread to a note for read/propose tools. Empty clears the binding.
+    /// No FK: a deleted note is treated as unbound by callers.
+    pub fn set_llm_thread_note(
+        &self,
+        id: &str,
+        note_id: &str,
+    ) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let n = conn.execute(
+            "UPDATE llm_threads SET note_id=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![note_id.trim(), now, id],
         )?;
         drop(conn);
         if n == 0 {
@@ -3229,6 +3290,391 @@ impl Db {
         }
         Ok(())
     }
+
+    pub fn insert_note_proposal(
+        &self,
+        thread_id: &str,
+        note_id: &str,
+        request_id: &str,
+        kind: &str,
+        heading: &str,
+        old_text: &str,
+        new_text: &str,
+        chunk: &str,
+        note_updated_at: i64,
+    ) -> Result<LlmNoteProposalRow, rusqlite::Error> {
+        let heading = notes_md::normalize_heading(heading);
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_note_proposals SET status='superseded'
+             WHERE note_id=?1 AND heading=?2 AND status='pending'",
+            rusqlite::params![note_id, heading],
+        )?;
+        conn.execute(
+            "INSERT INTO llm_note_proposals(
+               id, thread_id, note_id, request_id, assistant_message_id, kind, heading,
+               old_text, new_text, chunk, note_updated_at, status, created_at, applied_at
+             ) VALUES(?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, NULL)",
+            rusqlite::params![
+                id,
+                thread_id,
+                note_id,
+                request_id,
+                kind,
+                heading,
+                old_text,
+                new_text,
+                chunk,
+                note_updated_at,
+                now
+            ],
+        )?;
+        drop(conn);
+        self.get_note_proposal(&id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    fn proposal_select_sql(where_clause: &str) -> String {
+        format!(
+            "SELECT p.id, p.thread_id, p.note_id, p.request_id, p.assistant_message_id,
+                    p.kind, p.heading, p.old_text, p.new_text, p.chunk, p.note_updated_at,
+                    p.status, p.created_at, p.applied_at, COALESCE(n.title, '')
+             FROM llm_note_proposals p
+             LEFT JOIN notes n ON n.id = p.note_id
+             {where_clause}"
+        )
+    }
+
+    fn map_note_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmNoteProposalRow> {
+        let kind: String = row.get(5)?;
+        let old_text: String = row.get(7)?;
+        let new_text: String = row.get(8)?;
+        let chunk: String = row.get(9)?;
+        let diff = proposal_line_diff(&kind, &old_text, &new_text, &chunk);
+        Ok(LlmNoteProposalRow {
+            id: row.get(0)?,
+            thread_id: row.get(1)?,
+            note_id: row.get(2)?,
+            request_id: row.get(3)?,
+            assistant_message_id: row.get(4)?,
+            kind,
+            heading: row.get(6)?,
+            old_text,
+            new_text,
+            chunk,
+            note_updated_at: row.get(10)?,
+            status: row.get(11)?,
+            created_at: row.get(12)?,
+            applied_at: row.get(13)?,
+            note_title: row.get(14)?,
+            diff,
+        })
+    }
+
+    pub fn get_note_proposal(
+        &self,
+        id: &str,
+    ) -> Result<Option<LlmNoteProposalRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = Self::proposal_select_sql("WHERE p.id=?1");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map([id], Self::map_note_proposal)?;
+        match rows.next() {
+            Some(Ok(n)) => Ok(Some(n)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_note_proposals_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<LlmNoteProposalRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = Self::proposal_select_sql(
+            "WHERE p.thread_id=?1
+             AND (p.assistant_message_id != '' OR p.status='pending')
+             ORDER BY p.created_at ASC",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([thread_id], Self::map_note_proposal)?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn list_orphan_note_proposals(
+        &self,
+        thread_id: &str,
+        request_id: &str,
+    ) -> Result<Vec<LlmNoteProposalRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = Self::proposal_select_sql(
+            "WHERE p.thread_id=?1 AND p.request_id=?2 AND p.assistant_message_id = ''
+             ORDER BY p.created_at ASC",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![thread_id, request_id], Self::map_note_proposal)?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn list_note_proposals_for_note(
+        &self,
+        note_id: &str,
+    ) -> Result<Vec<LlmNoteProposalRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = Self::proposal_select_sql(
+            "WHERE p.note_id=?1 ORDER BY p.created_at DESC",
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([note_id], Self::map_note_proposal)?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn attach_note_proposals_to_assistant(
+        &self,
+        request_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE llm_note_proposals SET assistant_message_id=?1
+             WHERE request_id=?2 AND assistant_message_id = '' AND status='pending'",
+            rusqlite::params![assistant_message_id, request_id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn discard_orphan_note_proposals(
+        &self,
+        request_id: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM llm_note_proposals
+             WHERE request_id=?1 AND assistant_message_id = ''",
+            [request_id],
+        )?;
+        Ok(n)
+    }
+
+    pub fn dismiss_note_proposal(&self, id: &str) -> Result<Option<LlmNoteProposalRow>, String> {
+        let row = self
+            .get_note_proposal(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "提案が見つかりません".to_string())?;
+        if row.status != "pending" {
+            return Err("この提案は操作できません。".into());
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_note_proposals SET status='dismissed' WHERE id=?1 AND status='pending'",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;
+        drop(conn);
+        self.get_note_proposal(id)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn apply_note_proposal(&self, id: &str) -> Result<NoteRow, String> {
+        let row = self
+            .get_note_proposal(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "提案が見つかりません".to_string())?;
+        if row.status != "pending" {
+            return Err("この提案は採用できません。".into());
+        }
+        let note = self
+            .get_note(&row.note_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let next = match apply_proposal_to_memo(&note.memo, &row) {
+            Ok(s) => s,
+            Err(stale) => {
+                let conn = self.conn.lock();
+                let _ = conn.execute(
+                    "UPDATE llm_note_proposals SET status=?1 WHERE id=?2 AND status='pending'",
+                    rusqlite::params![stale, id],
+                );
+                return Err(if stale == "stale" {
+                    "メモが変わっています。却下して再度依頼してください。".into()
+                } else {
+                    "この提案は採用できません。".into()
+                });
+            }
+        };
+        self.update_note_memo(&note.id, &next)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_note_proposals SET status='applied', applied_at=?1
+             WHERE id=?2 AND status='pending'",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| e.to_string())?;
+        drop(conn);
+        self.get_note(&note.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+
+    pub fn undo_note_proposal(&self, id: &str) -> Result<NoteRow, String> {
+        let row = self
+            .get_note_proposal(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "提案が見つかりません".to_string())?;
+        if row.status != "applied" {
+            return Err("採用済みの提案だけ取り消せます。".into());
+        }
+        let note = self
+            .get_note(&row.note_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let next = undo_proposal_on_memo(&note.memo, &row).ok_or_else(|| {
+            "メモが人がさらに変えたため取り消せません。".to_string()
+        })?;
+        self.update_note_memo(&note.id, &next)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_note_proposals SET status='dismissed', applied_at=NULL WHERE id=?1",
+            [id],
+        )
+        .map_err(|e| e.to_string())?;
+        drop(conn);
+        self.get_note(&note.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+}
+
+fn proposal_line_diff(
+    kind: &str,
+    old_text: &str,
+    new_text: &str,
+    chunk: &str,
+) -> Vec<notes_md::DiffLine> {
+    if kind == "append" {
+        notes_md::line_diff("", chunk)
+    } else {
+        notes_md::line_diff(old_text, new_text)
+    }
+}
+
+fn apply_proposal_to_memo(memo: &str, row: &LlmNoteProposalRow) -> Result<String, &'static str> {
+    match row.kind.as_str() {
+        "replace" => {
+            let secs = notes_md::split_sections(memo);
+            match notes_md::find_section(&secs, &row.heading) {
+                Ok(s) if s.text == row.old_text => notes_md::replace_section(
+                    memo,
+                    &row.heading,
+                    &row.new_text,
+                )
+                .map_err(|_| "stale"),
+                _ => Err("stale"),
+            }
+        }
+        "insert" => {
+            let secs = notes_md::split_sections(memo);
+            match notes_md::find_section(&secs, &row.heading) {
+                Err(notes_md::SectionError::Missing) => Ok(notes_md::insert_section(
+                    memo,
+                    &row.heading,
+                    insert_body_from_new_text(&row.heading, &row.new_text),
+                )),
+                _ => Err("stale"),
+            }
+        }
+        "append" => {
+            if row.heading.is_empty() {
+                if memo != row.old_text {
+                    return Err("stale");
+                }
+                notes_md::append_chunk(memo, None, &row.chunk).map_err(|_| "stale")
+            } else {
+                let secs = notes_md::split_sections(memo);
+                match notes_md::find_section(&secs, &row.heading) {
+                    Ok(s) if s.text == row.old_text => notes_md::append_chunk(
+                        memo,
+                        Some(row.heading.as_str()),
+                        &row.chunk,
+                    )
+                    .map_err(|_| "stale"),
+                    _ => Err("stale"),
+                }
+            }
+        }
+        _ => Err("bad"),
+    }
+}
+
+fn insert_body_from_new_text<'a>(heading: &str, new_text: &'a str) -> &'a str {
+    let want = notes_md::normalize_heading(heading);
+    let mut rest = new_text;
+    if let Some(first) = rest.lines().next() {
+        if let Some((_, title)) = notes_md::parse_atx_heading(first) {
+            if notes_md::normalize_heading(&title) == want {
+                rest = rest[first.len()..].trim_start_matches(['\r', '\n']);
+                return rest;
+            }
+        }
+    }
+    new_text
+}
+
+fn undo_proposal_on_memo(memo: &str, row: &LlmNoteProposalRow) -> Option<String> {
+    match row.kind.as_str() {
+        "replace" => {
+            let secs = notes_md::split_sections(memo);
+            let s = notes_md::find_section(&secs, &row.heading).ok()?;
+            if s.text != row.new_text {
+                return None;
+            }
+            notes_md::replace_section(memo, &row.heading, &row.old_text).ok()
+        }
+        "insert" => {
+            let piece = if memo.ends_with(&row.new_text) {
+                row.new_text.clone()
+            } else {
+                let formatted = notes_md::format_insert_section(&row.heading, insert_body_from_new_text(&row.heading, &row.new_text));
+                if memo.ends_with(&formatted) {
+                    formatted
+                } else {
+                    return None;
+                }
+            };
+            Some(memo[..memo.len() - piece.len()].to_string())
+        }
+        "append" => notes_md::undo_append(memo, &row.chunk).ok(),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmNoteProposalRow {
+    pub id: String,
+    pub thread_id: String,
+    pub note_id: String,
+    pub request_id: String,
+    pub assistant_message_id: String,
+    pub kind: String,
+    pub heading: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub chunk: String,
+    pub note_updated_at: i64,
+    pub status: String,
+    pub created_at: i64,
+    pub applied_at: Option<i64>,
+    pub note_title: String,
+    #[serde(default, skip_deserializing)]
+    pub diff: Vec<notes_md::DiffLine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3735,6 +4181,126 @@ mod llm_source_pending_tests {
             updated.body, "短い",
             "pending は上書きされるので、スニペット保存は既存行を避ける"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod note_proposal_tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-prop-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn create_note_starts_empty() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件A").unwrap();
+        assert!(note.memo.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_replace_and_stale_and_supersede() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件A").unwrap();
+        db.update_note_memo(&note.id, "# 争点\nA\n\n# 日程\nB\n")
+            .unwrap();
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        let thread = db.create_llm_thread("会話", true).unwrap();
+        db.set_llm_thread_note(&thread.id, &note.id).unwrap();
+
+        let first = db
+            .insert_note_proposal(
+                &thread.id,
+                &note.id,
+                "req1",
+                "replace",
+                "日程",
+                "# 日程\nB\n",
+                "# 日程\nC\n",
+                "",
+                note.updated_at,
+            )
+            .unwrap();
+        let second = db
+            .insert_note_proposal(
+                &thread.id,
+                &note.id,
+                "req2",
+                "replace",
+                "日程",
+                "# 日程\nB\n",
+                "# 日程\nD\n",
+                "",
+                note.updated_at,
+            )
+            .unwrap();
+        let first = db.get_note_proposal(&first.id).unwrap().unwrap();
+        assert_eq!(first.status, "superseded");
+        assert_eq!(second.status, "pending");
+
+        db.apply_note_proposal(&second.id).unwrap();
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        assert!(note.memo.contains("# 日程\nD"));
+        assert!(note.memo.contains("# 争点\nA"));
+
+        db.update_note_memo(&note.id, "# 争点\nA\n\n# 日程\nB\n")
+            .unwrap();
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        let stale = db
+            .insert_note_proposal(
+                &thread.id,
+                &note.id,
+                "req3",
+                "replace",
+                "日程",
+                "# 日程\nOLD\n",
+                "# 日程\nNEW\n",
+                "",
+                note.updated_at,
+            )
+            .unwrap();
+        let err = db.apply_note_proposal(&stale.id).unwrap_err();
+        assert!(err.contains("変わって"));
+        let stale = db.get_note_proposal(&stale.id).unwrap().unwrap();
+        assert_eq!(stale.status, "stale");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphan_proposals_are_discarded() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        let thread = db.create_llm_thread("t", true).unwrap();
+        db.insert_note_proposal(
+            &thread.id,
+            &note.id,
+            "req-x",
+            "append",
+            "",
+            &note.memo,
+            "x",
+            "x",
+            note.updated_at,
+        )
+        .unwrap();
+        assert_eq!(db.discard_orphan_note_proposals("req-x").unwrap(), 1);
+        assert!(db
+            .list_note_proposals_for_thread(&thread.id)
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

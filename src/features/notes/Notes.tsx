@@ -28,6 +28,15 @@ import {
 } from "./exportNoteText";
 import ChatDestPicker, { attachToChat } from "../chat/ChatDestPicker";
 import { openPreview } from "../preview/openPreview";
+import MemoMdHelper from "./MemoMdHelper";
+import { applyMemoMdInsert, type MemoMdKind } from "./memoMdInsert";
+import NoteMemoView from "./NoteMemoView";
+import {
+  memoHasOpenWork,
+  parseNoteTasks,
+  toggleTaskLine,
+  type NoteTask,
+} from "./noteTasks";
 import "./notes.css";
 
 const SIDEBAR_MIN = 160;
@@ -41,6 +50,65 @@ const BODY_HEIGHTS_KEY = "argos.notes.bodyHeights";
 
 const LEGAL_MD_FORMAT_KEY = "argos.notes.legalMdFormat";
 const PRINT_OPTS_KEY = "argos.notes.printOpts";
+const SPLIT_DIR_KEY = "argos.notes.splitDir";
+const SPLIT_RATIO_KEY = "argos.notes.splitRatio";
+const MEMO_EDIT_KEY = "argos.notes.memoEdit";
+const SIDEBAR_FILTER_KEY = "argos.notes.sidebarFilter";
+const SPLIT_RATIO_MIN = 0.22;
+const SPLIT_RATIO_MAX = 0.78;
+const SPLIT_FORCE_COL_PX = 560;
+const MEMO_ATTACH_FULL_MAX = 4000;
+
+type SplitDir = "col" | "row";
+type SidebarFilter = "notes" | "tasks";
+type NoteUpdatedPayload = { noteId?: string; kind?: string };
+
+function loadSplitDir(): SplitDir {
+  try {
+    return localStorage.getItem(SPLIT_DIR_KEY) === "row" ? "row" : "col";
+  } catch {
+    return "col";
+  }
+}
+
+function loadSplitRatio(): number {
+  try {
+    const n = Number(localStorage.getItem(SPLIT_RATIO_KEY));
+    if (!Number.isFinite(n)) return 0.4;
+    return Math.min(SPLIT_RATIO_MAX, Math.max(SPLIT_RATIO_MIN, n));
+  } catch {
+    return 0.4;
+  }
+}
+
+function loadMemoEdit(): boolean {
+  try {
+    return localStorage.getItem(MEMO_EDIT_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function loadSidebarFilter(): SidebarFilter {
+  try {
+    return localStorage.getItem(SIDEBAR_FILTER_KEY) === "tasks" ? "tasks" : "notes";
+  } catch {
+    return "notes";
+  }
+}
+
+function memoAttachBody(title: string, memo: string): string {
+  const text = memo.trim();
+  if (!text) return "";
+  if ([...text].length <= MEMO_ATTACH_FULL_MAX) return text;
+  const heads = text
+    .split("\n")
+    .filter((ln) => /^#{1,6}\s+\S/.test(ln))
+    .map((ln) => ln.trim());
+  const head = [...text].slice(0, 1200).join("");
+  const outline = heads.length > 0 ? heads.join("\n") : "（見出しなし）";
+  return `ノート『${title}』のメモ（長いため要約）\n見出し:\n${outline}\n\n先頭:\n${head}\n…`;
+}
 
 type PrintOpts = {
   path: boolean;
@@ -403,6 +471,13 @@ export default function Notes() {
   const [printOpts, setPrintOpts] = useState(loadPrintOpts);
   const [printMenuOpen, setPrintMenuOpen] = useState(false);
   const [chatNotice, setChatNotice] = useState("");
+  const [splitDirPref, setSplitDirPref] = useState<SplitDir>(loadSplitDir);
+  const [splitRatio, setSplitRatio] = useState(loadSplitRatio);
+  const [forceCol, setForceCol] = useState(false);
+  const [resizingSplit, setResizingSplit] = useState(false);
+  const [memoEdit, setMemoEdit] = useState(loadMemoEdit);
+  const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>(loadSidebarFilter);
+  const [pendingProposal, setPendingProposal] = useState(false);
   const printMenuRef = useRef<HTMLDivElement | null>(null);
   const chatNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -411,8 +486,26 @@ export default function Notes() {
   const itemMemoTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
+  const memoDirtyRef = useRef(false);
+  const pendingMemoRef = useRef<{ id: string; memo: string } | null>(null);
+  const skipMemoReloadRef = useRef<{ id: string; at: number } | null>(null);
+  const activeRef = useRef<NoteRow | null>(null);
+  const mainRef = useRef<HTMLElement | null>(null);
+  const memoTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const memoViewRef = useRef<{
+    start: number;
+    end: number;
+    scrollTop: number;
+    scrollLeft: number;
+  } | null>(null);
+  const pendingMemoCaretRef = useRef<number | null>(null);
+  const pendingMemoScrollRef = useRef<{
+    top: number;
+    left: number;
+  } | null>(null);
 
   const viewMode = active?.viewMode === "grid" ? "grid" : "list";
+  const splitDir: SplitDir = forceCol ? "col" : splitDirPref;
   const notesReadyRef = useRef(false);
   const bootstrappingRef = useRef(false);
 
@@ -422,14 +515,57 @@ export default function Notes() {
     chatNoticeTimer.current = setTimeout(() => setChatNotice(""), 2200);
   }, []);
 
+  const flushNoteMemo = useCallback(async () => {
+    if (noteMemoTimer.current) {
+      clearTimeout(noteMemoTimer.current);
+      noteMemoTimer.current = null;
+    }
+    const pending = pendingMemoRef.current;
+    if (!pending) return;
+    pendingMemoRef.current = null;
+    memoDirtyRef.current = false;
+    skipMemoReloadRef.current = { id: pending.id, at: Date.now() };
+    try {
+      const row = await invoke<NoteRow>("update_note_memo", {
+        id: pending.id,
+        memo: pending.memo,
+      });
+      setActive((prev) =>
+        prev && prev.id === row.id
+          ? { ...prev, memo: row.memo, updatedAt: row.updatedAt }
+          : prev,
+      );
+      setNotes((prev) =>
+        prev.map((n) =>
+          n.id === row.id ? { ...n, memo: row.memo, updatedAt: row.updatedAt } : n,
+        ),
+      );
+    } catch (e) {
+      memoDirtyRef.current = true;
+      pendingMemoRef.current = pending;
+      setError(formatInvokeError(e));
+    }
+  }, []);
+
   const loadNotes = useCallback(async () => {
     const list = await invoke<NoteRow[]>("list_notes");
-    setNotes(list);
     let current = await invoke<NoteRow | null>("get_active_note");
     if (!current && list.length > 0) {
       current = await invoke<NoteRow>("set_active_note", { id: list[0].id });
     }
+    const dirty = pendingMemoRef.current;
+    if (dirty) {
+      setNotes(
+        list.map((n) => (n.id === dirty.id ? { ...n, memo: dirty.memo } : n)),
+      );
+      if (current && current.id === dirty.id) {
+        current = { ...current, memo: dirty.memo };
+      }
+    } else {
+      setNotes(list);
+    }
     setActive(current);
+    activeRef.current = current;
     if (current) {
       const nextItems = await invoke<NoteItemRow[]>("list_note_items", {
         noteId: current.id,
@@ -445,6 +581,20 @@ export default function Notes() {
       await loadNotes();
       notesReadyRef.current = true;
       setError("");
+      const id = activeRef.current?.id;
+      if (!id) {
+        setPendingProposal(false);
+      } else {
+        try {
+          const rows = await invoke<{ status: string }[]>(
+            "list_note_proposals_for_note",
+            { noteId: id },
+          );
+          setPendingProposal(rows.some((r) => r.status === "pending"));
+        } catch {
+          setPendingProposal(false);
+        }
+      }
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -502,16 +652,36 @@ export default function Notes() {
   }, [listQuery]);
 
   const visibleNotes = useMemo(() => {
+    let list = notes;
+    if (sidebarFilter === "tasks") {
+      list = list.filter((n) => memoHasOpenWork(n.memo));
+    }
     const q = listQuery.trim();
-    if (!q) return notes;
+    if (!q) return list;
     const content = new Set(contentHitIds ?? []);
-    return notes.filter(
+    return list.filter(
       (n) =>
         matchesListQuery(noteListTitle(n), q) ||
         matchesListQuery(n.memo, q) ||
         content.has(n.id),
     );
-  }, [notes, listQuery, contentHitIds]);
+  }, [notes, listQuery, contentHitIds, sidebarFilter]);
+
+  const openTasks = useMemo(() => {
+    const all: NoteTask[] = [];
+    for (const n of notes) {
+      for (const t of parseNoteTasks(n.id, noteListTitle(n), n.memo)) {
+        if (!t.done) all.push(t);
+      }
+    }
+    all.sort((a, b) => {
+      if (a.due && b.due) return a.due.localeCompare(b.due);
+      if (a.due) return -1;
+      if (b.due) return 1;
+      return 0;
+    });
+    return all;
+  }, [notes]);
 
   const listSearching = listQuery.trim().length > 0 && contentHitIds === null;
 
@@ -524,6 +694,9 @@ export default function Notes() {
       .onFocusChanged((event) => {
         if (event.payload && !notesReadyRef.current) {
           void bootstrapNotes();
+        }
+        if (!event.payload) {
+          void flushNoteMemo();
         }
       })
       .then((fn) => {
@@ -543,13 +716,45 @@ export default function Notes() {
       unlistenFocus?.();
       unlistenReady?.();
     };
-  }, [bootstrapNotes]);
+  }, [bootstrapNotes, flushNoteMemo]);
 
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    void listen("note-updated", () => {
-      void refresh();
+    void listen<NoteUpdatedPayload>("note-updated", (event) => {
+      const payload = event.payload ?? {};
+      const skip = skipMemoReloadRef.current;
+      const kind = payload.kind ?? "";
+      const noteId = payload.noteId ?? "";
+      const pending = pendingMemoRef.current;
+      if (
+        skip &&
+        kind === "memo" &&
+        (!noteId || noteId === skip.id) &&
+        Date.now() - skip.at < 1500
+      ) {
+        return;
+      }
+      if (
+        memoDirtyRef.current &&
+        kind === "memo" &&
+        (!noteId || noteId === pending?.id)
+      ) {
+        return;
+      }
+      if (
+        noteId &&
+        activeRef.current &&
+        noteId !== activeRef.current.id &&
+        kind === "items"
+      ) {
+        return;
+      }
+      void (async () => {
+        await flushNoteMemo();
+        if (cancelled) return;
+        await refresh();
+      })();
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -558,7 +763,43 @@ export default function Notes() {
       cancelled = true;
       unlisten?.();
     };
-  }, [refresh]);
+  }, [flushNoteMemo, refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ noteId?: string }>("llm-note-proposals", (event) => {
+      const noteId = event.payload?.noteId ?? "";
+      if (noteId && activeRef.current && noteId !== activeRef.current.id) {
+        return;
+      }
+      void (async () => {
+        const id = activeRef.current?.id;
+        if (!id) {
+          setPendingProposal(false);
+          return;
+        }
+        try {
+          const rows = await invoke<{ status: string }[]>(
+            "list_note_proposals_for_note",
+            { noteId: id },
+          );
+          if (!cancelled) {
+            setPendingProposal(rows.some((r) => r.status === "pending"));
+          }
+        } catch {
+          if (!cancelled) setPendingProposal(false);
+        }
+      })();
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -598,6 +839,53 @@ export default function Notes() {
       /* ignore */
     }
   }, [printOpts]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SPLIT_DIR_KEY, splitDirPref);
+    } catch {
+      /* ignore */
+    }
+  }, [splitDirPref]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SPLIT_RATIO_KEY, String(splitRatio));
+    } catch {
+      /* ignore */
+    }
+  }, [splitRatio]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(MEMO_EDIT_KEY, memoEdit ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [memoEdit]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_FILTER_KEY, sidebarFilter);
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarFilter]);
+
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      setForceCol(w > 0 && w < SPLIT_FORCE_COL_PX);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [active]);
 
   useEffect(() => {
     if (!printMenuOpen) return;
@@ -669,38 +957,75 @@ export default function Notes() {
     [bodyHeights],
   );
 
+  const onSplitResizeStart = useCallback(
+    (e: ReactMouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const main = mainRef.current;
+      if (!main) return;
+      setResizingSplit(true);
+      const rect = main.getBoundingClientRect();
+      const col = splitDir === "col";
+      const size = col ? rect.height : rect.width;
+      const head = main.querySelector(".notes-main-head") as HTMLElement | null;
+      const extra = (head?.offsetHeight ?? 0) + 24;
+
+      const onMove = (ev: MouseEvent) => {
+        const pos = col ? ev.clientY : ev.clientX;
+        const origin = col ? rect.top + extra : rect.left;
+        const usable = Math.max(80, size - extra);
+        const next = (pos - origin) / usable;
+        if (!Number.isFinite(next)) return;
+        setSplitRatio(
+          Math.min(SPLIT_RATIO_MAX, Math.max(SPLIT_RATIO_MIN, next)),
+        );
+      };
+      const onUp = () => {
+        setResizingSplit(false);
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [splitDir],
+  );
+
   const createNote = useCallback(async () => {
     try {
+      await flushNoteMemo();
       await invoke<NoteRow>("create_note", { title: "無題のノート" });
       await refresh();
     } catch (e) {
       setError(String(e));
     }
-  }, [refresh]);
+  }, [flushNoteMemo, refresh]);
 
   const selectNote = useCallback(
     async (id: string) => {
       try {
+        await flushNoteMemo();
         await invoke<NoteRow>("set_active_note", { id });
         await refresh();
       } catch (e) {
         setError(String(e));
       }
     },
-    [refresh],
+    [flushNoteMemo, refresh],
   );
 
   const deleteNote = useCallback(
     async (id: string) => {
       if (!window.confirm("このノートを削除しますか？")) return;
       try {
+        await flushNoteMemo();
         await invoke("delete_note", { id });
         await refresh();
       } catch (e) {
         setError(String(e));
       }
     },
-    [refresh],
+    [flushNoteMemo, refresh],
   );
 
   const commitRename = useCallback(
@@ -720,15 +1045,100 @@ export default function Notes() {
     (memo: string) => {
       if (!active) return;
       setActive({ ...active, memo });
+      setNotes((prev) =>
+        prev.map((n) => (n.id === active.id ? { ...n, memo } : n)),
+      );
+      memoDirtyRef.current = true;
+      pendingMemoRef.current = { id: active.id, memo };
       if (noteMemoTimer.current) clearTimeout(noteMemoTimer.current);
-      const id = active.id;
       noteMemoTimer.current = setTimeout(() => {
-        void invoke("update_note_memo", { id, memo }).catch((e) =>
-          setError(String(e)),
-        );
+        void flushNoteMemo();
       }, 400);
     },
-    [active],
+    [active, flushNoteMemo],
+  );
+
+  const captureMemoView = useCallback((el?: HTMLTextAreaElement | null) => {
+    const t = el ?? memoTextareaRef.current;
+    if (!t) return;
+    memoViewRef.current = {
+      start: t.selectionStart,
+      end: t.selectionEnd,
+      scrollTop: t.scrollTop,
+      scrollLeft: t.scrollLeft,
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    const caret = pendingMemoCaretRef.current;
+    const scroll = pendingMemoScrollRef.current;
+    const el = memoTextareaRef.current;
+    if (caret == null || !el) return;
+    pendingMemoCaretRef.current = null;
+    pendingMemoScrollRef.current = null;
+    el.focus({ preventScroll: true });
+    el.setSelectionRange(caret, caret);
+    if (scroll) {
+      el.scrollTop = scroll.top;
+      el.scrollLeft = scroll.left;
+      requestAnimationFrame(() => {
+        el.scrollTop = scroll.top;
+        el.scrollLeft = scroll.left;
+        requestAnimationFrame(() => {
+          el.scrollTop = scroll.top;
+          el.scrollLeft = scroll.left;
+        });
+      });
+    }
+  }, [active?.memo, memoEdit]);
+
+  const onInsertMemoMd = useCallback(
+    (kind: MemoMdKind) => {
+      if (!active) return;
+      const el = memoTextareaRef.current;
+      const snap = memoViewRef.current;
+      const start =
+        el && document.activeElement === el
+          ? el.selectionStart
+          : (snap?.start ?? el?.selectionStart ?? active.memo.length);
+      const end =
+        el && document.activeElement === el
+          ? el.selectionEnd
+          : (snap?.end ?? el?.selectionEnd ?? active.memo.length);
+      const { next, caret } = applyMemoMdInsert(active.memo, start, end, kind);
+      if (!memoEdit) setMemoEdit(true);
+      pendingMemoCaretRef.current = caret;
+      if (el || snap) {
+        pendingMemoScrollRef.current = {
+          top: snap?.scrollTop ?? el?.scrollTop ?? 0,
+          left: snap?.scrollLeft ?? el?.scrollLeft ?? 0,
+        };
+      }
+      onNoteMemoChange(next);
+    },
+    [active, memoEdit, onNoteMemoChange],
+  );
+
+  const onToggleTask = useCallback(
+    async (task: NoteTask) => {
+      const note = notes.find((n) => n.id === task.noteId);
+      if (!note) return;
+      const next = toggleTaskLine(note.memo, task.line);
+      if (next == null) return;
+      if (active?.id === note.id) {
+        onNoteMemoChange(next);
+        return;
+      }
+      try {
+        await invoke("update_note_memo", { id: note.id, memo: next });
+        setNotes((prev) =>
+          prev.map((n) => (n.id === note.id ? { ...n, memo: next } : n)),
+        );
+      } catch (e) {
+        setError(formatInvokeError(e));
+      }
+    },
+    [active, notes, onNoteMemoChange],
   );
 
   const onItemMemoChange = useCallback((itemId: string, memo: string) => {
@@ -964,6 +1374,7 @@ export default function Notes() {
       attachItems: ReturnType<typeof noteItemToAttach>[],
       title: string,
       threadId: "new" | string,
+      bindNoteId?: string,
     ) => {
       const items = attachItems.filter((it) => it.body.trim());
       if (items.length === 0) {
@@ -973,6 +1384,14 @@ export default function Notes() {
       setError("");
       try {
         const result = await attachToChat(items, title, threadId);
+        try {
+          await invoke("llm_set_thread_note", {
+            id: result.thread.id,
+            noteId: bindNoteId ?? "",
+          });
+        } catch {
+          /* command may be missing until bound */
+        }
         const dest = result.thread?.title?.trim() || "新しい会話";
         if (result.added > 0) {
           showChatNotice(
@@ -1000,13 +1419,16 @@ export default function Notes() {
       const attachItems = parsedItems.map(({ row, snap }) =>
         noteItemToAttach(row, snap),
       );
-      const memo = active.memo.trim();
-      if (memo) {
+      const memoBody = memoAttachBody(
+        active.title.trim() || "無題のノート",
+        active.memo,
+      );
+      if (memoBody) {
         attachItems.unshift({
           path: "",
           title: "ノートメモ",
           paragraphId: `note-memo:${active.id}`,
-          body: memo,
+          body: memoBody,
           query: "",
           origin: "attach",
         });
@@ -1019,6 +1441,7 @@ export default function Notes() {
         attachItems,
         active.title.trim() || "無題のノート",
         threadId,
+        active.id,
       );
     },
     [active, attachItemsToChat, noteItemToAttach, parsedItems],
@@ -1125,6 +1548,7 @@ export default function Notes() {
         "notes",
         resizingSidebar ? "notes--resizing" : "",
         resizingBodyId ? "notes--resizing-body" : "",
+        resizingSplit ? `notes--resizing-split notes--split-${splitDir}` : "",
         printOpts.path ? "" : "print-omit-path",
         printOpts.query ? "" : "print-omit-query",
         printOpts.itemMemo ? "" : "print-omit-item-memo",
@@ -1179,8 +1603,51 @@ export default function Notes() {
             </button>
           ) : null}
         </div>
+        <button
+          type="button"
+          className={
+            sidebarFilter === "tasks"
+              ? "notes-legal-toggle active notes-filter-toggle"
+              : "notes-legal-toggle notes-filter-toggle"
+          }
+          aria-pressed={sidebarFilter === "tasks"}
+          onClick={() =>
+            setSidebarFilter((v) => (v === "tasks" ? "notes" : "tasks"))
+          }
+        >
+          未完了ToDo：{openTasks.length}
+        </button>
         <div className="notes-sidebar-body">
-          {notes.length === 0 ? (
+          {sidebarFilter === "tasks" ? (
+            openTasks.length === 0 ? (
+              <p className="notes-empty-side">未完了の ToDo はありません</p>
+            ) : (
+              <ul className="notes-task-list">
+                {openTasks.map((t) => (
+                  <li key={`${t.noteId}:${t.line}`} className="notes-task-item">
+                    <label className="notes-task-row">
+                      <input
+                        type="checkbox"
+                        checked={false}
+                        onChange={() => void onToggleTask(t)}
+                      />
+                      <span>{t.text}</span>
+                      {t.due ? (
+                        <span className="notes-task-due">{t.due}</span>
+                      ) : null}
+                    </label>
+                    <button
+                      type="button"
+                      className="notes-task-note"
+                      onClick={() => void selectNote(t.noteId)}
+                    >
+                      {t.noteTitle}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )
+          ) : notes.length === 0 ? (
             <p className="notes-empty-side">保存済みノートはありません</p>
           ) : visibleNotes.length === 0 ? (
             <p className="notes-empty-side">
@@ -1307,7 +1774,7 @@ export default function Notes() {
         onMouseDown={onSidebarResizeStart}
       />
 
-      <main className="notes-main">
+      <main className="notes-main" ref={mainRef}>
         {!active ? (
           <div className="notes-empty-main">
             <p>ノートがありません。新規作成するか、検索結果からキープしてください。</p>
@@ -1318,12 +1785,7 @@ export default function Notes() {
         ) : (
           <>
             <header className="notes-main-head">
-              <div>
-                <h2>{active.title || "無題のノート"}</h2>
-                <p className="notes-muted">
-                  {items.length} 件キープ · 左のハンドルをドラッグで並べ替え
-                </p>
-              </div>
+              <h2>{active.title || "無題のノート"}</h2>
               <div className="notes-main-head-actions">
                 <ChatDestPicker
                   buttonClassName="notes-legal-toggle"
@@ -1402,51 +1864,157 @@ export default function Notes() {
                     </div>
                   ) : null}
                 </div>
-                <button
-                  type="button"
-                  className={
-                    legalMdFormat
-                      ? "notes-legal-toggle active"
-                      : "notes-legal-toggle"
-                  }
-                  aria-pressed={legalMdFormat}
-                  title="法令MD・裁判例を見やすく表示（表示のみ）"
-                  onClick={() => setLegalMdFormat((v) => !v)}
-                >
-                  整形
-                </button>
-                <div className="notes-view-toggle" role="group" aria-label="表示切替">
+                <div className="notes-view-toggle" role="group" aria-label="分割の向き">
                   <button
                     type="button"
-                    className={viewMode === "list" ? "active" : ""}
-                    onClick={() => void setViewMode("list")}
+                    className={splitDirPref === "col" ? "active" : ""}
+                    disabled={forceCol}
+                    title={forceCol ? "幅が狭いため上下のみ" : "上下に分割"}
+                    onClick={() => setSplitDirPref("col")}
                   >
-                    リスト
+                    上下
                   </button>
                   <button
                     type="button"
-                    className={viewMode === "grid" ? "active" : ""}
-                    onClick={() => void setViewMode("grid")}
+                    className={splitDirPref === "row" && !forceCol ? "active" : ""}
+                    disabled={forceCol}
+                    title={forceCol ? "幅が狭いため上下のみ" : "左右に分割"}
+                    onClick={() => setSplitDirPref("row")}
                   >
-                    グリッド
+                    左右
                   </button>
                 </div>
               </div>
             </header>
 
-            <label className="notes-memo-block">
-              <span className="notes-memo-label">ノートメモ</span>
-              <textarea
-                value={active.memo}
-                placeholder="このノートについてのメモ"
-                rows={2}
-                onChange={(e) => onNoteMemoChange(e.target.value)}
-              />
-            </label>
-
             {error ? <p className="notes-error">{error}</p> : null}
             {chatNotice ? <p className="notes-chat-notice">{chatNotice}</p> : null}
+            {pendingProposal ? (
+              <button
+                type="button"
+                className="notes-pending-banner"
+                onClick={() => void openWindow("show_chat_window")}
+              >
+                チャットに変更提案があります
+              </button>
+            ) : null}
 
+            <div
+              className={
+                splitDir === "row" ? "notes-split notes-split--row" : "notes-split notes-split--col"
+              }
+            >
+              <section
+                className="notes-memo-pane notes-memo-block"
+                style={
+                  splitDir === "col"
+                    ? { flex: `${splitRatio} 1 0` }
+                    : { flex: `${splitRatio} 1 0`, width: 0 }
+                }
+              >
+                <div className="notes-pane-head">
+                  <span className="notes-pane-head-title">メモ</span>
+                  <div className="notes-pane-head-actions">
+                    <MemoMdHelper
+                      key={active.id}
+                      onPick={onInsertMemoMd}
+                      onCapture={() => captureMemoView()}
+                    />
+                    <div className="notes-view-toggle" role="group" aria-label="メモの表示">
+                      <button
+                        type="button"
+                        className={!memoEdit ? "active" : ""}
+                        onClick={() => setMemoEdit(false)}
+                      >
+                        表示
+                      </button>
+                      <button
+                        type="button"
+                        className={memoEdit ? "active" : ""}
+                        onClick={() => setMemoEdit(true)}
+                      >
+                        編集
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div className="notes-pane-body">
+                  {memoEdit ? (
+                    <textarea
+                      ref={memoTextareaRef}
+                      value={active.memo}
+                      placeholder="このノートについてのメモ（Markdown）"
+                      onChange={(e) => onNoteMemoChange(e.target.value)}
+                      onSelect={(e) => captureMemoView(e.currentTarget)}
+                      onKeyUp={(e) => captureMemoView(e.currentTarget)}
+                      onMouseUp={(e) => captureMemoView(e.currentTarget)}
+                      onScroll={(e) => captureMemoView(e.currentTarget)}
+                      onBlur={(e) => {
+                        captureMemoView(e.currentTarget);
+                        void flushNoteMemo();
+                      }}
+                    />
+                  ) : (
+                    <NoteMemoView
+                      memo={active.memo}
+                      highlightQuery={listQuery}
+                      onToggleCheckbox={onNoteMemoChange}
+                    />
+                  )}
+                </div>
+              </section>
+              <div
+                className="notes-pane-splitter"
+                role="separator"
+                aria-orientation={splitDir === "col" ? "horizontal" : "vertical"}
+                aria-label="メモとキープの境界"
+                onMouseDown={onSplitResizeStart}
+              />
+              <section
+                className="notes-keep-pane"
+                style={
+                  splitDir === "col"
+                    ? { flex: `${1 - splitRatio} 1 0` }
+                    : { flex: `${1 - splitRatio} 1 0`, width: 0 }
+                }
+              >
+                <div className="notes-pane-head">
+                  <span className="notes-pane-head-title">
+                    {items.length} 件キープ
+                  </span>
+                  <div className="notes-pane-head-actions">
+                    <button
+                      type="button"
+                      className={
+                        legalMdFormat
+                          ? "notes-legal-toggle active"
+                          : "notes-legal-toggle"
+                      }
+                      aria-pressed={legalMdFormat}
+                      title="法令MD・裁判例を見やすく表示（表示のみ）"
+                      onClick={() => setLegalMdFormat((v) => !v)}
+                    >
+                      整形
+                    </button>
+                    <div className="notes-view-toggle" role="group" aria-label="キープの表示">
+                      <button
+                        type="button"
+                        className={viewMode === "list" ? "active" : ""}
+                        onClick={() => void setViewMode("list")}
+                      >
+                        リスト
+                      </button>
+                      <button
+                        type="button"
+                        className={viewMode === "grid" ? "active" : ""}
+                        onClick={() => void setViewMode("grid")}
+                      >
+                        グリッド
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div className="notes-pane-body">
             {parsedItems.length === 0 ? (
               <p className="notes-empty-items">
                 まだキープがありません。検索ポップアップの段落からキープできます。
@@ -1621,6 +2189,9 @@ export default function Notes() {
                 })}
               </ul>
             )}
+                </div>
+              </section>
+            </div>
           </>
         )}
       </main>

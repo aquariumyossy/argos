@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow};
+use crate::db::{LlmMessageRow, LlmNoteProposalRow, LlmSourceRow, LlmThreadRow, NoteRow};
 use crate::llm::context::{
     assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed, ChatTurn,
     STOP_TOOLS_HINT,
@@ -108,6 +108,7 @@ async fn execute_tool_off_runtime(
     thread_scope: Option<String>,
     next_cite: i64,
     web_search: bool,
+    request_id: String,
 ) -> (ToolExec, i64) {
     match tokio::task::spawn_blocking(move || {
         let mut n = next_cite;
@@ -119,6 +120,7 @@ async fn execute_tool_off_runtime(
             thread_scope.as_deref(),
             &mut n,
             web_search,
+            &request_id,
         );
         (exec, n)
     })
@@ -230,6 +232,133 @@ pub fn llm_set_thread_scope(
         .set_llm_thread_scope(&id, &joined)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "会話が見つかりません".into())
+}
+
+/// Bind this conversation to a note. Empty `note_id` clears the binding.
+#[tauri::command]
+pub fn llm_set_thread_note(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    note_id: String,
+) -> Result<LlmThreadRow, String> {
+    let note_id = note_id.trim();
+    if !note_id.is_empty()
+        && state
+            .db
+            .get_note(note_id)
+            .map_err(|e| e.to_string())?
+            .is_none()
+    {
+        return Err("ノートが見つかりません".into());
+    }
+    state
+        .db
+        .set_llm_thread_note(&id, note_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "会話が見つかりません".into())
+}
+
+#[tauri::command]
+pub fn llm_list_note_proposals(
+    state: State<'_, Arc<AppState>>,
+    thread_id: String,
+) -> Result<Vec<LlmNoteProposalRow>, String> {
+    state
+        .db
+        .list_note_proposals_for_thread(&thread_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_note_proposals_for_note(
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+) -> Result<Vec<LlmNoteProposalRow>, String> {
+    state
+        .db
+        .list_note_proposals_for_note(&note_id)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteProposalEvent {
+    pub thread_id: String,
+    pub note_id: String,
+}
+
+fn emit_note_proposals(app: &AppHandle, thread_id: &str, note_id: &str) {
+    let _ = app.emit(
+        "llm-note-proposals",
+        NoteProposalEvent {
+            thread_id: thread_id.to_string(),
+            note_id: note_id.to_string(),
+        },
+    );
+}
+
+#[tauri::command]
+pub fn apply_note_proposal(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<LlmNoteProposalRow, String> {
+    let before = state
+        .db
+        .get_note_proposal(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "提案が見つかりません".to_string())?;
+    let _note: NoteRow = state.db.apply_note_proposal(&id)?;
+    let row = state
+        .db
+        .get_note_proposal(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "提案が見つかりません".to_string())?;
+    let _ = app.emit(
+        "note-updated",
+        serde_json::json!({ "noteId": before.note_id, "kind": "memo" }),
+    );
+    emit_note_proposals(&app, &row.thread_id, &row.note_id);
+    Ok(row)
+}
+
+#[tauri::command]
+pub fn dismiss_note_proposal(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<LlmNoteProposalRow, String> {
+    let row = state
+        .db
+        .dismiss_note_proposal(&id)?
+        .ok_or_else(|| "提案が見つかりません".to_string())?;
+    emit_note_proposals(&app, &row.thread_id, &row.note_id);
+    Ok(row)
+}
+
+#[tauri::command]
+pub fn undo_note_proposal(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<LlmNoteProposalRow, String> {
+    let before = state
+        .db
+        .get_note_proposal(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "提案が見つかりません".to_string())?;
+    let _note = state.db.undo_note_proposal(&id)?;
+    let row = state
+        .db
+        .get_note_proposal(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "提案が見つかりません".to_string())?;
+    let _ = app.emit(
+        "note-updated",
+        serde_json::json!({ "noteId": before.note_id, "kind": "memo" }),
+    );
+    emit_note_proposals(&app, &row.thread_id, &row.note_id);
+    Ok(row)
 }
 
 #[tauri::command]
@@ -413,6 +542,17 @@ pub async fn llm_send(
     if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
         system.push_str(&line);
     }
+    let bound_note = {
+        let nid = thread.note_id.trim();
+        if nid.is_empty() {
+            None
+        } else {
+            state.db.get_note(nid).ok().flatten()
+        }
+    };
+    if let Some(n) = &bound_note {
+        system.push_str(&tools::format_note_target_system_line(&n.title, &n.memo));
+    }
     system.push_str(&tools::format_search_date_system_line(
         settings.mail_days_back,
     ));
@@ -451,7 +591,7 @@ pub async fn llm_send(
     }
     let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
 
-    let tools_schema = tools::tools_schema(web_search);
+    let tools_schema = tools::tools_schema_with(web_search, bound_note.is_some());
     let mut use_tools = true;
     let mut retried_without_tools = false;
     let mut extra_final = false;
@@ -507,7 +647,13 @@ pub async fn llm_send(
                 busy.finish();
                 kick_pending_ocr(&app, state_arc.clone());
                 let _ = state.db.delete_uncited_tool_sources(&thread.id);
+                let _ = state.db.discard_orphan_note_proposals(&request_id);
                 emit_sources_updated(&app, &thread.id);
+                emit_note_proposals(
+                    &app,
+                    &thread.id,
+                    bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
+                );
                 let thread = state
                     .db
                     .get_llm_thread(&thread.id)
@@ -545,7 +691,13 @@ pub async fn llm_send(
                 busy.finish();
                 kick_pending_ocr(&app, state_arc.clone());
                 let _ = state.db.delete_uncited_tool_sources(&thread.id);
+                let _ = state.db.discard_orphan_note_proposals(&request_id);
                 emit_sources_updated(&app, &thread.id);
+                emit_note_proposals(
+                    &app,
+                    &thread.id,
+                    bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
+                );
                 let _ = app.emit(
                     "llm-chat-error",
                     LlmChatError {
@@ -637,11 +789,21 @@ pub async fn llm_send(
                             thread_scope.clone(),
                             next_cite,
                             web_search,
+                            request_id.clone(),
                         )
                         .await;
                         next_cite = new_cite;
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
+                        if tc.name == tools::TOOL_PROPOSE_APPEND
+                            || tc.name == tools::TOOL_PROPOSE_REPLACE
+                        {
+                            emit_note_proposals(
+                                &app,
+                                &thread.id,
+                                bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
+                            );
+                        }
                         // `assemble_turns` sized the context before any tool ran, so tool
                         // output is pure overflow. Trim it to the reserve instead of
                         // letting the request exceed the window and get truncated by the
@@ -732,9 +894,19 @@ pub async fn llm_send(
                 .consume_llm_sources(&cited, &user_message.id, &assistant.id)
                 .map_err(|e| e.to_string())?;
         }
+        let _ = state
+            .db
+            .attach_note_proposals_to_assistant(&request_id, &assistant.id);
+    } else {
+        let _ = state.db.discard_orphan_note_proposals(&request_id);
     }
     let _ = state.db.delete_uncited_tool_sources(&thread.id);
     emit_sources_updated(&app, &thread.id);
+    emit_note_proposals(
+        &app,
+        &thread.id,
+        bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
+    );
     let thread = state
         .db
         .get_llm_thread(&thread.id)

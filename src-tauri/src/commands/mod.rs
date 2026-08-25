@@ -40,6 +40,23 @@ pub struct SearchScopeRow {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct NoteUpdatedPayload {
+    note_id: String,
+    kind: String,
+}
+
+fn emit_note_updated(app: &AppHandle, note_id: &str, kind: &str) {
+    let _ = app.emit(
+        "note-updated",
+        NoteUpdatedPayload {
+            note_id: note_id.to_string(),
+            kind: kind.to_string(),
+        },
+    );
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchScopesResult {
     pub recent: Vec<SearchScopeRow>,
     pub scopes: Vec<SearchScopeRow>,
@@ -1279,7 +1296,7 @@ pub fn create_note(
         .db
         .set_active_note_id(Some(&note.id))
         .map_err(|e| e.to_string())?;
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, &note.id, "list");
     Ok(note)
 }
 
@@ -1296,7 +1313,7 @@ pub fn rename_note(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "ノートが見つかりません".into())
         .map(|n| {
-            let _ = app.emit("note-updated", ());
+            emit_note_updated(&app, &n.id, "list");
             n
         })
 }
@@ -1315,7 +1332,7 @@ pub fn delete_note(
             .set_active_note_id(None)
             .map_err(|e| e.to_string())?;
     }
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, &id, "list");
     Ok(())
 }
 
@@ -1342,7 +1359,7 @@ pub fn set_active_note(
         .db
         .set_active_note_id(Some(&note.id))
         .map_err(|e| e.to_string())?;
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, &note.id, "active");
     Ok(note)
 }
 
@@ -1359,9 +1376,82 @@ pub fn update_note_memo(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "ノートが見つかりません".into())
         .map(|n| {
-            let _ = app.emit("note-updated", ());
+            emit_note_updated(&app, &n.id, "memo");
             n
         })
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendNoteMemoResult {
+    pub note: NoteRow,
+    pub chunk: String,
+}
+
+#[tauri::command]
+pub fn append_note_memo(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    chunk: String,
+    heading: Option<String>,
+) -> Result<AppendNoteMemoResult, String> {
+    let chunk = chunk.trim_end().to_string();
+    if chunk.trim().is_empty() {
+        return Err("追記する本文が空です。".into());
+    }
+    let note = if id.trim() == "new" {
+        let created = state
+            .db
+            .create_note("無題のノート")
+            .map_err(|e| e.to_string())?;
+        state
+            .db
+            .set_active_note_id(Some(&created.id))
+            .map_err(|e| e.to_string())?;
+        created
+    } else {
+        state
+            .db
+            .get_note(&id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?
+    };
+    let heading_ref = heading
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let next = crate::notes_md::append_chunk(&note.memo, heading_ref, &chunk)
+        .map_err(|e| e.message(heading_ref.unwrap_or("")))?;
+    let note = state
+        .db
+        .update_note_memo(&note.id, &next)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".to_string())?;
+    emit_note_updated(&app, &note.id, "memo");
+    Ok(AppendNoteMemoResult { note, chunk })
+}
+
+#[tauri::command]
+pub fn undo_append_note_memo(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    chunk: String,
+) -> Result<NoteRow, String> {
+    let note = state
+        .db
+        .get_note(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".to_string())?;
+    let next = crate::notes_md::undo_append(&note.memo, &chunk)?;
+    let note = state
+        .db
+        .update_note_memo(&note.id, &next)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".to_string())?;
+    emit_note_updated(&app, &note.id, "memo");
+    Ok(note)
 }
 
 #[tauri::command]
@@ -1377,7 +1467,7 @@ pub fn set_note_view_mode(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "ノートが見つかりません".into())
         .map(|n| {
-            let _ = app.emit("note-updated", ());
+            emit_note_updated(&app, &n.id, "list");
             n
         })
 }
@@ -1558,7 +1648,7 @@ pub fn keep_to_note(
     if !silent {
         show_notes(&app);
     }
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, &result.note.id, "active");
     Ok(result)
 }
 
@@ -1653,7 +1743,7 @@ pub async fn keep_path_matches(
         })
         .await
         .map_err(|e| e.to_string())??;
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, "", "list");
     Ok(result)
 }
 
@@ -1664,7 +1754,7 @@ pub fn remove_note_item(
     id: String,
 ) -> Result<(), String> {
     state.db.remove_note_item(&id).map_err(|e| e.to_string())?;
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, "", "items");
     Ok(())
 }
 
@@ -1681,7 +1771,7 @@ pub fn update_note_item_memo(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "キープ項目が見つかりません".into())
         .map(|n| {
-            let _ = app.emit("note-updated", ());
+            emit_note_updated(&app, &n.note_id, "items");
             n
         })
 }
@@ -1697,7 +1787,7 @@ pub fn reorder_note_items(
         .db
         .reorder_note_items(&note_id, &ordered_ids)
         .map_err(|e| e.to_string())?;
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, &note_id, "items");
     Ok(())
 }
 
@@ -1711,7 +1801,7 @@ pub fn reorder_notes(
         .db
         .reorder_notes(&ordered_ids)
         .map_err(|e| e.to_string())?;
-    let _ = app.emit("note-updated", ());
+    emit_note_updated(&app, "", "list");
     Ok(())
 }
 

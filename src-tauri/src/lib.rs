@@ -4,6 +4,7 @@ pub mod extractor;
 pub mod indexer;
 pub mod llm;
 pub mod mail;
+pub mod notes_md;
 pub mod pathutil;
 pub mod remote_server;
 pub mod search;
@@ -310,6 +311,8 @@ pub fn run() {
             commands::get_active_note,
             commands::set_active_note,
             commands::update_note_memo,
+            commands::append_note_memo,
+            commands::undo_append_note_memo,
             commands::set_note_view_mode,
             commands::list_note_items,
             commands::keep_to_note,
@@ -324,6 +327,12 @@ pub fn run() {
             llm::commands::llm_create_thread,
             llm::commands::llm_rename_thread,
             llm::commands::llm_set_thread_scope,
+            llm::commands::llm_set_thread_note,
+            llm::commands::llm_list_note_proposals,
+            llm::commands::list_note_proposals_for_note,
+            llm::commands::apply_note_proposal,
+            llm::commands::dismiss_note_proposal,
+            llm::commands::undo_note_proposal,
             llm::commands::llm_delete_thread,
             llm::commands::llm_reorder_threads,
             llm::commands::llm_get_active_thread,

@@ -158,7 +158,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.10.1";
+const APP_VERSION = "1.11.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -1410,16 +1410,20 @@ export default function Settings() {
           <section>
             <h2>ノート</h2>
             <p className="muted">
-              検索ヒットの段落やメールをノートにキープし、メモや並べ替えで整理できます。
+              検索ヒットの段落やメールをノートにキープし、案件の作業文書としてメモ（Markdown）にまとめます。ToDo と日程はメモ内のチェックと <code>@YYYY-MM-DD</code> から集約します。
             </p>
             <ol className="howto-steps">
               <li>ポップアップまたはプレビューの「キープ」から送り先のノートを選びます</li>
               <li>
                 トレイまたは <kbd>{settings.notesShortcut}</kbd>{" "}
-                でノートを開きます
+                でノートを開きます。メインはメモとキープの2ペインで、上下／左右を切り替えられます
               </li>
               <li>
-                ノート全体を「チャット」から出典として送れます。左下のアイコンから検索・チャット・設定へ移れます
+                メモは表示（Markdown）と編集を切り替えます。「記法」から見出し・リスト・ToDo・今日の日付を入れられます。チェックを付けると本文の{" "}
+                <code>- [ ]</code> が変わります。左の「未完了ToDo」で全ノートの宿題を一覧できます
+              </li>
+              <li>
+                「チャット」から出典として送れます（長いメモは要約）。送った会話はそのノートを対象にします。回答の「ノートへ」でメモ末尾へすぐ追記できます。モデルの変更は提案カードの採用後に反映されます
               </li>
             </ol>
           </section>
@@ -1499,7 +1503,7 @@ export default function Settings() {
               </li>
               <li>トレイから「チャットを開く」。左下のアイコンから検索・ノート・設定へ移れます</li>
               <li>
-                検索ヒットやノートの「チャット」から、送り先の会話を選べます。ノートは全体が1つの出典セットになります。同じ会話へ追送することもできます。
+                検索ヒットやノートの「チャット」から、送り先の会話を選べます。ノートから送るとそのノートが対象になり、回答は「ノートへ」でメモに戻せます。モデルが出した見出しの追記・置換は、チャット上の提案カードで採用または却下します。
               </li>
               <li>
                 根拠には出典番号 <code>[n]</code>{" "}

@@ -14,7 +14,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import ChatScopePicker from "./ChatScopePicker";
+import ChatNotePicker from "./ChatNotePicker";
+import NoteProposalCard, { type NoteProposalRow } from "./NoteProposalCard";
 import { AssistantBody } from "./AssistantBody";
+import NoteDestPicker from "../notes/NoteDestPicker";
 import { openPreview } from "../preview/openPreview";
 import { highlightText } from "../search/highlightText";
 import {
@@ -34,6 +37,7 @@ type LlmThreadRow = {
   title: string;
   /** Folder scope for index searches in this thread. Empty means the whole index. */
   pathPrefix?: string;
+  noteId?: string;
   sortOrder?: number;
   createdAt: number;
   updatedAt: number;
@@ -384,6 +388,11 @@ export default function Chat() {
   const [stream, setStream] = useState("");
   const [thinking, setThinking] = useState("");
   const [toolHint, setToolHint] = useState("");
+  const [proposals, setProposals] = useState<NoteProposalRow[]>([]);
+  const [appendUndo, setAppendUndo] = useState<{
+    noteId: string;
+    chunk: string;
+  } | null>(null);
   const [fontSize, setFontSize] = useState(14);
   const [maxContextChars, setMaxContextChars] = useState(80_000);
   const [searxngUrl, setSearxngUrl] = useState("");
@@ -425,14 +434,19 @@ export default function Chat() {
     if (!thread) {
       setMessages([]);
       setSources([]);
+      setProposals([]);
       return;
     }
-    const [msgs, srcs] = await Promise.all([
+    const [msgs, srcs, props] = await Promise.all([
       invoke<LlmMessageRow[]>("llm_list_messages", { threadId: thread.id }),
       invoke<LlmSourceRow[]>("llm_list_sources", { threadId: thread.id }),
+      invoke<NoteProposalRow[]>("llm_list_note_proposals", {
+        threadId: thread.id,
+      }).catch(() => [] as NoteProposalRow[]),
     ]);
     setMessages(msgs);
     setSources(srcs);
+    setProposals(props);
   }, []);
 
   const loadThreads = useCallback(async () => {
@@ -560,6 +574,7 @@ export default function Chat() {
     let unlistenError: (() => void) | undefined;
     let unlistenSources: (() => void) | undefined;
     let unlistenOcr: (() => void) | undefined;
+    let unlistenProposals: (() => void) | undefined;
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
       if (event.payload.threadId !== activeIdRef.current) return;
       const kind = event.payload.kind ?? "content";
@@ -609,11 +624,23 @@ export default function Chat() {
     }).then((fn) => {
       unlistenOcr = fn;
     });
+    void listen<{ threadId?: string }>("llm-note-proposals", (event) => {
+      const tid = event.payload?.threadId ?? activeIdRef.current;
+      if (!tid || tid !== activeIdRef.current) return;
+      void invoke<NoteProposalRow[]>("llm_list_note_proposals", { threadId: tid })
+        .then(setProposals)
+        .catch(() => {
+          /* ignore */
+        });
+    }).then((fn) => {
+      unlistenProposals = fn;
+    });
     return () => {
       unlistenDelta?.();
       unlistenError?.();
       unlistenSources?.();
       unlistenOcr?.();
+      unlistenProposals?.();
     };
   }, [loadThreads]);
 
@@ -736,6 +763,58 @@ export default function Chat() {
     setThreads((prev) => prev.map((x) => (x.id === t.id ? t : x)));
     setActive((prev) => (prev?.id === t.id ? t : prev));
   }, []);
+
+  const applyThreadNote = useCallback((t: LlmThreadRow) => {
+    setThreads((prev) => prev.map((x) => (x.id === t.id ? { ...x, ...t } : x)));
+    setActive((prev) => (prev?.id === t.id ? { ...prev, ...t } : prev));
+  }, []);
+
+  const onProposalChange = useCallback((row: NoteProposalRow) => {
+    setProposals((prev) => {
+      const i = prev.findIndex((p) => p.id === row.id);
+      if (i < 0) return [...prev, row];
+      const next = prev.slice();
+      next[i] = row;
+      return next;
+    });
+  }, []);
+
+  async function appendAnswerToNote(content: string, noteId: "new" | string) {
+    const text = content.trim();
+    if (!text) {
+      setError("追記する本文が空です。");
+      return;
+    }
+    try {
+      const result = await invoke<{
+        note: { id: string; title: string };
+        chunk: string;
+      }>("append_note_memo", {
+        id: noteId === "new" ? "new" : noteId,
+        chunk: text,
+      });
+      setAppendUndo({ noteId: result.note.id, chunk: result.chunk });
+      setNotice(
+        `ノート『${result.note.title.trim() || "無題のノート"}』に追記しました`,
+      );
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function undoAppendToNote() {
+    if (!appendUndo) return;
+    try {
+      await invoke("undo_append_note_memo", {
+        id: appendUndo.noteId,
+        chunk: appendUndo.chunk,
+      });
+      setAppendUndo(null);
+      setNotice("追記を取り消しました");
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
 
   async function openSource(s: LlmSourceRow) {
     const path = s.path.trim();
@@ -967,8 +1046,12 @@ export default function Chat() {
       const srcs = await invoke<LlmSourceRow[]>("llm_list_sources", {
         threadId: result.thread.id,
       });
+      const props = await invoke<NoteProposalRow[]>("llm_list_note_proposals", {
+        threadId: result.thread.id,
+      }).catch(() => [] as NoteProposalRow[]);
       setMessages(msgs);
       setSources(srcs);
+      setProposals(props);
       setStream("");
       setThinking("");
       setToolHint("");
@@ -1367,6 +1450,30 @@ export default function Chat() {
                       })}
                     </div>
                   ) : null}
+                  {m.role === "assistant" ? (
+                    <div className="chat-msg-actions">
+                      <NoteDestPicker
+                        buttonClassName="chat-tpl"
+                        title="この回答をノートのメモ末尾へ追記"
+                        disabled={blocked}
+                        onPick={(id) => void appendAnswerToNote(m.content, id)}
+                      >
+                        ノートへ
+                      </NoteDestPicker>
+                    </div>
+                  ) : null}
+                  {m.role === "assistant"
+                    ? proposals
+                        .filter((p) => p.assistantMessageId === m.id)
+                        .map((p) => (
+                          <NoteProposalCard
+                            key={p.id}
+                            proposal={p}
+                            onChange={onProposalChange}
+                            onError={setError}
+                          />
+                        ))
+                    : null}
                 </article>
               );
             })
@@ -1419,6 +1526,16 @@ export default function Chat() {
                   })}
                 </div>
               ) : null}
+              {proposals
+                .filter((p) => !p.assistantMessageId && p.status === "pending")
+                .map((p) => (
+                  <NoteProposalCard
+                    key={p.id}
+                    proposal={p}
+                    onChange={onProposalChange}
+                    onError={setError}
+                  />
+                ))}
             </article>
           ) : null}
           {ocrBusy && !busy ? (
@@ -1426,7 +1543,23 @@ export default function Chat() {
           ) : null}
         </div>
         {error ? <p className="chat-error">{error}</p> : null}
-        {notice ? <p className="chat-notice">{notice}</p> : null}
+        {notice ? (
+          <p className="chat-notice">
+            {notice}
+            {appendUndo ? (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  className="chat-notice-undo"
+                  onClick={() => void undoAppendToNote()}
+                >
+                  取り消し
+                </button>
+              </>
+            ) : null}
+          </p>
+        ) : null}
         <form
           className={dropActive ? "chat-composer drop-active" : "chat-composer"}
           onSubmit={(e) => {
@@ -1535,6 +1668,13 @@ export default function Chat() {
               threadId={active?.id ?? null}
               pathPrefix={active?.pathPrefix ?? ""}
               onApplied={applyThreadScope}
+              onError={setError}
+            />
+            <ChatNotePicker
+              disabled={blocked || !active}
+              threadId={active?.id ?? null}
+              noteId={active?.noteId ?? ""}
+              onApplied={applyThreadNote}
               onError={setError}
             />
             <button
