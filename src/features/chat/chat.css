@@ -1018,6 +1018,123 @@ body.md-col-resizing {
   cursor: pointer;
 }
 
+.chat-msg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.chat-proposal {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg-elevated);
+}
+
+.chat-proposal-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.chat-proposal-kind {
+  font-size: 0.8em;
+  color: var(--muted);
+}
+
+.chat-proposal-status {
+  margin: 4px 0 0;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.chat-proposal-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 8px 0 6px;
+}
+
+.chat-proposal-tabs button {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 0.8em;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.chat-proposal-tabs button.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.chat-proposal-diff {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  font-size: 0.8em;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.chat-diff-add {
+  background: #e5f6e5;
+  display: block;
+}
+
+.chat-diff-del {
+  background: #f8e4e4;
+  display: block;
+}
+
+.chat-diff-eq {
+  display: block;
+}
+
+.chat-proposal-preview {
+  max-height: 240px;
+  overflow: auto;
+}
+
+.chat-proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chat-proposal-actions button {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.chat-proposal-apply {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+  color: #fff !important;
+}
+
+.chat-notice-undo {
+  border: none;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
 .chat-char-meter {
   margin-left: auto;
   color: var(--muted);

@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::db::{Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL};
+use crate::db::{Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, LLM_NOTE_HINT, LLM_NOTE_SENTINEL};
 use crate::llm::context::ChatTurn;
 
 pub fn normalize_base_url(raw: &str) -> String {
@@ -260,6 +260,12 @@ pub fn system_for_request(settings: &Settings) -> String {
             s.push('\n');
         }
         s.push_str(LLM_FORMAT_HINT);
+    }
+    if !s.contains(LLM_NOTE_SENTINEL) && !s.contains(LLM_NOTE_HINT) {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(LLM_NOTE_HINT);
     }
     s
 }
@@ -1167,6 +1173,8 @@ mod tests {
         assert!(sys.contains("custom"));
         assert!(sys.contains("生のHTMLは書かないでください"));
         assert_eq!(sys.matches("生のHTMLは書かないでください").count(), 1);
+        assert!(sys.contains("採用までメモは変わりません"));
+        assert_eq!(sys.matches("採用までメモは変わりません").count(), 1);
     }
 
     #[test]
