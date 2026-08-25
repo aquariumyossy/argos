@@ -315,6 +315,19 @@ pub struct FolderRow {
     pub share_remote: bool,
 }
 
+/// Neutralize `LIKE` wildcards in a literal operand. Uses `|` as the escape character
+/// because Windows forbids it in a path, unlike the backslash that fills every path.
+fn escape_like_operand(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '%' | '_' | '|') {
+            out.push('|');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn parse_remote_share_folder_ids(raw: Option<&str>) -> Vec<i64> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Vec::new();
@@ -1156,6 +1169,37 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(rows.flatten().collect())
+    }
+
+    /// Indexed files under `prefix`, for a folder-scoped path allowlist.
+    ///
+    /// `LIKE` narrows in SQL, then [`pathutil::path_starts_with`] enforces the separator
+    /// boundary so the scope `C:\cases\alpha` never picks up `C:\cases\alpha2`. The escape
+    /// character is `|`, which Windows forbids in a path, so a folder literally named
+    /// `100%` cannot turn into a wildcard.
+    pub fn list_ok_file_paths_under_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let normalized = crate::pathutil::simplify_windows_path(prefix);
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("{}%", escape_like_operand(&normalized));
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM files
+             WHERE status='ok' AND path LIKE ?1 ESCAPE '|'
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows
+            .flatten()
+            .filter(|path| crate::pathutil::path_starts_with(path, &normalized))
+            .collect())
     }
 
     pub fn list_exclude_paths(&self) -> Result<Vec<ExcludePathRow>, rusqlite::Error> {

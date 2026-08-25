@@ -53,6 +53,11 @@ const W_COVERAGE: f32 = 1.5;
 const W_PROXIMITY: f32 = 1.0;
 /// `unit_label` is the paragraph heading (`第N条…` or the first 36 chars).
 const W_LABEL: f32 = 0.6;
+/// Parent folder names. Deliberately below `W_COVERAGE`: the folder is a prior about which
+/// case is meant, body matches are the evidence, and the evidence has to win. Kept under
+/// `W_LABEL` too, because a whole folder gets this bonus at once while a heading match
+/// singles out one paragraph.
+const W_PATH: f32 = 0.4;
 
 /// Share of query units a hit must match, tried in order. Precision mode starts strict
 /// and relaxes; the popup keeps its historical single-unit recall.
@@ -1224,6 +1229,69 @@ fn label_match_strength(unit_label: &str, tokens: &[String], cite_norm: bool) ->
     best
 }
 
+/// Folder segments that say nothing about a case, so a query unit hitting them is noise.
+const GENERIC_PATH_SEGMENTS: &[&str] = &[
+    "users",
+    "documents",
+    "desktop",
+    "downloads",
+    "onedrive",
+    "dropbox",
+    "google drive",
+    "temp",
+    "tmp",
+    "work",
+    "data",
+    "files",
+    "shared",
+    "public",
+];
+
+/// How strongly the parent folders carry a query unit: `1.0` when a folder name starts
+/// with it, `0.5` when one only contains it, `0.0` otherwise.
+///
+/// The query side cannot tell two cases apart when both match every term, so the
+/// directory is the only discriminator left. Reads the stored `path`, so no reindex is
+/// involved, and compares characters directly rather than re-running the tokenizer.
+///
+/// Only the parent folders count: the file name is already indexed as `title`. Outlook
+/// virtual paths are skipped, their folder scoping goes through `mail_folder`.
+fn path_match_strength(path: &str, tokens: &[String]) -> f32 {
+    if tokens.is_empty() || crate::mail::is_outlook_path(path) {
+        return 0.0;
+    }
+    let normalized = pathutil::simplify_windows_path(path);
+    let mut segments: Vec<&str> = normalized.split('\\').collect();
+    // Drop the file name; keep only directories.
+    segments.pop();
+
+    let mut best = 0.0f32;
+    for segment in segments {
+        let seg = segment.trim();
+        // A drive letter (`C:`) or a bare volume marker carries no case information.
+        if seg.len() < 2 || seg.ends_with(':') {
+            continue;
+        }
+        let lower = seg.to_lowercase();
+        if GENERIC_PATH_SEGMENTS.contains(&lower.as_str()) {
+            continue;
+        }
+        for t in tokens {
+            if t.chars().count() < 2 {
+                continue;
+            }
+            let needle = t.to_lowercase();
+            if lower.starts_with(&needle) {
+                return 1.0;
+            }
+            if lower.contains(&needle) {
+                best = best.max(0.5);
+            }
+        }
+    }
+    best
+}
+
 /// Char-index ranges `[start, end)` for every occurrence of `needle` in `hay`.
 fn find_occurrences(hay: &str, needle: &str) -> Vec<(usize, usize)> {
     if needle.is_empty() {
@@ -1629,8 +1697,17 @@ impl TantivyBackend {
                 };
                 let label_bonus =
                     W_LABEL * label_match_strength(&hit.unit_label, &proximity_tokens, cite_norm);
+                let path_bonus = if opts.path_boost {
+                    W_PATH * path_match_strength(&hit.path, &proximity_tokens)
+                } else {
+                    0.0
+                };
                 let combined = score
-                    * (1.0 + W_COVERAGE * coverage + W_PROXIMITY * coverage * compact + label_bonus);
+                    * (1.0
+                        + W_COVERAGE * coverage
+                        + W_PROXIMITY * coverage * compact
+                        + label_bonus
+                        + path_bonus);
                 hit.score = combined;
                 scored.push((combined, hit));
             }
@@ -2774,12 +2851,166 @@ mod tests {
                 )
                 .expect("index");
         }
+
+        /// Index a document under a named folder. Documents live outside the index
+        /// directory: Tantivy manages that one, and stray subdirectories break its
+        /// bookkeeping on Windows.
+        fn add_in(&self, subdir: &str, name: &str, body: &str) {
+            let docs = self.dir.with_file_name(format!(
+                "{}-docs",
+                self.dir.file_name().unwrap().to_string_lossy()
+            ));
+            let dir = docs.join(subdir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{name}.txt"));
+            std::fs::write(&path, body).unwrap();
+            self.backend
+                .index_file(
+                    &path,
+                    path.to_str().unwrap(),
+                    docs.to_str().unwrap(),
+                    1,
+                    body.len() as u64,
+                    &crate::extractor::ExtractedDoc {
+                        title: name.into(),
+                        pages: vec![body.into()],
+                    },
+                )
+                .expect("index");
+        }
     }
 
     impl Drop for TestIndex {
         fn drop(&mut self) {
+            let docs = self.dir.with_file_name(format!(
+                "{}-docs",
+                self.dir.file_name().unwrap().to_string_lossy()
+            ));
+            let _ = std::fs::remove_dir_all(&docs);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn path_match_strength_only_counts_meaningful_parent_folders() {
+        let tokens = vec!["準備書面".to_string(), "解除".to_string()];
+        assert_eq!(
+            path_match_strength(r"C:\cases\準備書面\a.txt", &tokens),
+            1.0,
+            "a folder named after the query unit is the strongest signal"
+        );
+        assert_eq!(
+            path_match_strength(r"C:\cases\第3準備書面控え\a.txt", &tokens),
+            0.5,
+            "a folder that merely contains the unit counts for half"
+        );
+        assert_eq!(
+            path_match_strength(r"C:\cases\alpha\a.txt", &tokens),
+            0.0
+        );
+        assert_eq!(
+            path_match_strength(r"C:\cases\alpha\準備書面.txt", &tokens),
+            0.0,
+            "the file name is already indexed as title"
+        );
+        assert_eq!(
+            path_match_strength("outlook:store/準備書面/x", &tokens),
+            0.0,
+            "Outlook items scope through mail_folder, not a path prefix"
+        );
+        assert_eq!(
+            path_match_strength(r"C:\Documents\a.txt", &["Documents".to_string()]),
+            0.0,
+            "generic segments say nothing about which case is meant"
+        );
+    }
+
+    /// Same text filed under two folders. Body relevance is identical by construction, so
+    /// the only thing that can separate them is the directory — which is the situation the
+    /// folder signal exists for.
+    fn two_folders_same_body(tag: &str) -> TestIndex {
+        let idx = TestIndex::new(tag);
+        let body = "本件について解除の意思表示を行った。準備書面のとおり主張する。";
+        idx.add_in("準備書面", "ours", body);
+        idx.add_in("参考資料", "theirs", body);
+        idx
+    }
+
+    fn score_of(hits: &[SearchHit], folder: &str) -> f32 {
+        hits.iter()
+            .find(|h| h.path.contains(folder))
+            .unwrap_or_else(|| panic!("no hit under {folder}"))
+            .score
+    }
+
+    #[test]
+    fn folder_name_lifts_a_hit_the_body_alone_cannot_separate() {
+        let idx = two_folders_same_body("path-boost");
+        let hits = idx
+            .backend
+            .search_opts(
+                "準備書面 解除",
+                10,
+                None,
+                None,
+                true,
+                SearchOpts::for_llm(3),
+            )
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert!(
+            score_of(&hits, "準備書面") > score_of(&hits, "参考資料"),
+            "the matching folder should break the tie"
+        );
+        assert!(
+            hits[0].path.contains("準備書面"),
+            "and that has to show up in the order: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn folder_name_cannot_outweigh_the_body() {
+        // The folder is a prior about which case is meant; the body is the evidence. A
+        // document that matches more of the query has to stay on top of a folder-name match.
+        let idx = TestIndex::new("path-boost-vs-body");
+        idx.add_in("準備書面", "thin", "本件の準備書面である。");
+        idx.add_in(
+            "参考資料",
+            "thick",
+            "解除の意思表示は準備書面のとおりである。解除の要件と解除の効果を検討し、\
+             解除に関する主張を準備書面に整理した。",
+        );
+        let hits = idx
+            .backend
+            .search_opts(
+                "準備書面 解除",
+                10,
+                None,
+                None,
+                true,
+                SearchOpts::for_llm(3),
+            )
+            .expect("search");
+        assert!(
+            hits[0].path.contains("参考資料"),
+            "body coverage must win: {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn popup_ranking_ignores_folder_names() {
+        let idx = two_folders_same_body("path-boost-popup");
+        let hits = idx
+            .backend
+            .search("準備書面 解除", 10, None, None, true)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert!(
+            (score_of(&hits, "準備書面") - score_of(&hits, "参考資料")).abs() < 1e-4,
+            "the popup keeps its historical ranking, folders included"
+        );
     }
 
     #[test]
