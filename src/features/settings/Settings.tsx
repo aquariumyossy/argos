@@ -158,7 +158,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.10.0";
+const APP_VERSION = "1.10.1";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [

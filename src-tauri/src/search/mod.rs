@@ -88,6 +88,11 @@ pub struct SearchOpts {
     pub precision: bool,
     /// `Some(n)`: return units directly, at most `n` per file. `None`: one best unit per file.
     pub per_file_units: Option<usize>,
+    /// Score a hit up when its parent folders carry a query unit. Directory names are the
+    /// one signal the query side cannot supply: two cases match `解除 通知` equally well,
+    /// and only the folder says which case is meant. Off for the popup, whose ranking is
+    /// covered by existing tests.
+    pub path_boost: bool,
 }
 
 impl SearchOpts {
@@ -96,6 +101,7 @@ impl SearchOpts {
         Self {
             precision: true,
             per_file_units: Some(per_file_units.max(1)),
+            path_boost: true,
         }
     }
 }
@@ -197,6 +203,51 @@ pub fn build_search_filter(
         mail_paths,
         file_paths,
     })
+}
+
+/// Narrow an existing filter to a preferred folder, for the scoped half of a folder-biased
+/// search.
+///
+/// A path allowlist reaches the retrieval query as a `Must` clause, so the strict rung of
+/// the ladder can find in-folder paragraphs directly. The prefix post-filter cannot: it
+/// runs after retrieval, so a folder whose paragraphs miss the global top-N only surfaces
+/// once the ladder has relaxed the query, which returns *looser* matches than an unscoped
+/// search would.
+///
+/// Returns the filter unchanged when the folder holds more files than
+/// [`tantivy_backend::PATH_OR_CAP`]; a `Must` clause of that many terms costs more than it
+/// buys, and the caller still passes the prefix for post-filtering.
+pub fn narrow_filter_to_prefix(
+    db: &Db,
+    base: &SearchFilter,
+    prefix: &str,
+) -> Result<SearchFilter, String> {
+    let prefix = prefix.trim();
+    let mut out = base.clone();
+    if prefix.is_empty() || prefix.starts_with("mailfolder:") || base.skip_files() {
+        return Ok(out);
+    }
+    match base.file_paths.as_ref() {
+        // A date filter already produced an allowlist. Intersect it: two path `Must`
+        // clauses in one query would require a path to equal two different values.
+        Some(list) => {
+            out.file_paths = Some(
+                list.iter()
+                    .filter(|p| pathutil::path_starts_with(p, prefix))
+                    .cloned()
+                    .collect(),
+            );
+        }
+        None => {
+            let paths = db
+                .list_ok_file_paths_under_prefix(prefix, tantivy_backend::PATH_OR_CAP + 1)
+                .map_err(|e| e.to_string())?;
+            if paths.len() <= tantivy_backend::PATH_OR_CAP {
+                out.file_paths = Some(paths);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub trait SearchBackend: Send + Sync {
@@ -1012,8 +1063,9 @@ pub fn ensure_server_token(settings: &mut Settings) {
 mod tests {
     use super::{
         assemble_preview_file, build_search_filter, collapse_email_threads, list_mail_hits,
-        preview_chunk_window, preview_keep_mask, run_preview_file, sort_hits_by_mail_date,
-        DateFilter, SearchFilter, SearchHit, TantivyBackend, UserDictMatcher,
+        narrow_filter_to_prefix, preview_chunk_window, preview_keep_mask, run_preview_file,
+        sort_hits_by_mail_date, DateFilter, SearchFilter, SearchHit, TantivyBackend,
+        UserDictMatcher,
     };
     use crate::db::{Db, Settings};
     use crate::extractor::ExtractedDoc;
@@ -1233,6 +1285,104 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("argos.db")).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn prefix_allowlist_stops_at_the_folder_boundary() {
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\cases", "").unwrap();
+        for path in [
+            r"C:\cases\alpha\a.txt",
+            r"C:\cases\alpha\sub\b.txt",
+            // A sibling that shares the prefix as raw text but not as a folder.
+            r"C:\cases\alpha2\c.txt",
+            r"C:\cases\beta\d.txt",
+        ] {
+            db.upsert_file(folder.id, path, "txt", 1, 1_700_000_000, "h")
+                .unwrap();
+        }
+        let base = SearchFilter::default();
+        let narrowed = narrow_filter_to_prefix(&db, &base, r"C:\cases\alpha").unwrap();
+        let mut paths = narrowed.file_paths.expect("allowlist");
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                r"C:\cases\alpha\a.txt".to_string(),
+                r"C:\cases\alpha\sub\b.txt".to_string(),
+            ],
+            "alpha2 shares the characters but is a different folder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_intersects_the_date_allowlist_instead_of_adding_a_second_one() {
+        // Two path constraints in one query would ask a path to equal two values at once.
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\cases", "").unwrap();
+        db.upsert_file(folder.id, r"C:\cases\alpha\new.txt", "txt", 1, 1_700_000_100, "h")
+            .unwrap();
+        db.upsert_file(folder.id, r"C:\cases\alpha\old.txt", "txt", 1, 1_600_000_000, "h")
+            .unwrap();
+        db.upsert_file(folder.id, r"C:\cases\beta\new.txt", "txt", 1, 1_700_000_100, "h")
+            .unwrap();
+
+        let date = DateFilter {
+            after_unix: Some(1_700_000_000),
+            before_unix: Some(1_700_000_200),
+        };
+        let base = build_search_filter(&db, date, None, None, None, false).unwrap();
+        assert_eq!(base.file_paths.as_ref().map(Vec::len), Some(2));
+
+        let narrowed = narrow_filter_to_prefix(&db, &base, r"C:\cases\alpha").unwrap();
+        assert_eq!(
+            narrowed.file_paths.as_deref(),
+            Some(&[r"C:\cases\alpha\new.txt".to_string()][..]),
+            "the date range and the folder must end up as one list"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_allowlist_is_empty_when_the_folder_holds_nothing() {
+        // The scoped half legitimately finds nothing; the caller still runs the unscoped
+        // half, so this must not read as "no results anywhere".
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\cases", "").unwrap();
+        db.upsert_file(folder.id, r"C:\cases\beta\d.txt", "txt", 1, 1_700_000_000, "h")
+            .unwrap();
+        let narrowed =
+            narrow_filter_to_prefix(&db, &SearchFilter::default(), r"C:\cases\empty").unwrap();
+        assert_eq!(narrowed.file_paths.as_deref(), Some(&[][..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_allowlist_treats_like_wildcards_literally() {
+        let (dir, db) = temp_db();
+        let folder = db.add_folder(r"C:\cases", "").unwrap();
+        db.upsert_file(folder.id, r"C:\cases\100%\a.txt", "txt", 1, 1_700_000_000, "h")
+            .unwrap();
+        db.upsert_file(folder.id, r"C:\cases\100X\b.txt", "txt", 1, 1_700_000_000, "h")
+            .unwrap();
+        let narrowed =
+            narrow_filter_to_prefix(&db, &SearchFilter::default(), r"C:\cases\100%").unwrap();
+        assert_eq!(
+            narrowed.file_paths.as_deref(),
+            Some(&[r"C:\cases\100%\a.txt".to_string()][..]),
+            "a folder named 100% is not a wildcard"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mail_folder_scope_leaves_the_file_allowlist_alone() {
+        let (dir, db) = temp_db();
+        let base = SearchFilter::default();
+        let narrowed = narrow_filter_to_prefix(&db, &base, "mailfolder:受信トレイ").unwrap();
+        assert!(narrowed.file_paths.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -58,7 +58,9 @@ pub fn tools_schema(web_search: bool) -> Value {
                         "query": { "type": "string", "description": "検索語（単語を空白区切り。\"...\" で完全一致、-語 で除外）" },
                         "path_prefix": {
                             "type": "string",
-                            "description": "フォルダパスで結果を絞る（任意）。スレッドに検索範囲が設定されている場合、その配下への絞り込みだけが有効。"
+                            "description": "優先するフォルダパス（任意）。そのフォルダを厚く返すが、結果には他フォルダの関連候補も混ざる（どれかは応答に示す）。\
+ユーザーが特定の案件やフォルダを指したとき、または出典のパス配下を深掘りするときに、分かっているフルパスを渡す。\
+検索語にフォルダ名が入っているだけなら渡さなくてよい。スレッドに検索範囲があるときは、その配下だけが有効。"
                         },
                         "k": { "type": "integer", "description": "件数（1〜16）" },
                         "after": {
@@ -517,20 +519,27 @@ fn unit_limit_for(k: usize) -> usize {
     (k * UNITS_PER_FILE).clamp(k, 48)
 }
 
+/// Share of the result slots kept for the preferred folder.
+const PREFERRED_FOLDER_SHARE: f32 = 0.6;
+/// How close to the best in-folder hit an outside hit must score to spend one of the
+/// remaining slots. Below this the slot returns to the preferred folder: a narrowing that
+/// was right should not be diluted with weak cross-folder noise.
+const OTHER_FOLDER_SCORE_RATIO: f32 = 0.6;
+
 fn run_index_search_multi(
     state: &AppState,
     query: &str,
-    prefixes: &[String],
+    scopes: &SearchScopes,
     k: usize,
     date: search::DateFilter,
     mail_from: Option<&str>,
     sort_date: bool,
     list_mail: bool,
 ) -> Result<Vec<SearchHit>, String> {
-    let prefixes: Vec<Option<&str>> = if prefixes.is_empty() {
+    let prefixes: Vec<Option<&str>> = if scopes.outer.is_empty() {
         vec![None]
     } else {
-        prefixes.iter().map(|p| Some(p.as_str())).collect()
+        scopes.outer.iter().map(|p| Some(p.as_str())).collect()
     };
     let mut all = Vec::new();
     for prefix in prefixes {
@@ -560,18 +569,149 @@ fn run_index_search_multi(
         let mut seen = HashSet::new();
         all.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
         all.truncate(k);
-        Ok(all)
-    } else {
-        Ok(merge_hits_by_score(all, unit_limit_for(k)))
+        return Ok(all);
     }
+
+    let limit = unit_limit_for(k);
+    let Some(preferred) = scopes.mixing_prefix(mail_from, sort_date, list_mail) else {
+        return Ok(merge_hits_diversified(all, limit));
+    };
+
+    let base = search::build_search_filter(
+        &state.db,
+        date,
+        mail_from,
+        Some(preferred),
+        None,
+        sort_date,
+    )?;
+    let filter = search::narrow_filter_to_prefix(&state.db, &base, preferred)?;
+    let scoped = run_index_search(state, query, Some(preferred), k, &filter, list_mail)?;
+    Ok(merge_with_folder_quota(scoped, all, preferred, limit))
 }
 
-fn merge_hits_by_score(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+fn sort_and_dedupe_by_path(hits: &mut Vec<SearchHit>) {
     hits.sort_by(|x, y| y.score.total_cmp(&x.score));
     let mut seen = HashSet::new();
     hits.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
+}
+
+/// Slots the tail gives up when one folder has shut everyone else out.
+const DIVERSITY_MAX_SWAPS: usize = 2;
+/// How close to the top hit an outside paragraph must score to claim a tail slot.
+const DIVERSITY_SCORE_RATIO: f32 = 0.7;
+
+/// Directory holding the file, or empty when the path has no folder to speak of (Outlook
+/// items, which scope through `mail_folder` instead).
+fn parent_folder(path: &str) -> String {
+    if crate::mail::is_outlook_path(path) {
+        return String::new();
+    }
+    let normalized = crate::pathutil::simplify_windows_path(path);
+    match normalized.rfind('\\') {
+        Some(i) => normalized[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Let a second folder into the tail when one folder has taken every slot.
+///
+/// Without a preferred folder there is nothing to state the user's intent, so a single
+/// case folder can fill the results while a comparable paragraph sits one folder over. The
+/// swap is deliberately small and never touches the top slots: when the answer really does
+/// live in one folder, that has to keep working.
+fn merge_hits_diversified(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    sort_and_dedupe_by_path(&mut hits);
+    let max_swaps = DIVERSITY_MAX_SWAPS.min(limit.saturating_sub(1));
+    if hits.len() <= limit || max_swaps == 0 {
+        hits.truncate(limit);
+        return hits;
+    }
+    let dominant = parent_folder(&hits[0].path);
+    if dominant.is_empty() {
+        hits.truncate(limit);
+        return hits;
+    }
+    let in_dominant =
+        |hit: &SearchHit| parent_folder(&hit.path).eq_ignore_ascii_case(&dominant);
+    // Only step in when the cut is a shutout; a mixed result needs no help.
+    if !hits[..limit].iter().all(in_dominant) {
+        hits.truncate(limit);
+        return hits;
+    }
+    let floor = hits[0].score * DIVERSITY_SCORE_RATIO;
+    let swaps: Vec<SearchHit> = hits[limit..]
+        .iter()
+        .filter(|h| h.score >= floor && !in_dominant(h))
+        .take(max_swaps)
+        .cloned()
+        .collect();
     hits.truncate(limit);
+    for (i, hit) in swaps.into_iter().enumerate() {
+        let idx = hits.len() - 1 - i;
+        hits[idx] = hit;
+    }
+    hits.sort_by(|x, y| y.score.total_cmp(&x.score));
     hits
+}
+
+/// Blend the preferred-folder search with the whole-boundary search.
+///
+/// The outside share is a cap rather than a reservation. Filling it unconditionally would
+/// punish a correct narrowing, so an outside hit has to score near the best in-folder one;
+/// otherwise its slot goes back to the preferred folder. When the folder itself comes up
+/// short the outside hits fill in, which is what stops the model from having to widen the
+/// scope and search again.
+fn merge_with_folder_quota(
+    scoped: Vec<SearchHit>,
+    outer: Vec<SearchHit>,
+    prefix: &str,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let mut preferred: Vec<SearchHit> = Vec::new();
+    let mut others: Vec<SearchHit> = Vec::new();
+    for hit in scoped.into_iter().chain(outer) {
+        if crate::pathutil::path_starts_with(&hit.path, prefix) {
+            preferred.push(hit);
+        } else {
+            others.push(hit);
+        }
+    }
+    sort_and_dedupe_by_path(&mut preferred);
+    sort_and_dedupe_by_path(&mut others);
+
+    let floor = preferred
+        .first()
+        .map(|h| h.score * OTHER_FOLDER_SCORE_RATIO)
+        .unwrap_or(f32::MIN);
+    let other_cap = limit.saturating_sub(preferred_quota(limit));
+
+    let mut out: Vec<SearchHit> = Vec::with_capacity(limit);
+    let mut others_rest: Vec<SearchHit> = Vec::new();
+    let mut taken_others = 0usize;
+    for hit in others {
+        if taken_others < other_cap && hit.score >= floor {
+            taken_others += 1;
+            out.push(hit);
+        } else {
+            others_rest.push(hit);
+        }
+    }
+    let room_for_preferred = limit.saturating_sub(out.len());
+    let mut preferred_iter = preferred.into_iter();
+    out.extend(preferred_iter.by_ref().take(room_for_preferred));
+    // Whatever the preferred folder left unused goes to the rest, best score first.
+    let leftover = limit.saturating_sub(out.len());
+    if leftover > 0 {
+        out.extend(others_rest.into_iter().take(leftover));
+    }
+    out.sort_by(|x, y| y.score.total_cmp(&x.score));
+    out.truncate(limit);
+    out
+}
+
+fn preferred_quota(limit: usize) -> usize {
+    (((limit as f32) * PREFERRED_FOLDER_SHARE).round() as usize).clamp(1, limit.max(1))
 }
 
 /// Split a persisted `path_prefix` (newline-separated) into folder paths.
@@ -655,30 +795,121 @@ fn date_reaches_before_sync(date: search::DateFilter, mail_days_back: u32) -> bo
     }
 }
 
-/// Resolve the folder scope for a tool call.
-///
-/// The thread scope is a user instruction, so a model-supplied `path_prefix` may only
-/// narrow it further. Anything outside is discarded rather than honoured, otherwise the
-/// model could silently search folders the user excluded.
-fn resolve_scopes(thread_scope: Option<&str>, requested: Option<&str>) -> Vec<String> {
-    let thread = thread_scope
-        .map(parse_thread_scopes)
-        .unwrap_or_default();
-    let requested = requested.map(str::trim).filter(|s| !s.is_empty());
-    match (thread.is_empty(), requested) {
-        (true, r) => r.map(|s| vec![s.to_string()]).unwrap_or_default(),
-        (false, None) => thread,
-        (false, Some(r)) => {
-            if thread
-                .iter()
-                .any(|t| crate::pathutil::path_starts_with(r, t))
-            {
-                vec![r.to_string()]
-            } else {
-                thread
-            }
+/// Folder scoping for one search round.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SearchScopes {
+    /// Hard boundary. Empty means the whole index. Only the user sets this.
+    pub outer: Vec<String>,
+    /// Folder the model asked to favour. Not a boundary: hits outside it still come back
+    /// through the other-folder quota, because the model can pick the wrong folder and a
+    /// case's answer often sits partly in shared statute or evidence folders.
+    pub preferred: Option<String>,
+}
+
+impl SearchScopes {
+    /// The folder to favour for this round, or `None` when the round blends nothing.
+    ///
+    /// Date listings and sender lookups order their results themselves, and a sender filter
+    /// searches mail only, so none of them has file paths to weigh.
+    fn mixing_prefix(
+        &self,
+        mail_from: Option<&str>,
+        sort_date: bool,
+        list_mail: bool,
+    ) -> Option<&str> {
+        if sort_date || list_mail || mail_from.is_some() {
+            return None;
         }
+        self.preferred_for_mixing()
     }
+
+    /// The folder to favour, when favouring it would actually change the retrieval.
+    ///
+    /// A preferred folder equal to the boundary would run the same query twice, and a mail
+    /// folder is not a path prefix, so both fall back to the single-search path.
+    fn preferred_for_mixing(&self) -> Option<&str> {
+        let preferred = self.preferred.as_deref()?;
+        if preferred.starts_with("mailfolder:") {
+            return None;
+        }
+        let same_as_boundary = self
+            .outer
+            .iter()
+            .any(|outer| same_folder_path(outer, preferred));
+        if same_as_boundary {
+            return None;
+        }
+        Some(preferred)
+    }
+}
+
+fn same_folder_path(a: &str, b: &str) -> bool {
+    crate::pathutil::simplify_windows_path(a)
+        .eq_ignore_ascii_case(&crate::pathutil::simplify_windows_path(b))
+}
+
+/// Resolve the folder scoping for a tool call.
+///
+/// The thread scope is a user instruction, so it stays a hard boundary and a model-supplied
+/// `path_prefix` outside it is discarded rather than honoured — otherwise the model could
+/// silently search folders the user excluded.
+///
+/// Inside the boundary the model's prefix is only a preference. Making it a filter trades
+/// one kind of miss for another: the folder-name signal is real, but so is the answer that
+/// lives one folder over.
+///
+/// A `mailfolder:` request is a hard scope, not a preference. Outlook folders are not a
+/// path hierarchy, so there is no "nearby folder" to fall back to.
+fn resolve_scopes(thread_scope: Option<&str>, requested: Option<&str>) -> SearchScopes {
+    let thread = thread_scope.map(parse_thread_scopes).unwrap_or_default();
+    let requested = requested.map(str::trim).filter(|s| !s.is_empty());
+
+    let Some(requested) = requested else {
+        return SearchScopes {
+            outer: thread,
+            preferred: None,
+        };
+    };
+    let inside = thread.is_empty()
+        || thread
+            .iter()
+            .any(|t| crate::pathutil::path_starts_with(requested, t));
+    if !inside {
+        return SearchScopes {
+            outer: thread,
+            preferred: None,
+        };
+    }
+    if requested.starts_with("mailfolder:") {
+        return SearchScopes {
+            outer: vec![requested.to_string()],
+            preferred: None,
+        };
+    }
+    SearchScopes {
+        outer: thread,
+        preferred: Some(requested.to_string()),
+    }
+}
+
+/// Flag the sources that came from outside the folder the model asked to favour, so it can
+/// weigh them as neighbouring material rather than assume everything is in-scope.
+///
+/// Carried in the tool reply instead of a source column: `llm_thread_sources` would need a
+/// migration for something only this round cares about.
+fn outside_folder_note(prefix: &str, rows: &[crate::db::LlmSourceRow]) -> Option<String> {
+    let outside: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.is_web() && !crate::pathutil::path_starts_with(&r.path, prefix))
+        .map(|r| format!("[{}]", r.cite_no))
+        .collect();
+    if outside.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} は「{prefix}」の外にある関連候補です。",
+        outside.join("")
+    ))
 }
 
 /// Tell the model when a file has matching paragraphs beyond the ones returned, so it can
@@ -843,6 +1074,7 @@ fn execute_tool_inner(
                 sort_date,
                 list_mail,
             )?;
+            let outside_prefix = scopes.mixing_prefix(mail_from, sort_date, list_mail);
             let web_outcome = match web_job {
                 Some(job) => match job.join() {
                     Ok(r) => Some(r),
@@ -866,6 +1098,7 @@ fn execute_tool_inner(
                     &mut consumed,
                 )?;
             }
+            let folder_note = outside_prefix.and_then(|p| outside_folder_note(p, &new_rows));
             let mut web_note = String::new();
             match web_outcome {
                 Some(Ok(web_hits)) => {
@@ -893,7 +1126,9 @@ fn execute_tool_inner(
             }
             let mut content = String::new();
             if hits.is_empty() {
-                let where_ = scope_where_clause(&scopes);
+                // Only the hard boundary explains an empty result. Naming the preferred
+                // folder would read as "not in that folder", which is not what was searched.
+                let where_ = scope_where_clause(&scopes.outer);
                 let period = date_where_clause(after, before);
                 let mut msg = format!(
                     "「{query}」に一致する索引ヒットはありません{period}{where_}。"
@@ -922,6 +1157,10 @@ fn execute_tool_inner(
                     content.push('\n');
                 }
                 content.push_str(&already.join("\n"));
+            }
+            if let Some(note) = folder_note {
+                content.push('\n');
+                content.push_str(&note);
             }
             if let Some(note) = more_matches_note(&hits) {
                 content.push('\n');
@@ -1103,32 +1342,64 @@ fn execute_tool_inner(
 mod tests {
     use super::*;
 
+    fn scopes(outer: &[&str], preferred: Option<&str>) -> SearchScopes {
+        SearchScopes {
+            outer: outer.iter().map(|s| s.to_string()).collect(),
+            preferred: preferred.map(|s| s.to_string()),
+        }
+    }
+
     #[test]
     fn thread_scope_is_a_hard_boundary() {
         let thread = Some(r"C:\cases\alpha");
         assert_eq!(
             resolve_scopes(thread, Some(r"C:\cases\alpha\pleadings")),
-            vec![r"C:\cases\alpha\pleadings".to_string()],
-            "a narrower request is honoured"
+            scopes(&[r"C:\cases\alpha"], Some(r"C:\cases\alpha\pleadings")),
+            "a narrower request only sets a preference; the boundary is unchanged"
         );
         assert_eq!(
             resolve_scopes(thread, Some(r"C:\cases\beta")),
-            vec![r"C:\cases\alpha".to_string()],
+            scopes(&[r"C:\cases\alpha"], None),
             "a request outside the thread scope must be discarded, not followed"
         );
         assert_eq!(
             resolve_scopes(thread, None),
-            vec![r"C:\cases\alpha".to_string()]
-        );
-        assert!(
-            resolve_scopes(None, None).is_empty(),
-            "unscoped stays unscoped"
+            scopes(&[r"C:\cases\alpha"], None)
         );
         assert_eq!(
-            resolve_scopes(None, Some(r"C:\cases\beta")),
-            vec![r"C:\cases\beta".to_string()],
-            "without a thread scope the model may narrow freely"
+            resolve_scopes(None, None),
+            scopes(&[], None),
+            "unscoped stays unscoped"
         );
+    }
+
+    #[test]
+    fn model_prefix_prefers_a_folder_without_excluding_the_rest() {
+        // Without a thread scope the model may still steer, but it must not shrink the
+        // searched universe: the answer often sits in a shared statute folder.
+        let resolved = resolve_scopes(None, Some(r"C:\cases\beta"));
+        assert_eq!(resolved, scopes(&[], Some(r"C:\cases\beta")));
+        assert_eq!(resolved.preferred_for_mixing(), Some(r"C:\cases\beta"));
+    }
+
+    #[test]
+    fn preferred_equal_to_the_boundary_does_not_run_twice() {
+        let resolved = resolve_scopes(Some(r"C:\cases\alpha"), Some(r"C:\cases\alpha/"));
+        assert_eq!(resolved.outer, vec![r"C:\cases\alpha".to_string()]);
+        assert_eq!(
+            resolved.preferred_for_mixing(),
+            None,
+            "the two halves would issue the same query"
+        );
+    }
+
+    #[test]
+    fn mail_folder_request_stays_a_hard_scope() {
+        // Outlook folders are not a path hierarchy, so there is no neighbouring folder to
+        // fall back to and nothing to blend.
+        let resolved = resolve_scopes(None, Some("mailfolder:受信トレイ"));
+        assert_eq!(resolved.outer, vec!["mailfolder:受信トレイ".to_string()]);
+        assert_eq!(resolved.preferred_for_mixing(), None);
     }
 
     #[test]
@@ -1136,23 +1407,167 @@ mod tests {
         let thread = Some("C:\\cases\\alpha\nC:\\cases\\beta");
         assert_eq!(
             resolve_scopes(thread, Some(r"C:\cases\beta\exhibits")),
-            vec![r"C:\cases\beta\exhibits".to_string()],
+            scopes(
+                &[r"C:\cases\alpha", r"C:\cases\beta"],
+                Some(r"C:\cases\beta\exhibits")
+            ),
+            "both user folders stay searchable; one is merely favoured"
         );
         assert_eq!(
             resolve_scopes(thread, Some(r"C:\cases\gamma")),
-            vec![
-                r"C:\cases\alpha".to_string(),
-                r"C:\cases\beta".to_string()
-            ],
+            scopes(&[r"C:\cases\alpha", r"C:\cases\beta"], None),
             "outside the union, keep every thread folder"
         );
         assert_eq!(
             resolve_scopes(thread, None),
+            scopes(&[r"C:\cases\alpha", r"C:\cases\beta"], None)
+        );
+    }
+
+    fn file_hit(path: &str, score: f32) -> SearchHit {
+        SearchHit {
+            id: format!("{path}#1"),
+            title: path.rsplit('\\').next().unwrap_or(path).to_string(),
+            snippet: String::new(),
+            path: path.into(),
+            page: None,
+            chunk_id: None,
+            score,
+            source: "local".into(),
+            preview_text: "本文".into(),
+            highlight_terms: vec![],
+            match_count: 1,
+            paragraphs: vec![],
+            unit_label: String::new(),
+            mail_from: String::new(),
+            mail_date: String::new(),
+            mail_conversation_id: String::new(),
+            mail_folder: String::new(),
+            doc_kind: "file".into(),
+        }
+    }
+
+    fn paths_of(hits: &[SearchHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.path.as_str()).collect()
+    }
+
+    #[test]
+    fn quota_keeps_a_strong_hit_from_outside_the_preferred_folder() {
+        // The preferred folder could fill every slot on score alone. A comparable paragraph
+        // in the shared statute folder is exactly what hard scoping used to lose.
+        let scoped = vec![
+            file_hit(r"C:\cases\alpha\a1.txt", 9.0),
+            file_hit(r"C:\cases\alpha\a2.txt", 8.0),
+            file_hit(r"C:\cases\alpha\a3.txt", 7.5),
+            file_hit(r"C:\cases\alpha\a4.txt", 7.0),
+        ];
+        let outer = vec![file_hit(r"C:\law\minpo.txt", 8.5)];
+        let merged = merge_with_folder_quota(scoped, outer, r"C:\cases\alpha", 4);
+        assert!(
+            merged.iter().any(|h| h.path == r"C:\law\minpo.txt"),
+            "outside hit above the floor must survive: {:?}",
+            paths_of(&merged)
+        );
+        assert_eq!(merged.len(), 4);
+        let inside = merged
+            .iter()
+            .filter(|h| h.path.starts_with(r"C:\cases\alpha"))
+            .count();
+        assert_eq!(inside, 3, "the preferred folder still holds the 60% share");
+    }
+
+    #[test]
+    fn quota_slot_returns_to_the_preferred_folder_when_outside_is_weak() {
+        // The other-folder share is a cap, not a reservation: a correct narrowing must not
+        // be diluted with whatever happened to rank next.
+        let scoped = vec![
+            file_hit(r"C:\cases\alpha\a1.txt", 10.0),
+            file_hit(r"C:\cases\alpha\a2.txt", 9.0),
+            file_hit(r"C:\cases\alpha\a3.txt", 8.0),
+            file_hit(r"C:\cases\alpha\a4.txt", 7.0),
+        ];
+        let outer = vec![file_hit(r"C:\other\weak.txt", 1.0)];
+        let merged = merge_with_folder_quota(scoped, outer, r"C:\cases\alpha", 4);
+        assert_eq!(
+            paths_of(&merged),
             vec![
-                r"C:\cases\alpha".to_string(),
-                r"C:\cases\beta".to_string()
+                r"C:\cases\alpha\a1.txt",
+                r"C:\cases\alpha\a2.txt",
+                r"C:\cases\alpha\a3.txt",
+                r"C:\cases\alpha\a4.txt",
             ]
         );
+    }
+
+    #[test]
+    fn quota_falls_back_to_other_folders_when_the_preferred_one_is_thin() {
+        // Nothing in the folder means the model should still get material, instead of
+        // widening the scope and searching again.
+        let outer = vec![
+            file_hit(r"C:\law\a.txt", 5.0),
+            file_hit(r"C:\law\b.txt", 4.0),
+        ];
+        let merged = merge_with_folder_quota(Vec::new(), outer, r"C:\cases\alpha", 4);
+        assert_eq!(paths_of(&merged), vec![r"C:\law\a.txt", r"C:\law\b.txt"]);
+    }
+
+    #[test]
+    fn quota_dedupes_the_overlap_between_the_two_halves() {
+        let scoped = vec![file_hit(r"C:\cases\alpha\a1.txt", 9.0)];
+        let outer = vec![
+            file_hit(r"C:\cases\alpha\a1.txt", 6.0),
+            file_hit(r"C:\law\x.txt", 8.0),
+        ];
+        let merged = merge_with_folder_quota(scoped, outer, r"C:\cases\alpha", 4);
+        assert_eq!(paths_of(&merged), vec![r"C:\cases\alpha\a1.txt", r"C:\law\x.txt"]);
+    }
+
+    #[test]
+    fn diversify_breaks_a_single_folder_shutout() {
+        let hits = vec![
+            file_hit(r"C:\cases\alpha\a1.txt", 10.0),
+            file_hit(r"C:\cases\alpha\a2.txt", 9.5),
+            file_hit(r"C:\cases\alpha\a3.txt", 9.0),
+            file_hit(r"C:\law\minpo.txt", 8.0),
+        ];
+        let out = merge_hits_diversified(hits, 3);
+        assert!(
+            out.iter().any(|h| h.path == r"C:\law\minpo.txt"),
+            "a close second folder should reach the tail: {:?}",
+            paths_of(&out)
+        );
+        assert_eq!(
+            out[0].path,
+            r"C:\cases\alpha\a1.txt",
+            "the top slot is never given away"
+        );
+    }
+
+    #[test]
+    fn diversify_leaves_a_genuinely_single_folder_answer_alone() {
+        let hits = vec![
+            file_hit(r"C:\cases\alpha\a1.txt", 10.0),
+            file_hit(r"C:\cases\alpha\a2.txt", 9.5),
+            file_hit(r"C:\cases\alpha\a3.txt", 9.0),
+            file_hit(r"C:\law\minpo.txt", 2.0),
+        ];
+        let out = merge_hits_diversified(hits, 3);
+        assert!(
+            out.iter().all(|h| h.path.starts_with(r"C:\cases\alpha")),
+            "a distant hit must not displace in-folder ones: {:?}",
+            paths_of(&out)
+        );
+    }
+
+    #[test]
+    fn diversify_ignores_outlook_paths() {
+        // Mail has no parent folder in the filesystem sense; it scopes via mail_folder.
+        let mut a = file_hit("outlook:store/one", 10.0);
+        a.doc_kind = "email".into();
+        let mut b = file_hit("outlook:store/two", 9.0);
+        b.doc_kind = "email".into();
+        let out = merge_hits_diversified(vec![a, b], 1);
+        assert_eq!(paths_of(&out), vec!["outlook:store/one"]);
     }
 
     #[test]
