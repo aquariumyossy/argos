@@ -1099,7 +1099,9 @@
 
   .notes {
     display: block !important;
+    width: auto !important;
     height: auto !important;
+    grid-template-columns: none !important;
     background: #fff !important;
     color: #000 !important;
   }
@@ -1121,9 +1123,13 @@
   .notes-split,
   .notes-memo-pane,
   .notes-keep-pane,
-  .notes-pane-body {
+  .notes-pane-body,
+  .notes-memo-block {
     display: block !important;
     overflow: visible !important;
+    width: auto !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
     height: auto !important;
     min-height: 0 !important;
     flex: none !important;
@@ -1133,6 +1139,8 @@
   .notes-memo-preview {
     border: none !important;
     overflow: visible !important;
+    width: auto !important;
+    max-width: 100% !important;
     height: auto !important;
   }
 
