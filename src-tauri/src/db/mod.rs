@@ -68,8 +68,8 @@ pub const LLM_FORMAT_HINT: &str =
     "回答はMarkdownで書いてください。見出し・箇条書き・表を使ってよいです。生のHTMLは書かないでください。ユーザーに選ばせるときは ```choices フェンスに選択肢を1行ずつ書いてください。";
 pub const LLM_FORMAT_SENTINEL: &str = "生のHTMLは書かないでください";
 pub const LLM_NOTE_HINT: &str =
-    "ノートのメモを変えるツールは提案だけを作ります。採用までメモは変わりません。書いたと嘘をつかないでください。対象ノートが無いときは一覧だけ使えます。";
-pub const LLM_NOTE_SENTINEL: &str = "採用までメモは変わりません";
+    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。書いたと報告してよいです。採否はユーザーがノートで行います。読む前に消さないでください。全文を書き換えるときは、変えない箇所もそのまま含めてください。対象ノートが無いときは list_notes か create_note を使います。";
+pub const LLM_NOTE_SENTINEL: &str = "書いた内容はすぐメモに反映されます";
 pub const DEFAULT_LLM_SYSTEM_PROMPT: &str =
     "あなたは法律事務所の調査補助です。日本語で簡潔に答えてください。出典ブロックがあるときはその本文だけを根拠にし、根拠箇所には [n] を付けてください。根拠がないことは推測だと明示し、分からないことは分からないと言ってください。インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。\n回答はMarkdownで書いてください。見出し・箇条書き・表を使ってよいです。生のHTMLは書かないでください。ユーザーに選ばせるときは ```choices フェンスに選択肢を1行ずつ書いてください。";
 pub const DEFAULT_LLM_TIMEOUT_MS: u32 = 120_000;
@@ -722,6 +722,11 @@ impl Db {
         }
         let _ = conn.execute(
             "ALTER TABLE llm_threads ADD COLUMN note_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE notes ADD COLUMN llm_review_base TEXT", []);
+        let _ = conn.execute(
+            "UPDATE llm_note_proposals SET status='dismissed' WHERE status='pending'",
             [],
         );
         conn.execute_batch(
@@ -2118,8 +2123,216 @@ impl Db {
         if n == 0 {
             return Ok(None);
         }
+        let _ = conn.execute(
+            "UPDATE notes SET llm_review_base=NULL
+             WHERE id=?1 AND llm_review_base IS NOT NULL AND llm_review_base = memo",
+            [id],
+        );
         drop(conn);
         self.get_note(id)
+    }
+
+    fn llm_review_base(&self, id: &str) -> Result<Option<Option<String>>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT llm_review_base FROM notes WHERE id=?1")?;
+        let mut rows = stmt.query_map([id], |row| row.get::<_, Option<String>>(0))?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    fn set_llm_review_base(
+        &self,
+        id: &str,
+        base: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        match base {
+            Some(b) => {
+                conn.execute(
+                    "UPDATE notes SET llm_review_base=?1 WHERE id=?2",
+                    rusqlite::params![b, id],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE notes SET llm_review_base=NULL WHERE id=?1",
+                    [id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_note_review(&self, id: &str) -> Result<Option<NoteReview>, rusqlite::Error> {
+        let note = match self.get_note(id)? {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let stored = match self.llm_review_base(id)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        Ok(Some(note_review_from(&note, stored)))
+    }
+
+    pub fn apply_llm_note_write(
+        &self,
+        id: &str,
+        memo: &str,
+        heading: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<NoteRow, String> {
+        if memo.trim().is_empty() {
+            return Err("memo が空です。書き込みません。".into());
+        }
+        let note = self
+            .get_note(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let heading = heading.map(str::trim).filter(|s| !s.is_empty());
+        let next = if let Some(h) = heading {
+            let secs = notes_md::split_sections(&note.memo);
+            match notes_md::find_section(&secs, h) {
+                Ok(s) => {
+                    let new_text = notes_md::normalize_section_text(h, memo, s.level);
+                    notes_md::replace_section(&note.memo, h, &new_text)
+                        .map_err(|e| e.message(h))?
+                }
+                Err(notes_md::SectionError::Duplicate) => {
+                    return Err(notes_md::SectionError::Duplicate.message(h));
+                }
+                Err(notes_md::SectionError::Missing) => {
+                    let piece = notes_md::normalize_section_text(h, memo, 2);
+                    let mut out = note.memo.clone();
+                    if !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    out.push_str(&piece);
+                    out
+                }
+            }
+        } else {
+            if note.memo.chars().count() > notes_md::NOTE_FULL_CHAR_CAP {
+                return Err(
+                    "ノートが長いので heading を指定し、見出し単位で書いてください。".into(),
+                );
+            }
+            memo.to_string()
+        };
+        let title = title.map(str::trim).filter(|s| !s.is_empty());
+        let memo_changed = next != note.memo;
+        if memo_changed {
+            let stored = self.llm_review_base(id).map_err(|e| e.to_string())?;
+            if stored == Some(None) {
+                self.set_llm_review_base(id, Some(&note.memo))
+                    .map_err(|e| e.to_string())?;
+            }
+            self.update_note_memo(id, &next)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        }
+        if let Some(t) = title {
+            if t != note.title {
+                self.rename_note(id, t)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "ノートが見つかりません".to_string())?;
+            }
+        }
+        self.get_note(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+
+    fn review_lock_ok(review: &NoteReview, base_len: u32, memo_len: u32) -> Result<(), String> {
+        if !review.has_review {
+            return Err("未確認の変更はありません。".into());
+        }
+        if review.base_len != base_len || review.memo_len != memo_len {
+            return Err("メモが変わっています。差分を読み直してください。".into());
+        }
+        Ok(())
+    }
+
+    pub fn ack_note_review(&self, id: &str, memo_len: u32) -> Result<NoteReview, String> {
+        let review = self
+            .get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        Self::review_lock_ok(&review, review.base_len, memo_len)?;
+        self.set_llm_review_base(id, None)
+            .map_err(|e| e.to_string())?;
+        self.get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+
+    pub fn revert_note_review(&self, id: &str, memo_len: u32) -> Result<NoteReview, String> {
+        let review = self
+            .get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        Self::review_lock_ok(&review, review.base_len, memo_len)?;
+        self.update_note_memo(id, &review.base)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        self.set_llm_review_base(id, None)
+            .map_err(|e| e.to_string())?;
+        self.get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+
+    pub fn keep_note_hunk(
+        &self,
+        id: &str,
+        hunk_index: u32,
+        base_len: u32,
+        memo_len: u32,
+    ) -> Result<NoteReview, String> {
+        let review = self
+            .get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        Self::review_lock_ok(&review, base_len, memo_len)?;
+        let next_base = notes_md::keep_hunk(&review.base, &review.memo, hunk_index as usize)?;
+        if next_base == review.memo {
+            self.set_llm_review_base(id, None)
+                .map_err(|e| e.to_string())?;
+        } else {
+            self.set_llm_review_base(id, Some(&next_base))
+                .map_err(|e| e.to_string())?;
+        }
+        self.get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+
+    pub fn revert_note_hunk(
+        &self,
+        id: &str,
+        hunk_index: u32,
+        base_len: u32,
+        memo_len: u32,
+    ) -> Result<NoteReview, String> {
+        let review = self
+            .get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        Self::review_lock_ok(&review, base_len, memo_len)?;
+        let next_memo = notes_md::revert_hunk(&review.base, &review.memo, hunk_index as usize)?;
+        self.update_note_memo(id, &next_memo)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        if next_memo == review.base {
+            self.set_llm_review_base(id, None)
+                .map_err(|e| e.to_string())?;
+        }
+        self.get_note_review(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
     }
 
     pub fn set_note_view_mode(
@@ -3689,6 +3902,59 @@ pub struct NoteRow {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteReview {
+    pub note_id: String,
+    pub note_title: String,
+    pub has_review: bool,
+    pub base: String,
+    pub memo: String,
+    pub base_len: u32,
+    pub memo_len: u32,
+    pub hunks: Vec<notes_md::DiffHunk>,
+    pub heavy_delete: bool,
+}
+
+fn note_review_from(note: &NoteRow, stored: Option<String>) -> NoteReview {
+    let memo_len = note.memo.chars().count() as u32;
+    let Some(base) = stored else {
+        return NoteReview {
+            note_id: note.id.clone(),
+            note_title: note.title.clone(),
+            has_review: false,
+            base: String::new(),
+            memo: note.memo.clone(),
+            base_len: 0,
+            memo_len,
+            hunks: Vec::new(),
+            heavy_delete: false,
+        };
+    };
+    let has_review = base != note.memo;
+    let diff = if has_review {
+        notes_md::line_diff(&base, &note.memo)
+    } else {
+        Vec::new()
+    };
+    let hunks = if has_review {
+        notes_md::diff_hunks(&base, &note.memo)
+    } else {
+        Vec::new()
+    };
+    NoteReview {
+        note_id: note.id.clone(),
+        note_title: note.title.clone(),
+        has_review,
+        base_len: base.chars().count() as u32,
+        base,
+        memo: note.memo.clone(),
+        memo_len,
+        hunks,
+        heavy_delete: has_review && notes_md::heavy_delete(&diff),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteItemRow {
@@ -4186,12 +4452,12 @@ mod llm_source_pending_tests {
 }
 
 #[cfg(test)]
-mod note_proposal_tests {
+mod note_review_tests {
     use super::*;
 
     fn temp_db() -> (std::path::PathBuf, Db) {
         let dir = std::env::temp_dir().join(format!(
-            "argos-db-prop-{}",
+            "argos-db-rev-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -4207,100 +4473,123 @@ mod note_proposal_tests {
         let (dir, db) = temp_db();
         let note = db.create_note("事件A").unwrap();
         assert!(note.memo.is_empty());
+        let review = db.get_note_review(&note.id).unwrap().unwrap();
+        assert!(!review.has_review);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn apply_replace_and_stale_and_supersede() {
+    fn first_write_sets_base_second_keeps_it() {
         let (dir, db) = temp_db();
         let note = db.create_note("事件A").unwrap();
-        db.update_note_memo(&note.id, "# 争点\nA\n\n# 日程\nB\n")
+        db.update_note_memo(&note.id, "元の本文\n").unwrap();
+        db.apply_llm_note_write(&note.id, "一回目\n", None, None)
             .unwrap();
-        let note = db.get_note(&note.id).unwrap().unwrap();
-        let thread = db.create_llm_thread("会話", true).unwrap();
-        db.set_llm_thread_note(&thread.id, &note.id).unwrap();
-
-        let first = db
-            .insert_note_proposal(
-                &thread.id,
-                &note.id,
-                "req1",
-                "replace",
-                "日程",
-                "# 日程\nB\n",
-                "# 日程\nC\n",
-                "",
-                note.updated_at,
-            )
+        let r1 = db.get_note_review(&note.id).unwrap().unwrap();
+        assert!(r1.has_review);
+        assert_eq!(r1.base, "元の本文\n");
+        assert_eq!(r1.memo, "一回目\n");
+        db.apply_llm_note_write(&note.id, "二回目\n", None, None)
             .unwrap();
-        let second = db
-            .insert_note_proposal(
-                &thread.id,
-                &note.id,
-                "req2",
-                "replace",
-                "日程",
-                "# 日程\nB\n",
-                "# 日程\nD\n",
-                "",
-                note.updated_at,
-            )
-            .unwrap();
-        let first = db.get_note_proposal(&first.id).unwrap().unwrap();
-        assert_eq!(first.status, "superseded");
-        assert_eq!(second.status, "pending");
-
-        db.apply_note_proposal(&second.id).unwrap();
-        let note = db.get_note(&note.id).unwrap().unwrap();
-        assert!(note.memo.contains("# 日程\nD"));
-        assert!(note.memo.contains("# 争点\nA"));
-
-        db.update_note_memo(&note.id, "# 争点\nA\n\n# 日程\nB\n")
-            .unwrap();
-        let note = db.get_note(&note.id).unwrap().unwrap();
-        let stale = db
-            .insert_note_proposal(
-                &thread.id,
-                &note.id,
-                "req3",
-                "replace",
-                "日程",
-                "# 日程\nOLD\n",
-                "# 日程\nNEW\n",
-                "",
-                note.updated_at,
-            )
-            .unwrap();
-        let err = db.apply_note_proposal(&stale.id).unwrap_err();
-        assert!(err.contains("変わって"));
-        let stale = db.get_note_proposal(&stale.id).unwrap().unwrap();
-        assert_eq!(stale.status, "stale");
-
+        let r2 = db.get_note_review(&note.id).unwrap().unwrap();
+        assert_eq!(r2.base, "元の本文\n");
+        assert_eq!(r2.memo, "二回目\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn orphan_proposals_are_discarded() {
+    fn ack_clears_base_revert_restores_memo() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
-        let thread = db.create_llm_thread("t", true).unwrap();
-        db.insert_note_proposal(
-            &thread.id,
-            &note.id,
-            "req-x",
-            "append",
-            "",
-            &note.memo,
-            "x",
-            "x",
-            note.updated_at,
-        )
-        .unwrap();
-        assert_eq!(db.discard_orphan_note_proposals("req-x").unwrap(), 1);
-        assert!(db
-            .list_note_proposals_for_thread(&thread.id)
-            .unwrap()
-            .is_empty());
+        db.update_note_memo(&note.id, "before\n").unwrap();
+        db.apply_llm_note_write(&note.id, "after\n", None, None)
+            .unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        db.ack_note_review(&note.id, r.memo_len).unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        assert!(!r.has_review);
+        assert_eq!(r.memo, "after\n");
+
+        db.apply_llm_note_write(&note.id, "third\n", None, None)
+            .unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        db.revert_note_review(&note.id, r.memo_len).unwrap();
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(note.memo, "after\n");
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        assert!(!r.has_review);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_memo_does_not_open_review() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        db.update_note_memo(&note.id, "同じ\n").unwrap();
+        db.apply_llm_note_write(&note.id, "同じ\n", None, None)
+            .unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        assert!(!r.has_review);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_memo_is_rejected() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        let err = db.apply_llm_note_write(&note.id, "  \n", None, None).unwrap_err();
+        assert!(err.contains("空"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_hunk_lock_errors() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        db.update_note_memo(&note.id, "a\nx\nb\nc\nd\ny\ne\n")
+            .unwrap();
+        db.apply_llm_note_write(&note.id, "a\nX\nb\nc\nd\nY\ne\n", None, None)
+            .unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        let err = db
+            .keep_note_hunk(&note.id, 0, r.base_len, r.memo_len + 1)
+            .unwrap_err();
+        assert!(err.contains("変わって"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_note_requires_heading() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        let long = "あ".repeat(notes_md::NOTE_FULL_CHAR_CAP + 1);
+        db.update_note_memo(&note.id, &long).unwrap();
+        let err = db
+            .apply_llm_note_write(&note.id, "短い\n", None, None)
+            .unwrap_err();
+        assert!(err.contains("heading"));
+        db.apply_llm_note_write(&note.id, "追記区画", Some("新見出し"), None)
+            .unwrap();
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        assert!(note.memo.contains("新見出し"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keep_hunk_shrinks_review() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        db.update_note_memo(&note.id, "a\nx\nb\nc\nd\ny\ne\n")
+            .unwrap();
+        db.apply_llm_note_write(&note.id, "a\nX\nb\nc\nd\nY\ne\n", None, None)
+            .unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        assert_eq!(r.hunks.len(), 2);
+        db.keep_note_hunk(&note.id, 0, r.base_len, r.memo_len)
+            .unwrap();
+        let r = db.get_note_review(&note.id).unwrap().unwrap();
+        assert_eq!(r.hunks.len(), 1);
+        assert_eq!(r.base, "a\nX\nb\nc\nd\ny\ne\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

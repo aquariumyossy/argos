@@ -14,9 +14,9 @@ pub const TOOL_READ: &str = "read_unit";
 pub const TOOL_READ_URL: &str = "read_url";
 pub const TOOL_LIST_NOTES: &str = "list_notes";
 pub const TOOL_READ_NOTE: &str = "read_note";
-pub const TOOL_PROPOSE_APPEND: &str = "propose_note_append";
-pub const TOOL_PROPOSE_REPLACE: &str = "propose_note_replace_section";
-pub const MAX_TOOL_ROUNDS: usize = 3;
+pub const TOOL_CREATE_NOTE: &str = "create_note";
+pub const TOOL_WRITE_NOTE: &str = "write_note";
+pub const MAX_TOOL_ROUNDS: usize = 4;
 pub const MAX_TOOL_ROUNDS_WEB: usize = 4;
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
@@ -32,10 +32,6 @@ const UNITS_PER_FILE: usize = 3;
 pub const MAX_THREAD_SCOPES: usize = 8;
 
 pub fn tools_schema(web_search: bool) -> Value {
-    tools_schema_with(web_search, false)
-}
-
-pub fn tools_schema_with(web_search: bool, note_bound: bool) -> Value {
     let search_desc = if web_search {
         "Argosの索引を検索する（ファイルとメール）。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
@@ -129,66 +125,63 @@ pub fn tools_schema_with(web_search: bool, note_bound: bool) -> Value {
             }
         }));
     }
-    if note_bound {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": TOOL_READ_NOTE,
-                "description": "対象ノートの見出し一覧と、指定した見出しの区画（または先頭）を読む。全文は返らない。続きが必要なら見出しを変えて再度呼ぶ。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "heading": {
-                            "type": "string",
-                            "description": "ATX見出し（# の行）。空なら先頭の区画。"
-                        }
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_LIST_NOTES,
+            "description": "ノートの id・題名・更新日時。対象ノートが未設定のとき、どれを対象にするか確認するために使う。メモ本文は返さない。",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_READ_NOTE,
+            "description": "ノートの見出し一覧と本文を読む。note_id を省略したら対象ノート。heading を指定するとその区画だけ。長いノートは全文が返らないので heading を指定して読む。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": { "type": "string", "description": "ノート id。空なら対象ノート。" },
+                    "heading": {
+                        "type": "string",
+                        "description": "ATX見出し（# の行）。空なら全文（短いノートのみ）。"
                     }
                 }
             }
-        }));
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": TOOL_PROPOSE_APPEND,
-                "description": "対象ノートの末尾、または指定見出しの直下へ行を足す提案を作る。メモは採用されるまで変わらない。書いたと報告しない。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "heading": {
-                            "type": "string",
-                            "description": "追記先の見出し。空なら末尾。無い見出しは新設の提案になる。"
-                        },
-                        "text": { "type": "string", "description": "足す本文（Markdown）" }
-                    },
-                    "required": ["text"]
-                }
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_CREATE_NOTE,
+            "description": "ノートを新規作成してメモを書き、この会話の対象にする。書いた内容はすぐ反映される。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "題名" },
+                    "memo": { "type": "string", "description": "メモ本文（Markdown）" }
+                },
+                "required": ["memo"]
             }
-        }));
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": TOOL_PROPOSE_REPLACE,
-                "description": "対象ノートのATX見出し区画を置き換える提案を作る。見出しが無ければ新設の提案。同名が複数ならエラー。メモは採用されるまで変わらない。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "heading": { "type": "string", "description": "対象の見出し" },
-                        "text": { "type": "string", "description": "区画の新しい本文（見出し行を含めてもよい）" }
-                    },
-                    "required": ["heading", "text"]
-                }
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_WRITE_NOTE,
+            "description": "ノートのメモを書き換える。書いた内容はすぐ反映される。採否はユーザーが行う。note_id を省略したら対象ノート。heading があればその区画だけ置換（無ければ新設）。全文置換するときは変えない箇所も残してメモ全体を渡す。長いノートは heading 必須。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": { "type": "string", "description": "ノート id。空なら対象ノート。" },
+                    "title": { "type": "string", "description": "題名を変えるとき" },
+                    "heading": { "type": "string", "description": "対象の見出し。空なら全文置換。" },
+                    "memo": { "type": "string", "description": "新しい本文（Markdown）。全文置換ならメモ全体。" }
+                },
+                "required": ["memo"]
             }
-        }));
-    } else {
-        tools.push(json!({
-            "type": "function",
-            "function": {
-                "name": TOOL_LIST_NOTES,
-                "description": "ノートの id・題名・更新日時。対象ノートが未設定のとき、どれを対象にするか確認するために使う。メモ本文は返さない。",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        }));
-    }
+        }
+    }));
     Value::Array(tools)
 }
 
@@ -234,6 +227,17 @@ fn hit_body(hit: &SearchHit) -> String {
 pub struct ToolExec {
     pub content: String,
     pub consumed: Vec<(String, i64)>,
+    pub wrote_note_id: Option<String>,
+}
+
+impl ToolExec {
+    fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            consumed: Vec::new(),
+            wrote_note_id: None,
+        }
+    }
 }
 
 /// A hit already cited earlier in the thread is not re-sent in full. Carry a short
@@ -838,12 +842,12 @@ pub fn format_thread_scope_system_line(raw: &str) -> Option<String> {
 pub fn format_note_target_system_line(title: &str, memo: &str) -> String {
     let heads = crate::notes_md::outline(memo);
     let outline = if heads.is_empty() {
-        "見出しはまだありません。置換は見出し新設の提案になります。".to_string()
+        "見出しはまだありません。".to_string()
     } else {
         format!("見出し: {}。", heads.join("、"))
     };
     format!(
-        "\n対象ノートは「{title}」。{outline}メモの変更は提案ツールで出し、採用まで本文は変わりません。"
+        "\n対象ノートは「{title}」。{outline}create_note / read_note / write_note でメモを読めます。書いた内容はすぐ反映されます。採否はユーザーがノートで行います。"
     )
 }
 
@@ -1050,8 +1054,6 @@ fn preview_hit(state: &AppState, paragraph_id: &str) -> Result<Option<SearchHit>
     )
 }
 
-const READ_NOTE_CAP: usize = 2_200;
-
 fn bound_note(state: &AppState, thread_id: &str) -> Result<crate::db::NoteRow, String> {
     let thread = state
         .db
@@ -1060,21 +1062,42 @@ fn bound_note(state: &AppState, thread_id: &str) -> Result<crate::db::NoteRow, S
         .ok_or_else(|| "会話が見つかりません".to_string())?;
     let id = thread.note_id.trim();
     if id.is_empty() {
-        return Err("対象ノートがありません。".into());
+        return Err("対象ノートがありません。list_notes か create_note を使ってください。".into());
     }
     state
         .db
         .get_note(id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "対象ノートがありません。".into())
+        .ok_or_else(|| "対象ノートがありません。list_notes か create_note を使ってください。".into())
+}
+
+fn resolve_note(
+    state: &AppState,
+    thread_id: &str,
+    args: &Value,
+) -> Result<crate::db::NoteRow, String> {
+    let id = args
+        .get("note_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = id {
+        return state
+            .db
+            .get_note(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません。".into());
+    }
+    bound_note(state, thread_id)
+}
+
+fn bind_thread_note(state: &AppState, thread_id: &str, note_id: &str) {
+    let _ = state.db.set_llm_thread_note(thread_id, note_id);
 }
 
 fn tool_list_notes(state: &AppState) -> ToolExec {
     match state.db.list_notes() {
-        Ok(list) if list.is_empty() => ToolExec {
-            content: "ノートはありません。".into(),
-            consumed: Vec::new(),
-        },
+        Ok(list) if list.is_empty() => ToolExec::text("ノートはありません。"),
         Ok(list) => {
             let mut lines = vec!["id\t題名\tupdated_at".to_string()];
             for n in list {
@@ -1085,234 +1108,129 @@ fn tool_list_notes(state: &AppState) -> ToolExec {
                     n.updated_at
                 ));
             }
-            ToolExec {
-                content: lines.join("\n"),
-                consumed: Vec::new(),
-            }
+            ToolExec::text(lines.join("\n"))
         }
-        Err(e) => ToolExec {
-            content: format!("ツールエラー: {e}"),
-            consumed: Vec::new(),
-        },
+        Err(e) => ToolExec::text(format!("ツールエラー: {e}")),
     }
 }
 
 fn tool_read_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
-    let note = match bound_note(state, thread_id) {
+    let note = match resolve_note(state, thread_id, args) {
         Ok(n) => n,
-        Err(e) => {
-            return ToolExec {
-                content: e,
-                consumed: Vec::new(),
-            };
-        }
+        Err(e) => return ToolExec::text(e),
     };
     let heading = args
         .get("heading")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let secs = crate::notes_md::split_sections(&note.memo);
+    let chars = note.memo.chars().count();
     let outline = crate::notes_md::outline(&note.memo);
     let outline_line = if outline.is_empty() {
         "見出し: （なし）".to_string()
     } else {
         format!("見出し: {}", outline.join("、"))
     };
-    let text = if let Some(h) = heading {
-        match crate::notes_md::find_section(&secs, h) {
+    let head = format!(
+        "ノート『{}』 id={}\n{outline_line}\n文字数: {chars}",
+        note.title, note.id
+    );
+    if let Some(h) = heading {
+        let secs = crate::notes_md::split_sections(&note.memo);
+        let text = match crate::notes_md::find_section(&secs, h) {
             Ok(s) => s.text.clone(),
             Err(e) => {
-                return ToolExec {
-                    content: format!("{}\n{outline_line}", e.message(h)),
-                    consumed: Vec::new(),
-                };
+                return ToolExec::text(format!("{}\n{head}", e.message(h)));
             }
-        }
-    } else {
-        secs.first().map(|s| s.text.clone()).unwrap_or_default()
-    };
-    let body = cap_chars(&text, READ_NOTE_CAP);
-    ToolExec {
-        content: format!("ノート『{}』\n{outline_line}\n\n{body}", note.title),
-        consumed: Vec::new(),
+        };
+        let body = cap_chars(&text, crate::notes_md::NOTE_FULL_CHAR_CAP);
+        return ToolExec::text(format!("{head}\n\n{body}"));
     }
+    if chars > crate::notes_md::NOTE_FULL_CHAR_CAP {
+        return ToolExec::text(format!(
+            "{head}\n\nノートが長いため全文は返しません。heading を指定して区画ごとに読み、write_note も heading 付きで書いてください。"
+        ));
+    }
+    ToolExec::text(format!("{head}\n\n{}", note.memo))
 }
 
-fn tool_propose_append(
-    state: &AppState,
-    thread_id: &str,
-    request_id: &str,
-    args: &Value,
-) -> ToolExec {
-    let note = match bound_note(state, thread_id) {
-        Ok(n) => n,
-        Err(e) => {
-            return ToolExec {
-                content: e,
-                consumed: Vec::new(),
-            };
-        }
-    };
-    let text = args
-        .get("text")
+fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
+    let memo = args
+        .get("memo")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim_end();
-    if text.trim().is_empty() {
-        return ToolExec {
-            content: "text が空です。提案は作りません。".into(),
-            consumed: Vec::new(),
-        };
+    if memo.trim().is_empty() {
+        return ToolExec::text("memo が空です。ノートは作りません。");
+    }
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let note = match state.db.create_note(title) {
+        Ok(n) => n,
+        Err(e) => return ToolExec::text(format!("ノートの作成に失敗しました: {e}")),
+    };
+    match state
+        .db
+        .apply_llm_note_write(&note.id, memo, None, None)
+    {
+        Ok(note) => {
+            bind_thread_note(state, thread_id, &note.id);
+            ToolExec {
+                content: format!(
+                    "ノート『{}』を作成してメモに書きました。id={}。反映済みです。採否はユーザーがノートで行います。",
+                    note.title, note.id
+                ),
+                consumed: Vec::new(),
+                wrote_note_id: Some(note.id),
+            }
+        }
+        Err(e) => ToolExec::text(format!("ノートの作成に失敗しました: {e}")),
+    }
+}
+
+fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
+    let note = match resolve_note(state, thread_id, args) {
+        Ok(n) => n,
+        Err(e) => return ToolExec::text(e),
+    };
+    let memo = args
+        .get("memo")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_end();
+    if memo.trim().is_empty() {
+        return ToolExec::text("memo が空です。書き込みません。");
     }
     let heading = args
         .get("heading")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let secs = crate::notes_md::split_sections(&note.memo);
-    let (kind, heading_s, old_text, new_text) = if let Some(h) = heading {
-        match crate::notes_md::find_section(&secs, h) {
-            Ok(s) => match crate::notes_md::append_chunk(&note.memo, Some(h), text) {
-                Ok(next) => {
-                    let after = crate::notes_md::split_sections(&next);
-                    let new_sec = crate::notes_md::find_section(&after, h)
-                        .map(|x| x.text.clone())
-                        .unwrap_or(next);
-                    ("append", h.to_string(), s.text.clone(), new_sec)
-                }
-                Err(e) => {
-                    return ToolExec {
-                        content: e.message(h),
-                        consumed: Vec::new(),
-                    };
-                }
-            },
-            Err(crate::notes_md::SectionError::Duplicate) => {
-                return ToolExec {
-                    content: crate::notes_md::SectionError::Duplicate.message(h),
-                    consumed: Vec::new(),
-                };
-            }
-            Err(crate::notes_md::SectionError::Missing) => {
-                let inserted = crate::notes_md::format_insert_section(h, text);
-                ("insert", h.to_string(), String::new(), inserted)
-            }
-        }
-    } else {
-        match crate::notes_md::append_chunk(&note.memo, None, text) {
-            Ok(next) => ("append", String::new(), note.memo.clone(), next),
-            Err(e) => {
-                return ToolExec {
-                    content: e.message(""),
-                    consumed: Vec::new(),
-                };
-            }
-        }
-    };
-    match state.db.insert_note_proposal(
-        thread_id,
-        &note.id,
-        request_id,
-        kind,
-        &heading_s,
-        &old_text,
-        &new_text,
-        text,
-        note.updated_at,
-    ) {
-        Ok(row) => ToolExec {
-            content: format!(
-                "提案を作りました（未反映）。id={} kind={} heading={}。採用されるまでメモは変わりません。",
-                row.id,
-                row.kind,
-                if row.heading.is_empty() { "（末尾）" } else { row.heading.as_str() }
-            ),
-            consumed: Vec::new(),
-        },
-        Err(e) => ToolExec {
-            content: format!("提案の保存に失敗しました: {e}"),
-            consumed: Vec::new(),
-        },
-    }
-}
-
-fn tool_propose_replace(
-    state: &AppState,
-    thread_id: &str,
-    request_id: &str,
-    args: &Value,
-) -> ToolExec {
-    let note = match bound_note(state, thread_id) {
-        Ok(n) => n,
-        Err(e) => {
-            return ToolExec {
-                content: e,
-                consumed: Vec::new(),
-            };
-        }
-    };
-    let heading = args
-        .get("heading")
+    let title = args
+        .get("title")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    let text = args
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim_end();
-    if heading.is_empty() {
-        return ToolExec {
-            content: "heading が空です。提案は作りません。".into(),
-            consumed: Vec::new(),
-        };
-    }
-    if text.trim().is_empty() {
-        return ToolExec {
-            content: "text が空です。提案は作りません。".into(),
-            consumed: Vec::new(),
-        };
-    }
-    let secs = crate::notes_md::split_sections(&note.memo);
-    let (kind, old_text, new_text) = match crate::notes_md::find_section(&secs, heading) {
-        Ok(s) => {
-            let new_text = crate::notes_md::normalize_section_text(heading, text, s.level);
-            ("replace", s.text.clone(), new_text)
-        }
-        Err(crate::notes_md::SectionError::Duplicate) => {
-            return ToolExec {
-                content: crate::notes_md::SectionError::Duplicate.message(heading),
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match state
+        .db
+        .apply_llm_note_write(&note.id, memo, heading, title)
+    {
+        Ok(note) => {
+            bind_thread_note(state, thread_id, &note.id);
+            let content = format!(
+                "ノート『{}』のメモを更新しました。id={}。反映済みです。採否はユーザーがノートで行います。",
+                note.title, note.id
+            );
+            ToolExec {
+                content,
                 consumed: Vec::new(),
-            };
+                wrote_note_id: Some(note.id),
+            }
         }
-        Err(crate::notes_md::SectionError::Missing) => {
-            let new_text = crate::notes_md::normalize_section_text(heading, text, 2);
-            ("insert", String::new(), new_text)
-        }
-    };
-    match state.db.insert_note_proposal(
-        thread_id,
-        &note.id,
-        request_id,
-        kind,
-        heading,
-        &old_text,
-        &new_text,
-        "",
-        note.updated_at,
-    ) {
-        Ok(row) => ToolExec {
-            content: format!(
-                "提案を作りました（未反映）。id={} kind={} heading={}。採用されるまでメモは変わりません。",
-                row.id, row.kind, row.heading
-            ),
-            consumed: Vec::new(),
-        },
-        Err(e) => ToolExec {
-            content: format!("提案の保存に失敗しました: {e}"),
-            consumed: Vec::new(),
-        },
+        Err(e) => ToolExec::text(e),
     }
 }
 
@@ -1340,6 +1258,7 @@ pub fn execute_tool(
         Err(e) => ToolExec {
             content: format!("ツールエラー: {e}"),
             consumed: Vec::new(),
+            wrote_note_id: None,
         },
     }
 }
@@ -1352,7 +1271,7 @@ fn execute_tool_inner(
     thread_scope: Option<&str>,
     next_cite: &mut i64,
     web_search: bool,
-    request_id: &str,
+    _request_id: &str,
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     match name {
@@ -1367,6 +1286,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "query が空です。".into(),
                     consumed: Vec::new(),
+                    wrote_note_id: None,
                 });
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
@@ -1391,6 +1311,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: e,
                         consumed: Vec::new(),
+                        wrote_note_id: None,
                     });
                 }
             };
@@ -1524,7 +1445,11 @@ fn execute_tool_inner(
             if content.trim().is_empty() {
                 content = "使える本文のあるヒットはありませんでした。".into();
             }
-            Ok(ToolExec { content, consumed })
+            Ok(ToolExec {
+                content,
+                consumed,
+                wrote_note_id: None,
+            })
         }
         TOOL_READ => {
             let paragraph_id = args
@@ -1537,12 +1462,14 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "paragraph_id が空です。".into(),
                     consumed: Vec::new(),
+                    wrote_note_id: None,
                 });
             }
             let Some(hit) = preview_hit(state, &paragraph_id)? else {
                 return Ok(ToolExec {
                     content: format!("段落 {paragraph_id} は索引にありません。"),
                     consumed: Vec::new(),
+                    wrote_note_id: None,
                 });
             };
             let mut new_rows = Vec::new();
@@ -1593,13 +1520,18 @@ fn execute_tool_inner(
             if content.trim().is_empty() {
                 content = "本文が空です。".into();
             }
-            Ok(ToolExec { content, consumed })
+            Ok(ToolExec {
+                content,
+                consumed,
+                wrote_note_id: None,
+            })
         }
         TOOL_READ_URL => {
             if !web_search {
                 return Ok(ToolExec {
                     content: "ウェブ検索がオフです。".into(),
                     consumed: Vec::new(),
+                    wrote_note_id: None,
                 });
             }
             let url = args
@@ -1612,6 +1544,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "url が空です。".into(),
                     consumed: Vec::new(),
+                    wrote_note_id: None,
                 });
             }
             if let Some(existing) = state
@@ -1627,6 +1560,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: already_line(&existing),
                         consumed,
+                        wrote_note_id: None,
                     });
                 }
             }
@@ -1641,6 +1575,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: format!("URL を読めません: {e}"),
                         consumed: Vec::new(),
+                        wrote_note_id: None,
                     });
                 }
             };
@@ -1678,19 +1613,20 @@ fn execute_tool_inner(
             if content.trim().is_empty() {
                 content = "本文が空です。".into();
             }
-            Ok(ToolExec { content, consumed })
+            Ok(ToolExec {
+                content,
+                consumed,
+                wrote_note_id: None,
+            })
         }
         TOOL_LIST_NOTES => Ok(tool_list_notes(state)),
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
-        TOOL_PROPOSE_APPEND => Ok(tool_propose_append(
-            state, thread_id, request_id, &args,
-        )),
-        TOOL_PROPOSE_REPLACE => Ok(tool_propose_replace(
-            state, thread_id, request_id, &args,
-        )),
+        TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
+        TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),
             consumed: Vec::new(),
+            wrote_note_id: None,
         }),
     }
 }
@@ -2004,19 +1940,18 @@ mod tests {
         assert!(!off.contains("公開ウェブも同時に検索"));
         assert!(!off.contains(TOOL_READ_URL));
         assert!(off.contains(TOOL_LIST_NOTES));
-        assert!(!off.contains(TOOL_PROPOSE_APPEND));
+        assert!(off.contains(TOOL_READ_NOTE));
+        assert!(off.contains(TOOL_CREATE_NOTE));
+        assert!(off.contains(TOOL_WRITE_NOTE));
+        assert!(!off.contains("propose_note_"));
         let on = tools_schema(true).to_string();
         assert!(on.contains("公開ウェブも同時に検索"));
         assert!(on.contains(TOOL_READ_URL));
         assert!(on.contains("read_url"));
         assert_eq!(max_tool_rounds(false), MAX_TOOL_ROUNDS);
         assert_eq!(max_tool_rounds(true), MAX_TOOL_ROUNDS_WEB);
-        let bound = tools_schema_with(false, true).to_string();
-        assert!(bound.contains(TOOL_READ_NOTE));
-        assert!(bound.contains(TOOL_PROPOSE_APPEND));
-        assert!(bound.contains(TOOL_PROPOSE_REPLACE));
-        assert!(!bound.contains(TOOL_LIST_NOTES));
-        assert!(!bound.contains("ノートの id・題名・更新日時"));
+        assert!(on.contains(TOOL_WRITE_NOTE));
+        assert!(off.contains("ノートの id・題名・更新日時"));
     }
 
     #[test]

@@ -43,14 +43,20 @@ pub struct SearchScopeRow {
 struct NoteUpdatedPayload {
     note_id: String,
     kind: String,
+    source: String,
 }
 
 fn emit_note_updated(app: &AppHandle, note_id: &str, kind: &str) {
+    emit_note_updated_from(app, note_id, kind, "");
+}
+
+pub(crate) fn emit_note_updated_from(app: &AppHandle, note_id: &str, kind: &str, source: &str) {
     let _ = app.emit(
         "note-updated",
         NoteUpdatedPayload {
             note_id: note_id.to_string(),
             kind: kind.to_string(),
+            source: source.to_string(),
         },
     );
 }

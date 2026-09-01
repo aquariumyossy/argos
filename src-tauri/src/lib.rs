@@ -328,11 +328,11 @@ pub fn run() {
             llm::commands::llm_rename_thread,
             llm::commands::llm_set_thread_scope,
             llm::commands::llm_set_thread_note,
-            llm::commands::llm_list_note_proposals,
-            llm::commands::list_note_proposals_for_note,
-            llm::commands::apply_note_proposal,
-            llm::commands::dismiss_note_proposal,
-            llm::commands::undo_note_proposal,
+            llm::commands::get_note_review,
+            llm::commands::ack_note_review,
+            llm::commands::revert_note_review,
+            llm::commands::keep_note_hunk,
+            llm::commands::revert_note_hunk,
             llm::commands::llm_delete_thread,
             llm::commands::llm_reorder_threads,
             llm::commands::llm_get_active_thread,
@@ -497,6 +497,12 @@ fn ensure_notes_window(app: &AppHandle) -> Option<WebviewWindow> {
     }
     eprintln!("argos: notes window missing; recreating");
     create_notes_window(app)
+}
+
+pub fn notes_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("notes")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false)
 }
 
 pub fn show_notes(app: &AppHandle) {

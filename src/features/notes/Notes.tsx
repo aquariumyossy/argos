@@ -31,6 +31,7 @@ import { openPreview } from "../preview/openPreview";
 import MemoMdHelper from "./MemoMdHelper";
 import { applyMemoMdInsert, type MemoMdKind } from "./memoMdInsert";
 import NoteMemoView from "./NoteMemoView";
+import NoteReviewPanel, { type NoteReview } from "./NoteReviewPanel";
 import {
   memoHasOpenWork,
   parseNoteTasks,
@@ -61,7 +62,7 @@ const MEMO_ATTACH_FULL_MAX = 4000;
 
 type SplitDir = "col" | "row";
 type SidebarFilter = "notes" | "tasks";
-type NoteUpdatedPayload = { noteId?: string; kind?: string };
+type NoteUpdatedPayload = { noteId?: string; kind?: string; source?: string };
 
 function loadSplitDir(): SplitDir {
   try {
@@ -477,7 +478,7 @@ export default function Notes() {
   const [resizingSplit, setResizingSplit] = useState(false);
   const [memoEdit, setMemoEdit] = useState(loadMemoEdit);
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>(loadSidebarFilter);
-  const [pendingProposal, setPendingProposal] = useState(false);
+  const [noteReview, setNoteReview] = useState<NoteReview | null>(null);
   const printMenuRef = useRef<HTMLDivElement | null>(null);
   const chatNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -489,6 +490,9 @@ export default function Notes() {
   const memoDirtyRef = useRef(false);
   const pendingMemoRef = useRef<{ id: string; memo: string } | null>(null);
   const skipMemoReloadRef = useRef<{ id: string; at: number } | null>(null);
+  const loadReviewRef = useRef<(id: string | undefined) => Promise<void>>(
+    async () => {},
+  );
   const activeRef = useRef<NoteRow | null>(null);
   const mainRef = useRef<HTMLElement | null>(null);
   const memoTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -540,6 +544,7 @@ export default function Notes() {
           n.id === row.id ? { ...n, memo: row.memo, updatedAt: row.updatedAt } : n,
         ),
       );
+      void loadReviewRef.current(pending.id);
     } catch (e) {
       memoDirtyRef.current = true;
       pendingMemoRef.current = pending;
@@ -576,29 +581,30 @@ export default function Notes() {
     }
   }, []);
 
+  const loadReview = useCallback(async (noteId: string | undefined) => {
+    if (!noteId) {
+      setNoteReview(null);
+      return;
+    }
+    try {
+      const row = await invoke<NoteReview | null>("get_note_review", { noteId });
+      setNoteReview(row && row.hasReview ? row : null);
+    } catch {
+      setNoteReview(null);
+    }
+  }, []);
+  loadReviewRef.current = loadReview;
+
   const refresh = useCallback(async () => {
     try {
       await loadNotes();
       notesReadyRef.current = true;
       setError("");
-      const id = activeRef.current?.id;
-      if (!id) {
-        setPendingProposal(false);
-      } else {
-        try {
-          const rows = await invoke<{ status: string }[]>(
-            "list_note_proposals_for_note",
-            { noteId: id },
-          );
-          setPendingProposal(rows.some((r) => r.status === "pending"));
-        } catch {
-          setPendingProposal(false);
-        }
-      }
+      await loadReview(activeRef.current?.id);
     } catch (e) {
       setError(formatInvokeError(e));
     }
-  }, [loadNotes]);
+  }, [loadNotes, loadReview]);
 
   const bootstrapNotes = useCallback(async () => {
     if (bootstrappingRef.current || notesReadyRef.current) return;
@@ -614,6 +620,7 @@ export default function Notes() {
           await loadNotes();
           notesReadyRef.current = true;
           setError("");
+          await loadReview(activeRef.current?.id);
           return;
         } catch (e) {
           lastError = e;
@@ -623,7 +630,7 @@ export default function Notes() {
     } finally {
       bootstrappingRef.current = false;
     }
-  }, [loadNotes]);
+  }, [loadNotes, loadReview]);
 
   useEffect(() => {
     void bootstrapNotes();
@@ -727,6 +734,22 @@ export default function Notes() {
       const kind = payload.kind ?? "";
       const noteId = payload.noteId ?? "";
       const pending = pendingMemoRef.current;
+      const llm = payload.source === "llm";
+      if (llm && (!noteId || noteId === pending?.id || noteId === activeRef.current?.id)) {
+        if (noteMemoTimer.current) {
+          clearTimeout(noteMemoTimer.current);
+          noteMemoTimer.current = null;
+        }
+        pendingMemoRef.current = null;
+        memoDirtyRef.current = false;
+        skipMemoReloadRef.current = null;
+        void (async () => {
+          await loadNotes();
+          if (cancelled) return;
+          await loadReview(activeRef.current?.id);
+        })();
+        return;
+      }
       if (
         skip &&
         kind === "memo" &&
@@ -763,34 +786,17 @@ export default function Notes() {
       cancelled = true;
       unlisten?.();
     };
-  }, [flushNoteMemo, refresh]);
+  }, [flushNoteMemo, refresh, loadNotes, loadReview]);
 
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    void listen<{ noteId?: string }>("llm-note-proposals", (event) => {
+    void listen<{ noteId?: string }>("llm-note-review", (event) => {
       const noteId = event.payload?.noteId ?? "";
       if (noteId && activeRef.current && noteId !== activeRef.current.id) {
         return;
       }
-      void (async () => {
-        const id = activeRef.current?.id;
-        if (!id) {
-          setPendingProposal(false);
-          return;
-        }
-        try {
-          const rows = await invoke<{ status: string }[]>(
-            "list_note_proposals_for_note",
-            { noteId: id },
-          );
-          if (!cancelled) {
-            setPendingProposal(rows.some((r) => r.status === "pending"));
-          }
-        } catch {
-          if (!cancelled) setPendingProposal(false);
-        }
-      })();
+      void loadReview(activeRef.current?.id);
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -799,7 +805,7 @@ export default function Notes() {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [loadReview]);
 
   useEffect(() => {
     return () => {
@@ -1889,14 +1895,14 @@ export default function Notes() {
 
             {error ? <p className="notes-error">{error}</p> : null}
             {chatNotice ? <p className="notes-chat-notice">{chatNotice}</p> : null}
-            {pendingProposal ? (
-              <button
-                type="button"
-                className="notes-pending-banner"
-                onClick={() => void openWindow("show_chat_window")}
-              >
-                チャットに変更提案があります
-              </button>
+            {noteReview?.hasReview ? (
+              <NoteReviewPanel
+                review={noteReview}
+                onChange={(row) =>
+                  setNoteReview(row.hasReview ? row : null)
+                }
+                onError={setError}
+              />
             ) : null}
 
             <div

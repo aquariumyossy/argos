@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::db::{LlmMessageRow, LlmNoteProposalRow, LlmSourceRow, LlmThreadRow, NoteRow};
+use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed, ChatTurn,
     STOP_TOOLS_HINT,
@@ -49,6 +49,16 @@ pub struct LlmSendResult {
     pub truncated: bool,
     pub context_chars: usize,
     pub warning: Option<String>,
+    #[serde(default)]
+    pub note_writes: Vec<NoteWriteNotice>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteWriteNotice {
+    pub note_id: String,
+    pub title: String,
+    pub has_review: bool,
 }
 
 #[derive(Serialize)]
@@ -131,6 +141,7 @@ async fn execute_tool_off_runtime(
             ToolExec {
                 content: format!("ツール実行に失敗しました: {e}"),
                 consumed: Vec::new(),
+                wrote_note_id: None,
             },
             next_cite,
         ),
@@ -259,106 +270,113 @@ pub fn llm_set_thread_note(
 }
 
 #[tauri::command]
-pub fn llm_list_note_proposals(
-    state: State<'_, Arc<AppState>>,
-    thread_id: String,
-) -> Result<Vec<LlmNoteProposalRow>, String> {
-    state
-        .db
-        .list_note_proposals_for_thread(&thread_id)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn list_note_proposals_for_note(
+pub fn get_note_review(
     state: State<'_, Arc<AppState>>,
     note_id: String,
-) -> Result<Vec<LlmNoteProposalRow>, String> {
-    state
-        .db
-        .list_note_proposals_for_note(&note_id)
-        .map_err(|e| e.to_string())
+) -> Result<Option<NoteReview>, String> {
+    state.db.get_note_review(&note_id).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NoteProposalEvent {
+pub struct NoteReviewEvent {
     pub thread_id: String,
     pub note_id: String,
 }
 
-fn emit_note_proposals(app: &AppHandle, thread_id: &str, note_id: &str) {
+fn emit_note_review(app: &AppHandle, thread_id: &str, note_id: &str) {
     let _ = app.emit(
-        "llm-note-proposals",
-        NoteProposalEvent {
+        "llm-note-review",
+        NoteReviewEvent {
             thread_id: thread_id.to_string(),
             note_id: note_id.to_string(),
         },
     );
 }
 
-#[tauri::command]
-pub fn apply_note_proposal(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    id: String,
-) -> Result<LlmNoteProposalRow, String> {
-    let before = state
-        .db
-        .get_note_proposal(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "提案が見つかりません".to_string())?;
-    let _note: NoteRow = state.db.apply_note_proposal(&id)?;
-    let row = state
-        .db
-        .get_note_proposal(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "提案が見つかりません".to_string())?;
-    let _ = app.emit(
-        "note-updated",
-        serde_json::json!({ "noteId": before.note_id, "kind": "memo" }),
-    );
-    emit_note_proposals(&app, &row.thread_id, &row.note_id);
-    Ok(row)
+fn after_llm_note_write(app: &AppHandle, state: &AppState, thread_id: &str, note_id: &str) {
+    crate::commands::emit_note_updated_from(app, note_id, "memo", "llm");
+    emit_note_review(app, thread_id, note_id);
+    if !crate::notes_window_visible(app) {
+        let _ = state.db.set_active_note_id(Some(note_id));
+    }
+}
+
+fn note_write_notices(state: &AppState, ids: &[String]) -> Vec<NoteWriteNotice> {
+    let mut out = Vec::new();
+    for id in ids {
+        let review = state.db.get_note_review(id).ok().flatten();
+        let (title, has_review) = match &review {
+            Some(r) => (r.note_title.clone(), r.has_review),
+            None => (String::new(), false),
+        };
+        out.push(NoteWriteNotice {
+            note_id: id.clone(),
+            title,
+            has_review,
+        });
+    }
+    out
+}
+
+fn review_event_after(app: &AppHandle, review: NoteReview, memo_changed: bool) -> NoteReview {
+    if memo_changed {
+        crate::commands::emit_note_updated_from(app, &review.note_id, "memo", "");
+    }
+    emit_note_review(app, "", &review.note_id);
+    review
 }
 
 #[tauri::command]
-pub fn dismiss_note_proposal(
+pub fn ack_note_review(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-    id: String,
-) -> Result<LlmNoteProposalRow, String> {
-    let row = state
-        .db
-        .dismiss_note_proposal(&id)?
-        .ok_or_else(|| "提案が見つかりません".to_string())?;
-    emit_note_proposals(&app, &row.thread_id, &row.note_id);
-    Ok(row)
+    note_id: String,
+    memo_len: u32,
+) -> Result<NoteReview, String> {
+    let review = state.db.ack_note_review(&note_id, memo_len)?;
+    Ok(review_event_after(&app, review, false))
 }
 
 #[tauri::command]
-pub fn undo_note_proposal(
+pub fn revert_note_review(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-    id: String,
-) -> Result<LlmNoteProposalRow, String> {
-    let before = state
+    note_id: String,
+    memo_len: u32,
+) -> Result<NoteReview, String> {
+    let review = state.db.revert_note_review(&note_id, memo_len)?;
+    Ok(review_event_after(&app, review, true))
+}
+
+#[tauri::command]
+pub fn keep_note_hunk(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+    hunk_index: u32,
+    base_len: u32,
+    memo_len: u32,
+) -> Result<NoteReview, String> {
+    let review = state
         .db
-        .get_note_proposal(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "提案が見つかりません".to_string())?;
-    let _note = state.db.undo_note_proposal(&id)?;
-    let row = state
+        .keep_note_hunk(&note_id, hunk_index, base_len, memo_len)?;
+    Ok(review_event_after(&app, review, false))
+}
+
+#[tauri::command]
+pub fn revert_note_hunk(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+    hunk_index: u32,
+    base_len: u32,
+    memo_len: u32,
+) -> Result<NoteReview, String> {
+    let review = state
         .db
-        .get_note_proposal(&id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "提案が見つかりません".to_string())?;
-    let _ = app.emit(
-        "note-updated",
-        serde_json::json!({ "noteId": before.note_id, "kind": "memo" }),
-    );
-    emit_note_proposals(&app, &row.thread_id, &row.note_id);
-    Ok(row)
+        .revert_note_hunk(&note_id, hunk_index, base_len, memo_len)?;
+    Ok(review_event_after(&app, review, true))
 }
 
 #[tauri::command]
@@ -591,7 +609,7 @@ pub async fn llm_send(
     }
     let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
 
-    let tools_schema = tools::tools_schema_with(web_search, bound_note.is_some());
+    let tools_schema = tools::tools_schema(web_search);
     let mut use_tools = true;
     let mut retried_without_tools = false;
     let mut extra_final = false;
@@ -603,6 +621,8 @@ pub async fn llm_send(
     // allowance. A quarter of the window leaves room for the history and the answer.
     let tool_budget = (max_chars / 4).max(2_000);
     let mut tool_used = 0usize;
+    let mut read_note_called = false;
+    let mut wrote_note_ids: Vec<String> = Vec::new();
     let result_text;
 
     loop {
@@ -647,13 +667,7 @@ pub async fn llm_send(
                 busy.finish();
                 kick_pending_ocr(&app, state_arc.clone());
                 let _ = state.db.delete_uncited_tool_sources(&thread.id);
-                let _ = state.db.discard_orphan_note_proposals(&request_id);
                 emit_sources_updated(&app, &thread.id);
-                emit_note_proposals(
-                    &app,
-                    &thread.id,
-                    bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
-                );
                 let thread = state
                     .db
                     .get_llm_thread(&thread.id)
@@ -668,6 +682,7 @@ pub async fn llm_send(
                     truncated,
                     context_chars,
                     warning,
+                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
             }
             Err(e)
@@ -677,10 +692,10 @@ pub async fn llm_send(
                 retried_without_tools = true;
                 warning = Some(match warning.take() {
                     Some(prev) => format!(
-                        "{prev} このモデルはインデックス検索ツールに対応していません。検索窓から出典を送ってください。"
+                        "{prev} このモデルはインデックス検索とノート編集のツールに対応していません。検索窓から出典を送ってください。"
                     ),
                     None => {
-                        "このモデルはインデックス検索ツールに対応していません。検索窓から出典を送ってください。"
+                        "このモデルはインデックス検索とノート編集のツールに対応していません。検索窓から出典を送ってください。"
                             .into()
                     }
                 });
@@ -691,13 +706,7 @@ pub async fn llm_send(
                 busy.finish();
                 kick_pending_ocr(&app, state_arc.clone());
                 let _ = state.db.delete_uncited_tool_sources(&thread.id);
-                let _ = state.db.discard_orphan_note_proposals(&request_id);
                 emit_sources_updated(&app, &thread.id);
-                emit_note_proposals(
-                    &app,
-                    &thread.id,
-                    bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
-                );
                 let _ = app.emit(
                     "llm-chat-error",
                     LlmChatError {
@@ -720,6 +729,7 @@ pub async fn llm_send(
                     truncated,
                     context_chars,
                     warning,
+                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
             }
             Ok(out) => {
@@ -781,6 +791,9 @@ pub async fn llm_send(
                         if tc.name == tools::TOOL_READ_URL {
                             read_url_in_round += 1;
                         }
+                        if tc.name == tools::TOOL_READ_NOTE {
+                            read_note_called = true;
+                        }
                         let (exec, new_cite) = execute_tool_off_runtime(
                             state_arc.clone(),
                             thread.id.clone(),
@@ -795,20 +808,23 @@ pub async fn llm_send(
                         next_cite = new_cite;
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
-                        if tc.name == tools::TOOL_PROPOSE_APPEND
-                            || tc.name == tools::TOOL_PROPOSE_REPLACE
-                        {
-                            emit_note_proposals(
-                                &app,
-                                &thread.id,
-                                bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
+                        if let Some(nid) = exec.wrote_note_id.clone() {
+                            after_llm_note_write(&app, state.inner().as_ref(), &thread.id, &nid);
+                            if !wrote_note_ids.iter().any(|x| x == &nid) {
+                                wrote_note_ids.push(nid);
+                            }
+                        }
+                        let mut content = exec.content;
+                        if tc.name == tools::TOOL_WRITE_NOTE && !read_note_called {
+                            content.push_str(
+                                "\n（警告: この請求では read_note の前に書きました。読んでいない部分を消していないか確認してください。）",
                             );
                         }
-                        // `assemble_turns` sized the context before any tool ran, so tool
-                        // output is pure overflow. Trim it to the reserve instead of
-                        // letting the request exceed the window and get truncated by the
-                        // server, which would drop the question itself.
-                        let content = fit_tool_content(exec.content, tool_budget, tool_used);
+                        let content = if tc.name == tools::TOOL_READ_NOTE {
+                            content
+                        } else {
+                            fit_tool_content(content, tool_budget, tool_used)
+                        };
                         tool_used += content.chars().count();
                         current_turns.push(ChatTurn {
                             role: "tool".into(),
@@ -894,19 +910,9 @@ pub async fn llm_send(
                 .consume_llm_sources(&cited, &user_message.id, &assistant.id)
                 .map_err(|e| e.to_string())?;
         }
-        let _ = state
-            .db
-            .attach_note_proposals_to_assistant(&request_id, &assistant.id);
-    } else {
-        let _ = state.db.discard_orphan_note_proposals(&request_id);
     }
     let _ = state.db.delete_uncited_tool_sources(&thread.id);
     emit_sources_updated(&app, &thread.id);
-    emit_note_proposals(
-        &app,
-        &thread.id,
-        bound_note.as_ref().map(|n| n.id.as_str()).unwrap_or(""),
-    );
     let thread = state
         .db
         .get_llm_thread(&thread.id)
@@ -928,6 +934,7 @@ pub async fn llm_send(
         truncated,
         context_chars,
         warning,
+        note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
     })
 }
 
