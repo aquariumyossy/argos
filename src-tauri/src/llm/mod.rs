@@ -1173,8 +1173,8 @@ mod tests {
         assert!(sys.contains("custom"));
         assert!(sys.contains("生のHTMLは書かないでください"));
         assert_eq!(sys.matches("生のHTMLは書かないでください").count(), 1);
-        assert!(sys.contains("採用までメモは変わりません"));
-        assert_eq!(sys.matches("採用までメモは変わりません").count(), 1);
+        assert!(sys.contains("書いた内容はすぐメモに反映されます"));
+        assert_eq!(sys.matches("書いた内容はすぐメモに反映されます").count(), 1);
     }
 
     #[test]

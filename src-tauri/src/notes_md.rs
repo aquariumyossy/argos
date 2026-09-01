@@ -35,6 +35,19 @@ pub struct DiffLine {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffHunk {
+    pub gap_before: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+/// Full-memo `read_note` / `write_note` without `heading` is refused above this.
+pub const NOTE_FULL_CHAR_CAP: usize = 12_000;
+/// After prefix/suffix trim, skip LCS when either side exceeds this many lines.
+const DIFF_LCS_LINE_CAP: usize = 1_500;
+/// Merge change islands separated by this many equal lines or fewer.
+const HUNK_MERGE_EQ: usize = 2;
+
 pub fn outline(md: &str) -> Vec<String> {
     split_sections(md)
         .into_iter()
@@ -220,10 +233,139 @@ pub fn undo_append(md: &str, chunk: &str) -> Result<String, String> {
 pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
     let a: Vec<&str> = split_lines(old);
     let b: Vec<&str> = split_lines(new);
-    let table = lcs_table(&a, &b);
-    let mut out = Vec::new();
-    backtrack(&a, &b, &table, a.len(), b.len(), &mut out);
+    let mut pre = 0usize;
+    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while suf < a.len().saturating_sub(pre) && suf < b.len().saturating_sub(pre) && a[a.len() - 1 - suf] == b[b.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    let a_mid = &a[pre..a.len() - suf];
+    let b_mid = &b[pre..b.len() - suf];
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    for line in &a[..pre] {
+        out.push(eq_line(line));
+    }
+    if a_mid.len() > DIFF_LCS_LINE_CAP || b_mid.len() > DIFF_LCS_LINE_CAP {
+        for line in a_mid {
+            out.push(del_line(line));
+        }
+        for line in b_mid {
+            out.push(add_line(line));
+        }
+    } else if !a_mid.is_empty() || !b_mid.is_empty() {
+        let table = lcs_table(a_mid, b_mid);
+        out.extend(backtrack_iter(a_mid, b_mid, &table));
+    }
+    for line in &a[a.len() - suf..] {
+        out.push(eq_line(line));
+    }
     out
+}
+
+pub fn diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
+    hunks_from_diff(&line_diff(old, new))
+}
+
+pub fn heavy_delete(diff: &[DiffLine]) -> bool {
+    let del = diff.iter().filter(|l| l.kind == "del").count();
+    let add = diff.iter().filter(|l| l.kind == "add").count();
+    let changed = del + add;
+    changed > 0 && del * 2 > changed
+}
+
+pub fn keep_hunk(base: &str, current: &str, hunk_index: usize) -> Result<String, String> {
+    reconstruct_hunk(base, current, hunk_index, true)
+}
+
+pub fn revert_hunk(base: &str, current: &str, hunk_index: usize) -> Result<String, String> {
+    reconstruct_hunk(base, current, hunk_index, false)
+}
+
+fn reconstruct_hunk(
+    base: &str,
+    current: &str,
+    hunk_index: usize,
+    keep: bool,
+) -> Result<String, String> {
+    let diff = line_diff(base, current);
+    let spans = hunk_spans(&diff);
+    if hunk_index >= spans.len() {
+        return Err("その変更はもうありません。差分を読み直してください。".into());
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut h = 0usize;
+    for (i, line) in diff.iter().enumerate() {
+        while h < spans.len() && i >= spans[h].1 {
+            h += 1;
+        }
+        let in_hunk = h < spans.len() && i >= spans[h].0 && i < spans[h].1;
+        let use_new = if !in_hunk {
+            true
+        } else if keep {
+            h == hunk_index
+        } else {
+            h != hunk_index
+        };
+        let include = match line.kind {
+            "eq" => true,
+            "add" => use_new,
+            "del" => !use_new,
+            _ => false,
+        };
+        if include {
+            out.push(line.text.as_str());
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+fn hunks_from_diff(diff: &[DiffLine]) -> Vec<DiffHunk> {
+    let spans = hunk_spans(diff);
+    let mut prev = 0usize;
+    let mut hunks = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        hunks.push(DiffHunk {
+            gap_before: start.saturating_sub(prev),
+            lines: diff[start..end].to_vec(),
+        });
+        prev = end;
+    }
+    hunks
+}
+
+fn hunk_spans(diff: &[DiffLine]) -> Vec<(usize, usize)> {
+    let mut islands: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < diff.len() {
+        if diff[i].kind == "eq" {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < diff.len() && diff[i].kind != "eq" {
+            i += 1;
+        }
+        islands.push((start, i));
+    }
+    if islands.is_empty() {
+        return Vec::new();
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    let mut cur = islands[0];
+    for &(start, end) in islands.iter().skip(1) {
+        let gap = start.saturating_sub(cur.1);
+        if gap <= HUNK_MERGE_EQ {
+            cur.1 = end;
+        } else {
+            merged.push(cur);
+            cur = (start, end);
+        }
+    }
+    merged.push(cur);
+    merged
 }
 
 fn split_lines(s: &str) -> Vec<&str> {
@@ -231,6 +373,27 @@ fn split_lines(s: &str) -> Vec<&str> {
         return Vec::new();
     }
     s.split('\n').collect()
+}
+
+fn eq_line(text: &str) -> DiffLine {
+    DiffLine {
+        kind: "eq",
+        text: text.to_string(),
+    }
+}
+
+fn add_line(text: &str) -> DiffLine {
+    DiffLine {
+        kind: "add",
+        text: text.to_string(),
+    }
+}
+
+fn del_line(text: &str) -> DiffLine {
+    DiffLine {
+        kind: "del",
+        text: text.to_string(),
+    }
 }
 
 fn lcs_table(a: &[&str], b: &[&str]) -> Vec<Vec<usize>> {
@@ -247,33 +410,27 @@ fn lcs_table(a: &[&str], b: &[&str]) -> Vec<Vec<usize>> {
     t
 }
 
-fn backtrack(
-    a: &[&str],
-    b: &[&str],
-    t: &[Vec<usize>],
-    i: usize,
-    j: usize,
-    out: &mut Vec<DiffLine>,
-) {
-    if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
-        backtrack(a, b, t, i - 1, j - 1, out);
-        out.push(DiffLine {
-            kind: "eq",
-            text: a[i - 1].to_string(),
-        });
-    } else if j > 0 && (i == 0 || t[i][j - 1] >= t[i - 1][j]) {
-        backtrack(a, b, t, i, j - 1, out);
-        out.push(DiffLine {
-            kind: "add",
-            text: b[j - 1].to_string(),
-        });
-    } else if i > 0 {
-        backtrack(a, b, t, i - 1, j, out);
-        out.push(DiffLine {
-            kind: "del",
-            text: a[i - 1].to_string(),
-        });
+fn backtrack_iter(a: &[&str], b: &[&str], t: &[Vec<usize>]) -> Vec<DiffLine> {
+    let mut i = a.len();
+    let mut j = b.len();
+    let mut rev = Vec::new();
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
+            rev.push(eq_line(a[i - 1]));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || t[i][j - 1] >= t[i.saturating_sub(1)][j]) {
+            rev.push(add_line(b[j - 1]));
+            j -= 1;
+        } else if i > 0 {
+            rev.push(del_line(a[i - 1]));
+            i -= 1;
+        } else {
+            break;
+        }
     }
+    rev.reverse();
+    rev
 }
 
 fn append_at_end(md: &str, piece: &str) -> String {
@@ -446,6 +603,60 @@ mod tests {
         let d = line_diff("a\nb\n", "a\nc\n");
         let kinds: Vec<_> = d.iter().map(|l| l.kind).collect();
         assert_eq!(kinds, ["eq", "del", "add", "eq"]);
+    }
+
+    #[test]
+    fn line_diff_trims_equal_prefix_suffix() {
+        let old = "p\nq\nmiddle\nr\ns\n";
+        let new = "p\nq\nchanged\nr\ns\n";
+        let d = line_diff(old, new);
+        let kinds: Vec<_> = d.iter().map(|l| l.kind).collect();
+        assert_eq!(kinds, ["eq", "eq", "del", "add", "eq", "eq", "eq"]);
+    }
+
+    #[test]
+    fn line_diff_skips_lcs_when_mid_is_huge() {
+        let old: String = (0..DIFF_LCS_LINE_CAP + 2)
+            .map(|i| format!("o{i}\n"))
+            .collect();
+        let new: String = (0..DIFF_LCS_LINE_CAP + 2)
+            .map(|i| format!("n{i}\n"))
+            .collect();
+        let d = line_diff(&old, &new);
+        assert!(d.iter().any(|l| l.kind == "del"));
+        assert!(d.iter().any(|l| l.kind == "add"));
+        assert!(!d.iter().any(|l| l.kind == "eq" && l.text.starts_with('o')));
+        let hunks = diff_hunks(&old, &new);
+        assert_eq!(hunks.len(), 1);
+    }
+
+    #[test]
+    fn hunks_merge_when_eq_gap_is_small() {
+        let hunks = diff_hunks("a\nx\nb\nc\ny\n", "a\nX\nb\nc\nY\n");
+        assert_eq!(hunks.len(), 1, "two changes with 2 eq lines merge");
+        let hunks = diff_hunks("a\nx\nb\nc\nd\ny\n", "a\nX\nb\nc\nd\nY\n");
+        assert_eq!(hunks.len(), 2, "3 eq lines stay split");
+    }
+
+    #[test]
+    fn keep_and_revert_hunk_two_islands() {
+        let base = "a\nx\nb\nc\nd\ny\ne\n";
+        let current = "a\nX\nb\nc\nd\nY\ne\n";
+        let hunks = diff_hunks(base, current);
+        assert_eq!(hunks.len(), 2);
+        let kept = keep_hunk(base, current, 0).unwrap();
+        assert_eq!(kept, "a\nX\nb\nc\nd\ny\ne\n");
+        let reverted = revert_hunk(base, current, 0).unwrap();
+        assert_eq!(reverted, "a\nx\nb\nc\nd\nY\ne\n");
+        assert!(keep_hunk(base, current, 9).is_err());
+    }
+
+    #[test]
+    fn heavy_delete_when_majority_removed() {
+        let d = line_diff("a\nb\nc\nd\n", "a\n");
+        assert!(heavy_delete(&d));
+        let d = line_diff("a\n", "a\nb\nc\n");
+        assert!(!heavy_delete(&d));
     }
 
     #[test]

@@ -15,9 +15,9 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
-import NoteProposalCard, { type NoteProposalRow } from "./NoteProposalCard";
 import { AssistantBody } from "./AssistantBody";
 import NoteDestPicker from "../notes/NoteDestPicker";
+import type { NoteReview } from "../notes/NoteReviewPanel";
 import { openPreview } from "../preview/openPreview";
 import { highlightText } from "../search/highlightText";
 import {
@@ -110,6 +110,7 @@ type LlmSendResult = {
   truncated?: boolean;
   contextChars?: number;
   warning?: string | null;
+  noteWrites?: { noteId: string; title: string; hasReview: boolean }[];
 };
 
 type LlmChatDelta = {
@@ -388,7 +389,7 @@ export default function Chat() {
   const [stream, setStream] = useState("");
   const [thinking, setThinking] = useState("");
   const [toolHint, setToolHint] = useState("");
-  const [proposals, setProposals] = useState<NoteProposalRow[]>([]);
+  const [noteReviews, setNoteReviews] = useState<NoteReview[]>([]);
   const [appendUndo, setAppendUndo] = useState<{
     noteId: string;
     chunk: string;
@@ -430,24 +431,41 @@ export default function Chat() {
     attachingRef.current = attaching;
   }, [attaching]);
 
+  const loadNoteReview = useCallback(async (noteId: string | undefined) => {
+    const id = (noteId ?? "").trim();
+    if (!id) return;
+    try {
+      const row = await invoke<NoteReview | null>("get_note_review", {
+        noteId: id,
+      });
+      setNoteReviews((prev) => {
+        const rest = prev.filter((r) => r.noteId !== id);
+        if (row && row.hasReview) return [...rest, row];
+        return rest;
+      });
+    } catch {
+      setNoteReviews((prev) => prev.filter((r) => r.noteId !== id));
+    }
+  }, []);
+
   const loadThreadContent = useCallback(async (thread: LlmThreadRow | null) => {
     if (!thread) {
       setMessages([]);
       setSources([]);
-      setProposals([]);
+      setNoteReviews([]);
       return;
     }
-    const [msgs, srcs, props] = await Promise.all([
+    const [msgs, srcs] = await Promise.all([
       invoke<LlmMessageRow[]>("llm_list_messages", { threadId: thread.id }),
       invoke<LlmSourceRow[]>("llm_list_sources", { threadId: thread.id }),
-      invoke<NoteProposalRow[]>("llm_list_note_proposals", {
-        threadId: thread.id,
-      }).catch(() => [] as NoteProposalRow[]),
     ]);
     setMessages(msgs);
     setSources(srcs);
-    setProposals(props);
-  }, []);
+    setNoteReviews([]);
+    if (thread.noteId) {
+      await loadNoteReview(thread.noteId);
+    }
+  }, [loadNoteReview]);
 
   const loadThreads = useCallback(async () => {
     const list = await invoke<LlmThreadRow[]>("llm_list_threads");
@@ -574,7 +592,7 @@ export default function Chat() {
     let unlistenError: (() => void) | undefined;
     let unlistenSources: (() => void) | undefined;
     let unlistenOcr: (() => void) | undefined;
-    let unlistenProposals: (() => void) | undefined;
+    let unlistenReview: (() => void) | undefined;
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
       if (event.payload.threadId !== activeIdRef.current) return;
       const kind = event.payload.kind ?? "content";
@@ -624,25 +642,20 @@ export default function Chat() {
     }).then((fn) => {
       unlistenOcr = fn;
     });
-    void listen<{ threadId?: string }>("llm-note-proposals", (event) => {
-      const tid = event.payload?.threadId ?? activeIdRef.current;
-      if (!tid || tid !== activeIdRef.current) return;
-      void invoke<NoteProposalRow[]>("llm_list_note_proposals", { threadId: tid })
-        .then(setProposals)
-        .catch(() => {
-          /* ignore */
-        });
+    void listen<{ noteId?: string }>("llm-note-review", (event) => {
+      const nid = event.payload?.noteId ?? "";
+      if (nid) void loadNoteReview(nid);
     }).then((fn) => {
-      unlistenProposals = fn;
+      unlistenReview = fn;
     });
     return () => {
       unlistenDelta?.();
       unlistenError?.();
       unlistenSources?.();
       unlistenOcr?.();
-      unlistenProposals?.();
+      unlistenReview?.();
     };
-  }, [loadThreads]);
+  }, [loadThreads, loadNoteReview]);
 
   const scrollLog = useCallback(() => {
     const el = listRef.current;
@@ -767,17 +780,8 @@ export default function Chat() {
   const applyThreadNote = useCallback((t: LlmThreadRow) => {
     setThreads((prev) => prev.map((x) => (x.id === t.id ? { ...x, ...t } : x)));
     setActive((prev) => (prev?.id === t.id ? { ...prev, ...t } : prev));
-  }, []);
-
-  const onProposalChange = useCallback((row: NoteProposalRow) => {
-    setProposals((prev) => {
-      const i = prev.findIndex((p) => p.id === row.id);
-      if (i < 0) return [...prev, row];
-      const next = prev.slice();
-      next[i] = row;
-      return next;
-    });
-  }, []);
+    if (t.noteId) void loadNoteReview(t.noteId);
+  }, [loadNoteReview]);
 
   async function appendAnswerToNote(content: string, noteId: "new" | string) {
     const text = content.trim();
@@ -811,6 +815,31 @@ export default function Chat() {
       });
       setAppendUndo(null);
       setNotice("追記を取り消しました");
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function openReviewedNote(noteId: string) {
+    try {
+      await invoke("set_active_note", { id: noteId });
+      await invoke("show_notes_window");
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function revertReviewedNote(review: NoteReview) {
+    try {
+      const next = await invoke<NoteReview>("revert_note_review", {
+        noteId: review.noteId,
+        memoLen: review.memoLen,
+      });
+      setNoteReviews((prev) => {
+        const rest = prev.filter((r) => r.noteId !== review.noteId);
+        if (next.hasReview) return [...rest, next];
+        return rest;
+      });
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1046,12 +1075,12 @@ export default function Chat() {
       const srcs = await invoke<LlmSourceRow[]>("llm_list_sources", {
         threadId: result.thread.id,
       });
-      const props = await invoke<NoteProposalRow[]>("llm_list_note_proposals", {
-        threadId: result.thread.id,
-      }).catch(() => [] as NoteProposalRow[]);
       setMessages(msgs);
       setSources(srcs);
-      setProposals(props);
+      for (const w of result.noteWrites ?? []) {
+        if (w.noteId) await loadNoteReview(w.noteId);
+      }
+      if (result.thread.noteId) await loadNoteReview(result.thread.noteId);
       setStream("");
       setThinking("");
       setToolHint("");
@@ -1462,18 +1491,6 @@ export default function Chat() {
                       </NoteDestPicker>
                     </div>
                   ) : null}
-                  {m.role === "assistant"
-                    ? proposals
-                        .filter((p) => p.assistantMessageId === m.id)
-                        .map((p) => (
-                          <NoteProposalCard
-                            key={p.id}
-                            proposal={p}
-                            onChange={onProposalChange}
-                            onError={setError}
-                          />
-                        ))
-                    : null}
                 </article>
               );
             })
@@ -1526,16 +1543,6 @@ export default function Chat() {
                   })}
                 </div>
               ) : null}
-              {proposals
-                .filter((p) => !p.assistantMessageId && p.status === "pending")
-                .map((p) => (
-                  <NoteProposalCard
-                    key={p.id}
-                    proposal={p}
-                    onChange={onProposalChange}
-                    onError={setError}
-                  />
-                ))}
             </article>
           ) : null}
           {ocrBusy && !busy ? (
@@ -1543,6 +1550,27 @@ export default function Chat() {
           ) : null}
         </div>
         {error ? <p className="chat-error">{error}</p> : null}
+        {noteReviews.map((r) => (
+          <p key={r.noteId} className="chat-notice">
+            ノート『{r.noteTitle.trim() || "無題"}』を更新しました
+            {" "}
+            <button
+              type="button"
+              className="chat-notice-undo"
+              onClick={() => void openReviewedNote(r.noteId)}
+            >
+              ノートで開く
+            </button>
+            {" "}
+            <button
+              type="button"
+              className="chat-notice-undo"
+              onClick={() => void revertReviewedNote(r)}
+            >
+              すべて戻す
+            </button>
+          </p>
+        ))}
         {notice ? (
           <p className="chat-notice">
             {notice}
