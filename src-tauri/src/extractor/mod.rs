@@ -1,11 +1,11 @@
+mod docx;
 mod html;
 pub mod segment;
 
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
-use zip::ZipArchive;
+use docx::extract_docx;
 
 pub use html::{decode_html_bytes, decode_html_bytes_with_charset, html_to_text};
 pub use segment::{
@@ -130,69 +130,6 @@ pub fn is_skippable_extract_error(err: &str) -> bool {
     err == SKIP_NO_TEXT || err.starts_with("pdf extract panicked")
 }
 
-fn extract_docx(path: &Path) -> Result<ExtractedDoc, String> {
-    let file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
-    let mut xml = String::new();
-    {
-        let mut entry = archive
-            .by_name("word/document.xml")
-            .map_err(|e| e.to_string())?;
-        entry.read_to_string(&mut xml).map_err(|e| e.to_string())?;
-    }
-    // Preserve `w:p` boundaries as blank-line separated blocks for segmentation.
-    let paragraphs = docx_paragraphs(&xml);
-    let text = if paragraphs.is_empty() {
-        strip_xml_text(&xml)
-    } else {
-        paragraphs.join("\n\n")
-    };
-    if !text.chars().any(|c| !c.is_whitespace()) {
-        return Err(SKIP_NO_TEXT.into());
-    }
-    Ok(ExtractedDoc {
-        title: file_title(path),
-        pages: vec![text],
-    })
-}
-
-/// Extract text per `w:p` element (empty paragraphs kept as blank separators).
-fn docx_paragraphs(xml: &str) -> Vec<String> {
-    let mut paras = Vec::new();
-    let mut rest = xml;
-    while let Some(rel) = rest.find("<w:p") {
-        let from = &rest[rel..];
-        // Reject lookalikes: w:pPr, w:pStyle, w:pict, …
-        let is_paragraph = from.starts_with("<w:p>")
-            || from.starts_with("<w:p ")
-            || from.starts_with("<w:p\t")
-            || from.starts_with("<w:p\n")
-            || from.starts_with("<w:p\r")
-            || from.starts_with("<w:p/");
-        if !is_paragraph {
-            rest = &from[1..]; // skip this `<` and keep searching
-            continue;
-        }
-        let Some(gt) = from.find('>') else {
-            break;
-        };
-        // Self-closing empty paragraph → blank separator
-        if from[..gt].ends_with('/') {
-            paras.push(String::new());
-            rest = &from[gt + 1..];
-            continue;
-        }
-        let after_open = &from[gt + 1..];
-        let Some(end_rel) = after_open.find("</w:p>") else {
-            break;
-        };
-        let inner = &after_open[..end_rel];
-        paras.push(strip_xml_text(inner));
-        rest = &after_open[end_rel + "</w:p>".len()..];
-    }
-    paras
-}
-
 fn extract_doc(path: &Path) -> Result<ExtractedDoc, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let text = rwml::extract_text(&bytes).map_err(|e| e.to_string())?;
@@ -261,57 +198,11 @@ fn extract_spreadsheet(path: &Path) -> Result<ExtractedDoc, String> {
     })
 }
 
-fn file_title(path: &Path) -> String {
+pub(super) fn file_title(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("untitled")
         .to_string()
-}
-
-fn strip_xml_text(xml: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    let mut tag_buf = String::new();
-    let mut last_was_space = true;
-    for ch in xml.chars() {
-        match ch {
-            '<' => {
-                in_tag = true;
-                tag_buf.clear();
-            }
-            '>' => {
-                in_tag = false;
-                // Tag name is the first token; strip leading `/` (end tags) and trailing `/` (self-close).
-                let raw = tag_buf.trim();
-                let name = raw
-                    .trim_start_matches('/')
-                    .split(|c: char| c.is_whitespace() || c == '/')
-                    .next()
-                    .unwrap_or("");
-                if name == "w:br" || name == "w:cr" {
-                    out.push('\n');
-                    last_was_space = true;
-                } else if name == "w:tab" {
-                    out.push('\t');
-                    last_was_space = true;
-                }
-                // Other tags (w:t, w:r, …): concatenate adjacent runs with no break.
-            }
-            _ if in_tag => tag_buf.push(ch),
-            _ => {
-                if ch.is_whitespace() {
-                    if !last_was_space {
-                        out.push(' ');
-                        last_was_space = true;
-                    }
-                } else {
-                    out.push(ch);
-                    last_was_space = false;
-                }
-            }
-        }
-    }
-    out.trim().to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -364,82 +255,5 @@ mod tests {
     fn file_title_keeps_html_extension() {
         assert_eq!(file_title(Path::new("C:\\docs\\report.html")), "report.html");
         assert_eq!(file_title(Path::new("C:\\docs\\index.htm")), "index.htm");
-    }
-
-    #[test]
-    fn docx_paragraphs_split_on_wp() {
-        let xml = r#"<?xml version="1.0"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>
-    <w:p><w:r><w:t>第一条（目的）</w:t></w:r></w:p>
-    <w:p><w:pPr/><w:r><w:t>この契約は甲乙間の取引条件を定めることを目的として締結されるものであり、十分な長さの本文を持つ。</w:t></w:r></w:p>
-    <w:p><w:r><w:t></w:t></w:r></w:p>
-    <w:p><w:r><w:t>第二条（定義）</w:t></w:r></w:p>
-    <w:p><w:r><w:t>本契約において用いる用語の定義は次のとおりとし、こちらも十分な長さの段落本文とするものである。</w:t></w:r></w:p>
-  </w:body>
-</w:document>"#;
-        let paras = docx_paragraphs(xml);
-        assert!(
-            paras.iter().any(|p| p.contains("第一条")),
-            "paras={paras:?}"
-        );
-        assert!(
-            paras.iter().any(|p| p.contains("第二条")),
-            "paras={paras:?}"
-        );
-        let joined = paras.join("\n\n");
-        let units = segment_pages(&[joined]);
-        assert!(
-            units.len() >= 2,
-            "expected blank-line units from w:p, got {}: {:?}",
-            units.len(),
-            units.iter().map(|u| &u.label).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn strip_xml_joins_adjacent_runs() {
-        let inner = r#"<w:r><w:t>１</w:t></w:r><w:r><w:t>ヵ月以内</w:t></w:r>"#;
-        assert_eq!(strip_xml_text(inner), "１ヵ月以内");
-    }
-
-    #[test]
-    fn strip_xml_joins_split_parentheses() {
-        let inner = concat!(
-            r#"<w:r><w:t>（</w:t></w:r>"#,
-            r#"<w:r><w:t>甲または甲の技術者の故意または過失による瑕疵</w:t></w:r>"#,
-            r#"<w:r><w:t>）</w:t></w:r>"#,
-        );
-        assert_eq!(
-            strip_xml_text(inner),
-            "（甲または甲の技術者の故意または過失による瑕疵）"
-        );
-    }
-
-    #[test]
-    fn strip_xml_preserves_soft_break_and_tab() {
-        let inner = r#"<w:r><w:t>前段</w:t><w:br/><w:t>後段</w:t><w:tab/><w:t>続き</w:t></w:r>"#;
-        assert_eq!(strip_xml_text(inner), "前段\n後段\t続き");
-    }
-
-    #[test]
-    fn docx_paragraph_with_split_runs_has_no_internal_newline() {
-        let xml = concat!(
-            r#"<?xml version="1.0"?>"#,
-            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
-            r#"<w:body><w:p>"#,
-            r#"<w:r><w:t>１</w:t></w:r>"#,
-            r#"<w:r><w:t>ヵ月以内（個別契約において別途</w:t></w:r>"#,
-            r#"<w:r><w:t>期間</w:t></w:r>"#,
-            r#"<w:r><w:t>を定めた場合は個別契約の定めに従う。）</w:t></w:r>"#,
-            r#"</w:p></w:body></w:document>"#,
-        );
-        let paras = docx_paragraphs(xml);
-        assert_eq!(paras.len(), 1);
-        assert_eq!(
-            paras[0],
-            "１ヵ月以内（個別契約において別途期間を定めた場合は個別契約の定めに従う。）"
-        );
-        assert!(!paras[0].contains('\n'));
     }
 }

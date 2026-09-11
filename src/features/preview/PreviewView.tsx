@@ -105,6 +105,13 @@ function seedHitFromTarget(target: PreviewTarget): SearchHit {
   };
 }
 
+/** File attached in chat (no paragraph id): show extract body, not the index. */
+function usesChatAttachedBody(target: PreviewTarget): boolean {
+  if (target.origin !== "chat") return false;
+  if (!(target.fallbackBody ?? "").trim()) return false;
+  return !(target.paragraphId ?? "").trim();
+}
+
 type SettingsData = { fontSize: number };
 
 export default function PreviewView({
@@ -256,6 +263,15 @@ export default function PreviewView({
       setPreviewFile({
         units: [seed],
         excerpt: true,
+        matchIds: [seed.id],
+      });
+      setLoading(false);
+      return;
+    }
+    if (usesChatAttachedBody(target)) {
+      setPreviewFile({
+        units: [seed],
+        excerpt: false,
         matchIds: [seed.id],
       });
       setLoading(false);
