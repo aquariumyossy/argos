@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatLegalDisplayHtml, formatLegalMdHtml } from "../notes/legalMdFormat";
 import { highlightText } from "../search/highlightText";
+import { highlightDocxMarkup } from "./docxMarkup";
 import {
   applyPreviewHighlights,
   findFormattedContentOffset,
@@ -232,7 +233,11 @@ export function PreviewBody({
 
   return (
     <pre className="preview-body">
-      {highlightText(hit.previewText, query, highlightTerms ?? hit.highlightTerms)}
+      {highlightDocxMarkup(
+        hit.previewText,
+        query,
+        highlightTerms ?? hit.highlightTerms,
+      )}
     </pre>
   );
 }

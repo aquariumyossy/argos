@@ -176,6 +176,25 @@
   line-height: 1.6;
 }
 
+.preview-rev--del {
+  color: #8b2e2e;
+  background: #f4ddd8;
+}
+
+.preview-rev-del-text {
+  text-decoration: line-through;
+}
+
+.preview-rev--ins {
+  color: #0b4d32;
+  background: #8fd4a8;
+}
+
+.preview-rev--note {
+  color: #5c4a12;
+  background: #f3e6c0;
+}
+
 .preview-body--markdown,
 .preview-body.md-body {
   white-space: normal;
