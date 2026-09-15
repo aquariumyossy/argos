@@ -10,6 +10,8 @@ const MIN_KEEP_TURNS: usize = 4;
 pub const CITATION_GUIDE: &str = "\n\n出典ブロックがあるときは、その本文だけを根拠にしてください。出典にない事実は推測だと明示し、根拠箇所には [n]（出典番号）を付けてください。";
 pub const IMAGE_TRANSCRIPT_NOTE: &str = "（画像の書き起こし。原本の画素ではない）";
 
+pub const REASONING_CARRY_CAP: usize = 4_000;
+
 #[derive(Debug, Clone)]
 pub struct ChatTurn {
     pub role: String,
@@ -17,6 +19,7 @@ pub struct ChatTurn {
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
     pub tool_calls: Option<serde_json::Value>,
+    pub reasoning: Option<String>,
 }
 
 impl ChatTurn {
@@ -27,6 +30,7 @@ impl ChatTurn {
             name: None,
             tool_call_id: None,
             tool_calls: None,
+            reasoning: None,
         }
     }
 }
@@ -50,7 +54,7 @@ fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-fn cap_chars(s: &str, max: usize) -> String {
+pub(crate) fn cap_chars(s: &str, max: usize) -> String {
     if char_len(s) <= max {
         return s.to_string();
     }
@@ -115,6 +119,18 @@ pub const FINAL_CITE_HINT: &str =
     "使った出典にだけ [n] を付けて答えてください。使っていない番号は本文に並べないでください。";
 pub const STOP_TOOLS_HINT: &str =
     "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。";
+pub const PHANTOM_CITE_HINT: &str =
+    "存在しない出典番号があります。実際にツールで裏を取るか、出典がないと明示して書き直してください。";
+
+/// True when the answer cites `[n]` that is not among this thread's sources.
+pub fn answer_has_phantom_cites(answer: &str, sources: &[LlmSourceRow]) -> bool {
+    let cited = parse_cited_nos(answer);
+    if cited.is_empty() {
+        return false;
+    }
+    let known: HashSet<i64> = sources.iter().map(cite_no_of).filter(|n| *n > 0).collect();
+    cited.iter().any(|n| !known.contains(n))
+}
 
 /// Rows from this turn's tool/attach consume list, in cite-number order.
 pub fn sources_for_consumed(all: &[LlmSourceRow], consumed: &[(String, i64)]) -> Vec<LlmSourceRow> {
@@ -725,6 +741,35 @@ mod tests {
         let consumed = vec![("tool-a".into(), 1), ("attach-b".into(), 2)];
         let kept = consumed_cited_in_answer(&consumed, "検索しましたが該当なし。");
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn phantom_cites_when_answer_uses_unknown_number() {
+        let mut s = src("a", "attach", 0, "本文");
+        s.cite_no = 1;
+        assert!(answer_has_phantom_cites("根拠は [3] です。", &[s]));
+    }
+
+    #[test]
+    fn phantom_cites_false_when_number_exists() {
+        let mut s = src("a", "attach", 0, "本文");
+        s.cite_no = 1;
+        assert!(!answer_has_phantom_cites("根拠は [1] です。", &[s]));
+    }
+
+    #[test]
+    fn phantom_cites_skips_markdown_links() {
+        let mut s = src("a", "attach", 0, "本文");
+        s.cite_no = 2;
+        assert!(!answer_has_phantom_cites(
+            "see [1](https://example.com) and cite [2].",
+            &[s]
+        ));
+    }
+
+    #[test]
+    fn phantom_cites_false_when_no_brackets() {
+        assert!(!answer_has_phantom_cites("検索しました。", &[]));
     }
 
     #[test]

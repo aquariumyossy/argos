@@ -7,7 +7,8 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
-    assemble_turns, consumed_cited_in_answer, final_source_turn, sources_for_consumed, ChatTurn,
+    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer,
+    final_source_turn, sources_for_consumed, ChatTurn, PHANTOM_CITE_HINT, REASONING_CARRY_CAP,
     STOP_TOOLS_HINT,
 };
 use crate::llm::tools::{self, ToolExec};
@@ -613,6 +614,7 @@ pub async fn llm_send(
     let mut use_tools = true;
     let mut retried_without_tools = false;
     let mut extra_final = false;
+    let mut phantom_retried = false;
     let mut rounds = 0usize;
     let max_rounds = tools::max_tool_rounds(web_search);
     let mut current_turns = assembled;
@@ -627,12 +629,7 @@ pub async fn llm_send(
 
     loop {
         let with_tools = use_tools;
-        let disable_thinking = with_tools;
-        let turns_now = if with_tools {
-            llm::turns_for_tool_round(current_turns.clone())
-        } else {
-            llm::apply_thinking_to_turns(current_turns.clone(), &settings)
-        };
+        let turns_now = llm::apply_thinking_to_turns(current_turns.clone(), &settings);
         let outcome = {
             let app2 = app.clone();
             let req = request_id.clone();
@@ -646,7 +643,6 @@ pub async fn llm_send(
                 } else {
                     None
                 },
-                disable_thinking,
                 move |kind, delta| {
                     let _ = app2.emit(
                         "llm-chat-delta",
@@ -746,12 +742,21 @@ pub async fn llm_send(
                             "function": { "name": c.name, "arguments": c.arguments }
                         }))
                         .collect::<Vec<_>>());
+                    let reasoning = {
+                        let r = out.reasoning.trim();
+                        if r.is_empty() {
+                            None
+                        } else {
+                            Some(cap_chars(r, REASONING_CARRY_CAP))
+                        }
+                    };
                     current_turns.push(ChatTurn {
                         role: "assistant".into(),
                         content: out.content,
                         name: None,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls_json),
+                        reasoning,
                     });
                     let mut read_url_in_round = 0usize;
                     for tc in out.tool_calls {
@@ -785,6 +790,7 @@ pub async fn llm_send(
                                 name: Some(tc.name),
                                 tool_call_id: Some(tc.id),
                                 tool_calls: None,
+                                reasoning: None,
                             });
                             continue;
                         }
@@ -832,6 +838,7 @@ pub async fn llm_send(
                             name: Some(tc.name),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
+                            reasoning: None,
                         });
                     }
                     // The reserve is spent; answer from what the rounds already produced.
@@ -881,6 +888,15 @@ pub async fn llm_send(
                             extra_final = true;
                             continue;
                         }
+                    }
+                }
+                if !phantom_retried {
+                    let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                    if answer_has_phantom_cites(&out.content, &all) {
+                        phantom_retried = true;
+                        current_turns.push(ChatTurn::text("user", PHANTOM_CITE_HINT));
+                        use_tools = true;
+                        continue;
                     }
                 }
                 result_text = out.content;
