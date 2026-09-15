@@ -282,13 +282,6 @@ pub fn apply_thinking_to_turns(mut turns: Vec<ChatTurn>, settings: &Settings) ->
     turns
 }
 
-/// Tool-calling rounds: turn thinking off in both JSON params and the last user turn.
-pub fn turns_for_tool_round(turns: Vec<ChatTurn>) -> Vec<ChatTurn> {
-    let mut off = Settings::default();
-    off.llm_thinking = "off".into();
-    apply_thinking_to_turns(turns, &off)
-}
-
 fn apply_thinking_params(body: &mut serde_json::Value, settings: &Settings) {
     match settings.llm_thinking.trim() {
         "off" => {
@@ -461,6 +454,17 @@ fn turn_to_message(t: &ChatTurn) -> Option<Value> {
         } else {
             m["content"] = json!(t.content);
         }
+        if let Some(r) = t
+            .reasoning
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            m["reasoning_content"] = json!(crate::llm::context::cap_chars(
+                r,
+                crate::llm::context::REASONING_CARRY_CAP
+            ));
+        }
         return Some(m);
     }
     if role == "tool" {
@@ -505,6 +509,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Default)]
 pub struct StreamOutcome {
     pub content: String,
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -525,6 +530,7 @@ impl StreamParse {
         calls.sort_by_key(|c| c.index);
         StreamOutcome {
             content,
+            reasoning: self.reasoning,
             tool_calls: calls
                 .into_iter()
                 .filter(|c| !c.name.is_empty() || !c.arguments.is_empty())
@@ -623,7 +629,6 @@ pub async fn stream_chat(
     turns: &[ChatTurn],
     cancel: Arc<AtomicBool>,
     tools: Option<&Value>,
-    disable_thinking: bool,
     mut on_delta: impl FnMut(&str, &str),
 ) -> Result<StreamOutcome, String> {
     let base = normalize_base_url(&settings.llm_base_url);
@@ -653,13 +658,7 @@ pub async fn stream_chat(
         body["tools"] = tools.clone();
         body["tool_choice"] = json!("auto");
     }
-    if disable_thinking {
-        let mut off = settings.clone();
-        off.llm_thinking = "off".into();
-        apply_thinking_params(&mut body, &off);
-    } else {
-        apply_thinking_params(&mut body, settings);
-    }
+    apply_thinking_params(&mut body, settings);
     let req = apply_auth(
         client
             .post(&url)
@@ -1208,9 +1207,89 @@ mod tests {
     }
 
     #[test]
-    fn tool_round_appends_no_think() {
-        let turns = turns_for_tool_round(vec![ChatTurn::text("user", "民法555条")]);
-        assert!(turns[0].content.ends_with("/no_think"));
+    fn tool_round_keeps_thinking_on() {
+        let s = thinking_settings("brief", 1024);
+        let mut body = serde_json::json!({});
+        apply_thinking_params(&mut body, &s);
+        assert_eq!(body["enable_thinking"], true);
+        let turns = apply_thinking_to_turns(vec![ChatTurn::text("user", "民法555条")], &s);
+        assert!(!turns[0].content.contains("/no_think"));
+    }
+
+    #[test]
+    fn turn_to_message_sends_reasoning_with_tool_calls() {
+        let t = ChatTurn {
+            role: "assistant".into(),
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(serde_json::json!([{
+                "id": "c1",
+                "type": "function",
+                "index": 0,
+                "function": { "name": "search_index", "arguments": "{}" }
+            }])),
+            reasoning: Some("検索する。".into()),
+        };
+        let m = turn_to_message(&t).expect("message");
+        assert_eq!(m["reasoning_content"], "検索する。");
+        assert!(m.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn turn_to_message_omits_empty_reasoning() {
+        let t = ChatTurn {
+            role: "assistant".into(),
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(serde_json::json!([{
+                "id": "c1",
+                "type": "function",
+                "index": 0,
+                "function": { "name": "search_index", "arguments": "{}" }
+            }])),
+            reasoning: Some("  ".into()),
+        };
+        let m = turn_to_message(&t).expect("message");
+        assert!(m.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn turn_to_message_caps_long_reasoning() {
+        let long = "あ".repeat(crate::llm::context::REASONING_CARRY_CAP + 10);
+        let t = ChatTurn {
+            role: "assistant".into(),
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: Some(serde_json::json!([{
+                "id": "c1",
+                "type": "function",
+                "index": 0,
+                "function": { "name": "search_index", "arguments": "{}" }
+            }])),
+            reasoning: Some(long),
+        };
+        let m = turn_to_message(&t).expect("message");
+        let sent = m["reasoning_content"].as_str().unwrap();
+        assert_eq!(
+            sent.chars().count(),
+            crate::llm::context::REASONING_CARRY_CAP
+        );
+        assert!(sent.ends_with('…'));
+    }
+
+    #[test]
+    fn into_outcome_keeps_reasoning() {
+        let parse = StreamParse {
+            content: "答え".into(),
+            reasoning: "検討".into(),
+            tool_calls: Vec::new(),
+        };
+        let out = parse.into_outcome();
+        assert_eq!(out.reasoning, "検討");
+        assert_eq!(out.content, "答え");
     }
 
     #[test]

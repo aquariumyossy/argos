@@ -158,7 +158,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.11.4";
+const APP_VERSION = "1.11.5";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -2650,7 +2650,7 @@ export default function Settings() {
                 </label>
               ) : null}
               <p className="field-hint">
-                Qwen の長い思考はプロンプトだけではあまり短くなりません。「短くする」は上限トークンをサーバに渡し、「オフ」は思考そのものを止めます。
+                Qwen の長い思考はプロンプトだけではあまり短くなりません。「短くする」は上限トークンをサーバに渡し、「オフ」は思考そのものを止めます。オフにすると、モデルがツールを呼ばずに出典番号だけ書いてターンを切ることがあります。
               </p>
               <label>
                 <span className="field-label">コンテキスト目安（文字）</span>
