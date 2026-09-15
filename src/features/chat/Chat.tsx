@@ -4,8 +4,8 @@ import {
   useMemo,
   useRef,
   useState,
-  type DragEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -348,6 +348,69 @@ function threadListTitle(t: { title: string }): string {
   return t.title.trim() || "新しい会話";
 }
 
+/** HTML5 DnD is blocked while the chat window has Tauri file-drop enabled. */
+function reorderIds(
+  ids: string[],
+  sourceId: string,
+  targetId: string,
+): string[] | null {
+  if (sourceId === targetId) return null;
+  const from = ids.indexOf(sourceId);
+  const to = ids.indexOf(targetId);
+  if (from < 0 || to < 0) return null;
+  const next = [...ids];
+  next.splice(from, 1);
+  next.splice(to, 0, sourceId);
+  return next;
+}
+
+function threadIdFromPoint(x: number, y: number): string | null {
+  const node = document.elementFromPoint(x, y);
+  if (!(node instanceof Element)) return null;
+  const item = node.closest(".chat-thread-item");
+  return item instanceof HTMLElement ? (item.dataset.threadId ?? null) : null;
+}
+
+const THREAD_DRAG_THRESHOLD = 4;
+
+type ThreadDragSession = {
+  pointerId: number;
+  sourceId: string;
+  overId: string | null;
+  started: boolean;
+  startX: number;
+  startY: number;
+  offsetX: number;
+  offsetY: number;
+  ghost: HTMLElement | null;
+};
+
+function moveThreadDragGhost(ghost: HTMLElement, x: number, y: number) {
+  ghost.style.transform = `translate(${Math.round(x)}px, ${Math.round(y)}px)`;
+}
+
+function makeThreadDragGhost(
+  item: HTMLElement,
+  x: number,
+  y: number,
+): HTMLElement {
+  const rect = item.getBoundingClientRect();
+  const cs = getComputedStyle(item);
+  const ghost = item.cloneNode(true) as HTMLElement;
+  ghost.removeAttribute("data-thread-id");
+  ghost.classList.add("chat-thread-item--ghost");
+  ghost.setAttribute("aria-hidden", "true");
+  ghost.style.width = `${rect.width}px`;
+  ghost.style.fontSize = cs.fontSize;
+  ghost.style.color = cs.color;
+  ghost.querySelectorAll("button, input").forEach((el) => {
+    el.setAttribute("tabindex", "-1");
+  });
+  moveThreadDragGhost(ghost, x, y);
+  document.body.appendChild(ghost);
+  return ghost;
+}
+
 const SIDEBAR_MIN = 160;
 const SIDEBAR_MAX = 420;
 const SIDEBAR_DEFAULT = 220;
@@ -403,7 +466,6 @@ export default function Chat() {
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [threadDragId, setThreadDragId] = useState<string | null>(null);
-  const [threadDraggableId, setThreadDraggableId] = useState<string | null>(null);
   const [listQuery, setListQuery] = useState("");
   const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -414,6 +476,9 @@ export default function Chat() {
   const ocrBusyRef = useRef(false);
   const attachingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const threadsRef = useRef(threads);
+  const threadDragRef = useRef<ThreadDragSession | null>(null);
+  threadsRef.current = threads;
 
   useEffect(() => {
     activeIdRef.current = active?.id ?? null;
@@ -1169,52 +1234,21 @@ export default function Chat() {
     window.addEventListener("mouseup", onUp);
   }, [sidebarWidth]);
 
-  const onThreadDragOver = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
+  const clearThreadDrag = useCallback(() => {
+    const drag = threadDragRef.current;
+    threadDragRef.current = null;
+    drag?.ghost?.remove();
+    setThreadDragId(null);
   }, []);
 
-  const onThreadListMouseDown = useCallback((e: ReactMouseEvent, id: string) => {
-    const el = e.target as HTMLElement | null;
-    if (el?.closest(".chat-thread-handle")) {
-      setThreadDraggableId(id);
-      return;
-    }
-    setThreadDraggableId(null);
-  }, []);
-
-  const onThreadDragStart = useCallback(
-    (e: DragEvent, id: string) => {
-      if (threadDraggableId !== id) {
-        e.preventDefault();
-        return;
-      }
-      setThreadDragId(id);
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData("text/thread-id", id);
-      e.dataTransfer.setData("text/plain", id);
-    },
-    [threadDraggableId],
-  );
-
-  const onThreadDrop = useCallback(
-    async (e: DragEvent, targetId: string) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const sourceId =
-        threadDragId ||
-        e.dataTransfer.getData("text/thread-id") ||
-        e.dataTransfer.getData("text/plain");
-      setThreadDragId(null);
-      setThreadDraggableId(null);
-      if (!sourceId || sourceId === targetId) return;
-      const ids = threads.map((t) => t.id);
-      const from = ids.indexOf(sourceId);
-      const to = ids.indexOf(targetId);
-      if (from < 0 || to < 0) return;
-      const next = [...ids];
-      next.splice(from, 1);
-      next.splice(to, 0, sourceId);
+  const commitThreadReorder = useCallback(
+    async (sourceId: string, targetId: string) => {
+      const next = reorderIds(
+        threadsRef.current.map((t) => t.id),
+        sourceId,
+        targetId,
+      );
+      if (!next) return;
       setThreads((prev) => {
         const map = new Map(prev.map((t) => [t.id, t]));
         return next
@@ -1231,13 +1265,124 @@ export default function Chat() {
         await loadThreads();
       }
     },
-    [threadDragId, threads, loadThreads],
+    [loadThreads],
   );
+
+  const onThreadHandlePointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLSpanElement>, id: string) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const item = e.currentTarget.closest(".chat-thread-item");
+      if (!(item instanceof HTMLElement)) return;
+      const rect = item.getBoundingClientRect();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      threadDragRef.current = {
+        pointerId: e.pointerId,
+        sourceId: id,
+        overId: id,
+        started: false,
+        startX: e.clientX,
+        startY: e.clientY,
+        offsetX: e.clientX - rect.left,
+        offsetY: e.clientY - rect.top,
+        ghost: null,
+      };
+    },
+    [],
+  );
+
+  const onThreadHandlePointerMove = useCallback(
+    (e: ReactPointerEvent<HTMLSpanElement>) => {
+      const drag = threadDragRef.current;
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (!drag.started) {
+        if (
+          Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) <
+          THREAD_DRAG_THRESHOLD
+        ) {
+          return;
+        }
+        const item = e.currentTarget.closest(".chat-thread-item");
+        if (!(item instanceof HTMLElement)) return;
+        drag.started = true;
+        drag.ghost = makeThreadDragGhost(
+          item,
+          e.clientX - drag.offsetX,
+          e.clientY - drag.offsetY,
+        );
+        setThreadDragId(drag.sourceId);
+      }
+      if (drag.ghost) {
+        moveThreadDragGhost(
+          drag.ghost,
+          e.clientX - drag.offsetX,
+          e.clientY - drag.offsetY,
+        );
+      }
+      const body = e.currentTarget.closest(".chat-sidebar-body");
+      if (body instanceof HTMLElement) {
+        const rect = body.getBoundingClientRect();
+        const margin = 36;
+        if (e.clientY < rect.top + margin) body.scrollBy(0, -14);
+        else if (e.clientY > rect.bottom - margin) body.scrollBy(0, 14);
+      }
+      drag.overId = threadIdFromPoint(e.clientX, e.clientY);
+    },
+    [],
+  );
+
+  const onThreadHandlePointerUp = useCallback(
+    (e: ReactPointerEvent<HTMLSpanElement>) => {
+      const drag = threadDragRef.current;
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+      const started = drag.started;
+      const sourceId = drag.sourceId;
+      const targetId = threadIdFromPoint(e.clientX, e.clientY) ?? drag.overId;
+      clearThreadDrag();
+      if (started && sourceId && targetId) {
+        void commitThreadReorder(sourceId, targetId);
+      }
+    },
+    [clearThreadDrag, commitThreadReorder],
+  );
+
+  const onThreadHandlePointerCancel = useCallback(
+    (e: ReactPointerEvent<HTMLSpanElement>) => {
+      const drag = threadDragRef.current;
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+      clearThreadDrag();
+    },
+    [clearThreadDrag],
+  );
+
+  useEffect(() => {
+    if (!threadDragId) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault();
+      clearThreadDrag();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [threadDragId, clearThreadDrag]);
+
+  useEffect(() => () => threadDragRef.current?.ghost?.remove(), []);
 
   return (
     <div
       ref={rootRef}
-      className={["chat", resizingSidebar ? "chat--resizing" : ""]
+      className={[
+        "chat",
+        resizingSidebar ? "chat--resizing" : "",
+        threadDragId ? "chat--reordering" : "",
+      ]
         .filter(Boolean)
         .join(" ")}
       style={{
@@ -1309,26 +1454,22 @@ export default function Chat() {
                 return (
                 <li
                   key={t.id}
+                  data-thread-id={t.id}
                   className={[
                     t.id === active?.id ? "chat-thread-item active" : "chat-thread-item",
                     threadDragId === t.id ? "chat-thread-item--dragging" : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
-                  draggable={threadDraggableId === t.id}
-                  onMouseDown={(e) => onThreadListMouseDown(e, t.id)}
-                  onDragStart={(e) => onThreadDragStart(e, t.id)}
-                  onDragOver={onThreadDragOver}
-                  onDrop={(e) => void onThreadDrop(e, t.id)}
-                  onDragEnd={() => {
-                    setThreadDragId(null);
-                    setThreadDraggableId(null);
-                  }}
                 >
                   <span
                     className="chat-thread-handle"
                     title="ドラッグで並べ替え"
                     aria-hidden="true"
+                    onPointerDown={(e) => onThreadHandlePointerDown(e, t.id)}
+                    onPointerMove={onThreadHandlePointerMove}
+                    onPointerUp={onThreadHandlePointerUp}
+                    onPointerCancel={onThreadHandlePointerCancel}
                   >
                     <IconGrip />
                   </span>
