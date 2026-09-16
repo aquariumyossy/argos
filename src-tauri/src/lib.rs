@@ -162,7 +162,7 @@ pub fn run() {
                 Err(e) => eprintln!("watcher start failed: {e}"),
             }
 
-            // Start LAN search server if enabled in settings
+                // Local search API (127.0.0.1) always; LAN bind if enabled.
             {
                 let state = app.state::<Arc<AppState>>();
                 state.sync_remote_server();

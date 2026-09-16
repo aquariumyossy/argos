@@ -158,7 +158,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.11.5";
+const APP_VERSION = "1.11.6";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -2801,6 +2801,10 @@ export default function Settings() {
         >
           <section>
             <h2>この PC を検索ホストにする</h2>
+            <p className="muted">
+              ポート（既定 17890）は、LAN 共有のオンオフに関係なく、同一 PC
+              向けのローカル検索 API（http://127.0.0.1）でも使います。
+            </p>
             <p className="muted">
               有効にすると、フォルダ設定で「LAN共有」を付けた登録フォルダのインデックスだけを、LAN
               上の他の Argos から検索できるようになります（既定ポート

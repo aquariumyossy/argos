@@ -1,6 +1,6 @@
 [package]
 name = "argos"
-version = "1.11.5"
+version = "1.11.6"
 description = "Argos  Elocal desktop instant search"
 authors = ["Shuhei Yoshida"]
 license = "Apache-2.0"
@@ -54,3 +54,6 @@ axum = "0.8"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
 encoding_rs = "0.8"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

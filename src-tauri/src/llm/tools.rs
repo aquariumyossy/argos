@@ -805,22 +805,7 @@ pub fn join_thread_scopes(prefixes: &[String]) -> String {
 }
 
 fn collapse_thread_scopes(prefixes: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for raw in prefixes {
-        let p = raw.trim();
-        if p.is_empty() {
-            continue;
-        }
-        if out
-            .iter()
-            .any(|kept| crate::pathutil::path_starts_with(p, kept))
-        {
-            continue;
-        }
-        out.retain(|kept| !crate::pathutil::path_starts_with(kept, p));
-        out.push(p.to_string());
-    }
-    out
+    crate::pathutil::collapse_path_prefixes(prefixes)
 }
 
 /// System-prompt line so the model does not treat a scoped miss as "nothing exists".
