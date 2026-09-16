@@ -30,13 +30,7 @@ pub struct SearchPayload {
     pub searching: bool,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchScopeRow {
-    pub path: String,
-    pub label: String,
-    pub is_root: bool,
-}
+pub use crate::search::{SearchScopeRow, SearchScopesResult};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,116 +53,6 @@ pub(crate) fn emit_note_updated_from(app: &AppHandle, note_id: &str, kind: &str,
             source: source.to_string(),
         },
     );
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchScopesResult {
-    pub recent: Vec<SearchScopeRow>,
-    pub scopes: Vec<SearchScopeRow>,
-}
-
-/// Wider than typical UI `max_results` so scope picker can see more matching folders.
-const SCOPE_QUERY_HIT_LIMIT: usize = 200;
-
-fn folder_display_name(path: &str) -> String {
-    let simplified = pathutil::simplify_windows_path(path);
-    simplified
-        .rsplit('\\')
-        .find(|s| !s.is_empty())
-        .unwrap_or(path)
-        .to_string()
-}
-
-fn parent_dir(path: &str) -> Option<String> {
-    let simplified = pathutil::simplify_windows_path(path);
-    let truncated = simplified.trim_end_matches('\\');
-    let (parent, name) = match truncated.rfind('\\') {
-        Some(i) => (&truncated[..i], &truncated[i + 1..]),
-        None => return None,
-    };
-    if name.is_empty() {
-        return None;
-    }
-    // Keep drive root like `C:` as `C:\`
-    if parent.len() == 2 && parent.as_bytes()[1] == b':' {
-        return Some(format!("{parent}\\"));
-    }
-    if parent.is_empty() {
-        // UNC `\\server\share\file` → parent `\\server\share` handled by rfind;
-        // bare `\\server` shouldn't appear as a file parent we care about.
-        return None;
-    }
-    Some(parent.to_string())
-}
-
-fn relative_label(root: &str, dir: &str) -> String {
-    let root = pathutil::simplify_windows_path(root);
-    let dir = pathutil::simplify_windows_path(dir);
-    if dir.eq_ignore_ascii_case(&root) {
-        return folder_display_name(&root);
-    }
-    if !pathutil::path_starts_with(&dir, &root) {
-        return folder_display_name(&dir);
-    }
-    let rest = dir[root.len()..].trim_start_matches('\\');
-    if rest.is_empty() {
-        folder_display_name(&root)
-    } else {
-        rest.replace('\\', "/")
-    }
-}
-
-fn collect_search_scopes(
-    folders: &[FolderRow],
-    list_paths: impl Fn(i64) -> Result<Vec<String>, String>,
-) -> Result<Vec<SearchScopeRow>, String> {
-    use std::collections::BTreeMap;
-
-    let mut out: Vec<SearchScopeRow> = Vec::new();
-    for folder in folders.iter().filter(|f| f.enabled) {
-        let root = pathutil::effective_public_root(&folder.path, &folder.public_path);
-        out.push(SearchScopeRow {
-            path: root.clone(),
-            label: folder_display_name(&root),
-            is_root: true,
-        });
-
-        let paths = list_paths(folder.id)?;
-        // BTreeMap keeps labels sorted for stable UI. Do not cap: a silent
-        // per-root limit dropped newer indexed folders from the picker.
-        let mut subdirs: BTreeMap<String, String> = BTreeMap::new();
-        for file_path in paths {
-            let mut current = parent_dir(&file_path);
-            while let Some(dir) = current {
-                if !pathutil::path_starts_with(&dir, &root) {
-                    break;
-                }
-                if dir.eq_ignore_ascii_case(&root) {
-                    break;
-                }
-                let key = dir.to_ascii_lowercase();
-                subdirs.entry(key).or_insert_with(|| dir.clone());
-                current = parent_dir(&dir);
-            }
-        }
-
-        let mut subs: Vec<SearchScopeRow> = subdirs
-            .into_values()
-            .map(|path| SearchScopeRow {
-                label: relative_label(&root, &path),
-                path,
-                is_root: false,
-            })
-            .collect();
-        subs.sort_by(|a, b| {
-            a.label
-                .to_ascii_lowercase()
-                .cmp(&b.label.to_ascii_lowercase())
-        });
-        out.extend(subs);
-    }
-    Ok(out)
 }
 
 pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
@@ -704,63 +588,20 @@ pub fn list_search_scopes(
     state: State<'_, Arc<AppState>>,
     query: Option<String>,
 ) -> Result<SearchScopesResult, String> {
-    let folders = state.db.list_folders().map_err(|e| e.to_string())?;
-    let db = state.db.clone();
-    let all = collect_search_scopes(&folders, |folder_id| {
-        db.list_file_paths_by_folder(folder_id)
-            .map_err(|e| e.to_string())
-    })?;
-
-    let recent: Vec<SearchScopeRow> = state
-        .db
-        .list_recent_search_scopes()
-        .into_iter()
-        .map(|s| SearchScopeRow {
-            path: s.path,
-            label: s.label,
-            is_root: false,
-        })
-        .collect();
-
-    let filtered = match query.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        None => all,
-        Some(q) => {
-            let settings = state.settings.read().clone();
-            let user_dict = state.user_dict.read().clone();
-            let hits = search::run_search(
-                &settings,
-                state.backend.as_ref(),
-                Some(state.mail_backend.as_ref()),
-                q,
-                SCOPE_QUERY_HIT_LIMIT,
-                None,
-                None,
-                &user_dict,
-            )?;
-            if hits.is_empty() {
-                Vec::new()
-            } else {
-                all.into_iter()
-                    .filter(|scope| {
-                        hits.iter()
-                            .any(|h| pathutil::path_starts_with(&h.path, &scope.path))
-                    })
-                    .collect()
-            }
-        }
-    };
-
-    // Prefer recent at the top; drop duplicates from the main list.
-    let scopes = filtered
-        .into_iter()
-        .filter(|scope| {
-            !recent
-                .iter()
-                .any(|r| r.path.eq_ignore_ascii_case(&scope.path))
-        })
-        .collect();
-
-    Ok(SearchScopesResult { recent, scopes })
+    let settings = state.settings.read().clone();
+    let user_dict = state.user_dict.read().clone();
+    search::assemble_search_scopes(
+        &state.db,
+        query.as_deref(),
+        &settings,
+        state.backend.as_ref(),
+        Some(state.mail_backend.as_ref()),
+        &user_dict,
+        search::ScopeListOpts {
+            include_mail: false,
+            share: None,
+        },
+    )
 }
 
 #[tauri::command]
@@ -1809,73 +1650,4 @@ pub fn reorder_notes(
         .map_err(|e| e.to_string())?;
     emit_note_updated(&app, "", "list");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::FolderRow;
-
-    fn folder(id: i64, path: &str, enabled: bool) -> FolderRow {
-        FolderRow {
-            id,
-            path: path.to_string(),
-            public_path: String::new(),
-            enabled,
-            indexed_count: 0,
-            exists: false,
-            share_remote: false,
-        }
-    }
-
-    #[test]
-    fn collect_search_scopes_keeps_more_than_400_unique_subdirs() {
-        let root = r"C:\docs";
-        let folders = vec![folder(1, root, true)];
-        let mut paths: Vec<String> = (0..449)
-            .map(|i| format!(r"{root}\case{i:04}\file.md"))
-            .collect();
-        paths.push(format!(r"{root}\20260817借地権相談3\note.md"));
-
-        let rows = collect_search_scopes(&folders, |id| {
-            assert_eq!(id, 1);
-            Ok(paths.clone())
-        })
-        .expect("scopes");
-
-        let subs: Vec<_> = rows.iter().filter(|r| !r.is_root).collect();
-        assert_eq!(subs.len(), 450);
-        assert!(rows
-            .iter()
-            .any(|r| r.is_root && r.path.eq_ignore_ascii_case(root)));
-        assert!(
-            rows.iter().any(|r| r.path.ends_with("20260817借地権相談3")),
-            "newest folder must remain in the picker"
-        );
-        assert!(
-            rows.iter().any(|r| r.label.contains("20260817借地権相談3")),
-            "filter by folder name should match the relative label"
-        );
-    }
-
-    #[test]
-    fn collect_search_scopes_includes_nested_parents() {
-        let root = r"C:\docs";
-        let folders = vec![folder(1, root, true)];
-        let paths = vec![format!(r"{root}\a\b\file.md")];
-        let rows = collect_search_scopes(&folders, |_| Ok(paths.clone())).expect("scopes");
-        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(root)));
-        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(r"C:\docs\a")));
-        assert!(paths.iter().any(|p| p.eq_ignore_ascii_case(r"C:\docs\a\b")));
-    }
-
-    #[test]
-    fn collect_search_scopes_skips_disabled_folders() {
-        let folders = vec![folder(1, r"C:\docs", false)];
-        let rows =
-            collect_search_scopes(&folders, |_| panic!("disabled folders must not list files"))
-                .expect("scopes");
-        assert!(rows.is_empty());
-    }
 }

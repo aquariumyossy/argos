@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "argos"
-version = "1.11.5"
+version = "1.11.6"
 dependencies = [
  "arboard",
  "axum",
@@ -160,6 +160,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "thiserror 2.0.19",
  "tokio",
+ "tower",
  "tower-http",
  "uuid",
  "walkdir",

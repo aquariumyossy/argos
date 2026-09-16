@@ -45,7 +45,7 @@ pub struct PreviewTarget {
 
 pub struct AppState {
     pub db: Arc<Db>,
-    pub settings: RwLock<Settings>,
+    pub settings: Arc<RwLock<Settings>>,
     pub data_dir: PathBuf,
     pub backend: Arc<TantivyBackend>,
     /// Dedicated Outlook mail index (`index-mail/`). Independent of file reindex.
@@ -55,7 +55,7 @@ pub struct AppState {
     /// Set during app setup after the FS watcher thread starts.
     pub watcher: RwLock<Option<WatcherHandle>>,
     /// Client-side user dictionary for query phrase forcing.
-    pub user_dict: RwLock<UserDictMatcher>,
+    pub user_dict: Arc<RwLock<UserDictMatcher>>,
     /// Outlook Classic COM worker (STA). Always present; errors if Outlook missing.
     pub mail: MailStaHandle,
     pub llm_job: RwLock<Option<LlmJob>>,
@@ -105,14 +105,14 @@ impl AppState {
         Ok((
             Self {
                 db,
-                settings: RwLock::new(settings),
+                settings: Arc::new(RwLock::new(settings)),
                 data_dir,
                 backend,
                 mail_backend,
                 indexer,
                 remote_server,
                 watcher: RwLock::new(None),
-                user_dict: RwLock::new(user_dict),
+                user_dict: Arc::new(RwLock::new(user_dict)),
                 mail,
                 llm_job: RwLock::new(None),
                 preview_target: RwLock::new(None),
@@ -159,17 +159,24 @@ impl AppState {
 
     pub fn sync_remote_server(&self) {
         self.refresh_remote_share();
-        let (enabled, port, token, pos_filter) = {
+        let (enabled, port, token) = {
             let s = self.settings.read();
             (
                 s.remote_server_enabled,
                 s.remote_server_port,
                 s.remote_server_token.clone(),
-                s.pos_filter_enabled,
             )
         };
-        self.remote_server
-            .sync(enabled, port, &token, self.backend.clone(), pos_filter);
+        self.remote_server.sync(
+            enabled,
+            port,
+            &token,
+            self.backend.clone(),
+            self.mail_backend.clone(),
+            self.db.clone(),
+            self.settings.clone(),
+            self.user_dict.clone(),
+        );
     }
 
     pub fn is_llm_busy(&self) -> bool {

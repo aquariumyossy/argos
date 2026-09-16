@@ -8,6 +8,7 @@ pub mod legal_ref;
 pub mod morph;
 pub mod remote_backend;
 pub mod remote_share;
+pub mod scopes;
 pub mod tantivy_backend;
 
 pub use date::{format_unix_ymd, parse_date_range, today_ymd, DateFilter};
@@ -16,6 +17,10 @@ pub use morph::{apply_user_dictionary, is_noise_highlight_term, MorphAnalyzer, U
 pub use remote_backend::{hybrid_search, RemoteArgosBackend};
 pub use remote_share::{
     filter_hits_by_share, path_is_remotely_shared, RemoteShareSnapshot,
+};
+pub use scopes::{
+    assemble_search_scopes, collect_search_scopes, ScopeListOpts, SearchScopeRow,
+    SearchScopesResult,
 };
 pub use tantivy_backend::{parse_query_syntax, TantivyBackend};
 
@@ -719,6 +724,55 @@ pub fn run_search_precise(
         SearchOpts::for_llm(per_file_units),
         filter,
     )
+}
+
+/// Cap on simultaneous folder prefixes (each prefix is a separate index search).
+pub const MAX_SEARCH_PREFIXES: usize = 8;
+const LOCAL_MULTI_UNITS_PER_FILE: usize = 3;
+
+/// Local chat-like retrieval over one or more folder prefixes. Forces `search_mode=local`.
+pub fn run_local_search_multi(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    query: &str,
+    prefixes: &[String],
+    limit: usize,
+    exts: Option<&[String]>,
+    user_dict: &UserDictMatcher,
+) -> Result<Vec<SearchHit>, String> {
+    let mut settings = settings.clone();
+    settings.search_mode = "local".into();
+    let collapsed: Vec<String> = crate::pathutil::collapse_path_prefixes(prefixes)
+        .into_iter()
+        .take(MAX_SEARCH_PREFIXES)
+        .collect();
+    let prefix_opts: Vec<Option<&str>> = if collapsed.is_empty() {
+        vec![None]
+    } else {
+        collapsed.iter().map(|p| Some(p.as_str())).collect()
+    };
+    let unit_limit = (limit * LOCAL_MULTI_UNITS_PER_FILE).clamp(limit, 48);
+    let mut all = Vec::new();
+    for prefix in prefix_opts {
+        all.extend(run_search_precise(
+            &settings,
+            local,
+            mail,
+            query,
+            unit_limit,
+            prefix,
+            exts,
+            user_dict,
+            LOCAL_MULTI_UNITS_PER_FILE,
+            &SearchFilter::default(),
+        )?);
+    }
+    all.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut seen = HashSet::new();
+    all.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
+    all.truncate(limit);
+    Ok(all)
 }
 
 #[allow(clippy::too_many_arguments)]

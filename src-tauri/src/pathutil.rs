@@ -58,6 +58,23 @@ pub fn path_starts_with(path: &str, prefix: &str) -> bool {
         || path.as_bytes().get(prefix.len()) == Some(&b'\\')
 }
 
+/// Drop children when a parent is already selected. Order of first appearance is kept.
+pub fn collapse_path_prefixes(prefixes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in prefixes {
+        let p = raw.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if out.iter().any(|kept| path_starts_with(p, kept)) {
+            continue;
+        }
+        out.retain(|kept| !path_starts_with(kept, p));
+        out.push(p.to_string());
+    }
+    out
+}
+
 /// Replace `from` prefix with `to`. Returns `path` unchanged when prefix does not match.
 pub fn rewrite_prefix(path: &str, from: &str, to: &str) -> String {
     let path = simplify_windows_path(path);
@@ -256,5 +273,15 @@ mod tests {
     fn path_starts_with_boundary() {
         assert!(path_starts_with(r"C:\Data\file", r"C:\Data"));
         assert!(!path_starts_with(r"C:\Data2\file", r"C:\Data"));
+    }
+
+    #[test]
+    fn collapse_path_prefixes_drops_children_keeps_parent() {
+        let out = collapse_path_prefixes(&[
+            r"C:\cases\alpha".into(),
+            r"C:\cases\alpha\pleadings".into(),
+            r"C:\cases\beta".into(),
+        ]);
+        assert_eq!(out, vec![r"C:\cases\alpha".to_string(), r"C:\cases\beta".into()]);
     }
 }
