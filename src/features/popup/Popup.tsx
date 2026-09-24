@@ -398,9 +398,26 @@ function scoreLevel(score: number, maxScore: number): number {
   return Math.min(5, Math.max(1, Math.ceil(ratio * 5)));
 }
 
+type RelatedEvent = {
+  start: string;
+  end: string;
+  allDay: boolean;
+  subject: string;
+  location: string;
+  organizer: string;
+  attendees: string;
+  categories: string;
+  body: string;
+  calendarName: string;
+  private: boolean;
+};
+
 export default function Popup() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
+  const [related, setRelated] = useState<RelatedEvent[]>([]);
+  const [relatedOpen, setRelatedOpen] = useState(false);
+  const [relatedRow, setRelatedRow] = useState<number | null>(null);
   const [index, setIndex] = useState(0);
   const [maximized, setMaximized] = useState(false);
   const [searching, setSearching] = useState(false);
@@ -507,6 +524,50 @@ export default function Popup() {
     [query],
   );
 
+  const loadRelated = useCallback(
+    async (
+      q: string,
+      seq: number,
+      after: string | null,
+      before: string | null,
+    ) => {
+      const trimmed = q.trim();
+      if (!trimmed) {
+        if (seq === searchSeq.current) setRelated([]);
+        return;
+      }
+      let enabled = false;
+      try {
+        const s = await invoke<{ calendarEnabled?: boolean }>("get_settings");
+        enabled = !!s.calendarEnabled;
+      } catch {
+        enabled = false;
+      }
+      if (!enabled) {
+        if (seq === searchSeq.current) {
+          setRelated([]);
+          setRelatedOpen(false);
+          setRelatedRow(null);
+        }
+        return;
+      }
+      try {
+        const rows = await invoke<RelatedEvent[]>("calendar_related", {
+          query: trimmed,
+          dateAfter: after,
+          dateBefore: before,
+        });
+        if (seq !== searchSeq.current) return;
+        setRelated(rows);
+        setRelatedOpen(false);
+        setRelatedRow(null);
+      } catch {
+        if (seq === searchSeq.current) setRelated([]);
+      }
+    },
+    [],
+  );
+
   const runSearch = useCallback(
     async (q: string, pathPrefix?: string | null, exts?: string[] | null) => {
       const seq = ++searchSeq.current;
@@ -514,6 +575,7 @@ export default function Popup() {
       if (!trimmed) {
         if (seq === searchSeq.current) {
           setHits([]);
+          setRelated([]);
           setIndex(0);
           setSearching(false);
         }
@@ -535,6 +597,12 @@ export default function Popup() {
         setHits(next);
         setIndex(0);
         setExpandedParas({});
+        void loadRelated(
+          trimmed,
+          seq,
+          dateAfterRef.current,
+          dateBeforeRef.current,
+        );
         void invoke("record_search_query", { query: trimmed }).catch(console.error);
       } catch (e) {
         console.error(e);
@@ -544,7 +612,7 @@ export default function Popup() {
         }
       }
     },
-    [],
+    [loadRelated],
   );
 
   const scheduleSearch = useCallback(
@@ -668,6 +736,8 @@ export default function Popup() {
       dateBeforeRef.current = null;
       setQuery(event.payload.query);
       setHits(event.payload.hits);
+      const seq = searchSeq.current;
+      void loadRelated(event.payload.query, seq, null, null);
       setIndex(0);
       setActionError("");
       setSearching(Boolean(event.payload.searching));
@@ -689,7 +759,7 @@ export default function Popup() {
       unlisten?.();
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [clearScope, clearExtFilter]);
+  }, [clearScope, clearExtFilter, loadRelated]);
 
   useEffect(() => {
     void invoke<SearchWordRow[]>("list_search_words")
@@ -1956,6 +2026,45 @@ export default function Popup() {
         ) : null}
       </header>
 
+      {related.length > 0 ? (
+        <div className="related-cal">
+          <button
+            type="button"
+            className="related-cal-toggle"
+            onClick={() => setRelatedOpen((v) => !v)}
+          >
+            {relatedOpen ? "▼" : "▶"} 関連する予定 {related.length}件
+          </button>
+          {relatedOpen ? (
+            <ul className="related-cal-list">
+              {related.map((ev, i) => (
+                <li key={`${ev.start}-${ev.subject}-${i}`}>
+                  <button
+                    type="button"
+                    className="related-cal-row"
+                    onClick={() => setRelatedRow(relatedRow === i ? null : i)}
+                  >
+                    <span>
+                      {ev.allDay ? `${ev.start} 終日` : ev.end ? `${ev.start}–${ev.end}` : ev.start}
+                    </span>
+                    <span>{ev.subject || "(件名なし)"}</span>
+                    {ev.location ? <span>{ev.location}</span> : null}
+                  </button>
+                  {relatedRow === i && !ev.private ? (
+                    <div className="related-cal-detail">
+                      {ev.organizer ? <div>主催 {ev.organizer}</div> : null}
+                      {ev.attendees ? <div>{ev.attendees}</div> : null}
+                      {ev.categories ? <div>{ev.categories}</div> : null}
+                      {ev.calendarName ? <div>{ev.calendarName}</div> : null}
+                      {ev.body ? <div>{ev.body}</div> : null}
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
       <ul className="hit-list" ref={listRef}>
           {hits.length === 0 ? (
             <li className="empty">

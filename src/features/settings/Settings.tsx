@@ -38,6 +38,12 @@ type SettingsData = {
   mailLatestOnly: boolean;
   mailThreadCollapse: boolean;
   mailLastSyncAt: string;
+  calendarEnabled: boolean;
+  calendarDaysBack: number;
+  calendarDaysAhead: number;
+  calendarSyncIntervalSecs: number;
+  calendarLastSyncAt: string;
+  calendarTruncated: boolean;
   llmBaseUrl: string;
   llmApiKey: string;
   llmModel: string;
@@ -79,7 +85,19 @@ type EmailFolderRow = {
   indexedCount?: number;
 };
 
-type TabId = "howto" | "folders" | "mail" | "words" | "options" | "llm" | "remote" | "credits";
+type CalendarFolderRow = {
+  id: number;
+  storeId: string;
+  entryId: string;
+  name: string;
+  pathLabel: string;
+  selected: boolean;
+  isDefault: boolean;
+  itemCount?: number;
+  eventCount?: number;
+};
+
+type TabId = "howto" | "folders" | "mail" | "calendar" | "words" | "options" | "llm" | "remote" | "credits";
 
 type IndexProgressPayload = {
   folderId: number;
@@ -151,6 +169,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "howto", label: "操作方法" },
   { id: "folders", label: "フォルダ設定" },
   { id: "mail", label: "メール設定" },
+  { id: "calendar", label: "予定表" },
   { id: "words", label: "辞書登録" },
   { id: "options", label: "各種設定" },
   { id: "llm", label: "ローカルLLM" },
@@ -158,7 +177,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.11.6";
+const APP_VERSION = "1.11.7";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -313,6 +332,12 @@ function normalizeSettings(s: SettingsData): SettingsData {
   if (typeof s.mailLatestOnly !== "boolean") s.mailLatestOnly = false;
   if (typeof s.mailThreadCollapse !== "boolean") s.mailThreadCollapse = true;
   if (typeof s.mailLastSyncAt !== "string") s.mailLastSyncAt = "";
+  if (typeof s.calendarEnabled !== "boolean") s.calendarEnabled = false;
+  if (typeof s.calendarDaysBack !== "number") s.calendarDaysBack = 7;
+  if (typeof s.calendarDaysAhead !== "number") s.calendarDaysAhead = 60;
+  if (typeof s.calendarSyncIntervalSecs !== "number") s.calendarSyncIntervalSecs = 3600;
+  if (typeof s.calendarLastSyncAt !== "string") s.calendarLastSyncAt = "";
+  if (typeof s.calendarTruncated !== "boolean") s.calendarTruncated = false;
   if (typeof s.llmBaseUrl !== "string" || !s.llmBaseUrl.trim()) {
     s.llmBaseUrl = "http://127.0.0.1:11434/v1";
   }
@@ -408,6 +433,12 @@ export default function Settings() {
   const [mailFolders, setMailFolders] = useState<EmailFolderRow[]>([]);
   const [mailDetect, setMailDetect] = useState<string>("");
   const [mailBusy, setMailBusy] = useState(false);
+  const [calendarFolders, setCalendarFolders] = useState<CalendarFolderRow[]>([]);
+  const [calendarBusy, setCalendarBusy] = useState(false);
+  const [calendarCount, setCalendarCount] = useState(0);
+  const [calendarProgress, setCalendarProgress] = useState<MailSyncProgressPayload | null>(
+    null,
+  );
   const [mailProgress, setMailProgress] = useState<MailSyncProgressPayload | null>(
     null,
   );
@@ -633,6 +664,31 @@ export default function Settings() {
       .catch(console.error);
   }, [tab]);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<MailSyncProgressPayload>("calendar-sync-progress", (event) => {
+      setCalendarProgress(event.payload);
+      if (typeof event.payload.indexedTotal === "number") {
+        setCalendarCount(event.payload.indexedTotal);
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "calendar") return;
+    void invoke<CalendarFolderRow[]>("calendar_list_folders")
+      .then(setCalendarFolders)
+      .catch(console.error);
+    void invoke<number>("calendar_event_count")
+      .then(setCalendarCount)
+      .catch(console.error);
+  }, [tab]);
+
   // Settings window stays mounted; refresh when opening this tab.
   useEffect(() => {
     if (tab !== "words") return;
@@ -738,6 +794,68 @@ export default function Settings() {
     } finally {
       setMailBusy(false);
       setMailProgress(null);
+    }
+  }
+
+  async function refreshCalendarFolders() {
+    setCalendarBusy(true);
+    try {
+      const rows = await invoke<CalendarFolderRow[]>("calendar_refresh_folder_catalog");
+      setCalendarFolders(rows);
+      setMessage(`予定表 ${rows.length} 件を取得しました`);
+    } catch (err) {
+      setMessage(`予定表の取得失敗: ${String(err)}`);
+    } finally {
+      setCalendarBusy(false);
+    }
+  }
+
+  async function toggleCalendarFolder(folder: CalendarFolderRow, selected: boolean) {
+    const next = calendarFolders.map((f) =>
+      f.storeId === folder.storeId && f.entryId === folder.entryId
+        ? { ...f, selected }
+        : f,
+    );
+    setCalendarFolders(next);
+    const keys = next
+      .filter((f) => f.selected)
+      .map((f) => ({ storeId: f.storeId, entryId: f.entryId }));
+    try {
+      await invoke("calendar_set_selected_folders", { folders: keys });
+    } catch (err) {
+      setMessage(`選択の保存に失敗: ${String(err)}`);
+      await reload();
+    }
+  }
+
+  async function runCalendarSync() {
+    if (!settings) return;
+    setCalendarBusy(true);
+    setCalendarProgress(null);
+    try {
+      if (!settings.calendarEnabled) {
+        const saved = await invoke<SettingsData>("update_settings", {
+          settings: { ...settings, calendarEnabled: true },
+        });
+        setSettings(saved);
+      }
+      const stats = await invoke<{
+        indexed: number;
+        errors: number;
+        folders: number;
+        truncated: boolean;
+      }>("calendar_run_sync");
+      setMessage(
+        `予定表の同期完了: ${stats.indexed} 件 / エラー ${stats.errors}${stats.truncated ? "（件数上限で打ち切り）" : ""}`,
+      );
+      setCalendarCount(await invoke<number>("calendar_event_count"));
+      setCalendarFolders(await invoke<CalendarFolderRow[]>("calendar_list_folders"));
+      await reload();
+    } catch (err) {
+      setMessage(`予定表の同期失敗: ${String(err)}`);
+    } finally {
+      setCalendarBusy(false);
+      setCalendarProgress(null);
     }
   }
 
@@ -2180,6 +2298,157 @@ export default function Settings() {
                     </li>
                   );
                 })
+              )}
+            </ul>
+          </section>
+          {message ? <p className="msg">{message}</p> : null}
+        </div>
+      ) : null}
+
+      {tab === "calendar" ? (
+        <div
+          className="tab-panel"
+          role="region"
+          id="panel-calendar"
+          aria-labelledby="tab-calendar"
+        >
+          <section>
+            <h2>Outlook予定表</h2>
+            <p className="muted">
+              同一 PC の Outlook クラシックの予定を、直近の期間だけ読みます（新しい Outlook
+              のみの環境では利用できません）。チャット、検索ポップアップの「関連する予定」、同一
+              PC の API から参照できます。LAN には公開しません。オンにするまで検索には出ません。
+            </p>
+          </section>
+          <section className="mail-step options-form">
+            <h3 className="mail-step-title">設定</h3>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={!!settings?.calendarEnabled}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({ ...settings, calendarEnabled: e.target.checked })
+                }
+              />
+              予定表を読み取る
+            </label>
+            <label>
+              過去（日）
+              <input
+                type="number"
+                min={0}
+                max={365}
+                value={settings?.calendarDaysBack ?? 7}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({
+                    ...settings,
+                    calendarDaysBack: Number(e.target.value) || 0,
+                  })
+                }
+              />
+            </label>
+            <label>
+              未来（日）
+              <input
+                type="number"
+                min={1}
+                max={365}
+                value={settings?.calendarDaysAhead ?? 60}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({
+                    ...settings,
+                    calendarDaysAhead: Number(e.target.value) || 60,
+                  })
+                }
+              />
+            </label>
+            <label>
+              自動同期間隔（秒・0 で手動のみ）
+              <input
+                type="number"
+                min={0}
+                step={60}
+                value={settings?.calendarSyncIntervalSecs ?? 3600}
+                onChange={(e) =>
+                  settings &&
+                  setSettings({
+                    ...settings,
+                    calendarSyncIntervalSecs: Number(e.target.value) || 0,
+                  })
+                }
+              />
+            </label>
+            <div className="row">
+              <button type="button" onClick={() => void saveSettings()}>
+                設定を保存
+              </button>
+            </div>
+          </section>
+          <section className="mail-step">
+            <h3 className="mail-step-title">予定表の選択・同期</h3>
+            <p className="muted mail-step-desc">
+              一覧を取得すると、既定の予定表が最初に選択されます。チェックした予定表だけを同期します。
+            </p>
+            <div className="row">
+              <button
+                type="button"
+                onClick={() => void refreshCalendarFolders()}
+                disabled={calendarBusy}
+              >
+                予定表一覧を取得
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void runCalendarSync()}
+                disabled={calendarBusy}
+              >
+                {calendarBusy
+                  ? calendarProgress?.message || "同期中…"
+                  : "今すぐ同期"}
+              </button>
+            </div>
+            <p className="field-hint">
+              最終同期: {settings?.calendarLastSyncAt || "未実行"} / 予定{" "}
+              {calendarCount.toLocaleString()} 件
+              {settings?.calendarTruncated ? " / 前回は件数上限で打ち切り" : ""}
+            </p>
+            <ul className="folder-list">
+              {calendarFolders.length === 0 ? (
+                <li className="empty">
+                  まだ予定表がありません。上の「予定表一覧を取得」を実行してください。
+                </li>
+              ) : (
+                calendarFolders.map((f) => (
+                  <li
+                    key={`${f.storeId}/${f.entryId}`}
+                    className={
+                      f.selected
+                        ? "folder-item mail-folder-item is-selected"
+                        : "folder-item mail-folder-item"
+                    }
+                  >
+                    <label className="mail-folder-select">
+                      <input
+                        type="checkbox"
+                        checked={f.selected}
+                        onChange={(e) => void toggleCalendarFolder(f, e.target.checked)}
+                      />
+                      <span className="folder-main">
+                        <span className="folder-path" title={f.pathLabel}>
+                          {f.pathLabel || f.name}
+                          {f.isDefault ? "（既定）" : ""}
+                        </span>
+                        <span className="folder-count">
+                          {(f.eventCount ?? 0).toLocaleString()} 件
+                        </span>
+                      </span>
+                    </label>
+                  </li>
+                ))
               )}
             </ul>
           </section>

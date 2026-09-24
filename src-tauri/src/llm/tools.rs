@@ -10,6 +10,7 @@ use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
 pub const TOOL_SEARCH: &str = "search_index";
+pub const TOOL_LIST_CALENDAR: &str = "list_calendar";
 pub const TOOL_READ: &str = "read_unit";
 pub const TOOL_READ_URL: &str = "read_url";
 pub const TOOL_LIST_NOTES: &str = "list_notes";
@@ -85,6 +86,21 @@ pub fn tools_schema(web_search: bool) -> Value {
                         }
                     },
                     "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_LIST_CALENDAR,
+                "description": "このPCのOutlook予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。search_index の「直近は過去」は予定に使わない。資料が要るときは、返った件名や当事者名を search_index の query にする。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "after": { "type": "string", "description": "この日以降（YYYY-MM-DD）。省略時は今日。" },
+                        "before": { "type": "string", "description": "この日以前（YYYY-MM-DD）。省略時は今日から14日後。" },
+                        "query": { "type": "string", "description": "任意。空白区切りの語をすべて含む予定だけ（件名・場所・参加者・本文）。" }
+                    }
                 }
             }
         }),
@@ -534,6 +550,10 @@ pub fn topical_query(query: &str, mail_from: Option<&str>) -> String {
         parts.push(t.to_string());
     }
     parts.join(" ")
+}
+
+pub fn format_calendar_system_line() -> String {
+    "\n予定・期日・会議・今日・今週・明日は list_calendar を使う。資料が要るときだけ、返った件名や当事者名を search_index の query にする。search_index の「直近は30日前」はファイルとメール用で、予定には使わない。".into()
 }
 
 pub fn format_search_date_system_line(mail_days_back: u32) -> String {
@@ -1219,6 +1239,129 @@ fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
     }
 }
 
+fn tool_list_calendar(state: &AppState, args: &Value) -> ToolExec {
+    let settings = state.settings.read().clone();
+    if !settings.calendar_enabled {
+        return ToolExec::text("予定表は設定でオフです。設定の予定表をオンにして同期してください。");
+    }
+    let now = chrono::Local::now();
+    let synced = crate::mail::calendar::sync_window_filter(
+        settings.calendar_days_back,
+        settings.calendar_days_ahead,
+        now,
+    );
+    let after = args.get("after").and_then(|v| v.as_str());
+    let before = args.get("before").and_then(|v| v.as_str());
+    let requested = if after.map(str::trim).unwrap_or("").is_empty()
+        && before.map(str::trim).unwrap_or("").is_empty()
+    {
+        crate::mail::calendar::default_list_filter(now)
+    } else {
+        match crate::search::parse_date_range(after, before) {
+            Ok(f) => f,
+            Err(e) => return ToolExec::text(e),
+        }
+    };
+    let terms = crate::mail::calendar::whitespace_terms(
+        args.get("query").and_then(|v| v.as_str()).unwrap_or(""),
+    );
+    if settings.calendar_last_sync_at.trim().is_empty() {
+        return ToolExec::text("予定表はまだ同期されていません。設定から同期してください。");
+    }
+    let rows = match state.db.list_calendar_events() {
+        Ok(r) => r,
+        Err(e) => return ToolExec::text(format!("予定表を読めません: {e}")),
+    };
+    let mut views: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let appt = crate::mail::calendar::OutlookAppointment {
+                store_id: row.store_id.clone(),
+                entry_id: row.entry_id.clone(),
+                folder_entry_id: row.folder_entry_id.clone(),
+                calendar_name: row.calendar_name.clone(),
+                subject: row.subject.clone(),
+                location: row.location.clone(),
+                organizer: row.organizer.clone(),
+                attendees: row.attendees.clone(),
+                categories: row.categories.clone(),
+                body: row.body.clone(),
+                start_unix: row.start_unix,
+                end_unix: row.end_unix,
+                all_day: row.all_day,
+                busy_status: row.busy_status,
+                private: row.private,
+            };
+            crate::mail::calendar::to_view(&appt)
+        })
+        .filter(|v| crate::mail::calendar::in_date_filter(v.start_unix, requested))
+        .filter(|v| crate::mail::calendar::event_matches_terms(v, &terms))
+        .collect();
+    views = crate::mail::calendar::sort_by_start(views);
+    let mut head = String::new();
+    if crate::mail::calendar::range_outside_sync(requested, synced) {
+        let from = synced
+            .after_unix
+            .map(crate::mail::calendar::ymd_of_unix)
+            .unwrap_or_default();
+        let to = synced
+            .before_unix
+            .map(crate::mail::calendar::ymd_of_unix)
+            .unwrap_or_default();
+        head.push_str(&format!(
+            "問い合わせ範囲の一部は同期範囲（{from}〜{to}）の外です。範囲内の予定だけを返します。\n"
+        ));
+    }
+    if settings.calendar_truncated {
+        head.push_str("一部の予定表は件数上限で打ち切られています。\n");
+    }
+    if views.is_empty() {
+        head.push_str("この期間の予定はありません。");
+        return ToolExec::text(head);
+    }
+    let mut lines = Vec::new();
+    for v in views {
+        let when = if v.all_day {
+            format!("{} 終日", v.start)
+        } else if v.end.is_empty() {
+            v.start.clone()
+        } else {
+            format!("{}–{}", v.start, v.end)
+        };
+        let mut line = format!("- {when} {}", v.subject);
+        if !v.private {
+            let mut extra = Vec::new();
+            if !v.location.is_empty() {
+                extra.push(v.location.clone());
+            }
+            if !v.organizer.is_empty() {
+                extra.push(format!("主催 {}", v.organizer));
+            }
+            if !v.attendees.is_empty() {
+                extra.push(v.attendees.clone());
+            }
+            if !v.categories.is_empty() {
+                extra.push(v.categories.clone());
+            }
+            if !v.calendar_name.is_empty() {
+                extra.push(v.calendar_name.clone());
+            }
+            if !extra.is_empty() {
+                line.push_str(&format!("（{}）", extra.join("、")));
+            }
+            if !v.body.is_empty() {
+                line.push('\n');
+                line.push_str(&v.body);
+            }
+        } else {
+            line.push_str("（非公開）");
+        }
+        lines.push(line);
+    }
+    head.push_str(&lines.join("\n"));
+    ToolExec::text(head)
+}
+
 pub fn execute_tool(
     state: &AppState,
     thread_id: &str,
@@ -1260,6 +1403,7 @@ fn execute_tool_inner(
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     match name {
+        TOOL_LIST_CALENDAR => Ok(tool_list_calendar(state, &args)),
         TOOL_SEARCH => {
             let query = args
                 .get("query")

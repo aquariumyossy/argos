@@ -35,6 +35,19 @@ static SETUP_DONE: AtomicBool = AtomicBool::new(false);
 /// Show the settings window once setup can do so (user launch or a second instance).
 static OPEN_SETTINGS: AtomicBool = AtomicBool::new(false);
 
+fn sync_due(enabled: bool, interval: u64, last: &str) -> bool {
+    if !enabled || interval == 0 {
+        return false;
+    }
+    if last.is_empty() {
+        return true;
+    }
+    match chrono::DateTime::parse_from_rfc3339(last) {
+        Ok(dt) => chrono::Utc::now().timestamp() - dt.timestamp() >= interval as i64,
+        Err(_) => true,
+    }
+}
+
 pub fn set_popup_dragging(dragging: bool) {
     POPUP_DRAGGING.store(dragging, Ordering::SeqCst);
 }
@@ -193,40 +206,50 @@ pub fn run() {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                         let state = app_handle.state::<Arc<AppState>>();
-                        let (enabled, interval) = {
+                        let (mail_on, mail_interval, cal_on, cal_interval) = {
                             let s = state.settings.read();
-                            (s.mail_enabled, s.mail_sync_interval_secs)
+                            (
+                                s.mail_enabled,
+                                s.mail_sync_interval_secs,
+                                s.calendar_enabled,
+                                s.calendar_sync_interval_secs,
+                            )
                         };
-                        if !enabled || interval == 0 {
-                            continue;
-                        }
-                        let due = {
-                            let last = state.settings.read().mail_last_sync_at.clone();
-                            if last.is_empty() {
-                                true
-                            } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&last) {
-                                let elapsed = chrono::Utc::now().timestamp() - dt.timestamp();
-                                elapsed >= interval as i64
-                            } else {
-                                true
-                            }
-                        };
-                        if !due {
-                            continue;
-                        }
-                        let mail = state.mail.clone();
-                        let app2 = app_handle.clone();
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            // Do not launch Outlook from background sync.
-                            mail.sync_all(false, move |p| {
-                                let _ = app2.emit("mail-sync-progress", &p);
+                        let mail_due = sync_due(
+                            mail_on,
+                            mail_interval,
+                            &state.settings.read().mail_last_sync_at,
+                        );
+                        let cal_due = sync_due(
+                            cal_on,
+                            cal_interval,
+                            &state.settings.read().calendar_last_sync_at,
+                        );
+                        if mail_due {
+                            let mail = state.mail.clone();
+                            let app2 = app_handle.clone();
+                            let _ = tauri::async_runtime::spawn_blocking(move || {
+                                mail.sync_all(false, move |p| {
+                                    let _ = app2.emit("mail-sync-progress", &p);
+                                })
                             })
-                        })
-                        .await;
-                        // Refresh cached settings (last sync timestamp).
-                        let state = app_handle.state::<Arc<AppState>>();
-                        let refreshed = state.db.load_settings();
-                        *state.settings.write() = refreshed;
+                            .await;
+                        }
+                        if cal_due {
+                            let mail = state.mail.clone();
+                            let app2 = app_handle.clone();
+                            let _ = tauri::async_runtime::spawn_blocking(move || {
+                                mail.sync_calendar(false, move |p| {
+                                    let _ = app2.emit("calendar-sync-progress", &p);
+                                })
+                            })
+                            .await;
+                        }
+                        if mail_due || cal_due {
+                            let state = app_handle.state::<Arc<AppState>>();
+                            let refreshed = state.db.load_settings();
+                            *state.settings.write() = refreshed;
+                        }
                     }
                 });
             }
@@ -298,6 +321,12 @@ pub fn run() {
             commands::mail_list_selected_folder_names,
             commands::mail_run_sync,
             commands::mail_indexed_count,
+            commands::calendar_list_folders,
+            commands::calendar_refresh_folder_catalog,
+            commands::calendar_set_selected_folders,
+            commands::calendar_run_sync,
+            commands::calendar_event_count,
+            commands::calendar_related,
             commands::show_notes_window,
             commands::show_popup_window,
             commands::show_preview_window,

@@ -1,5 +1,6 @@
 //! Outlook Classic COM mail sync (separate from FS indexer).
 
+pub mod calendar;
 pub mod ole_date;
 pub mod path;
 pub mod sync;
@@ -35,6 +36,21 @@ pub mod outlook_com {
     }
 
     pub fn open_mail_item(_store_id: &str, _entry_id: &str) -> Result<(), String> {
+        Err("Outlook 連携は Windows のみ対応です".into())
+    }
+
+    pub fn list_calendar_folders() -> Result<Vec<crate::mail::calendar::CalendarFolderInfo>, String> {
+        Err("Outlook 連携は Windows のみ対応です".into())
+    }
+
+    pub fn fetch_appointments_in_folder(
+        _folder_entry_id: &str,
+        _store_id: &str,
+        _calendar_name: &str,
+        _start_unix: i64,
+        _end_exclusive_unix: i64,
+        _allow_launch: bool,
+    ) -> Result<(Vec<crate::mail::calendar::OutlookAppointment>, bool), String> {
         Err("Outlook 連携は Windows のみ対応です".into())
     }
 }
@@ -86,6 +102,21 @@ pub mod sta_worker {
         }
 
         pub fn open_item(&self, _store_id: &str, _entry_id: &str) -> Result<(), String> {
+            Err("Outlook 連携は Windows のみ対応です".into())
+        }
+
+        pub fn list_calendars(&self) -> Result<Vec<crate::mail::calendar::CalendarFolderInfo>, String> {
+            Err("Outlook 連携は Windows のみ対応です".into())
+        }
+
+        pub fn sync_calendar<F>(
+            &self,
+            _allow_launch: bool,
+            _on_progress: F,
+        ) -> Result<crate::mail::calendar::CalendarSyncStats, String>
+        where
+            F: FnMut(crate::mail::calendar::CalendarSyncProgress) + Send + 'static,
+        {
             Err("Outlook 連携は Windows のみ対応です".into())
         }
     }

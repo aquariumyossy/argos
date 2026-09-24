@@ -178,6 +178,9 @@ pub fn update_settings(
     settings.remote_timeout_ms = settings.remote_timeout_ms.clamp(500, 60_000);
     settings.mail_days_back = settings.mail_days_back.clamp(1, 3650);
     settings.mail_sync_interval_secs = settings.mail_sync_interval_secs.min(7 * 24 * 3600);
+    settings.calendar_days_back = settings.calendar_days_back.clamp(0, 365);
+    settings.calendar_days_ahead = settings.calendar_days_ahead.clamp(1, 365);
+    settings.calendar_sync_interval_secs = settings.calendar_sync_interval_secs.min(7 * 24 * 3600);
     settings.llm_base_url = crate::llm::normalize_base_url(&settings.llm_base_url);
     if settings.llm_base_url.is_empty() {
         settings.llm_base_url = crate::db::DEFAULT_LLM_BASE_URL.into();
@@ -1042,6 +1045,137 @@ pub async fn mail_run_sync(
 #[tauri::command]
 pub fn mail_indexed_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
     state.db.count_indexed_emails().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn calendar_list_folders(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::db::CalendarFolderRow>, String> {
+    state.db.list_calendar_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn calendar_refresh_folder_catalog(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::db::CalendarFolderRow>, String> {
+    let mail = state.mail.clone();
+    let listed = tauri::async_runtime::spawn_blocking(move || mail.list_calendars())
+        .await
+        .map_err(|e| e.to_string())??;
+    let rows: Vec<crate::db::CalendarFolderRow> = listed
+        .into_iter()
+        .map(|f| crate::db::CalendarFolderRow {
+            id: 0,
+            store_id: f.store_id,
+            entry_id: f.entry_id,
+            name: f.name,
+            path_label: f.path_label,
+            selected: false,
+            is_default: f.is_default,
+            item_count: f.item_count,
+            event_count: 0,
+        })
+        .collect();
+    state
+        .db
+        .replace_calendar_folder_catalog(&rows)
+        .map_err(|e| e.to_string())?;
+    state.db.list_calendar_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn calendar_set_selected_folders(
+    state: State<'_, Arc<AppState>>,
+    folders: Vec<MailFolderKey>,
+) -> Result<(), String> {
+    let keys: Vec<(String, String)> = folders
+        .into_iter()
+        .map(|f| (f.store_id, f.entry_id))
+        .collect();
+    state
+        .db
+        .set_calendar_folders_selected(&keys)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn calendar_run_sync(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::mail::calendar::CalendarSyncStats, String> {
+    if !state.settings.read().calendar_enabled {
+        return Err("Outlook 予定表が無効です。設定で有効にしてください。".into());
+    }
+    let mail = state.mail.clone();
+    let app2 = app.clone();
+    let stats = tauri::async_runtime::spawn_blocking(move || {
+        mail.sync_calendar(true, move |p| {
+            let _ = app2.emit("calendar-sync-progress", &p);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let refreshed = state.db.load_settings();
+    *state.settings.write() = refreshed;
+    Ok(stats)
+}
+
+#[tauri::command]
+pub fn calendar_event_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    state.db.count_calendar_events().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn calendar_related(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    date_after: Option<String>,
+    date_before: Option<String>,
+) -> Result<Vec<crate::mail::calendar::CalendarEventView>, String> {
+    if !state.settings.read().calendar_enabled {
+        return Ok(Vec::new());
+    }
+    let settings = state.settings.read().clone();
+    let morph = crate::search::morph::MorphAnalyzer::new()?;
+    let surfaces = morph
+        .content_surfaces(&query, settings.pos_filter_enabled)
+        .unwrap_or_default();
+    let terms = crate::mail::calendar::take_content_terms(&surfaces);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let date = crate::search::parse_date_range(date_after.as_deref(), date_before.as_deref())?;
+    let rows = state.db.list_calendar_events().map_err(|e| e.to_string())?;
+    let mut views: Vec<_> = rows
+        .iter()
+        .map(calendar_row_view)
+        .filter(|v| crate::mail::calendar::in_date_filter(v.start_unix, date))
+        .filter(|v| crate::mail::calendar::event_matches_terms(v, &terms))
+        .collect();
+    let today = crate::mail::calendar::window_bounds(0, 0, chrono::Local::now()).0;
+    views = crate::mail::calendar::sort_related(views, today);
+    Ok(views)
+}
+
+fn calendar_row_view(row: &crate::db::CalendarEventRow) -> crate::mail::calendar::CalendarEventView {
+    let appt = crate::mail::calendar::OutlookAppointment {
+        store_id: row.store_id.clone(),
+        entry_id: row.entry_id.clone(),
+        folder_entry_id: row.folder_entry_id.clone(),
+        calendar_name: row.calendar_name.clone(),
+        subject: row.subject.clone(),
+        location: row.location.clone(),
+        organizer: row.organizer.clone(),
+        attendees: row.attendees.clone(),
+        categories: row.categories.clone(),
+        body: row.body.clone(),
+        start_unix: row.start_unix,
+        end_unix: row.end_unix,
+        all_day: row.all_day,
+        busy_status: row.busy_status,
+        private: row.private,
+    };
+    crate::mail::calendar::to_view(&appt)
 }
 
 // --- Notes ---

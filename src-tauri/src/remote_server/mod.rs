@@ -399,6 +399,117 @@ async fn path_matches(
     Ok(Json(SearchResponse { hits }))
 }
 
+#[derive(Deserialize)]
+struct CalendarQuery {
+    after: Option<String>,
+    before: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarHttpResponse {
+    events: Vec<crate::mail::calendar::CalendarEventView>,
+    truncated: bool,
+    window_after: String,
+    window_before: String,
+}
+
+/// LAN callers get 404 even with a bearer token. Loopback is open.
+pub fn calendar_off_machine_status(loopback: bool) -> Result<(), StatusCode> {
+    if loopback {
+        Ok(())
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn calendar(
+    State(state): State<ServerState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(q): Query<CalendarQuery>,
+) -> Result<Json<CalendarHttpResponse>, StatusCode> {
+    calendar_off_machine_status(is_loopback_addr(addr))?;
+    let settings = state.settings.read().clone();
+    if !settings.calendar_enabled {
+        let synced = crate::mail::calendar::sync_window_filter(
+            settings.calendar_days_back,
+            settings.calendar_days_ahead,
+            chrono::Local::now(),
+        );
+        return Ok(Json(CalendarHttpResponse {
+            events: Vec::new(),
+            truncated: false,
+            window_after: synced
+                .after_unix
+                .map(crate::mail::calendar::ymd_of_unix)
+                .unwrap_or_default(),
+            window_before: synced
+                .before_unix
+                .map(crate::mail::calendar::ymd_of_unix)
+                .unwrap_or_default(),
+        }));
+    }
+    let now = chrono::Local::now();
+    let synced = crate::mail::calendar::sync_window_filter(
+        settings.calendar_days_back,
+        settings.calendar_days_ahead,
+        now,
+    );
+    let requested = if q.after.as_deref().unwrap_or("").trim().is_empty()
+        && q.before.as_deref().unwrap_or("").trim().is_empty()
+    {
+        crate::mail::calendar::default_list_filter(now)
+    } else {
+        crate::search::parse_date_range(q.after.as_deref(), q.before.as_deref())
+            .map_err(|_| StatusCode::BAD_REQUEST)?
+    };
+    let terms = crate::mail::calendar::whitespace_terms(q.q.as_deref().unwrap_or(""));
+    let db = state.db.clone();
+    let events = tokio::task::spawn_blocking(move || db.list_calendar_events())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut views: Vec<_> = events
+        .into_iter()
+        .map(|row| {
+            let appt = crate::mail::calendar::OutlookAppointment {
+                store_id: row.store_id,
+                entry_id: row.entry_id,
+                folder_entry_id: row.folder_entry_id,
+                calendar_name: row.calendar_name,
+                subject: row.subject,
+                location: row.location,
+                organizer: row.organizer,
+                attendees: row.attendees,
+                categories: row.categories,
+                body: row.body,
+                start_unix: row.start_unix,
+                end_unix: row.end_unix,
+                all_day: row.all_day,
+                busy_status: row.busy_status,
+                private: row.private,
+            };
+            crate::mail::calendar::to_view(&appt)
+        })
+        .filter(|v| crate::mail::calendar::in_date_filter(v.start_unix, requested))
+        .filter(|v| crate::mail::calendar::event_matches_terms(v, &terms))
+        .collect();
+    views = crate::mail::calendar::sort_by_start(views);
+    Ok(Json(CalendarHttpResponse {
+        events: views,
+        truncated: settings.calendar_truncated,
+        window_after: synced
+            .after_unix
+            .map(crate::mail::calendar::ymd_of_unix)
+            .unwrap_or_default(),
+        window_before: synced
+            .before_unix
+            .map(crate::mail::calendar::ymd_of_unix)
+            .unwrap_or_default(),
+    }))
+}
+
 fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -406,6 +517,7 @@ fn router(state: ServerState) -> Router {
         .route("/search", post(search))
         .route("/path_matches", post(path_matches))
         .route("/preview", post(preview))
+        .route("/calendar", get(calendar))
         .layer(loopback_cors())
         .with_state(state)
 }
@@ -572,6 +684,15 @@ mod tests {
 
     fn lan_info() -> ConnectInfo<SocketAddr> {
         ConnectInfo(SocketAddr::from(([192, 168, 1, 10], 1)))
+    }
+
+    #[test]
+    fn calendar_lan_is_not_found() {
+        assert!(calendar_off_machine_status(true).is_ok());
+        assert_eq!(
+            calendar_off_machine_status(false).unwrap_err(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     fn temp_dir() -> std::path::PathBuf {

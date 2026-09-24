@@ -787,6 +787,50 @@
   align-items: stretch;
 }
 
+.related-cal {
+  margin: 8px 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel, transparent);
+}
+
+.related-cal-toggle {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.related-cal-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 8px;
+}
+
+.related-cal-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--line);
+  padding: 6px 2px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.related-cal-detail {
+  padding: 0 2px 8px;
+  white-space: pre-wrap;
+  color: var(--muted, inherit);
+  font-size: 0.92em;
+}
+
 .hit-list {
   list-style: none;
   margin: 0;

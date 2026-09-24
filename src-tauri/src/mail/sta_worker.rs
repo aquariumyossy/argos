@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::db::Db;
+use crate::db::{CalendarEventRow, Db};
+use crate::mail::calendar::{self, CalendarFolderInfo};
 use crate::mail::outlook_com;
-use crate::mail::path::make_outlook_path;
+use crate::mail::path::{make_calendar_path, make_outlook_path};
 use crate::mail::sync::{
     content_fingerprint, index_message, MailSyncProgress, MailSyncStats, OutlookFolderInfo,
 };
@@ -40,6 +41,14 @@ enum Job {
         store_id: String,
         entry_id: String,
         reply: Sender<Result<(), String>>,
+    },
+    ListCalendars {
+        reply: Sender<Result<Vec<CalendarFolderInfo>, String>>,
+    },
+    SyncCalendar {
+        allow_launch: bool,
+        reply: Sender<Result<calendar::CalendarSyncStats, String>>,
+        progress: Sender<calendar::CalendarSyncProgress>,
     },
 }
 
@@ -141,6 +150,42 @@ impl MailStaHandle {
             .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
         recv_result(rx, SHORT_JOB_TIMEOUT, "open")?
     }
+
+    pub fn list_calendars(&self) -> Result<Vec<CalendarFolderInfo>, String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Job::ListCalendars { reply })
+            .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
+        recv_result(rx, SHORT_JOB_TIMEOUT, "list_calendars")?
+    }
+
+    pub fn sync_calendar<F>(
+        &self,
+        allow_launch: bool,
+        on_progress: F,
+    ) -> Result<calendar::CalendarSyncStats, String>
+    where
+        F: FnMut(calendar::CalendarSyncProgress) + Send + 'static,
+    {
+        let (reply, rx) = mpsc::channel();
+        let (ptx, prx) = mpsc::channel::<calendar::CalendarSyncProgress>();
+        self.tx
+            .send(Job::SyncCalendar {
+                allow_launch,
+                reply,
+                progress: ptx,
+            })
+            .map_err(|_| "Outlook STA スレッドが停止しています".to_string())?;
+        let progress_thread = thread::spawn(move || {
+            let mut cb = on_progress;
+            while let Ok(p) = prx.recv() {
+                cb(p);
+            }
+        });
+        let result = recv_result(rx, SYNC_JOB_TIMEOUT, "calendar_sync")?;
+        let _ = progress_thread.join();
+        result
+    }
 }
 
 fn sta_loop(
@@ -166,6 +211,12 @@ fn sta_loop(
                     let _ = reply.send(Err(e.clone()));
                 }
                 Job::Open { reply, .. } => {
+                    let _ = reply.send(Err(e.clone()));
+                }
+                Job::ListCalendars { reply } => {
+                    let _ = reply.send(Err(e.clone()));
+                }
+                Job::SyncCalendar { reply, .. } => {
                     let _ = reply.send(Err(e.clone()));
                 }
             }
@@ -203,6 +254,22 @@ fn sta_loop(
                 reply,
             } => {
                 let _ = reply.send(outlook_com::open_mail_item(&store_id, &entry_id));
+            }
+            Job::ListCalendars { reply } => {
+                let _ = reply.send(outlook_com::list_calendar_folders());
+            }
+            Job::SyncCalendar {
+                allow_launch,
+                reply,
+                progress,
+            } => {
+                syncing.store(true, Ordering::SeqCst);
+                let result = run_calendar_sync(&db, allow_launch, |p| {
+                    let _ = progress.send(p);
+                });
+                syncing.store(false, Ordering::SeqCst);
+                drop(progress);
+                let _ = reply.send(result);
             }
         }
     }
@@ -423,5 +490,158 @@ fn mail_progress(
         message: message.into(),
         indexed_total: db.count_indexed_emails().unwrap_or(0),
         folder_indexed,
+    }
+}
+
+fn run_calendar_sync<F>(
+    db: &Db,
+    allow_launch: bool,
+    mut on_progress: F,
+) -> Result<calendar::CalendarSyncStats, String>
+where
+    F: FnMut(calendar::CalendarSyncProgress),
+{
+    let settings = db.load_settings();
+    if !settings.calendar_enabled {
+        return Err("Outlook 予定表が無効です".into());
+    }
+    let folders = db
+        .list_selected_calendar_folders()
+        .map_err(|e| e.to_string())?;
+    if folders.is_empty() {
+        return Err("同期する予定表が選択されていません".into());
+    }
+    if allow_launch && !outlook_com::outlook_is_running() {
+        on_progress(calendar_progress(
+            db,
+            "starting",
+            "",
+            0,
+            folders.len() as u32,
+            "Outlook を起動しています…",
+        ));
+    }
+    match outlook_com::connect_outlook(allow_launch) {
+        Ok(_) => {}
+        Err(e) if !allow_launch => {
+            eprintln!("argos: periodic calendar sync skipped: {e}");
+            return Ok(calendar::CalendarSyncStats::default());
+        }
+        Err(e) => return Err(e),
+    }
+    let (start, end_excl) = calendar::window_bounds(
+        settings.calendar_days_back,
+        settings.calendar_days_ahead,
+        chrono::Local::now(),
+    );
+    let mut stats = calendar::CalendarSyncStats {
+        folders: folders.len() as u32,
+        ..calendar::CalendarSyncStats::default()
+    };
+    on_progress(calendar_progress(
+        db,
+        "starting",
+        "",
+        0,
+        folders.len() as u32,
+        "予定表の同期を開始",
+    ));
+    for (fi, folder) in folders.iter().enumerate() {
+        on_progress(calendar_progress(
+            db,
+            "folder",
+            folder.path_label.clone(),
+            fi as u32 + 1,
+            folders.len() as u32,
+            format!("予定表取得中: {}", folder.path_label),
+        ));
+        let fetched = outlook_com::fetch_appointments_in_folder(
+            &folder.entry_id,
+            &folder.store_id,
+            &folder.path_label,
+            start,
+            end_excl,
+            false,
+        );
+        let (appointments, truncated) = match fetched {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "argos: calendar folder sync error ({}): {e}",
+                    folder.path_label
+                );
+                stats.errors += 1;
+                continue;
+            }
+        };
+        if truncated {
+            stats.truncated = true;
+        }
+        let rows: Vec<CalendarEventRow> = appointments
+            .into_iter()
+            .map(|a| CalendarEventRow {
+                path: make_calendar_path(&a.store_id, &a.entry_id, a.start_unix),
+                folder_entry_id: a.folder_entry_id,
+                store_id: a.store_id,
+                entry_id: a.entry_id,
+                start_unix: a.start_unix,
+                end_unix: a.end_unix,
+                all_day: a.all_day,
+                subject: a.subject,
+                location: a.location,
+                organizer: a.organizer,
+                attendees: a.attendees,
+                categories: a.categories,
+                body: a.body,
+                calendar_name: a.calendar_name,
+                busy_status: a.busy_status,
+                private: a.private,
+            })
+            .collect();
+        let n = rows.len() as u32;
+        if let Err(e) = db.replace_calendar_folder_events(&folder.entry_id, &rows) {
+            eprintln!(
+                "argos: calendar replace failed ({}): {e}",
+                folder.path_label
+            );
+            stats.errors += 1;
+            continue;
+        }
+        stats.indexed += n;
+    }
+    let selected_ids: Vec<String> = folders.iter().map(|f| f.entry_id.clone()).collect();
+    if let Some(keep) = calendar::prune_keep_ids(&selected_ids) {
+        let _ = db.delete_calendar_events_except(&keep);
+    }
+    let _ = db.set_calendar_last_sync_now(stats.truncated);
+    on_progress(calendar_progress(
+        db,
+        "done",
+        "",
+        stats.folders,
+        stats.folders,
+        format!(
+            "完了: 予定 {} / エラー {}",
+            stats.indexed, stats.errors
+        ),
+    ));
+    Ok(stats)
+}
+
+fn calendar_progress(
+    db: &Db,
+    phase: &str,
+    folder_label: impl Into<String>,
+    current: u32,
+    total: u32,
+    message: impl Into<String>,
+) -> calendar::CalendarSyncProgress {
+    calendar::CalendarSyncProgress {
+        phase: phase.into(),
+        folder_label: folder_label.into(),
+        current,
+        total,
+        message: message.into(),
+        indexed_total: db.count_calendar_events().unwrap_or(0),
     }
 }
