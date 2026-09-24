@@ -575,6 +575,7 @@ pub async fn llm_send(
     system.push_str(&tools::format_search_date_system_line(
         settings.mail_days_back,
     ));
+    system.push_str(&tools::format_calendar_system_line());
     let web_search = web_search && !settings.searxng_url.trim().is_empty();
     if web_search {
         system.push_str(&tools::format_web_search_system_line());

@@ -1,6 +1,11 @@
 //! Virtual document paths for Outlook items: `outlook:{storeId}/{entryId}`.
 
 pub const OUTLOOK_SCHEME: &str = "outlook:";
+pub const OUTLOOK_CAL_SCHEME: &str = "outlookcal:";
+
+pub fn make_calendar_path(store_id: &str, entry_id: &str, start_unix: i64) -> String {
+    format!("{OUTLOOK_CAL_SCHEME}{store_id}/{entry_id}/{start_unix}")
+}
 
 pub fn is_outlook_path(path: &str) -> bool {
     path.len() > OUTLOOK_SCHEME.len()

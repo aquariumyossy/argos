@@ -39,6 +39,18 @@ pub struct Settings {
     pub mail_thread_collapse: bool,
     /// Last successful mail sync (RFC3339), empty if never.
     pub mail_last_sync_at: String,
+    /// Index Outlook Classic calendar via COM (separate from mail).
+    pub calendar_enabled: bool,
+    /// How many days before today to keep.
+    pub calendar_days_back: u32,
+    /// How many days after today to keep.
+    pub calendar_days_ahead: u32,
+    /// Periodic calendar sync interval (seconds). 0 = manual only.
+    pub calendar_sync_interval_secs: u64,
+    /// Last successful calendar sync (RFC3339), empty if never.
+    pub calendar_last_sync_at: String,
+    /// True when the last sync hit the per-folder cap.
+    pub calendar_truncated: bool,
     /// OpenAI-compatible base URL, e.g. http://127.0.0.1:11434/v1
     pub llm_base_url: String,
     pub llm_api_key: String,
@@ -105,6 +117,12 @@ impl Default for Settings {
             mail_latest_only: false,
             mail_thread_collapse: true,
             mail_last_sync_at: String::new(),
+            calendar_enabled: false,
+            calendar_days_back: 7,
+            calendar_days_ahead: 60,
+            calendar_sync_interval_secs: 3600,
+            calendar_last_sync_at: String::new(),
+            calendar_truncated: false,
             llm_base_url: DEFAULT_LLM_BASE_URL.into(),
             llm_api_key: String::new(),
             llm_model: String::new(),
@@ -280,6 +298,43 @@ pub struct EmailFolderRow {
     /// Messages with status=indexed for this folder (searchable in Argos).
     #[serde(default)]
     pub indexed_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarFolderRow {
+    pub id: i64,
+    pub store_id: String,
+    pub entry_id: String,
+    pub name: String,
+    pub path_label: String,
+    pub selected: bool,
+    pub is_default: bool,
+    #[serde(default)]
+    pub item_count: i32,
+    #[serde(default)]
+    pub event_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarEventRow {
+    pub path: String,
+    pub folder_entry_id: String,
+    pub store_id: String,
+    pub entry_id: String,
+    pub start_unix: i64,
+    pub end_unix: i64,
+    pub all_day: bool,
+    pub subject: String,
+    pub location: String,
+    pub organizer: String,
+    pub attendees: String,
+    pub categories: String,
+    pub body: String,
+    pub calendar_name: String,
+    pub busy_status: i32,
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +591,35 @@ impl Db {
               conversation_id TEXT PRIMARY KEY,
               path TEXT NOT NULL,
               date_unix INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS calendar_folders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              store_id TEXT NOT NULL,
+              entry_id TEXT NOT NULL,
+              name TEXT NOT NULL DEFAULT '',
+              path_label TEXT NOT NULL DEFAULT '',
+              selected INTEGER NOT NULL DEFAULT 0,
+              is_default INTEGER NOT NULL DEFAULT 0,
+              item_count INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(store_id, entry_id)
+            );
+            CREATE TABLE IF NOT EXISTS calendar_events (
+              path TEXT PRIMARY KEY,
+              folder_entry_id TEXT NOT NULL,
+              store_id TEXT NOT NULL,
+              entry_id TEXT NOT NULL,
+              start_unix INTEGER NOT NULL,
+              end_unix INTEGER NOT NULL DEFAULT 0,
+              all_day INTEGER NOT NULL DEFAULT 0,
+              subject TEXT NOT NULL DEFAULT '',
+              location TEXT NOT NULL DEFAULT '',
+              organizer TEXT NOT NULL DEFAULT '',
+              attendees TEXT NOT NULL DEFAULT '',
+              categories TEXT NOT NULL DEFAULT '',
+              body TEXT NOT NULL DEFAULT '',
+              calendar_name TEXT NOT NULL DEFAULT '',
+              busy_status INTEGER NOT NULL DEFAULT 0,
+              private INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS notes (
               id TEXT PRIMARY KEY,
@@ -815,6 +899,16 @@ impl Db {
                         s.mail_thread_collapse = !(row.1 == "0" || row.1 == "false")
                     }
                     "mail_last_sync_at" => s.mail_last_sync_at = row.1,
+                    "calendar_enabled" => s.calendar_enabled = row.1 == "1" || row.1 == "true",
+                    "calendar_days_back" => s.calendar_days_back = row.1.parse().unwrap_or(7),
+                    "calendar_days_ahead" => s.calendar_days_ahead = row.1.parse().unwrap_or(60),
+                    "calendar_sync_interval_secs" => {
+                        s.calendar_sync_interval_secs = row.1.parse().unwrap_or(3600)
+                    }
+                    "calendar_last_sync_at" => s.calendar_last_sync_at = row.1,
+                    "calendar_truncated" => {
+                        s.calendar_truncated = row.1 == "1" || row.1 == "true"
+                    }
                     "llm_base_url" => {
                         s.llm_base_url = if row.1.trim().is_empty() {
                             DEFAULT_LLM_BASE_URL.into()
@@ -923,6 +1017,21 @@ impl Db {
                 if s.mail_thread_collapse { "1" } else { "0" }.to_string(),
             ),
             ("mail_last_sync_at", s.mail_last_sync_at.clone()),
+            (
+                "calendar_enabled",
+                if s.calendar_enabled { "1" } else { "0" }.to_string(),
+            ),
+            ("calendar_days_back", s.calendar_days_back.to_string()),
+            ("calendar_days_ahead", s.calendar_days_ahead.to_string()),
+            (
+                "calendar_sync_interval_secs",
+                s.calendar_sync_interval_secs.to_string(),
+            ),
+            ("calendar_last_sync_at", s.calendar_last_sync_at.clone()),
+            (
+                "calendar_truncated",
+                if s.calendar_truncated { "1" } else { "0" }.to_string(),
+            ),
             ("llm_base_url", s.llm_base_url.clone()),
             ("llm_api_key", s.llm_api_key.clone()),
             ("llm_model", s.llm_model.clone()),
@@ -1935,6 +2044,210 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM email_messages", [])?;
         conn.execute("DELETE FROM email_threads", [])?;
+        Ok(())
+    }
+
+    pub fn replace_calendar_folder_catalog(
+        &self,
+        folders: &[CalendarFolderRow],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let selected: std::collections::HashSet<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT store_id, entry_id FROM calendar_folders WHERE selected=1")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.flatten().collect()
+        };
+        let had_any: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_folders", [], |r| r.get(0))?;
+        conn.execute("DELETE FROM calendar_folders", [])?;
+        for f in folders {
+            let mut is_selected = selected.contains(&(f.store_id.clone(), f.entry_id.clone()));
+            if had_any == 0 && f.is_default {
+                is_selected = true;
+            }
+            conn.execute(
+                "INSERT INTO calendar_folders(store_id, entry_id, name, path_label, selected, is_default, item_count)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    f.store_id,
+                    f.entry_id,
+                    f.name,
+                    f.path_label,
+                    if is_selected { 1 } else { 0 },
+                    if f.is_default { 1 } else { 0 },
+                    f.item_count
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_calendar_folders(&self) -> Result<Vec<CalendarFolderRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.store_id, f.entry_id, f.name, f.path_label, f.selected, f.is_default, f.item_count,
+                    (SELECT COUNT(*) FROM calendar_events e WHERE e.folder_entry_id = f.entry_id) AS event_count
+             FROM calendar_folders f
+             ORDER BY f.path_label COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CalendarFolderRow {
+                id: row.get(0)?,
+                store_id: row.get(1)?,
+                entry_id: row.get(2)?,
+                name: row.get(3)?,
+                path_label: row.get(4)?,
+                selected: row.get::<_, i64>(5)? != 0,
+                is_default: row.get::<_, i64>(6)? != 0,
+                item_count: row.get(7)?,
+                event_count: row.get::<_, i64>(8)? as u32,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn list_selected_calendar_folders(&self) -> Result<Vec<CalendarFolderRow>, rusqlite::Error> {
+        Ok(self
+            .list_calendar_folders()?
+            .into_iter()
+            .filter(|f| f.selected)
+            .collect())
+    }
+
+    pub fn set_calendar_folders_selected(
+        &self,
+        keys: &[(String, String)],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE calendar_folders SET selected=0", [])?;
+        for (store_id, entry_id) in keys {
+            conn.execute(
+                "UPDATE calendar_folders SET selected=1 WHERE store_id=?1 AND entry_id=?2",
+                rusqlite::params![store_id, entry_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn replace_calendar_folder_events(
+        &self,
+        folder_entry_id: &str,
+        events: &[CalendarEventRow],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM calendar_events WHERE folder_entry_id=?1",
+            [folder_entry_id],
+        )?;
+        for e in events {
+            conn.execute(
+                "INSERT INTO calendar_events(
+                    path, folder_entry_id, store_id, entry_id, start_unix, end_unix, all_day,
+                    subject, location, organizer, attendees, categories, body, calendar_name,
+                    busy_status, private
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                rusqlite::params![
+                    e.path,
+                    e.folder_entry_id,
+                    e.store_id,
+                    e.entry_id,
+                    e.start_unix,
+                    e.end_unix,
+                    if e.all_day { 1 } else { 0 },
+                    e.subject,
+                    e.location,
+                    e.organizer,
+                    e.attendees,
+                    e.categories,
+                    e.body,
+                    e.calendar_name,
+                    e.busy_status,
+                    if e.private { 1 } else { 0 },
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Drop events whose folder is no longer selected. Does nothing when `keep` is empty
+    /// only if the caller passes None — an empty keep list deletes every event.
+    pub fn delete_calendar_events_except(
+        &self,
+        keep_folder_ids: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        if keep_folder_ids.is_empty() {
+            conn.execute("DELETE FROM calendar_events", [])?;
+            return Ok(());
+        }
+        let mut sql = String::from("DELETE FROM calendar_events WHERE folder_entry_id NOT IN (");
+        for (i, _) in keep_folder_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            sql.push_str(&(i + 1).to_string());
+        }
+        sql.push(')');
+        let params: Vec<&dyn rusqlite::ToSql> = keep_folder_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    pub fn list_calendar_events(&self) -> Result<Vec<CalendarEventRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path, folder_entry_id, store_id, entry_id, start_unix, end_unix, all_day,
+                    subject, location, organizer, attendees, categories, body, calendar_name,
+                    busy_status, private
+             FROM calendar_events
+             ORDER BY start_unix",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CalendarEventRow {
+                path: row.get(0)?,
+                folder_entry_id: row.get(1)?,
+                store_id: row.get(2)?,
+                entry_id: row.get(3)?,
+                start_unix: row.get(4)?,
+                end_unix: row.get(5)?,
+                all_day: row.get::<_, i64>(6)? != 0,
+                subject: row.get(7)?,
+                location: row.get(8)?,
+                organizer: row.get(9)?,
+                attendees: row.get(10)?,
+                categories: row.get(11)?,
+                body: row.get(12)?,
+                calendar_name: row.get(13)?,
+                busy_status: row.get(14)?,
+                private: row.get::<_, i64>(15)? != 0,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    pub fn count_calendar_events(&self) -> Result<u32, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_events", [], |r| r.get(0))?;
+        Ok(n as u32)
+    }
+
+    pub fn set_calendar_last_sync_now(&self, truncated: bool) -> Result<(), rusqlite::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('calendar_last_sync_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![now],
+        )?;
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('calendar_truncated', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![if truncated { "1" } else { "0" }],
+        )?;
         Ok(())
     }
 

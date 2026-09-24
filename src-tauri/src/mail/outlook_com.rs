@@ -7,16 +7,23 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, BSTR, GUID, PCWSTR};
 use windows::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, CLSIDFromProgID, COINIT_APARTMENTTHREADED, DISPATCH_FLAGS,
-    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS, IDispatch, EXCEPINFO,
+    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, DISPPARAMS,
+    IDispatch, EXCEPINFO,
 };
 use windows::Win32::System::Ole::GetActiveObject;
 use windows::Win32::System::Variant::{
     VariantChangeType, VariantClear, VariantInit, VAR_CHANGE_FLAGS, VARIANT, VT_BSTR, VT_BYREF,
+    VT_DISPATCH,
     VT_CY, VT_DATE, VT_EMPTY, VT_I2, VT_I4, VT_I8, VT_NULL, VT_R4, VT_R8, VT_UI2, VT_UI4,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
 
+use crate::mail::calendar::{
+    cap_chars, redact_private, restrict_filter, walk_occurrence, CalendarFolderInfo,
+    OutlookAppointment, WindowWalk, BODY_CAP_CHARS, MAX_APPOINTMENTS_PER_FOLDER, OL_APPOINTMENT,
+    OL_APPOINTMENT_ITEM, OL_FOLDER_CALENDAR, OL_MEETING_CANCELED, OL_SENSITIVITY_PRIVATE,
+};
 use crate::mail::sync::{normalize_mail_body, OutlookFolderInfo, OutlookMessage};
 
 /// Result of connecting to classic Outlook via COM.
@@ -76,6 +83,245 @@ pub fn list_mail_folders() -> Result<Vec<OutlookFolderInfo>, String> {
         collect_folders(&root, &store_id, &store_name, &mut out, 0)?;
     }
     Ok(out)
+}
+
+pub fn list_calendar_folders() -> Result<Vec<CalendarFolderInfo>, String> {
+    let (app, _) = connect_outlook(true)?;
+    let session = get_session(&app)?;
+    let default_entry = default_calendar_entry_id(&session);
+    let stores = get_dispatch_prop(&session, "Stores")?;
+    let store_count = get_i32_prop(&stores, "Count").unwrap_or(0);
+    let mut out = Vec::new();
+    for i in 1..=store_count {
+        let store = match get_item_dispatch(&stores, i) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let store_id = get_string_prop(&store, "StoreID").unwrap_or_default();
+        if store_id.is_empty() {
+            continue;
+        }
+        let store_name = get_string_prop(&store, "DisplayName").unwrap_or_else(|_| "Store".into());
+        let root = match invoke_method0(&store, "GetRootFolder").and_then(|v| dispatch_from_variant(&v))
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        collect_calendar_folders(&root, &store_id, &store_name, default_entry.as_deref(), &mut out, 0)?;
+    }
+    Ok(out)
+}
+
+fn default_calendar_entry_id(session: &IDispatch) -> Option<String> {
+    let v = invoke_method1_i32(session, "GetDefaultFolder", OL_FOLDER_CALENDAR).ok()?;
+    let folder = dispatch_from_variant(&v).ok()?;
+    let entry = get_string_prop(&folder, "EntryID").ok()?;
+    if entry.is_empty() {
+        None
+    } else {
+        Some(entry)
+    }
+}
+
+fn collect_calendar_folders(
+    folder: &IDispatch,
+    store_id: &str,
+    parent_label: &str,
+    default_entry: Option<&str>,
+    out: &mut Vec<CalendarFolderInfo>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 12 {
+        return Ok(());
+    }
+    let name = get_string_prop(folder, "Name").unwrap_or_else(|_| "Folder".into());
+    let entry_id = get_string_prop(folder, "EntryID").unwrap_or_default();
+    let path_label = if name.eq_ignore_ascii_case(parent_label) {
+        name.clone()
+    } else {
+        format!("{parent_label} / {name}")
+    };
+    let default_type = get_i32_prop(folder, "DefaultItemType").unwrap_or(0);
+    if !entry_id.is_empty() && default_type == OL_APPOINTMENT_ITEM {
+        let item_count = get_dispatch_prop(folder, "Items")
+            .ok()
+            .and_then(|items| get_i32_prop(&items, "Count").ok())
+            .unwrap_or(0);
+        out.push(CalendarFolderInfo {
+            store_id: store_id.to_string(),
+            entry_id: entry_id.clone(),
+            name: name.clone(),
+            path_label: path_label.clone(),
+            item_count,
+            is_default: default_entry.is_some_and(|d| d == entry_id),
+        });
+    }
+    let folders = match get_dispatch_prop(folder, "Folders") {
+        Ok(f) => f,
+        Err(_) => return Ok(()),
+    };
+    let count = get_i32_prop(&folders, "Count").unwrap_or(0);
+    for i in 1..=count {
+        if let Ok(child) = get_item_dispatch(&folders, i) {
+            let _ = collect_calendar_folders(
+                &child,
+                store_id,
+                &path_label,
+                default_entry,
+                out,
+                depth + 1,
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn fetch_appointments_in_folder(
+    folder_entry_id: &str,
+    store_id: &str,
+    calendar_name: &str,
+    start_unix: i64,
+    end_exclusive_unix: i64,
+    allow_launch: bool,
+) -> Result<(Vec<OutlookAppointment>, bool), String> {
+    let (app, _) = connect_outlook(allow_launch)?;
+    let session = get_session(&app)?;
+    let folder = get_folder_from_id(&session, folder_entry_id)?;
+    let items = get_dispatch_prop(&folder, "Items")?;
+    let _ = invoke_method1_str(&items, "Sort", "[Start]", false);
+    set_bool_prop(&items, "IncludeRecurrences", true)?;
+    let filter = restrict_filter(start_unix, end_exclusive_unix);
+    eprintln!("argos: calendar restrict {filter}");
+    let restricted = invoke_method1_str(&items, "Restrict", &filter, false)
+        .and_then(|v| dispatch_from_variant(&v))
+        .map_err(|e| format!("予定の絞り込みに失敗しました: {e}"))?;
+    // IncludeRecurrences stays on the collection that was restricted.
+    // Setting it again here clears the filter. Count is not used: it expands
+    // open-ended series. Stop walking at the first start outside the window.
+    let _ = invoke_method1_str(&restricted, "Sort", "[Start]", false);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut truncated = false;
+    let mut step = next_items_step(&restricted, true)?;
+    let mut scanned = 0u32;
+    while let ItemsStep::Item(current) = step {
+        scanned += 1;
+        if scanned > MAX_APPOINTMENTS_PER_FOLDER as u32 * 2 {
+            truncated = true;
+            break;
+        }
+        let occur_start = get_date_unix(&current, "Start").unwrap_or(0);
+        match walk_occurrence(occur_start, start_unix, end_exclusive_unix) {
+            WindowWalk::Stop => break,
+            WindowWalk::Skip => {
+                step = next_items_step(&restricted, false)?;
+                continue;
+            }
+            WindowWalk::Keep => {}
+        }
+        if out.len() >= MAX_APPOINTMENTS_PER_FOLDER {
+            truncated = true;
+            break;
+        }
+        let class = get_i32_prop(&current, "Class").unwrap_or(0);
+        let canceled = get_i32_prop(&current, "MeetingStatus").unwrap_or(0) == OL_MEETING_CANCELED;
+        if class == OL_APPOINTMENT && !canceled {
+            if let Ok(entry_id) = get_string_prop(&current, "EntryID") {
+                if !entry_id.is_empty() {
+                    let key = format!("{store_id}/{entry_id}/{occur_start}");
+                    if seen.insert(key) {
+                        let private = get_i32_prop(&current, "Sensitivity").unwrap_or(0)
+                            == OL_SENSITIVITY_PRIVATE;
+                        let mut appt = OutlookAppointment {
+                            store_id: store_id.to_string(),
+                            entry_id,
+                            folder_entry_id: folder_entry_id.to_string(),
+                            calendar_name: calendar_name.to_string(),
+                            subject: get_string_prop(&current, "Subject").unwrap_or_default(),
+                            location: get_string_prop(&current, "Location").unwrap_or_default(),
+                            organizer: get_string_prop(&current, "Organizer").unwrap_or_default(),
+                            attendees: join_attendees(
+                                &get_string_prop(&current, "RequiredAttendees").unwrap_or_default(),
+                                &get_string_prop(&current, "OptionalAttendees").unwrap_or_default(),
+                            ),
+                            categories: get_string_prop(&current, "Categories").unwrap_or_default(),
+                            body: cap_chars(
+                                &get_string_prop(&current, "Body").unwrap_or_default(),
+                                BODY_CAP_CHARS,
+                            ),
+                            start_unix: occur_start,
+                            end_unix: get_date_unix(&current, "End").unwrap_or(occur_start),
+                            all_day: get_bool_prop(&current, "AllDayEvent"),
+                            busy_status: get_i32_prop(&current, "BusyStatus").unwrap_or(0),
+                            private,
+                        };
+                        redact_private(&mut appt);
+                        out.push(appt);
+                    }
+                }
+            }
+        }
+        step = next_items_step(&restricted, false)?;
+    }
+    if out.is_empty() {
+        eprintln!("argos: calendar walk finished with 0 items (scanned={scanned})");
+    }
+    Ok((out, truncated))
+}
+
+enum ItemsStep {
+    /// GetFirst/GetNext returned an empty variant: no further occurrences.
+    Empty,
+    Item(IDispatch),
+}
+
+/// Empty variant is a normal end. Invoke and type-conversion failures are errors.
+fn next_items_step(items: &IDispatch, first: bool) -> Result<ItemsStep, String> {
+    let name = if first { "GetFirst" } else { "GetNext" };
+    let mut v = match invoke_method0(items, name) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("予定の列挙に失敗しました ({name}): {e}");
+            eprintln!("argos: {msg}");
+            return Err(msg);
+        }
+    };
+    let vt = v.vt();
+    // VB Nothing is VT_DISPATCH with a null pointer. windows-rs reports that as
+    // TYPE_E_TYPEMISMATCH, but it means the collection has no further item.
+    let step = if vt == VT_EMPTY || vt == VT_NULL || variant_dispatch_is_null(&v) {
+        if first {
+            eprintln!("argos: calendar {name} returned empty (vt={})", vt.0);
+        }
+        ItemsStep::Empty
+    } else {
+        match dispatch_from_variant(&v) {
+            Ok(item) => ItemsStep::Item(item),
+            Err(e) => {
+                unsafe {
+                    let _ = VariantClear(&mut v);
+                }
+                let msg = format!("予定の列挙に失敗しました ({name}, vt={}): {e}", vt.0);
+                eprintln!("argos: {msg}");
+                return Err(msg);
+            }
+        }
+    };
+    unsafe {
+        let _ = VariantClear(&mut v);
+    }
+    Ok(step)
+}
+
+fn join_attendees(required: &str, optional: &str) -> String {
+    let req = required.trim();
+    let opt = optional.trim();
+    match (req.is_empty(), opt.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => req.to_string(),
+        (true, false) => opt.to_string(),
+        (false, false) => format!("{req}; {opt}"),
+    }
 }
 
 fn get_session(app: &IDispatch) -> Result<IDispatch, String> {
@@ -408,6 +654,62 @@ fn invoke_method0(obj: &IDispatch, name: &str) -> Result<VARIANT, String> {
     invoke(obj, name, DISPATCH_METHOD, &[])
 }
 
+fn invoke_method1_i32(obj: &IDispatch, name: &str, n: i32) -> Result<VARIANT, String> {
+    invoke(obj, name, DISPATCH_METHOD, &[i32_variant(n)])
+}
+
+fn set_bool_prop(obj: &IDispatch, name: &str, value: bool) -> Result<(), String> {
+    unsafe {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut dispid = 0i32;
+        let name_ptr = PCWSTR::from_raw(wide.as_ptr());
+        obj.GetIDsOfNames(&GUID::zeroed(), &name_ptr, 1, 0, &mut dispid)
+            .map_err(|e| format!("GetIDsOfNames({name}): {e}"))?;
+        let mut arg = bool_variant(value);
+        let mut named = -3i32;
+        let params = DISPPARAMS {
+            rgvarg: &mut arg,
+            rgdispidNamedArgs: &mut named,
+            cArgs: 1,
+            cNamedArgs: 1,
+        };
+        let mut result = VariantInit();
+        let mut excep = EXCEPINFO::default();
+        let mut arg_err = 0u32;
+        let hr = obj.Invoke(
+            dispid,
+            &GUID::zeroed(),
+            0,
+            DISPATCH_PROPERTYPUT,
+            &params,
+            Some(&mut result),
+            Some(&mut excep),
+            Some(&mut arg_err),
+        );
+        let _ = VariantClear(&mut arg);
+        let _ = VariantClear(&mut result);
+        hr.map_err(|e| {
+            let desc = if !excep.bstrDescription.is_empty() {
+                excep.bstrDescription.to_string()
+            } else {
+                e.to_string()
+            };
+            format!("Invoke({name}): {desc}")
+        })?;
+        Ok(())
+    }
+}
+
+fn get_bool_prop(obj: &IDispatch, name: &str) -> bool {
+    let Ok(v) = invoke(obj, name, DISPATCH_PROPERTYGET, &[]) else {
+        return false;
+    };
+    if let Ok(b) = bool::try_from(&v) {
+        return b;
+    }
+    i32_from_variant(&v).unwrap_or(0) != 0
+}
+
 fn invoke_method1_str(
     obj: &IDispatch,
     name: &str,
@@ -468,6 +770,13 @@ fn invoke(
         })?;
         Ok(result)
     }
+}
+
+fn variant_dispatch_is_null(v: &VARIANT) -> bool {
+    if v.vt() != VT_DISPATCH {
+        return false;
+    }
+    unsafe { v.Anonymous.Anonymous.Anonymous.pdispVal.is_none() }
 }
 
 fn dispatch_from_variant(v: &VARIANT) -> Result<IDispatch, String> {
