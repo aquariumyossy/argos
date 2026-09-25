@@ -181,6 +181,8 @@ pub fn update_settings(
     settings.calendar_days_back = settings.calendar_days_back.clamp(0, 365);
     settings.calendar_days_ahead = settings.calendar_days_ahead.clamp(1, 365);
     settings.calendar_sync_interval_secs = settings.calendar_sync_interval_secs.min(7 * 24 * 3600);
+    settings.calendar_ical_feeds =
+        crate::mail::ical::normalize_ical_feeds(settings.calendar_ical_feeds)?;
     settings.llm_base_url = crate::llm::normalize_base_url(&settings.llm_base_url);
     if settings.llm_base_url.is_empty() {
         settings.llm_base_url = crate::db::DEFAULT_LLM_BASE_URL.into();
@@ -213,9 +215,18 @@ pub fn update_settings(
     let prev_search = state.settings.read().shortcut.clone();
     let prev_notes = state.settings.read().notes_shortcut.clone();
 
+    let ical_keep: Vec<String> = crate::mail::ical::enabled_ical_feeds(&settings.calendar_ical_feeds)
+        .into_iter()
+        .map(|f| crate::mail::ical::ical_folder_id(&f.id))
+        .collect();
+
     state
         .db
         .save_settings(&settings)
+        .map_err(|e| e.to_string())?;
+    state
+        .db
+        .delete_ical_events_except(&ical_keep)
         .map_err(|e| e.to_string())?;
     // Apply autostart
     use tauri_plugin_autostart::ManagerExt;
@@ -1051,6 +1062,10 @@ pub fn mail_indexed_count(state: State<'_, Arc<AppState>>) -> Result<u32, String
 pub fn calendar_list_folders(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::db::CalendarFolderRow>, String> {
+    state
+        .db
+        .prune_outlook_events_to_selected()
+        .map_err(|e| e.to_string())?;
     state.db.list_calendar_folders().map_err(|e| e.to_string())
 }
 
@@ -1104,12 +1119,13 @@ pub async fn calendar_run_sync(
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::mail::calendar::CalendarSyncStats, String> {
     if !state.settings.read().calendar_enabled {
-        return Err("Outlook 予定表が無効です。設定で有効にしてください。".into());
+        return Err("予定表が無効です。設定で有効にしてください。".into());
     }
-    let mail = state.mail.clone();
+    let st = (*state).clone();
     let app2 = app.clone();
     let stats = tauri::async_runtime::spawn_blocking(move || {
-        mail.sync_calendar(true, move |p| {
+        let _guard = st.calendar_sync.lock();
+        crate::mail::ical::sync_calendar_sources(&st.db, &st.mail, true, move |p| {
             let _ = app2.emit("calendar-sync-progress", &p);
         })
     })

@@ -1,6 +1,7 @@
 //! Outlook Classic COM mail sync (separate from FS indexer).
 
 pub mod calendar;
+pub mod ical;
 pub mod ole_date;
 pub mod path;
 pub mod sync;

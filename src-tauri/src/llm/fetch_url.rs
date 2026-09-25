@@ -266,7 +266,7 @@ fn check_ip(ip: IpAddr, access: FetchAccess) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_and_check(url: &Url, access: FetchAccess) -> Result<(), String> {
+pub fn resolve_and_check(url: &Url, access: FetchAccess) -> Result<(), String> {
     check_url(url, access)?;
     let host = url
         .host_str()

@@ -932,3 +932,44 @@
     grid-template-columns: 1fr;
   }
 }
+
+.ical-feed-list .ical-feed-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 8px;
+  margin: 0 -8px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.ical-feed-item.is-selected {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.ical-feed-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ical-feed-enabled {
+  flex-shrink: 0;
+  width: 1.05em;
+  height: 1.05em;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.ical-feed-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.ical-feed-url {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  margin: 0 0 0 1.7em;
+}

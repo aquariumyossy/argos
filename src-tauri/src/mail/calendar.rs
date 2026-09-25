@@ -248,14 +248,10 @@ pub fn sort_by_start(mut events: Vec<CalendarEventView>) -> Vec<CalendarEventVie
     events
 }
 
-/// `None` means do not delete anything (no folders selected).
-/// Otherwise every selected folder id is kept, including ones whose fetch failed.
-pub fn prune_keep_ids(selected_folder_ids: &[String]) -> Option<Vec<String>> {
-    if selected_folder_ids.is_empty() {
-        None
-    } else {
-        Some(selected_folder_ids.to_vec())
-    }
+/// Outlook folder ids to keep. Empty keep drops every Outlook event (iCal is untouched).
+#[cfg(test)]
+fn prune_keep_ids(selected_folder_ids: &[String]) -> Vec<String> {
+    selected_folder_ids.to_vec()
 }
 
 pub fn format_event_span(start_unix: i64, end_unix: i64, all_day: bool) -> (String, String) {
@@ -430,9 +426,9 @@ mod tests {
     }
 
     #[test]
-    fn prune_skips_when_none_selected() {
-        assert!(prune_keep_ids(&[]).is_none());
-        let keep = prune_keep_ids(&["a".into(), "b".into()]).unwrap();
+    fn prune_empty_keep_means_drop_all_outlook() {
+        assert!(prune_keep_ids(&[]).is_empty());
+        let keep = prune_keep_ids(&["a".into(), "b".into()]);
         assert_eq!(keep, vec!["a".to_string(), "b".to_string()]);
     }
 
@@ -484,7 +480,7 @@ mod tests {
             .unwrap();
         // A succeeded (replaced). B failed so it is still selected and not replaced.
         // C was unselected.
-        let keep = prune_keep_ids(&["A".into(), "B".into()]).unwrap();
+        let keep = prune_keep_ids(&["A".into(), "B".into()]);
         db.delete_calendar_events_except(&keep).unwrap();
         let subjects: Vec<String> = db
             .list_calendar_events()
@@ -495,7 +491,14 @@ mod tests {
         assert!(subjects.contains(&"keep".to_string()));
         assert!(subjects.contains(&"fail".to_string()));
         assert!(!subjects.iter().any(|s| s == "drop"));
-        assert!(prune_keep_ids(&[]).is_none());
+        db.delete_calendar_events_except(&prune_keep_ids(&[])).unwrap();
+        let subjects: Vec<String> = db
+            .list_calendar_events()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.subject)
+            .collect();
+        assert!(subjects.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -51,6 +51,7 @@ pub struct Settings {
     pub calendar_last_sync_at: String,
     /// True when the last sync hit the per-folder cap.
     pub calendar_truncated: bool,
+    pub calendar_ical_feeds: Vec<CalendarIcalFeed>,
     /// OpenAI-compatible base URL, e.g. http://127.0.0.1:11434/v1
     pub llm_base_url: String,
     pub llm_api_key: String,
@@ -68,6 +69,23 @@ pub struct Settings {
     pub searxng_url: String,
     pub searxng_timeout_ms: u32,
     pub llm_web_search_top_k: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarIcalFeed {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 pub const DEFAULT_LLM_BASE_URL: &str = "http://127.0.0.1:11434/v1";
@@ -123,6 +141,7 @@ impl Default for Settings {
             calendar_sync_interval_secs: 3600,
             calendar_last_sync_at: String::new(),
             calendar_truncated: false,
+            calendar_ical_feeds: Vec::new(),
             llm_base_url: DEFAULT_LLM_BASE_URL.into(),
             llm_api_key: String::new(),
             llm_model: String::new(),
@@ -909,6 +928,10 @@ impl Db {
                     "calendar_truncated" => {
                         s.calendar_truncated = row.1 == "1" || row.1 == "true"
                     }
+                    "calendar_ical_feeds" => {
+                        s.calendar_ical_feeds =
+                            serde_json::from_str(&row.1).unwrap_or_default()
+                    }
                     "llm_base_url" => {
                         s.llm_base_url = if row.1.trim().is_empty() {
                             DEFAULT_LLM_BASE_URL.into()
@@ -1031,6 +1054,10 @@ impl Db {
             (
                 "calendar_truncated",
                 if s.calendar_truncated { "1" } else { "0" }.to_string(),
+            ),
+            (
+                "calendar_ical_feeds",
+                serde_json::to_string(&s.calendar_ical_feeds).unwrap_or_else(|_| "[]".into()),
             ),
             ("llm_base_url", s.llm_base_url.clone()),
             ("llm_api_key", s.llm_api_key.clone()),
@@ -2118,15 +2145,36 @@ impl Db {
         &self,
         keys: &[(String, String)],
     ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock();
-        conn.execute("UPDATE calendar_folders SET selected=0", [])?;
-        for (store_id, entry_id) in keys {
-            conn.execute(
-                "UPDATE calendar_folders SET selected=1 WHERE store_id=?1 AND entry_id=?2",
-                rusqlite::params![store_id, entry_id],
-            )?;
+        {
+            let conn = self.conn.lock();
+            conn.execute("UPDATE calendar_folders SET selected=0", [])?;
+            for (store_id, entry_id) in keys {
+                conn.execute(
+                    "UPDATE calendar_folders SET selected=1 WHERE store_id=?1 AND entry_id=?2",
+                    rusqlite::params![store_id, entry_id],
+                )?;
+            }
         }
-        Ok(())
+        self.prune_outlook_events_to_selected()
+    }
+
+    /// Drop Outlook events that are not in a currently selected folder.
+    /// If the Outlook catalog has never been fetched, leave rows as-is.
+    /// An empty selection (every folder unchecked) deletes every Outlook row.
+    pub fn prune_outlook_events_to_selected(&self) -> Result<(), rusqlite::Error> {
+        let catalog_n: i64 = {
+            let conn = self.conn.lock();
+            conn.query_row("SELECT COUNT(*) FROM calendar_folders", [], |r| r.get(0))?
+        };
+        if catalog_n == 0 {
+            return Ok(());
+        }
+        let keep: Vec<String> = self
+            .list_selected_calendar_folders()?
+            .into_iter()
+            .map(|f| f.entry_id)
+            .collect();
+        self.delete_calendar_events_except(&keep)
     }
 
     pub fn replace_calendar_folder_events(
@@ -2169,18 +2217,52 @@ impl Db {
         Ok(())
     }
 
-    /// Drop events whose folder is no longer selected. Does nothing when `keep` is empty
-    /// only if the caller passes None — an empty keep list deletes every event.
+    /// Drop Outlook events whose folder is no longer selected.
+    /// iCal rows (`store_id = ical`) are never removed here.
     pub fn delete_calendar_events_except(
         &self,
         keep_folder_ids: &[String],
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock();
         if keep_folder_ids.is_empty() {
-            conn.execute("DELETE FROM calendar_events", [])?;
+            conn.execute(
+                "DELETE FROM calendar_events WHERE store_id != 'ical'",
+                [],
+            )?;
             return Ok(());
         }
-        let mut sql = String::from("DELETE FROM calendar_events WHERE folder_entry_id NOT IN (");
+        let mut sql = String::from(
+            "DELETE FROM calendar_events WHERE store_id != 'ical' AND folder_entry_id NOT IN (",
+        );
+        for (i, _) in keep_folder_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            sql.push_str(&(i + 1).to_string());
+        }
+        sql.push(')');
+        let params: Vec<&dyn rusqlite::ToSql> = keep_folder_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Drop iCal events that are not in `keep_folder_ids`. Empty keep deletes every iCal row.
+    pub fn delete_ical_events_except(
+        &self,
+        keep_folder_ids: &[String],
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        if keep_folder_ids.is_empty() {
+            conn.execute("DELETE FROM calendar_events WHERE store_id='ical'", [])?;
+            return Ok(());
+        }
+        let mut sql = String::from(
+            "DELETE FROM calendar_events WHERE store_id='ical' AND folder_entry_id NOT IN (",
+        );
         for (i, _) in keep_folder_ids.iter().enumerate() {
             if i > 0 {
                 sql.push(',');
@@ -2198,6 +2280,7 @@ impl Db {
     }
 
     pub fn list_calendar_events(&self) -> Result<Vec<CalendarEventRow>, rusqlite::Error> {
+        self.prune_outlook_events_to_selected()?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path, folder_entry_id, store_id, entry_id, start_unix, end_unix, all_day,
@@ -2230,6 +2313,7 @@ impl Db {
     }
 
     pub fn count_calendar_events(&self) -> Result<u32, rusqlite::Error> {
+        self.prune_outlook_events_to_selected()?;
         let conn = self.conn.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_events", [], |r| r.get(0))?;
         Ok(n as u32)

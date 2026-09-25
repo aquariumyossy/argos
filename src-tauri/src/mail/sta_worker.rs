@@ -503,13 +503,14 @@ where
 {
     let settings = db.load_settings();
     if !settings.calendar_enabled {
-        return Err("Outlook 予定表が無効です".into());
+        return Err("予定表が無効です".into());
     }
     let folders = db
         .list_selected_calendar_folders()
         .map_err(|e| e.to_string())?;
     if folders.is_empty() {
-        return Err("同期する予定表が選択されていません".into());
+        let _ = db.prune_outlook_events_to_selected();
+        return Ok(calendar::CalendarSyncStats::default());
     }
     if allow_launch && !outlook_com::outlook_is_running() {
         on_progress(calendar_progress(
@@ -609,22 +610,7 @@ where
         }
         stats.indexed += n;
     }
-    let selected_ids: Vec<String> = folders.iter().map(|f| f.entry_id.clone()).collect();
-    if let Some(keep) = calendar::prune_keep_ids(&selected_ids) {
-        let _ = db.delete_calendar_events_except(&keep);
-    }
-    let _ = db.set_calendar_last_sync_now(stats.truncated);
-    on_progress(calendar_progress(
-        db,
-        "done",
-        "",
-        stats.folders,
-        stats.folders,
-        format!(
-            "完了: 予定 {} / エラー {}",
-            stats.indexed, stats.errors
-        ),
-    ));
+    let _ = db.prune_outlook_events_to_selected();
     Ok(stats)
 }
 
