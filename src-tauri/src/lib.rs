@@ -236,12 +236,20 @@ pub fn run() {
                             .await;
                         }
                         if cal_due {
-                            let mail = state.mail.clone();
+                            let st = (*app_handle.state::<Arc<AppState>>()).clone();
                             let app2 = app_handle.clone();
                             let _ = tauri::async_runtime::spawn_blocking(move || {
-                                mail.sync_calendar(false, move |p| {
-                                    let _ = app2.emit("calendar-sync-progress", &p);
-                                })
+                                let Some(_guard) = st.calendar_sync.try_lock() else {
+                                    return;
+                                };
+                                let _ = crate::mail::ical::sync_calendar_sources(
+                                    &st.db,
+                                    &st.mail,
+                                    false,
+                                    move |p| {
+                                        let _ = app2.emit("calendar-sync-progress", &p);
+                                    },
+                                );
                             })
                             .await;
                         }

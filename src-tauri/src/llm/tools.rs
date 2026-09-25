@@ -93,7 +93,7 @@ pub fn tools_schema(web_search: bool) -> Value {
             "type": "function",
             "function": {
                 "name": TOOL_LIST_CALENDAR,
-                "description": "このPCのOutlook予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。search_index の「直近は過去」は予定に使わない。資料が要るときは、返った件名や当事者名を search_index の query にする。",
+                "description": "このPCの予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。search_index の「直近は過去」は予定に使わない。資料が要るときは、返った件名や当事者名を search_index の query にする。",
                 "parameters": {
                     "type": "object",
                     "properties": {

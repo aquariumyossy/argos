@@ -14,6 +14,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import "./settings.css";
 
+type CalendarIcalFeed = {
+  id: string;
+  url: string;
+  name: string;
+  enabled: boolean;
+};
+
 type SettingsData = {
   shortcut: string;
   notesShortcut: string;
@@ -44,6 +51,7 @@ type SettingsData = {
   calendarSyncIntervalSecs: number;
   calendarLastSyncAt: string;
   calendarTruncated: boolean;
+  calendarIcalFeeds: CalendarIcalFeed[];
   llmBaseUrl: string;
   llmApiKey: string;
   llmModel: string;
@@ -177,7 +185,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.11.7";
+const APP_VERSION = "1.11.8";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -193,6 +201,7 @@ const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] =
   { name: "axum / tower-http", license: "MIT" },
   { name: "tokio", license: "MIT" },
   { name: "reqwest", license: "Apache-2.0 OR MIT" },
+  { name: "icalendar / rrule / chrono-tz", license: "MIT / Apache-2.0 / MIT", note: "Google カレンダー iCal" },
   { name: "SearXNG", license: "AGPL-3.0", note: "接続先（任意）。アプリには同梱しない" },
   { name: "serde / serde_json", license: "Apache-2.0 OR MIT" },
   { name: "notify", license: "CC0-1.0" },
@@ -338,6 +347,13 @@ function normalizeSettings(s: SettingsData): SettingsData {
   if (typeof s.calendarSyncIntervalSecs !== "number") s.calendarSyncIntervalSecs = 3600;
   if (typeof s.calendarLastSyncAt !== "string") s.calendarLastSyncAt = "";
   if (typeof s.calendarTruncated !== "boolean") s.calendarTruncated = false;
+  if (!Array.isArray(s.calendarIcalFeeds)) s.calendarIcalFeeds = [];
+  s.calendarIcalFeeds = s.calendarIcalFeeds.map((f) => ({
+    id: typeof f?.id === "string" ? f.id : "",
+    url: typeof f?.url === "string" ? f.url : "",
+    name: typeof f?.name === "string" ? f.name : "",
+    enabled: typeof f?.enabled === "boolean" ? f.enabled : true,
+  }));
   if (typeof s.llmBaseUrl !== "string" || !s.llmBaseUrl.trim()) {
     s.llmBaseUrl = "http://127.0.0.1:11434/v1";
   }
@@ -802,9 +818,9 @@ export default function Settings() {
     try {
       const rows = await invoke<CalendarFolderRow[]>("calendar_refresh_folder_catalog");
       setCalendarFolders(rows);
-      setMessage(`予定表 ${rows.length} 件を取得しました`);
+      setMessage(`Outlook 予定表 ${rows.length} 件を取得しました`);
     } catch (err) {
-      setMessage(`予定表の取得失敗: ${String(err)}`);
+      setMessage(`Outlook 予定表の取得失敗: ${String(err)}`);
     } finally {
       setCalendarBusy(false);
     }
@@ -822,6 +838,12 @@ export default function Settings() {
       .map((f) => ({ storeId: f.storeId, entryId: f.entryId }));
     try {
       await invoke("calendar_set_selected_folders", { folders: keys });
+      const [rows, n] = await Promise.all([
+        invoke<CalendarFolderRow[]>("calendar_list_folders"),
+        invoke<number>("calendar_event_count"),
+      ]);
+      setCalendarFolders(rows);
+      setCalendarCount(n);
     } catch (err) {
       setMessage(`選択の保存に失敗: ${String(err)}`);
       await reload();
@@ -833,12 +855,10 @@ export default function Settings() {
     setCalendarBusy(true);
     setCalendarProgress(null);
     try {
-      if (!settings.calendarEnabled) {
-        const saved = await invoke<SettingsData>("update_settings", {
-          settings: { ...settings, calendarEnabled: true },
-        });
-        setSettings(saved);
-      }
+      const saved = await invoke<SettingsData>("update_settings", {
+        settings: { ...settings, calendarEnabled: true },
+      });
+      setSettings(saved);
       const stats = await invoke<{
         indexed: number;
         errors: number;
@@ -846,7 +866,7 @@ export default function Settings() {
         truncated: boolean;
       }>("calendar_run_sync");
       setMessage(
-        `予定表の同期完了: ${stats.indexed} 件 / エラー ${stats.errors}${stats.truncated ? "（件数上限で打ち切り）" : ""}`,
+        `同期完了: ${stats.indexed} 件（Google と Outlook をまとめて取り込み） / エラー ${stats.errors}${stats.truncated ? "（件数上限で打ち切り）" : ""}`,
       );
       setCalendarCount(await invoke<number>("calendar_event_count"));
       setCalendarFolders(await invoke<CalendarFolderRow[]>("calendar_list_folders"));
@@ -857,6 +877,47 @@ export default function Settings() {
       setCalendarBusy(false);
       setCalendarProgress(null);
     }
+  }
+
+  const ICAL_FEED_CAP = 8;
+
+  function newIcalFeed(): CalendarIcalFeed {
+    return {
+      id:
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `ical-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      url: "",
+      name: "",
+      enabled: true,
+    };
+  }
+
+  function addIcalFeed() {
+    if (!settings) return;
+    if (settings.calendarIcalFeeds.length >= ICAL_FEED_CAP) return;
+    setSettings({
+      ...settings,
+      calendarIcalFeeds: [...settings.calendarIcalFeeds, newIcalFeed()],
+    });
+  }
+
+  function updateIcalFeed(id: string, patch: Partial<CalendarIcalFeed>) {
+    if (!settings) return;
+    setSettings({
+      ...settings,
+      calendarIcalFeeds: settings.calendarIcalFeeds.map((f) =>
+        f.id === id ? { ...f, ...patch } : f,
+      ),
+    });
+  }
+
+  function removeIcalFeed(id: string) {
+    if (!settings) return;
+    setSettings({
+      ...settings,
+      calendarIcalFeeds: settings.calendarIcalFeeds.filter((f) => f.id !== id),
+    });
   }
 
   async function saveSettings() {
@@ -2313,15 +2374,28 @@ export default function Settings() {
           aria-labelledby="tab-calendar"
         >
           <section>
-            <h2>Outlook予定表</h2>
+            <h2>予定表</h2>
             <p className="muted">
-              同一 PC の Outlook クラシックの予定を、直近の期間だけ読みます（新しい Outlook
-              のみの環境では利用できません）。チャット、検索ポップアップの「関連する予定」、同一
-              PC の API から参照できます。LAN には公開しません。オンにするまで検索には出ません。
+              Google と Outlook の予定を、この PC のチャットと検索に出します。LAN
+              には公開しません。取り込み元は別々に足し、同期は一度にまとめて行います。
             </p>
+            <ol className="mail-flow">
+              <li>予定表をオン</li>
+              <li>Google か Outlook を足す</li>
+              <li>今すぐ同期</li>
+            </ol>
           </section>
+
           <section className="mail-step options-form">
-            <h3 className="mail-step-title">設定</h3>
+            <h3 className="mail-step-title">
+              <span className="mail-step-num" aria-hidden="true">
+                1
+              </span>
+              共通の設定と同期
+            </h3>
+            <p className="muted mail-step-desc">
+              オフのあいだは、下で登録してあってもチャットと検索に出ません。
+            </p>
             <label className="check">
               <input
                 type="checkbox"
@@ -2331,7 +2405,7 @@ export default function Settings() {
                   setSettings({ ...settings, calendarEnabled: e.target.checked })
                 }
               />
-              予定表を読み取る
+              予定表をチャットと検索に出す
             </label>
             <label>
               過去（日）
@@ -2385,21 +2459,6 @@ export default function Settings() {
               <button type="button" onClick={() => void saveSettings()}>
                 設定を保存
               </button>
-            </div>
-          </section>
-          <section className="mail-step">
-            <h3 className="mail-step-title">予定表の選択・同期</h3>
-            <p className="muted mail-step-desc">
-              一覧を取得すると、既定の予定表が最初に選択されます。チェックした予定表だけを同期します。
-            </p>
-            <div className="row">
-              <button
-                type="button"
-                onClick={() => void refreshCalendarFolders()}
-                disabled={calendarBusy}
-              >
-                予定表一覧を取得
-              </button>
               <button
                 type="button"
                 className="primary"
@@ -2412,14 +2471,129 @@ export default function Settings() {
               </button>
             </div>
             <p className="field-hint">
-              最終同期: {settings?.calendarLastSyncAt || "未実行"} / 予定{" "}
+              「今すぐ同期」は、下でオンにした Google カレンダーと、選んだ Outlook
+              予定表をまとめて取り込みます。最終同期:{" "}
+              {settings?.calendarLastSyncAt || "未実行"} / 予定{" "}
               {calendarCount.toLocaleString()} 件
               {settings?.calendarTruncated ? " / 前回は件数上限で打ち切り" : ""}
             </p>
+          </section>
+
+          <section className="mail-step">
+            <h3 className="mail-step-title">
+              <span className="mail-step-num" aria-hidden="true">
+                2
+              </span>
+              Google カレンダー
+            </h3>
+            <p className="muted mail-step-desc">
+              ブラウザで Google カレンダー → 設定 → カレンダーの統合 →
+              非公開URL（ICAL形式）をコピーして追加します。チェックしたカレンダーだけを、上の「今すぐ同期」で取り込みます。
+            </p>
+            <ul className="folder-list ical-feed-list">
+              {(settings?.calendarIcalFeeds ?? []).length === 0 ? (
+                <li className="empty">
+                  まだありません。「カレンダーを追加」で非公開 URL を貼ってください。
+                </li>
+              ) : (
+                (settings?.calendarIcalFeeds ?? []).map((feed, index) => (
+                  <li
+                    key={feed.id}
+                    className={
+                      feed.enabled
+                        ? "folder-item ical-feed-item is-selected"
+                        : "folder-item ical-feed-item"
+                    }
+                  >
+                    <div className="ical-feed-top">
+                      <input
+                        type="checkbox"
+                        className="ical-feed-enabled"
+                        checked={feed.enabled}
+                        title="このカレンダーを同期する"
+                        aria-label={`Google カレンダー ${index + 1} を同期する`}
+                        onChange={(e) =>
+                          updateIcalFeed(feed.id, { enabled: e.target.checked })
+                        }
+                      />
+                      <input
+                        className="ical-feed-name"
+                        value={feed.name}
+                        placeholder="表示名（例: 仕事）"
+                        aria-label={`Google カレンダー ${index + 1} の表示名`}
+                        onChange={(e) =>
+                          updateIcalFeed(feed.id, { name: e.target.value })
+                        }
+                      />
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={() => removeIcalFeed(feed.id)}
+                      >
+                        削除
+                      </button>
+                    </div>
+                    <label className="ical-feed-url">
+                      非公開 URL
+                      <input
+                        type="password"
+                        autoComplete="off"
+                        value={feed.url}
+                        placeholder="https://calendar.google.com/calendar/ical/…/basic.ics"
+                        onChange={(e) =>
+                          updateIcalFeed(feed.id, { url: e.target.value })
+                        }
+                      />
+                    </label>
+                  </li>
+                ))
+              )}
+            </ul>
+            <div className="row">
+              <button
+                type="button"
+                onClick={addIcalFeed}
+                disabled={
+                  calendarBusy ||
+                  (settings?.calendarIcalFeeds.length ?? 0) >= ICAL_FEED_CAP
+                }
+              >
+                カレンダーを追加
+              </button>
+            </div>
+            <p className="field-hint">
+              最大 {ICAL_FEED_CAP}{" "}
+              件。チェックを外して上の「設定を保存」を押すと、そのカレンダーの予定は消えます。同じ予定を
+              Outlook からも取り込まないでください。Google
+              側の反映は遅れることがあります。
+            </p>
+          </section>
+
+          <section className="mail-step">
+            <h3 className="mail-step-title">
+              <span className="mail-step-num" aria-hidden="true">
+                3
+              </span>
+              Outlook クラシック
+            </h3>
+            <p className="muted mail-step-desc">
+              この PC の Outlook クラシックがあるときだけ使えます（新しい Outlook
+              のみでは不可）。一覧を取得してチェックした予定表だけを、上の「今すぐ同期」で取り込みます。チェックを外すと、その予定表から取り込んだ予定はすぐに消えます。Google
+              と同じ予定が Outlook 側にもあるときは、Outlook のチェックを外してください。
+            </p>
+            <div className="row">
+              <button
+                type="button"
+                onClick={() => void refreshCalendarFolders()}
+                disabled={calendarBusy}
+              >
+                Outlook 予定表一覧を取得
+              </button>
+            </div>
             <ul className="folder-list">
               {calendarFolders.length === 0 ? (
                 <li className="empty">
-                  まだ予定表がありません。上の「予定表一覧を取得」を実行してください。
+                  まだありません。Outlook を使わない場合は、この手順は不要です。
                 </li>
               ) : (
                 calendarFolders.map((f) => (

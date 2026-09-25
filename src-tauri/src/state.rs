@@ -58,6 +58,8 @@ pub struct AppState {
     pub user_dict: Arc<RwLock<UserDictMatcher>>,
     /// Outlook Classic COM worker (STA). Always present; errors if Outlook missing.
     pub mail: MailStaHandle,
+    /// Serializes Outlook + iCal calendar sync (manual waits, periodic skips).
+    pub calendar_sync: parking_lot::Mutex<()>,
     pub llm_job: RwLock<Option<LlmJob>>,
     pub preview_target: RwLock<Option<PreviewTarget>>,
 }
@@ -114,6 +116,7 @@ impl AppState {
                 watcher: RwLock::new(None),
                 user_dict: Arc::new(RwLock::new(user_dict)),
                 mail,
+                calendar_sync: parking_lot::Mutex::new(()),
                 llm_job: RwLock::new(None),
                 preview_target: RwLock::new(None),
             },
