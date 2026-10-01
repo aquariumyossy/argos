@@ -27,6 +27,10 @@ export function isImageSource(s: { kind?: string }): boolean {
   return (s.kind ?? "text").toLowerCase() === "image";
 }
 
+export function isRemoteSource(s: { kind?: string }): boolean {
+  return (s.kind ?? "").toLowerCase() === "remote";
+}
+
 export function isWebSource(s: { kind?: string; path?: string }): boolean {
   if ((s.kind ?? "").toLowerCase() === "web") return true;
   const p = (s.path ?? "").trim().toLowerCase();

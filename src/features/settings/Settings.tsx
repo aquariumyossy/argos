@@ -185,7 +185,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.11.8";
+const APP_VERSION = "1.11.9";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -1727,6 +1727,10 @@ export default function Settings() {
                 ）と接続トークンを入力します
               </li>
               <li>「接続テスト」で確認してから設定を保存します</li>
+              <li>
+                チャットの索引検索も、検索モードが「ホストのみ」または「ハイブリッド」のとき、共有インデックスを見ます。メールはこの
+                PC だけです
+              </li>
             </ol>
             <ul className="howto-tips">
               <li>

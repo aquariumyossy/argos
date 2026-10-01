@@ -32,8 +32,25 @@ const UNITS_PER_FILE: usize = 3;
 /// Cap on simultaneous thread folder scopes (each prefix is a separate index search).
 pub const MAX_THREAD_SCOPES: usize = 8;
 
-pub fn tools_schema(web_search: bool) -> Value {
-    let search_desc = if web_search {
+pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> Value {
+    let mut search_desc = if remote_only && web_search {
+        "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
+クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
+「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
+条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
+「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
+送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。\
+公開情報が必要な質問ではこのツールを呼ぶ。ウェブ結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。"
+    } else if remote_only {
+        "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。添付出典で足りるときは呼ばない。\
+クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
+「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
+条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
+「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
+送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
+    } else if web_search {
         "Argosの索引を検索する（ファイルとメール）。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
@@ -50,7 +67,13 @@ pub fn tools_schema(web_search: bool) -> Value {
 時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
 「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
 送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
-    };
+    }
+    .to_string();
+    if remote_index && !remote_only {
+        search_desc.push_str(
+            "別PCの共有フォルダも検索する。その出典には（リモート）が付く。メールと送信者はこのPCだけ。期間はホストが対応しているときだけ別PCにも効く。",
+        );
+    }
     let mut tools = vec![
         json!({
             "type": "function",
@@ -289,7 +312,8 @@ fn enrich_hit(state: &AppState, hit: &SearchHit) -> SearchHit {
     if !looks_thin(&body, &hit.snippet) || hit.id.trim().is_empty() {
         return hit.clone();
     }
-    match preview_hit(state, &hit.id) {
+    let also_remote = hit.source.eq_ignore_ascii_case("remote");
+    match preview_hit(state, &hit.id, also_remote) {
         Ok(Some(preview)) => {
             let p = hit_body(&preview);
             if p.chars().count() > body.chars().count() {
@@ -333,9 +357,14 @@ fn persist_hit(
         return Ok(());
     }
     let title = source_title(&hit);
+    let kind = if hit.source.eq_ignore_ascii_case("remote") {
+        "remote"
+    } else {
+        "text"
+    };
     let (mut row, created) = state
         .db
-        .insert_llm_source(
+        .insert_llm_source_full(
             thread_id,
             "tool",
             &hit.path,
@@ -343,6 +372,11 @@ fn persist_hit(
             &hit.id,
             &body,
             query,
+            "unit",
+            kind,
+            "",
+            "",
+            None,
         )
         .map_err(|e| e.to_string())?;
     if created || row.cite_no <= 0 {
@@ -568,6 +602,113 @@ pub fn format_web_search_system_line() -> String {
     "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。添付出典とインデックスを優先してください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_index を呼んでください。".into()
 }
 
+pub fn format_remote_index_system_line() -> String {
+    "\n別PCの共有フォルダも検索対象です。ファイル出典に（リモート）が付くことがあります。メールと送信者はこのPCだけです。期間はホストが対応しているときだけ別PCにも効きます。".into()
+}
+
+/// Hybrid and host-only modes add the "shared folders are also in scope" line.
+/// A remote-only thread scope already says this PC is excluded, so that line would contradict it.
+pub fn include_hybrid_remote_system_line(search_mode: &str, thread_prefix: &str) -> bool {
+    matches!(search_mode, "hybrid" | "remote") && !is_remote_only_thread(thread_prefix)
+}
+
+pub fn scopes_are_remote_only(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| search::is_remote_only_scope(s))
+}
+
+pub fn is_remote_only_thread(raw: &str) -> bool {
+    scopes_are_remote_only(&parse_thread_scopes(raw))
+}
+
+/// Host index search runs beside the local one. Mail listing and a mail-folder scope stay here.
+/// A remote-only thread scope queries the host even when settings are local-only.
+pub fn should_run_remote_sidecar(
+    search_mode: &str,
+    list_mail: bool,
+    mail_from: Option<&str>,
+    outer_scopes: &[String],
+) -> bool {
+    if list_mail {
+        return false;
+    }
+    if mail_from.map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return false;
+    }
+    if scopes_are_remote_only(outer_scopes) {
+        return true;
+    }
+    if search_mode != "hybrid" && search_mode != "remote" {
+        return false;
+    }
+    if !outer_scopes.is_empty()
+        && outer_scopes
+            .iter()
+            .all(|p| p.trim().starts_with("mailfolder:"))
+    {
+        return false;
+    }
+    true
+}
+
+/// Filesystem prefixes to send to the host. Mail folders and the remote-only mark are not paths.
+pub fn remote_chat_prefixes(outer: &[String]) -> Vec<String> {
+    outer
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| {
+            !s.is_empty() && !s.starts_with("mailfolder:") && !search::is_remote_only_scope(s)
+        })
+        .map(|s| s.to_string())
+        .collect()
+}
+
+pub const REMOTE_DATE_UNSUPPORTED: &str =
+    "ホストが期間指定に未対応のため、別 PC の結果は使わなかった。";
+
+/// Drop host hits when this query had a date and the host did not apply it.
+pub fn remote_date_rejection(asked_date: bool, date_applied: bool) -> Option<&'static str> {
+    if asked_date && !date_applied {
+        Some(REMOTE_DATE_UNSUPPORTED)
+    } else {
+        None
+    }
+}
+
+/// Keep the host's rank. Paths already returned locally are omitted. Cap is paragraphs, not files.
+pub fn select_remote_chat_hits(local: &[SearchHit], remote: &[SearchHit], k: usize) -> Vec<SearchHit> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let local_paths: HashSet<String> = local
+        .iter()
+        .map(|h| h.path.to_ascii_lowercase())
+        .collect();
+    let mut seen_ids = HashSet::new();
+    let mut out = Vec::new();
+    for hit in remote {
+        if local_paths.contains(&hit.path.to_ascii_lowercase()) {
+            continue;
+        }
+        if !seen_ids.insert(hit.id.to_ascii_lowercase()) {
+            continue;
+        }
+        out.push(hit.clone());
+        if out.len() >= k {
+            break;
+        }
+    }
+    out
+}
+
+/// Chat always retrieves locally with [`search::SearchOpts::for_llm`].
+/// `remote` mode still skips this PC's files. Mail stays.
+fn prepare_chat_local_search(mode: &str, mut filter: search::SearchFilter) -> search::SearchFilter {
+    if mode == "remote" {
+        filter.file_paths = Some(Vec::new());
+    }
+    filter
+}
+
 pub fn should_run_web_sidecar(web_search: bool, list_mail: bool, search_q: &str) -> bool {
     web_search && !list_mail && !search_q.trim().is_empty()
 }
@@ -580,7 +721,8 @@ fn run_index_search(
     filter: &search::SearchFilter,
     list_mail: bool,
 ) -> Result<Vec<SearchHit>, String> {
-    let settings = state.settings.read().clone();
+    let mut settings = state.settings.read().clone();
+    let mode = settings.search_mode.clone();
     let user_dict = state.user_dict.read().clone();
     if list_mail {
         let Some(mail_paths) = filter.mail_paths.as_ref() else {
@@ -593,6 +735,10 @@ fn run_index_search(
             settings.mail_thread_collapse,
         );
     }
+    // Hybrid and remote modes would drop SearchOpts inside run_search_with_opts.
+    // Force local so this half stays on for_llm. The host is a separate call.
+    settings.search_mode = "local".into();
+    let filter = prepare_chat_local_search(&mode, filter.clone());
     search::run_search_precise(
         &settings,
         state.backend.as_ref(),
@@ -603,7 +749,7 @@ fn run_index_search(
         None,
         &user_dict,
         UNITS_PER_FILE,
-        filter,
+        &filter,
     )
 }
 
@@ -628,6 +774,10 @@ fn run_index_search_multi(
     sort_date: bool,
     list_mail: bool,
 ) -> Result<Vec<SearchHit>, String> {
+    // The mark is not a folder. Searching it locally would miss, and mail stays off too.
+    if scopes_are_remote_only(&scopes.outer) {
+        return Ok(Vec::new());
+    }
     let prefixes: Vec<Option<&str>> = if scopes.outer.is_empty() {
         vec![None]
     } else {
@@ -825,6 +975,9 @@ pub fn join_thread_scopes(prefixes: &[String]) -> String {
 }
 
 fn collapse_thread_scopes(prefixes: &[String]) -> Vec<String> {
+    if scopes_are_remote_only(prefixes) {
+        return vec![search::REMOTE_ONLY_SCOPE.to_string()];
+    }
     crate::pathutil::collapse_path_prefixes(prefixes)
 }
 
@@ -833,6 +986,12 @@ pub fn format_thread_scope_system_line(raw: &str) -> Option<String> {
     let scopes = parse_thread_scopes(raw);
     if scopes.is_empty() {
         return None;
+    }
+    if scopes_are_remote_only(&scopes) {
+        return Some(
+            "\nこの会話の索引検索は別PCの共有フォルダだけです。このPCのファイルとメールは対象外です。"
+                .into(),
+        );
     }
     let quoted = scopes
         .iter()
@@ -856,11 +1015,29 @@ pub fn format_note_target_system_line(title: &str, memo: &str) -> String {
     )
 }
 
+fn scope_display(scope: &str) -> String {
+    if search::is_remote_only_scope(scope) {
+        "リモート".into()
+    } else {
+        scope.to_string()
+    }
+}
+
 fn scope_where_clause(scopes: &[String]) -> String {
     if scopes.is_empty() {
         String::new()
     } else {
-        format!("（検索範囲: {}）", scopes.join("、"))
+        let shown: Vec<String> = scopes.iter().map(|s| scope_display(s)).collect();
+        format!("（検索範囲: {}）", shown.join("、"))
+    }
+}
+
+/// Subject of an empty search_index line. Remote-only did not search this PC.
+fn empty_hit_subject(remote_only: bool, remote_note: Option<&str>) -> &'static str {
+    if !remote_only && remote_note == Some(REMOTE_DATE_UNSUPPORTED) {
+        "このPCの索引"
+    } else {
+        "索引"
     }
 }
 
@@ -950,7 +1127,10 @@ fn same_folder_path(a: &str, b: &str) -> bool {
 /// A `mailfolder:` request is a hard scope, not a preference. Outlook folders are not a
 /// path hierarchy, so there is no "nearby folder" to fall back to.
 fn resolve_scopes(thread_scope: Option<&str>, requested: Option<&str>) -> SearchScopes {
-    let thread = thread_scope.map(parse_thread_scopes).unwrap_or_default();
+    let mut thread = thread_scope.map(parse_thread_scopes).unwrap_or_default();
+    if scopes_are_remote_only(&thread) {
+        thread = vec![search::REMOTE_ONLY_SCOPE.to_string()];
+    }
     let requested = requested.map(str::trim).filter(|s| !s.is_empty());
 
     let Some(requested) = requested else {
@@ -989,7 +1169,11 @@ fn resolve_scopes(thread_scope: Option<&str>, requested: Option<&str>) -> Search
 fn outside_folder_note(prefix: &str, rows: &[crate::db::LlmSourceRow]) -> Option<String> {
     let outside: Vec<String> = rows
         .iter()
-        .filter(|r| !r.is_web() && !crate::pathutil::path_starts_with(&r.path, prefix))
+        .filter(|r| {
+            !r.is_web()
+                && !r.is_remote()
+                && !crate::pathutil::path_starts_with(&r.path, prefix)
+        })
         .map(|r| format!("[{}]", r.cite_no))
         .collect();
     if outside.is_empty() {
@@ -1049,14 +1233,27 @@ fn neighbor_ids(paragraph_id: &str) -> Vec<String> {
     out
 }
 
-fn preview_hit(state: &AppState, paragraph_id: &str) -> Result<Option<SearchHit>, String> {
+fn preview_hit(
+    state: &AppState,
+    paragraph_id: &str,
+    also_remote: bool,
+) -> Result<Option<SearchHit>, String> {
     let settings = state.settings.read().clone();
-    search::run_preview(
-        &settings,
-        state.backend.as_ref(),
-        Some(state.mail_backend.as_ref()),
-        paragraph_id,
-    )
+    if also_remote {
+        search::run_preview_also_remote(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            paragraph_id,
+        )
+    } else {
+        search::run_preview(
+            &settings,
+            state.backend.as_ref(),
+            Some(state.mail_backend.as_ref()),
+            paragraph_id,
+        )
+    }
 }
 
 fn bound_note(state: &AppState, thread_id: &str) -> Result<crate::db::NoteRow, String> {
@@ -1450,6 +1647,11 @@ fn execute_tool_inner(
                 .is_some_and(|s| s.eq_ignore_ascii_case("date"));
             let topical = topical_query(&query, mail_from);
             let list_mail = mail_from.is_some() && topical.is_empty();
+            if scopes_are_remote_only(&scopes.outer) && (list_mail || mail_from.is_some()) {
+                return Ok(ToolExec::text(
+                    "メールはこの検索範囲の対象外です。別PCの共有ファイルだけが対象です。",
+                ));
+            }
             let search_q = if list_mail || topical.is_empty() {
                 query.as_str()
             } else {
@@ -1463,6 +1665,42 @@ fn execute_tool_inner(
             } else {
                 None
             };
+            let run_remote = should_run_remote_sidecar(
+                &state.settings.read().search_mode,
+                list_mail,
+                mail_from,
+                &scopes.outer,
+            );
+            let remote_job = if run_remote {
+                let settings = state.settings.read().clone();
+                let q = search_q.to_string();
+                let prefixes = remote_chat_prefixes(&scopes.outer);
+                let user_dict = state.user_dict.read().clone();
+                let after_s = after
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let before_s = before
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let k_remote = k;
+                Some(std::thread::spawn(move || {
+                    let rewritten = search::apply_user_dictionary(&q, &user_dict);
+                    let remote = search::RemoteArgosBackend::from_settings(&settings)?;
+                    remote.search_chat(
+                        &rewritten,
+                        k_remote,
+                        &prefixes,
+                        search::SearchOpts::for_llm(UNITS_PER_FILE),
+                        after_s.as_deref(),
+                        before_s.as_deref(),
+                        None,
+                    )
+                }))
+            } else {
+                None
+            };
             let hits = run_index_search_multi(
                 state,
                 search_q,
@@ -1473,6 +1711,26 @@ fn execute_tool_inner(
                 sort_date,
                 list_mail,
             )?;
+            let (remote_hits, remote_note) = match remote_job {
+                Some(job) => match job.join() {
+                    Ok(Ok(found)) => {
+                        let note = remote_date_rejection(date.is_active(), found.date_applied)
+                            .map(str::to_string);
+                        let kept = if note.is_some() {
+                            Vec::new()
+                        } else {
+                            select_remote_chat_hits(&hits, &found.hits, k)
+                        };
+                        (kept, note)
+                    }
+                    Ok(Err(e)) => (Vec::new(), Some(format!("リモート検索に失敗: {e}"))),
+                    Err(_) => (
+                        Vec::new(),
+                        Some("リモート検索スレッドが失敗しました。".into()),
+                    ),
+                },
+                None => (Vec::new(), None),
+            };
             let outside_prefix = scopes.mixing_prefix(mail_from, sort_date, list_mail);
             let web_outcome = match web_job {
                 Some(job) => match job.join() {
@@ -1485,6 +1743,19 @@ fn execute_tool_inner(
             let mut already = Vec::new();
             let mut consumed = Vec::new();
             for hit in &hits {
+                persist_hit(
+                    state,
+                    thread_id,
+                    hit,
+                    &query,
+                    TOOL_BODY_CAP,
+                    next_cite,
+                    &mut new_rows,
+                    &mut already,
+                    &mut consumed,
+                )?;
+            }
+            for hit in &remote_hits {
                 persist_hit(
                     state,
                     thread_id,
@@ -1524,21 +1795,26 @@ fn execute_tool_inner(
                 None => {}
             }
             let mut content = String::new();
-            if hits.is_empty() {
+            if hits.is_empty() && remote_hits.is_empty() {
                 // Only the hard boundary explains an empty result. Naming the preferred
                 // folder would read as "not in that folder", which is not what was searched.
+                // A host that ignored the date is not "zero hits on the other PC".
                 let where_ = scope_where_clause(&scopes.outer);
                 let period = date_where_clause(after, before);
+                let remote_only = scopes_are_remote_only(&scopes.outer);
+                let which = empty_hit_subject(remote_only, remote_note.as_deref());
                 let mut msg = format!(
-                    "「{query}」に一致する索引ヒットはありません{period}{where_}。"
+                    "「{query}」に一致する{which}ヒットはありません{period}{where_}。"
                 );
                 if date.is_active() {
                     msg.push_str("この期間にヒットがなければ after を過去へ広げて再検索してください。");
-                    let days = state.settings.read().mail_days_back.max(1);
-                    if date_reaches_before_sync(date, days) {
-                        msg.push_str(&format!(
-                            "メールの同期範囲は過去{days}日です。それより前は索引にありません。"
-                        ));
+                    if !remote_only {
+                        let days = state.settings.read().mail_days_back.max(1);
+                        if date_reaches_before_sync(date, days) {
+                            msg.push_str(&format!(
+                                "メールの同期範囲は過去{days}日です。それより前は索引にありません。"
+                            ));
+                        }
                     }
                 } else {
                     msg.push_str("語を減らすか別の語で言い換えてください。");
@@ -1563,6 +1839,16 @@ fn execute_tool_inner(
             }
             if let Some(note) = more_matches_note(&hits) {
                 content.push('\n');
+                content.push_str(&note);
+            }
+            if let Some(note) = more_matches_note(&remote_hits) {
+                content.push('\n');
+                content.push_str(&note);
+            }
+            if let Some(note) = remote_note {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
                 content.push_str(&note);
             }
             if !web_note.is_empty() {
@@ -1594,7 +1880,8 @@ fn execute_tool_inner(
                     wrote_note_id: None,
                 });
             }
-            let Some(hit) = preview_hit(state, &paragraph_id)? else {
+            let also_remote = thread_scope.is_some_and(is_remote_only_thread);
+            let Some(hit) = preview_hit(state, &paragraph_id, also_remote)? else {
                 return Ok(ToolExec {
                     content: format!("段落 {paragraph_id} は索引にありません。"),
                     consumed: Vec::new(),
@@ -1624,7 +1911,7 @@ fn execute_tool_inner(
             // One email is one unit, so its neighbours are unrelated messages.
             if with_neighbors && !crate::mail::is_outlook_path(&hit.path) {
                 for nid in neighbor_ids(&paragraph_id) {
-                    if let Some(n) = preview_hit(state, &nid)? {
+                    if let Some(n) = preview_hit(state, &nid, also_remote)? {
                         persist_hit(
                             state,
                             thread_id,
@@ -2053,6 +2340,162 @@ mod tests {
     }
 
     #[test]
+    fn remote_sidecar_skips_local_mode_mail_and_mail_folders() {
+        assert!(!should_run_remote_sidecar("local", false, None, &[]));
+        assert!(should_run_remote_sidecar("hybrid", false, None, &[]));
+        assert!(should_run_remote_sidecar("remote", false, None, &[]));
+        assert!(!should_run_remote_sidecar(
+            "hybrid",
+            false,
+            Some("Aさん"),
+            &[]
+        ));
+        assert!(!should_run_remote_sidecar("hybrid", true, None, &[]));
+        assert!(!should_run_remote_sidecar(
+            "hybrid",
+            false,
+            None,
+            &["mailfolder:受信トレイ".into()]
+        ));
+        assert_eq!(
+            remote_chat_prefixes(&["mailfolder:受信トレイ".into(), r"C:\cases".into()]),
+            vec![r"C:\cases".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_only_scope_is_exclusive_and_not_a_host_folder() {
+        let mark = search::REMOTE_ONLY_SCOPE;
+        let joined = join_thread_scopes(&[
+            mark.into(),
+            r"C:\cases".into(),
+            "mailfolder:受信トレイ".into(),
+        ]);
+        assert_eq!(joined, mark);
+        assert!(
+            remote_chat_prefixes(&[mark.to_string()]).is_empty(),
+            "the mark must not be sent as a path prefix"
+        );
+        assert!(should_run_remote_sidecar(
+            "local",
+            false,
+            None,
+            &[mark.to_string()]
+        ));
+        assert!(!should_run_remote_sidecar(
+            "local",
+            true,
+            None,
+            &[mark.to_string()]
+        ));
+        assert!(!should_run_remote_sidecar(
+            "local",
+            false,
+            Some("Aさん"),
+            &[mark.to_string()]
+        ));
+        assert_eq!(
+            resolve_scopes(Some(mark), Some(r"C:\cases")),
+            scopes(&[mark], None),
+            "a local folder from the model is outside this scope"
+        );
+        let line = format_thread_scope_system_line(mark).expect("line");
+        assert!(line.contains("別PCの共有フォルダだけ"));
+        assert!(!line.contains(mark), "do not quote the mark as a folder");
+        assert!(!include_hybrid_remote_system_line("hybrid", mark));
+        assert!(include_hybrid_remote_system_line("hybrid", r"C:\cases"));
+        assert_eq!(
+            scope_where_clause(&[mark.to_string()]),
+            "（検索範囲: リモート）"
+        );
+        assert_eq!(
+            empty_hit_subject(true, Some(REMOTE_DATE_UNSUPPORTED)),
+            "索引"
+        );
+        assert_eq!(
+            empty_hit_subject(false, Some(REMOTE_DATE_UNSUPPORTED)),
+            "このPCの索引"
+        );
+        let schema = tools_schema(false, true, true).to_string();
+        assert!(schema.contains("別PCの共有ファイルだけ"));
+        assert!(!schema.contains("（ファイルとメール）"));
+        assert!(!schema.contains("メールと送信者はこのPCだけ"));
+    }
+
+    #[test]
+    fn dated_remote_without_flag_is_dropped_with_a_note() {
+        assert_eq!(
+            remote_date_rejection(true, false),
+            Some(REMOTE_DATE_UNSUPPORTED)
+        );
+        assert!(remote_date_rejection(true, true).is_none());
+        assert!(remote_date_rejection(false, false).is_none());
+    }
+
+    #[test]
+    fn remote_hits_drop_local_paths_and_cap_at_k() {
+        let local = vec![file_hit(r"C:\cases\a.txt", 9.0)];
+        let mut remote_a = file_hit(r"C:\cases\a.txt", 8.0);
+        remote_a.source = "remote".into();
+        let mut remote_b = file_hit(r"D:\share\b.txt", 7.0);
+        remote_b.source = "remote".into();
+        let mut remote_b2 = file_hit(r"D:\share\b.txt", 6.0);
+        remote_b2.id = r"D:\share\b.txt#2".into();
+        remote_b2.source = "remote".into();
+        let mut remote_c = file_hit(r"D:\share\c.txt", 5.0);
+        remote_c.source = "remote".into();
+        let kept = select_remote_chat_hits(&local, &[remote_a, remote_b, remote_b2, remote_c], 2);
+        assert_eq!(
+            kept.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec![r"D:\share\b.txt#1", r"D:\share\b.txt#2"]
+        );
+    }
+
+    #[test]
+    fn hybrid_chat_search_keeps_local_files_on_the_precise_path() {
+        let filter = prepare_chat_local_search("hybrid", search::SearchFilter::default());
+        assert!(filter.file_paths.is_none());
+        let remote_only = prepare_chat_local_search("remote", search::SearchFilter::default());
+        assert_eq!(remote_only.file_paths.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn outside_folder_note_skips_remote_sources() {
+        let rows = vec![
+            source_row("text", r"C:\other\a.txt", 1),
+            source_row("remote", r"D:\host\b.txt", 2),
+            source_row("web", "https://example.com", 3),
+        ];
+        let note = outside_folder_note(r"C:\cases", &rows).expect("local outside");
+        assert!(note.contains("[1]"), "{note}");
+        assert!(!note.contains("[2]"), "{note}");
+        assert!(!note.contains("[3]"), "{note}");
+    }
+
+    fn source_row(kind: &str, path: &str, cite: i64) -> LlmSourceRow {
+        LlmSourceRow {
+            id: format!("id{cite}"),
+            thread_id: "t".into(),
+            sort_order: 0,
+            origin: "tool".into(),
+            path: path.into(),
+            title: "t".into(),
+            paragraph_id: "p".into(),
+            body: "b".into(),
+            query: String::new(),
+            created_at: 0,
+            grain: "unit".into(),
+            unit_body: String::new(),
+            injected_user_message_id: String::new(),
+            cited_assistant_message_id: String::new(),
+            cite_no: cite,
+            kind: kind.into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
+        }
+    }
+
+    #[test]
     fn web_sidecar_skips_mail_listing() {
         assert!(should_run_web_sidecar(true, false, "解雇 有効性"));
         assert!(
@@ -2065,15 +2508,17 @@ mod tests {
 
     #[test]
     fn tools_schema_mentions_web_only_when_enabled() {
-        let off = tools_schema(false).to_string();
+        let off = tools_schema(false, false, false).to_string();
         assert!(!off.contains("公開ウェブも同時に検索"));
+        assert!(!off.contains("（リモート）"));
+        assert!(tools_schema(false, true, false).to_string().contains("（リモート）"));
         assert!(!off.contains(TOOL_READ_URL));
         assert!(off.contains(TOOL_LIST_NOTES));
         assert!(off.contains(TOOL_READ_NOTE));
         assert!(off.contains(TOOL_CREATE_NOTE));
         assert!(off.contains(TOOL_WRITE_NOTE));
         assert!(!off.contains("propose_note_"));
-        let on = tools_schema(true).to_string();
+        let on = tools_schema(true, false, false).to_string();
         assert!(on.contains("公開ウェブも同時に検索"));
         assert!(on.contains(TOOL_READ_URL));
         assert!(on.contains("read_url"));

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { isRemoteOnlyScope, REMOTE_ONLY_SCOPE } from "../preview/hitMeta";
 
 const MAX_SCOPES = 8;
 
@@ -26,6 +27,7 @@ function formatMailScopeLabel(raw: string): string {
 }
 
 function scopeChipLabel(path: string, label?: string | null): string {
+  if (isRemoteOnlyScope(path)) return "リモート";
   if (label && label.trim()) return label.trim();
   if (path.startsWith("mailfolder:")) {
     return formatMailScopeLabel(path.slice("mailfolder:".length));
@@ -51,6 +53,9 @@ function pathStartsWith(path: string, prefix: string): boolean {
 }
 
 function collapseScopes(paths: string[]): string[] {
+  if (paths.some((p) => isRemoteOnlyScope(p))) {
+    return [REMOTE_ONLY_SCOPE];
+  }
   const out: string[] = [];
   for (const raw of paths) {
     const p = raw.trim();
@@ -110,6 +115,7 @@ export default function ChatScopePicker({
   const [recentRows, setRecentRows] = useState<SearchScopeRow[]>([]);
   const [scopeFilter, setScopeFilter] = useState("");
   const [pending, setPending] = useState<string[]>([]);
+  const [remoteAvailable, setRemoteAvailable] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const filterRef = useRef<HTMLInputElement | null>(null);
   const genRef = useRef(0);
@@ -127,6 +133,16 @@ export default function ChatScopePicker({
     const gen = ++genRef.current;
     setLoading(true);
     try {
+      try {
+        const s = await invoke<{ remoteUrl?: string; remoteToken?: string }>(
+          "get_settings",
+        );
+        if (gen !== genRef.current) return;
+        setRemoteAvailable(!!(s.remoteUrl?.trim() && s.remoteToken?.trim()));
+      } catch {
+        if (gen !== genRef.current) return;
+        setRemoteAvailable(false);
+      }
       const result = await invoke<SearchScopesResult>("list_search_scopes", {
         query: null,
       });
@@ -200,9 +216,10 @@ export default function ChatScopePicker({
   }, [open, close]);
 
   const filteredRecent = useMemo(() => {
+    const rows = recentRows.filter((s) => !isRemoteOnlyScope(s.path));
     const q = scopeFilter.trim().toLowerCase();
-    if (!q) return recentRows;
-    return recentRows.filter(
+    if (!q) return rows;
+    return rows.filter(
       (s) =>
         s.label.toLowerCase().includes(q) || s.path.toLowerCase().includes(q),
     );
@@ -218,6 +235,8 @@ export default function ChatScopePicker({
   }, [scopeRows, scopeFilter]);
 
   const collapsedPending = useMemo(() => collapseScopes(pending), [pending]);
+  const remotePending =
+    collapsedPending.length === 1 && isRemoteOnlyScope(collapsedPending[0] ?? "");
   const atLimit = collapsedPending.length >= MAX_SCOPES;
 
   const isSelected = useCallback(
@@ -227,14 +246,18 @@ export default function ChatScopePicker({
 
   const toggle = useCallback((path: string) => {
     setPending((prev) => {
-      if (prev.some((p) => samePath(p, path))) {
-        return prev.filter((p) => !samePath(p, path));
+      if (isRemoteOnlyScope(path)) {
+        return prev.some((p) => isRemoteOnlyScope(p)) ? [] : [REMOTE_ONLY_SCOPE];
       }
-      if (prev.some((p) => pathStartsWith(path, p))) {
-        return prev;
+      const withoutRemote = prev.filter((p) => !isRemoteOnlyScope(p));
+      if (withoutRemote.some((p) => samePath(p, path))) {
+        return withoutRemote.filter((p) => !samePath(p, path));
       }
-      const next = collapseScopes([...prev, path]);
-      if (next.length > MAX_SCOPES) return prev;
+      if (withoutRemote.some((p) => pathStartsWith(path, p))) {
+        return withoutRemote;
+      }
+      const next = collapseScopes([...withoutRemote, path]);
+      if (next.length > MAX_SCOPES) return withoutRemote;
       return next;
     });
   }, []);
@@ -256,6 +279,7 @@ export default function ChatScopePicker({
           labels.set(row.path.toLowerCase(), row.label);
         }
         for (const path of collapsed) {
+          if (isRemoteOnlyScope(path)) continue;
           const label = labels.get(path.toLowerCase()) ?? scopeChipLabel(path);
           void invoke("push_recent_search_scope", {
             path,
@@ -341,88 +365,117 @@ export default function ChatScopePicker({
           <div className="chat-scope-picker-list">
             {loading ? (
               <div className="chat-scope-empty">読み込み中…</div>
-            ) : empty ? (
-              <div className="chat-scope-empty">
-                {scopeRows.length === 0 && recentRows.length === 0
-                  ? "検索対象フォルダがありません。設定からフォルダを追加してください。"
-                  : "一致するフォルダがありません。"}
-              </div>
             ) : (
-              <ul>
-                <li>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={collapsedPending.length === 0}
-                    onClick={() => void apply([])}
-                  >
-                    <span className="chat-scope-check" aria-hidden="true">
-                      {collapsedPending.length === 0 ? "✓" : ""}
-                    </span>
-                    <span className="chat-scope-kind">全体</span>
-                    <span className="chat-scope-label">索引全体</span>
-                  </button>
-                </li>
-                {filteredRecent.map((s) => (
-                  <li key={`recent:${s.path}`}>
+              <>
+                <ul>
+                  <li>
                     <button
                       type="button"
                       role="option"
-                      aria-selected={isSelected(s.path)}
-                      className="scope-recent"
-                      title={s.path}
-                      onClick={() => toggle(s.path)}
+                      aria-selected={collapsedPending.length === 0}
+                      onClick={() => void apply([])}
                     >
                       <span className="chat-scope-check" aria-hidden="true">
-                        {isSelected(s.path) ? "✓" : ""}
+                        {collapsedPending.length === 0 ? "✓" : ""}
                       </span>
-                      <span className="chat-scope-kind">直近</span>
-                      <span className="chat-scope-label">{s.label}</span>
+                      <span className="chat-scope-kind">全体</span>
+                      <span className="chat-scope-label">索引全体</span>
                     </button>
                   </li>
-                ))}
-                {filteredRecent.length > 0 && filteredScopes.length > 0 ? (
-                  <li className="chat-scope-sep" aria-hidden="true" />
-                ) : null}
-                {filteredScopes.map((s) => {
-                  const selected = isSelected(s.path);
-                  const blocked =
-                    !selected &&
-                    (atLimit || pending.some((p) => pathStartsWith(s.path, p)));
-                  return (
-                    <li key={s.path}>
+                  {remoteAvailable ? (
+                    <li>
                       <button
                         type="button"
                         role="option"
-                        aria-selected={selected}
-                        className={s.isRoot ? "scope-root" : "scope-sub"}
-                        title={
-                          blocked && atLimit
-                            ? `検索範囲は最大 ${MAX_SCOPES} 件です`
-                            : s.path
-                        }
-                        disabled={blocked}
-                        onClick={() => toggle(s.path)}
+                        aria-selected={remotePending}
+                        title="別PCの共有ファイルだけ。このPCのファイルとメールは含みません。"
+                        onClick={() => toggle(REMOTE_ONLY_SCOPE)}
                       >
                         <span className="chat-scope-check" aria-hidden="true">
-                          {selected ? "✓" : ""}
+                          {remotePending ? "✓" : ""}
                         </span>
-                        {s.isRoot ? (
-                          <span className="chat-scope-kind">ルート</span>
-                        ) : null}
-                        <span className="chat-scope-label">{s.label}</span>
+                        <span className="chat-scope-kind">リモート</span>
+                        <span className="chat-scope-label">リモート</span>
                       </button>
                     </li>
-                  );
-                })}
-              </ul>
+                  ) : null}
+                  {empty
+                    ? null
+                    : filteredRecent.map((s) => (
+                        <li key={`recent:${s.path}`}>
+                          <button
+                            type="button"
+                            role="option"
+                            aria-selected={isSelected(s.path)}
+                            className="scope-recent"
+                            title={s.path}
+                            onClick={() => toggle(s.path)}
+                          >
+                            <span className="chat-scope-check" aria-hidden="true">
+                              {isSelected(s.path) ? "✓" : ""}
+                            </span>
+                            <span className="chat-scope-kind">直近</span>
+                            <span className="chat-scope-label">{s.label}</span>
+                          </button>
+                        </li>
+                      ))}
+                  {!empty &&
+                  filteredRecent.length > 0 &&
+                  filteredScopes.length > 0 ? (
+                    <li className="chat-scope-sep" aria-hidden="true" />
+                  ) : null}
+                  {empty
+                    ? null
+                    : filteredScopes.map((s) => {
+                        const selected = isSelected(s.path);
+                        const blocked =
+                          !selected &&
+                          (atLimit ||
+                            pending.some((p) => pathStartsWith(s.path, p)));
+                        return (
+                          <li key={s.path}>
+                            <button
+                              type="button"
+                              role="option"
+                              aria-selected={selected}
+                              className={s.isRoot ? "scope-root" : "scope-sub"}
+                              title={
+                                blocked && atLimit
+                                  ? `検索範囲は最大 ${MAX_SCOPES} 件です`
+                                  : s.path
+                              }
+                              disabled={blocked}
+                              onClick={() => toggle(s.path)}
+                            >
+                              <span className="chat-scope-check" aria-hidden="true">
+                                {selected ? "✓" : ""}
+                              </span>
+                              {s.isRoot ? (
+                                <span className="chat-scope-kind">ルート</span>
+                              ) : null}
+                              <span className="chat-scope-label">{s.label}</span>
+                            </button>
+                          </li>
+                        );
+                      })}
+                </ul>
+                {empty ? (
+                  <div className="chat-scope-empty">
+                    {scopeRows.length === 0 && recentRows.length === 0
+                      ? "検索対象フォルダがありません。設定からフォルダを追加してください。"
+                      : "一致するフォルダがありません。"}
+                  </div>
+                ) : null}
+              </>
             )}
           </div>
           <div className="chat-scope-picker-actions">
             <span className="chat-scope-picker-count">
               {collapsedPending.length === 0
                 ? "索引全体"
-                : `${collapsedPending.length} 件選択`}
+                : remotePending
+                  ? "リモート"
+                  : `${collapsedPending.length} 件選択`}
             </span>
             <button
               type="button"

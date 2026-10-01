@@ -1989,6 +1989,10 @@ impl TantivyBackend {
     }
 
     /// LAN remote search: same retrieval as [`Self::search_filtered`], plus share gating.
+    ///
+    /// `opts` and `path_allowlist` are how chat asks for paragraph hits and a file-date
+    /// window. The popup passes the defaults, which keep one unit per file and no date list.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_for_remote(
         &self,
         query: &str,
@@ -1996,6 +2000,8 @@ impl TantivyBackend {
         path_prefix: Option<&str>,
         exts: Option<&[String]>,
         pos_filter_enabled: bool,
+        opts: SearchOpts,
+        path_allowlist: Option<&[String]>,
         share: &RemoteShareSnapshot,
     ) -> Result<Vec<SearchHit>, String> {
         if !share.has_shared_folders() {
@@ -2007,8 +2013,8 @@ impl TantivyBackend {
             path_prefix,
             exts,
             pos_filter_enabled,
-            SearchOpts::default(),
-            None,
+            opts,
+            path_allowlist,
             Some(share),
         )
     }

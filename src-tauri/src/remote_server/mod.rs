@@ -12,10 +12,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::db::{Db, Settings};
 use crate::search::{
-    assemble_search_scopes, filter_hits_by_exts, filter_hits_by_path_prefix, filter_out_email_hits,
-    run_local_search_multi, run_path_matches, run_preview, RemoteShareSnapshot, ScopeListOpts,
-    SearchBackend, SearchHit, SearchScopesResult, TantivyBackend, UserDictMatcher,
-    MAX_SEARCH_PREFIXES,
+    assemble_search_scopes, build_search_filter, filter_hits_by_exts, filter_hits_by_path_prefix,
+    filter_out_email_hits, parse_date_range, run_local_search_multi, run_path_matches, run_preview,
+    DateFilter, RemoteShareSnapshot, ScopeListOpts, SearchBackend, SearchHit, SearchOpts,
+    SearchScopesResult, TantivyBackend, UserDictMatcher, MAX_SEARCH_PREFIXES,
 };
 
 #[derive(Clone)]
@@ -45,11 +45,35 @@ struct SearchRequest {
     path_prefixes: Option<Vec<String>>,
     #[serde(default)]
     exts: Option<Vec<String>>,
+    /// Chat asks for the same retrieval as `SearchOpts::for_llm`. Absent means popup retrieval.
+    #[serde(default)]
+    precision: bool,
+    #[serde(default, rename = "perFileUnits", alias = "per_file_units")]
+    per_file_units: Option<usize>,
+    #[serde(default, rename = "pathBoost", alias = "path_boost")]
+    path_boost: bool,
+    /// Inclusive local dates (`YYYY-MM-DD`). Applied to this host's file mtimes.
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct SearchResponse {
     hits: Vec<SearchHit>,
+    /// True when `perFileUnits` was honored (paragraph hits, not one unit per file).
+    #[serde(default, skip_serializing_if = "is_false")]
+    unit_retrieval: bool,
+    /// True when `after` / `before` was applied on this host. Omitted means the client
+    /// must drop the hits for a dated query.
+    #[serde(default, skip_serializing_if = "is_false")]
+    date_applied: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Deserialize)]
@@ -148,12 +172,40 @@ fn request_prefixes(body: &SearchRequest) -> Vec<String> {
         .collect()
 }
 
-fn merge_lan_hits(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+fn merge_lan_hits(mut hits: Vec<SearchHit>, limit: usize, collapse_paths: bool) -> Vec<SearchHit> {
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut seen = std::collections::HashSet::new();
-    hits.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
+    if collapse_paths {
+        hits.retain(|h| seen.insert(h.path.to_ascii_lowercase()));
+    } else {
+        hits.retain(|h| seen.insert(h.id.to_ascii_lowercase()));
+    }
     hits.truncate(limit);
     hits
+}
+
+fn retrieval_from_request(body: &SearchRequest) -> (SearchOpts, bool) {
+    let per = body.per_file_units.filter(|n| *n > 0);
+    let unit = per.is_some();
+    (
+        SearchOpts {
+            precision: body.precision,
+            per_file_units: per,
+            path_boost: body.path_boost,
+        },
+        unit,
+    )
+}
+
+/// Files on this host whose mtime falls in `date`, optionally under one prefix.
+fn dated_file_allowlist(
+    db: &Db,
+    date: DateFilter,
+    prefix: Option<&str>,
+    exts: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    let filter = build_search_filter(db, date, None, prefix, exts, false)?;
+    Ok(filter.file_paths.unwrap_or_default())
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -213,6 +265,10 @@ async fn search(
     require_auth(&headers, &state.token, loopback)?;
     let prefixes = request_prefixes(&body);
     let limit = body.limit.unwrap_or(10).clamp(1, 50);
+    let (opts, unit_retrieval) = retrieval_from_request(&body);
+    let date = parse_date_range(body.after.as_deref(), body.before.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let date_applied = date.is_active();
     let query = body.query;
     let exts = crate::search::normalize_exts(body.exts);
     let backend = state.backend.clone();
@@ -236,12 +292,20 @@ async fn search(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        return Ok(Json(SearchResponse { hits }));
+        // Flags stay unset. A client that asked for a date treats that as "not applied".
+        return Ok(Json(SearchResponse {
+            hits,
+            ..SearchResponse::default()
+        }));
     }
 
     let share = state.share.lock().clone();
     if !share.has_shared_folders() {
-        return Ok(Json(SearchResponse { hits: Vec::new() }));
+        return Ok(Json(SearchResponse {
+            hits: Vec::new(),
+            unit_retrieval,
+            date_applied,
+        }));
     }
     let fetch_limit = (limit * 4).clamp(1, 50);
     let prefix_for_filter = if prefixes.len() == 1 {
@@ -257,15 +321,31 @@ async fn search(
     let pos_filter = settings.pos_filter_enabled;
     let share_for_search = share.clone();
     let exts_for_search = exts.clone();
+    let db = state.db.clone();
     let mut hits = tokio::task::spawn_blocking(move || {
         let mut all = Vec::new();
         for prefix in searches {
+            let allowlist = if date.is_active() {
+                Some(dated_file_allowlist(
+                    db.as_ref(),
+                    date,
+                    prefix.as_deref(),
+                    exts_for_search.as_deref(),
+                )?)
+            } else {
+                None
+            };
+            if allowlist.as_ref().is_some_and(|paths| paths.is_empty()) {
+                continue;
+            }
             all.extend(backend.search_for_remote(
                 &query,
                 fetch_limit,
                 prefix.as_deref(),
                 exts_for_search.as_deref(),
                 pos_filter,
+                opts,
+                allowlist.as_deref(),
                 &share_for_search,
             )?);
         }
@@ -278,11 +358,16 @@ async fn search(
     hits = filter_hits_by_exts(hits, exts.as_deref());
     hits = filter_out_email_hits(hits);
     hits = share.filter_hits(hits);
-    hits = merge_lan_hits(hits, limit);
+    // Paragraph mode keeps several units of one file. Popup mode stays one path each.
+    hits = merge_lan_hits(hits, limit, !unit_retrieval);
     for hit in &mut hits {
         hit.source = "remote".into();
     }
-    Ok(Json(SearchResponse { hits }))
+    Ok(Json(SearchResponse {
+        hits,
+        unit_retrieval,
+        date_applied,
+    }))
 }
 
 async fn preview(
@@ -347,7 +432,7 @@ async fn path_matches(
     require_auth(&headers, &state.token, loopback)?;
     let path = body.path.trim().to_string();
     if path.is_empty() {
-        return Ok(Json(SearchResponse { hits: Vec::new() }));
+        return Ok(Json(SearchResponse { hits: Vec::new(), ..SearchResponse::default() }));
     }
 
     if loopback {
@@ -371,15 +456,15 @@ async fn path_matches(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let limit = body.limit.unwrap_or(50).clamp(1, 50);
         hits.truncate(limit);
-        return Ok(Json(SearchResponse { hits }));
+        return Ok(Json(SearchResponse { hits, ..SearchResponse::default() }));
     }
 
     if crate::mail::is_outlook_path(&path) {
-        return Ok(Json(SearchResponse { hits: Vec::new() }));
+        return Ok(Json(SearchResponse { hits: Vec::new(), ..SearchResponse::default() }));
     }
     let share = state.share.lock().clone();
     if !share.path_is_shared(&path) {
-        return Ok(Json(SearchResponse { hits: Vec::new() }));
+        return Ok(Json(SearchResponse { hits: Vec::new(), ..SearchResponse::default() }));
     }
     let limit = body.limit.unwrap_or(50).clamp(1, 50);
     let backend = state.backend.clone();
@@ -396,7 +481,7 @@ async fn path_matches(
     for hit in &mut hits {
         hit.source = "remote".into();
     }
-    Ok(Json(SearchResponse { hits }))
+    Ok(Json(SearchResponse { hits, ..SearchResponse::default() }))
 }
 
 #[derive(Deserialize)]
@@ -874,6 +959,121 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lan_chat_search_sets_retrieval_flags_without_shared_folders() {
+        let (dir, state) = test_state("secret");
+        let app = router(state);
+        let body = serde_json::json!({
+            "query": "契約",
+            "limit": 4,
+            "precision": true,
+            "perFileUnits": 3,
+            "pathBoost": true,
+            "after": "2024-01-01"
+        });
+        let resp = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            lan_info(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["unitRetrieval"], true);
+        assert_eq!(v["dateApplied"], true);
+        assert_eq!(v["hits"].as_array().map(|h| h.len()), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn loopback_chat_search_omits_date_flag() {
+        let (dir, state) = test_state("");
+        let app = router(state);
+        let body = serde_json::json!({
+            "query": "契約",
+            "limit": 4,
+            "precision": true,
+            "perFileUnits": 3,
+            "after": "2024-01-01"
+        });
+        let resp = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            loopback_info(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v["hits"].is_array());
+        assert!(v.get("dateApplied").is_none() || v["dateApplied"] == false);
+        assert!(v.get("unitRetrieval").is_none() || v["unitRetrieval"] == false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lan_search_rejects_a_bad_date() {
+        let (dir, state) = test_state("secret");
+        let app = router(state);
+        let body = serde_json::json!({
+            "query": "契約",
+            "after": "yesterday"
+        });
+        let resp = oneshot(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/search")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            lan_info(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dated_file_allowlist_keeps_the_mtime_window() {
+        let (dir, state) = test_state("secret");
+        let folder = state.db.add_folder(r"C:\cases", "").unwrap();
+        state
+            .db
+            .upsert_file(folder.id, r"C:\cases\old.txt", "txt", 1, 1_600_000_000, "h")
+            .unwrap();
+        state
+            .db
+            .upsert_file(
+                folder.id,
+                r"C:\cases\new.txt",
+                "txt",
+                1,
+                1_700_000_100,
+                "h",
+            )
+            .unwrap();
+        let date = DateFilter {
+            after_unix: Some(1_700_000_000),
+            before_unix: Some(1_700_000_200),
+        };
+        let paths =
+            dated_file_allowlist(state.db.as_ref(), date, Some(r"C:\cases"), None).unwrap();
+        assert_eq!(paths, vec![r"C:\cases\new.txt".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
