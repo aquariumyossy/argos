@@ -26,6 +26,7 @@ import {
   groupSources,
   imageGroupKey,
   isImageSource,
+  isRemoteSource,
   isWebSource,
   ocrIncomplete,
   openableCitesFromGroups,
@@ -193,6 +194,7 @@ function isFileGrain(s: LlmSourceRow): boolean {
 function sourceCanExpand(s: LlmSourceRow): boolean {
   if (isImageSource(s)) return false;
   if (isWebSource(s)) return false;
+  if (isRemoteSource(s)) return false;
   if (!s.path.trim()) return false;
   if (isFileGrain(s) && !(s.paragraphId ?? "").trim()) return false;
   return true;
@@ -927,6 +929,7 @@ export default function Chat() {
         fallbackBody: s.body,
         kind: s.kind,
         sourceId: s.id,
+        source: isRemoteSource(s) ? "remote" : undefined,
       });
     } catch (e) {
       setError(formatInvokeError(e));
@@ -1746,6 +1749,7 @@ export default function Chat() {
                 const ocr = groupOcrState(g, ocrBusy);
                 const n = g.citeNo;
                 const web = isWebSource(s);
+                const remote = isRemoteSource(s);
                 const chipClass = [
                   "chat-source-chip",
                   fileGrain || image ? "file" : "",
@@ -1755,11 +1759,13 @@ export default function Chat() {
                   .join(" ");
                 const badge = ocr.badge
                   ? ocr.badge
-                  : web
-                    ? "ウェブ"
-                    : fileGrain && !image
-                      ? "全文"
-                      : null;
+                  : remote
+                    ? "リモート"
+                    : web
+                      ? "ウェブ"
+                      : fileGrain && !image
+                        ? "全文"
+                        : null;
                 const label = chipLabel(s);
                 return (
                   <span key={g.key} className={chipClass}>

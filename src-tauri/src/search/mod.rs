@@ -82,6 +82,14 @@ pub struct ParagraphHit {
     pub page: Option<u32>,
 }
 
+/// Thread and popup scope that means "the other PC's shared files only".
+/// Not a filesystem path. Strip it before sending `path_prefixes` to the host.
+pub const REMOTE_ONLY_SCOPE: &str = "source:remote";
+
+pub fn is_remote_only_scope(path: &str) -> bool {
+    path.trim() == REMOTE_ONLY_SCOPE
+}
+
 /// Retrieval tuning that differs between the popup and the LLM tool.
 ///
 /// The popup searches a sentence the user selected and wants recall: one matching noun
@@ -851,6 +859,27 @@ pub fn run_preview(
     mail: Option<&TantivyBackend>,
     hit_id: &str,
 ) -> Result<Option<SearchHit>, String> {
+    run_preview_inner(settings, local, mail, hit_id, false)
+}
+
+/// Same as [`run_preview`], and in local search mode a miss still asks the host.
+/// Used when the hit is already remote, or the thread scope is remote-only.
+pub fn run_preview_also_remote(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    hit_id: &str,
+) -> Result<Option<SearchHit>, String> {
+    run_preview_inner(settings, local, mail, hit_id, true)
+}
+
+fn run_preview_inner(
+    settings: &Settings,
+    local: &TantivyBackend,
+    mail: Option<&TantivyBackend>,
+    hit_id: &str,
+    also_remote: bool,
+) -> Result<Option<SearchHit>, String> {
     let prefer_mail = hit_id.starts_with("outlook:") || hit_id.contains("outlook:");
     if prefer_mail {
         if let Some(mail_be) = mail {
@@ -881,7 +910,16 @@ pub fn run_preview(
                 return Ok(Some(hit));
             }
             if let Some(mail_be) = mail {
-                return mail_be.preview(hit_id);
+                if let Some(hit) = mail_be.preview(hit_id)? {
+                    return Ok(Some(hit));
+                }
+                if !also_remote {
+                    return Ok(None);
+                }
+            }
+            if also_remote {
+                let remote = RemoteArgosBackend::from_settings(settings)?;
+                return remote.preview(hit_id);
             }
             Ok(None)
         }

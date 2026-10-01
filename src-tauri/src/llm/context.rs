@@ -218,6 +218,8 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         }
         if seed.is_web() {
             out.push_str("（ウェブ）");
+        } else if seed.is_remote() {
+            out.push_str("（リモート）");
         }
         let pid = seed.paragraph_id.trim();
         if !pid.is_empty() && !crate::llm::grain::is_file_grain(&seed.grain) {
@@ -557,6 +559,18 @@ mod tests {
         assert!(out.contains("（ウェブ）"), "{out}");
         assert!(out.contains("https://example.com/case"), "{out}");
         assert!(!out.contains("paragraph_id"), "{out}");
+    }
+
+    #[test]
+    fn remote_sources_are_labeled_and_keep_paragraph_id() {
+        let mut row = src("u9", "tool", 0, "本文");
+        row.kind = "remote".into();
+        row.path = r"\\host\share\a.txt".into();
+        row.title = "a.txt".into();
+        row.paragraph_id = r"\\host\share\a.txt#1".into();
+        let out = format_sources(&[row]);
+        assert!(out.contains("（リモート）"), "{out}");
+        assert!(out.contains("(paragraph_id: "), "{out}");
     }
 
     fn consumed(

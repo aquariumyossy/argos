@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Settings;
 
-use super::{filter_hits_by_exts, filter_hits_by_path_prefix, SearchBackend, SearchHit};
+use super::{filter_hits_by_exts, filter_hits_by_path_prefix, SearchBackend, SearchHit, SearchOpts};
 
 #[derive(Serialize)]
 struct SearchRequest<'a> {
@@ -25,8 +25,44 @@ struct PathMatchesRequest<'a> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchResponse {
     hits: Vec<SearchHit>,
+    #[serde(default)]
+    unit_retrieval: bool,
+    #[serde(default)]
+    date_applied: bool,
+}
+
+/// Chat retrieval against a host. Popup search does not use this.
+#[derive(Debug)]
+pub struct RemoteChatSearch {
+    pub hits: Vec<SearchHit>,
+    pub unit_retrieval: bool,
+    pub date_applied: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSearchRequest<'a> {
+    query: &'a str,
+    limit: usize,
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    path_prefixes: &'a [String],
+    precision: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_file_units: Option<usize>,
+    path_boost: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exts: Option<&'a [String]>,
+}
+
+fn slice_is_empty(prefixes: &[String]) -> bool {
+    prefixes.is_empty()
 }
 
 #[derive(Serialize)]
@@ -155,6 +191,88 @@ impl RemoteArgosBackend {
         hits.truncate(limit);
         Ok(hits)
     }
+
+    fn post_search(&self, body: &impl Serialize) -> Result<SearchResponse, String> {
+        let url = format!("{}/search", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, self.auth_header())
+            .json(body)
+            .send()
+            .map_err(|e| format!("リモート検索に失敗: {e}"))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("リモート認証に失敗しました（トークンを確認）".into());
+        }
+        if !resp.status().is_success() {
+            return Err(format!("リモート検索に失敗: HTTP {}", resp.status()));
+        }
+        resp.json()
+            .map_err(|e| format!("リモート検索結果の解析に失敗: {e}"))
+    }
+
+    /// Paragraph search for chat. `limit` is the maximum number of units to keep.
+    /// The query should already include this PC's user-dictionary quoting.
+    pub fn search_chat(
+        &self,
+        query: &str,
+        limit: usize,
+        prefixes: &[String],
+        opts: SearchOpts,
+        after: Option<&str>,
+        before: Option<&str>,
+        exts: Option<&[String]>,
+    ) -> Result<RemoteChatSearch, String> {
+        let limit = limit.clamp(1, 50);
+        let after = after.map(str::trim).filter(|s| !s.is_empty());
+        let before = before.map(str::trim).filter(|s| !s.is_empty());
+        let ext_list = exts.filter(|e| !e.is_empty());
+        let request_limit = if prefixes.is_empty() && ext_list.is_none() {
+            limit
+        } else {
+            (limit * 4).clamp(limit, 50)
+        };
+        let body = self.post_search(&ChatSearchRequest {
+            query,
+            limit: request_limit,
+            path_prefixes: prefixes,
+            precision: opts.precision,
+            per_file_units: opts.per_file_units,
+            path_boost: opts.path_boost,
+            after,
+            before,
+            exts: ext_list,
+        })?;
+        let mut hits = body.hits;
+        for hit in &mut hits {
+            hit.source = "remote".into();
+        }
+        hits = filter_hits_by_prefixes(hits, prefixes);
+        hits = filter_hits_by_exts(hits, ext_list);
+        hits.truncate(limit);
+        Ok(RemoteChatSearch {
+            hits,
+            unit_retrieval: body.unit_retrieval,
+            date_applied: body.date_applied,
+        })
+    }
+}
+
+fn filter_hits_by_prefixes(hits: Vec<SearchHit>, prefixes: &[String]) -> Vec<SearchHit> {
+    let prefs: Vec<&str> = prefixes
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if prefs.is_empty() {
+        return hits;
+    }
+    hits.into_iter()
+        .filter(|h| {
+            prefs.iter()
+                .any(|p| crate::pathutil::path_starts_with(&h.path, p))
+        })
+        .collect()
 }
 
 impl SearchBackend for RemoteArgosBackend {
@@ -166,7 +284,6 @@ impl SearchBackend for RemoteArgosBackend {
         exts: Option<&[String]>,
         _pos_filter_enabled: bool,
     ) -> Result<Vec<SearchHit>, String> {
-        let url = format!("{}/search", self.base_url);
         let scope = path_prefix.map(str::trim).filter(|s| !s.is_empty());
         let ext_list = exts.filter(|e| !e.is_empty());
         // Ask remote for more when scoping; older servers ignore filters so we post-filter.
@@ -175,27 +292,12 @@ impl SearchBackend for RemoteArgosBackend {
         } else {
             limit
         };
-        let resp = self
-            .client
-            .post(&url)
-            .header(reqwest::header::AUTHORIZATION, self.auth_header())
-            .json(&SearchRequest {
-                query,
-                limit: request_limit,
-                path_prefix: scope,
-                exts: ext_list,
-            })
-            .send()
-            .map_err(|e| format!("リモート検索に失敗: {e}"))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("リモート認証に失敗しました（トークンを確認）".into());
-        }
-        if !resp.status().is_success() {
-            return Err(format!("リモート検索に失敗: HTTP {}", resp.status()));
-        }
-        let body: SearchResponse = resp
-            .json()
-            .map_err(|e| format!("リモート検索結果の解析に失敗: {e}"))?;
+        let body = self.post_search(&SearchRequest {
+            query,
+            limit: request_limit,
+            path_prefix: scope,
+            exts: ext_list,
+        })?;
         let mut hits = body.hits;
         for hit in &mut hits {
             hit.source = "remote".into();
@@ -284,4 +386,32 @@ pub fn hybrid_search(
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out.truncate(limit);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatSearchRequest;
+
+    #[test]
+    fn chat_search_request_sends_precision_units_and_dates() {
+        let prefixes = vec![r"C:\cases".to_string()];
+        let body = ChatSearchRequest {
+            query: "解雇 有効性",
+            limit: 4,
+            path_prefixes: &prefixes,
+            precision: true,
+            per_file_units: Some(3),
+            path_boost: true,
+            after: Some("2026-01-01"),
+            before: Some("2026-01-31"),
+            exts: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["precision"], true);
+        assert_eq!(v["perFileUnits"], 3);
+        assert_eq!(v["pathBoost"], true);
+        assert_eq!(v["after"], "2026-01-01");
+        assert_eq!(v["before"], "2026-01-31");
+        assert_eq!(v["pathPrefixes"][0], r"C:\cases");
+    }
 }

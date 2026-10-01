@@ -230,6 +230,10 @@ impl LlmSourceRow {
         self.kind.eq_ignore_ascii_case("web") || looks_like_http_url(&self.path)
     }
 
+    pub fn is_remote(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("remote")
+    }
+
     /// Ready to put into an LLM 出典 block (OCR finished, body present).
     pub fn is_injectable(&self) -> bool {
         let st = self.ocr_status.trim();
@@ -3342,6 +3346,7 @@ impl Db {
         let kind = match kind.trim().to_ascii_lowercase().as_str() {
             "image" => "image",
             "web" => "web",
+            "remote" => "remote",
             _ => "text",
         };
         let stored_relpath = stored_relpath.trim();
@@ -4844,6 +4849,32 @@ mod llm_source_pending_tests {
             updated.body, "短い",
             "pending は上書きされるので、スニペット保存は既存行を避ける"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_full_keeps_remote_kind() {
+        let (dir, db) = temp_db();
+        let thread = db.create_llm_thread("t", false).unwrap();
+        let (row, _) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "tool",
+                r"D:\share\a.txt",
+                "a",
+                r"D:\share\a.txt#1",
+                "本文",
+                "契約",
+                "unit",
+                "remote",
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        assert_eq!(row.kind, "remote");
+        assert!(row.is_remote());
+        assert!(!row.is_web());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

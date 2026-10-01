@@ -518,6 +518,24 @@ pub async fn search_query(
         let exts = search::normalize_exts(exts);
         let user_dict = state.user_dict.read().clone();
         let date = search::parse_date_range(date_after.as_deref(), date_before.as_deref())?;
+        if prefix.is_some_and(search::is_remote_only_scope) {
+            let rewritten = search::apply_user_dictionary(&query, &user_dict);
+            let remote = search::RemoteArgosBackend::from_settings(&settings)?;
+            let found = remote.search_chat(
+                &rewritten,
+                limit,
+                &[],
+                search::SearchOpts::default(),
+                date_after.as_deref(),
+                date_before.as_deref(),
+                exts.as_deref(),
+            )?;
+            if let Some(msg) = crate::llm::tools::remote_date_rejection(date.is_active(), found.date_applied)
+            {
+                return Err(msg.to_string());
+            }
+            return Ok(found.hits);
+        }
         let filter =
             search::build_search_filter(&state.db, date, None, prefix, exts.as_deref(), false)?;
         search::run_search_with_mail_options(

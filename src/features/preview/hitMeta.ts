@@ -64,7 +64,15 @@ export function formatMailDateYmd(unixStr?: string): string {
   return `${y}/${m}/${day}`;
 }
 
+/** Scope mark for "the other PC's shared files only". Not a folder path. */
+export const REMOTE_ONLY_SCOPE = "source:remote";
+
+export function isRemoteOnlyScope(path: string): boolean {
+  return path.trim() === REMOTE_ONLY_SCOPE;
+}
+
 export function scopeChipLabel(path: string, label?: string | null): string {
+  if (isRemoteOnlyScope(path)) return "リモート";
   if (label && label.trim()) return label.trim();
   if (path.startsWith("mailfolder:")) {
     return formatMailScopeLabel(path.slice("mailfolder:".length));

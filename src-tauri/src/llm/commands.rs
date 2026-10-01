@@ -580,6 +580,11 @@ pub async fn llm_send(
     if web_search {
         system.push_str(&tools::format_web_search_system_line());
     }
+    let remote_index =
+        tools::include_hybrid_remote_system_line(&settings.search_mode, &thread.path_prefix);
+    if remote_index {
+        system.push_str(&tools::format_remote_index_system_line());
+    }
     if let Some(line) = paste.system_line() {
         system.push_str(&line);
     }
@@ -611,7 +616,8 @@ pub async fn llm_send(
     }
     let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
 
-    let tools_schema = tools::tools_schema(web_search);
+    let remote_only_scope = tools::is_remote_only_thread(&thread.path_prefix);
+    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
     let mut use_tools = true;
     let mut retried_without_tools = false;
     let mut extra_final = false;
@@ -1237,6 +1243,9 @@ pub fn llm_set_source_grain(
     }
     if row.is_web() {
         return Err("ウェブ出典は段落／全文を切り替えられません。".into());
+    }
+    if row.is_remote() {
+        return Err("リモート出典は段落／全文を切り替えられません。".into());
     }
     if !row.is_pending() {
         return Err("読み込み済みの出典は段落／全文を切り替えられません。".into());

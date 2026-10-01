@@ -18,7 +18,9 @@ import {
   formatMailFolderMeta,
   formatMailScopeLabel,
   isOutlookHit,
+  isRemoteOnlyScope,
   parentDir,
+  REMOTE_ONLY_SCOPE,
   scopeChipLabel,
 } from "../preview/hitMeta";
 import { openPreview } from "../preview/openPreview";
@@ -440,6 +442,7 @@ export default function Popup() {
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [searchScopes, setSearchScopes] = useState<SearchScopeRow[]>([]);
   const [recentScopes, setRecentScopes] = useState<SearchScopeRow[]>([]);
+  const [remoteScopeAvailable, setRemoteScopeAvailable] = useState(false);
   const [scopeFilter, setScopeFilter] = useState("");
   const [scopePath, setScopePath] = useState<string | null>(null);
   const [scopeLabel, setScopeLabel] = useState<string | null>(null);
@@ -594,6 +597,7 @@ export default function Popup() {
           dateBefore: dateBeforeRef.current,
         });
         if (seq !== searchSeq.current) return;
+        setActionError("");
         setHits(next);
         setIndex(0);
         setExpandedParas({});
@@ -606,6 +610,17 @@ export default function Popup() {
         void invoke("record_search_query", { query: trimmed }).catch(console.error);
       } catch (e) {
         console.error(e);
+        if (seq !== searchSeq.current) return;
+        setHits([]);
+        const msg =
+          typeof e === "string"
+            ? e
+            : e instanceof Error
+              ? e.message
+              : e && typeof e === "object" && "message" in e
+                ? String((e as { message: unknown }).message)
+                : String(e);
+        setActionError(msg);
       } finally {
         if (seq === searchSeq.current) {
           setSearching(false);
@@ -668,7 +683,7 @@ export default function Popup() {
       setFolderPickerOpen(false);
       setScopeFilter("");
       if (debounceRef.current) clearTimeout(debounceRef.current);
-      if (path && path.trim()) {
+      if (path && path.trim() && !isRemoteOnlyScope(path)) {
         const chip = scopeChipLabel(path, label);
         void invoke("push_recent_search_scope", {
           path,
@@ -935,6 +950,16 @@ export default function Popup() {
 
   const openFolderPicker = useCallback(async () => {
     try {
+      try {
+        const s = await invoke<{ remoteUrl?: string; remoteToken?: string }>(
+          "get_settings",
+        );
+        setRemoteScopeAvailable(
+          !!(s.remoteUrl?.trim() && s.remoteToken?.trim()),
+        );
+      } catch {
+        setRemoteScopeAvailable(false);
+      }
       const trimmed = query.trim();
       const result = await invoke<SearchScopesResult>("list_search_scopes", {
         query: trimmed || null,
@@ -1040,9 +1065,10 @@ export default function Popup() {
   );
 
   const filteredRecentScopes = useMemo(() => {
+    const rows = recentScopes.filter((s) => !isRemoteOnlyScope(s.path));
     const q = scopeFilter.trim().toLowerCase();
-    if (!q) return recentScopes;
-    return recentScopes.filter(
+    if (!q) return rows;
+    return rows.filter(
       (s) =>
         s.label.toLowerCase().includes(q) || s.path.toLowerCase().includes(q),
     );
@@ -1805,16 +1831,23 @@ export default function Popup() {
                 onMouseDown={(e) => e.stopPropagation()}
                 onChange={(e) => setScopeFilter(e.target.value)}
               />
-              {filteredScopes.length === 0 && filteredRecentScopes.length === 0 ? (
-                <div className="popup-word-empty">
-                  {recentScopes.length === 0 && searchScopes.length === 0
-                    ? query.trim()
-                      ? "この検索語にヒットするフォルダがありません。"
-                      : "検索対象フォルダがありません。設定からフォルダを追加してください。"
-                    : "一致するフォルダがありません。"}
-                </div>
-              ) : (
+              {remoteScopeAvailable ||
+              filteredScopes.length > 0 ||
+              filteredRecentScopes.length > 0 ? (
                 <ul>
+                  {remoteScopeAvailable ? (
+                    <li>
+                      <button
+                        type="button"
+                        role="option"
+                        title="別PCの共有ファイルだけ。このPCのファイルとメールは含みません。"
+                        onClick={() => applyScope(REMOTE_ONLY_SCOPE, "リモート")}
+                      >
+                        <span className="scope-kind">リモート</span>
+                        <span className="scope-label">リモート</span>
+                      </button>
+                    </li>
+                  ) : null}
                   {filteredRecentScopes.map((s) => (
                     <li key={`recent:${s.path}`}>
                       <button
@@ -1849,7 +1882,16 @@ export default function Popup() {
                     </li>
                   ))}
                 </ul>
-              )}
+              ) : null}
+              {filteredScopes.length === 0 && filteredRecentScopes.length === 0 ? (
+                <div className="popup-word-empty">
+                  {recentScopes.length === 0 && searchScopes.length === 0
+                    ? query.trim()
+                      ? "この検索語にヒットするフォルダがありません。"
+                      : "検索対象フォルダがありません。設定からフォルダを追加してください。"
+                    : "一致するフォルダがありません。"}
+                </div>
+              ) : null}
             </div>
           ) : null}
           {extPickerOpen ? (
