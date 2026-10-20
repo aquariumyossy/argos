@@ -293,10 +293,25 @@ pub fn update_folder_public_path(
 }
 
 /// Rebind a registered folder to a new path and remap the index (no content re-extract).
+///
+/// Async so the webview thread does not block on the reindex gate. A manual full
+/// reindex can hold that gate for minutes; a sync command would freeze the window.
 #[tauri::command]
-pub fn update_folder_path(
+pub async fn update_folder_path(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
+    id: i64,
+    path: String,
+) -> Result<FolderRow, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || update_folder_path_blocking(app, &state, id, path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn update_folder_path_blocking(
+    app: AppHandle,
+    state: &AppState,
     id: i64,
     path: String,
 ) -> Result<FolderRow, String> {
