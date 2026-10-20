@@ -94,35 +94,21 @@ pub struct OpenIndexResult {
 ///
 /// The clause is boost 0 so it does not alter BM25. Matching is case-insensitive and
 /// accepts both separators, but `C:\cases\alpha` does not match `C:\cases\alpha2`.
+/// `\\?\` and `\\?\UNC\` prefixes are stripped the same way `path_starts_with` does,
+/// so an extended path still finds the simplified path stored in the index.
 fn path_prefix_query(field: Field, prefix: &str) -> Result<Box<dyn Query>, String> {
-    let base = scope_base(prefix);
+    let simplified = pathutil::simplify_windows_path(prefix);
+    let base = scope_base(&simplified);
     if base.is_empty() {
         return Err("empty scope".into());
     }
-    let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    // Exact path (a scope that names one file). Case follows the stored term.
-    let mut seen_terms = Vec::new();
-    for variant in [base.clone(), flip_path_seps(&base)] {
-        if seen_terms.iter().any(|s: &String| s == &variant) {
-            continue;
-        }
-        seen_terms.push(variant.clone());
-        let term = Term::from_field_text(field, &variant);
-        shoulds.push((
-            Occur::Should,
-            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-        ));
-    }
-    // Children. Tantivy rejects `^` / `$` (empty-match operators), so the separator
-    // itself is what keeps `...\alpha` from matching `...\alpha2`. ASCII letters are
-    // folded; `\` and `/` are interchangeable.
+    // One regex covers the folder itself and its children. Tantivy rejects `^` / `$`.
+    // The optional separator is what lets a case-changed file path match, while still
+    // refusing `...\alpha2` for a scope of `...\alpha` (the pattern must match the
+    // whole term, so leftover characters do not fit).
     let pattern = path_scope_regex(&base);
     let query = RegexQuery::from_pattern(&pattern, field).map_err(|e| format!("{pattern}: {e}"))?;
-    shoulds.push((Occur::Should, Box::new(query)));
-    Ok(Box::new(BoostQuery::new(
-        Box::new(BooleanQuery::new(shoulds)),
-        0.0,
-    )))
+    Ok(Box::new(BoostQuery::new(Box::new(query), 0.0)))
 }
 
 fn scope_base(prefix: &str) -> String {
@@ -132,14 +118,6 @@ fn scope_base(prefix: &str) -> String {
         trimmed.chars().take(1).collect()
     } else {
         stripped.to_string()
-    }
-}
-
-fn flip_path_seps(path: &str) -> String {
-    if path.contains('\\') {
-        path.replace('\\', "/")
-    } else {
-        path.replace('/', "\\")
     }
 }
 
@@ -163,7 +141,7 @@ fn path_scope_regex(prefix: &str) -> String {
             body.push(c);
         }
     }
-    format!(r"{body}[\\/].*")
+    format!(r"{body}([\\/].*)?")
 }
 
 pub struct TantivyBackend {
@@ -1696,7 +1674,9 @@ impl TantivyBackend {
             limit.max(50).min(80)
         } else if allow_or.is_some() {
             (limit * 2).max(40).min(400)
-        } else if scope.is_some() || ext_filter.is_some() || allow_set.is_some() || share.is_some() {
+        } else if ext_filter.is_some() || allow_set.is_some() || share.is_some() {
+            // Scope is already a retrieval clause, so it uses the same cap as an
+            // unscoped search. Extension, allowlist, and share can still drop hits after.
             (limit * 5).max(80).min(400)
         } else {
             (limit * 2).max(40).min(200)
@@ -3607,6 +3587,80 @@ mod tests {
                 scoped.iter().all(|h| h.path != sibling_path && !h.path.contains(r"\noise\")),
                 "scope {prefix} must not leak sibling or noise hits: {:?}",
                 scoped.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn case_and_extended_path_still_match_and_scores_stay_put() {
+        let idx = TestIndex::new("scope-norm");
+        let body = "契約について一度だけ触れる。損害賠償の記載はここだけにする。";
+        add_raw_docs(
+            &idx.backend,
+            &[
+                (r"C:\Cases\Alpha\File.txt".into(), body.into()),
+                (r"C:\Cases\Alpha2\Sibling.txt".into(), body.into()),
+                (r"\\server\share\Cases\Public.txt".into(), body.into()),
+                (r"\\server\share\Cases2\Other.txt".into(), body.into()),
+            ],
+        );
+
+        let case_hits = idx
+            .backend
+            .matches_for_path("損害賠償", r"c:\cases\alpha\file.txt", 5, false)
+            .unwrap();
+        assert_eq!(
+            case_hits.len(),
+            1,
+            "case-only path fallback: {:?}",
+            case_hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert_eq!(case_hits[0].path, r"C:\Cases\Alpha\File.txt");
+
+        let extended = idx
+            .backend
+            .matches_for_path("損害賠償", r"\\?\C:\Cases\Alpha\File.txt", 5, false)
+            .unwrap();
+        assert_eq!(extended.len(), 1, "{:?}", extended.iter().map(|h| &h.path).collect::<Vec<_>>());
+        assert_eq!(extended[0].path, r"C:\Cases\Alpha\File.txt");
+
+        for prefix in [
+            r"\\server\share\Cases",
+            r"\\?\UNC\server\share\Cases",
+            r"//server/share/cases",
+        ] {
+            let hits = idx
+                .backend
+                .search("損害賠償", 10, Some(prefix), None, false)
+                .unwrap();
+            assert!(
+                hits.iter().any(|h| h.path.ends_with(r"Public.txt")),
+                "scope {prefix}: {:?}",
+                hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+            assert!(
+                hits.iter().all(|h| !h.path.contains("Cases2") && !h.path.contains("Alpha2")),
+                "scope {prefix} leaked a sibling: {:?}",
+                hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+        }
+
+        let scored = TestIndex::new("score-same");
+        scored.add("one", "契約について詳しく述べた文書。本文を足して長さを確保する。");
+        scored.add("two", "契約に一度だけ触れる短いメモ。別の話題が中心で長さを足す。");
+        let unscoped = scored.backend.search("契約", 10, None, None, false).unwrap();
+        let parent = scored.dir.to_str().unwrap();
+        let scoped = scored
+            .backend
+            .search("契約", 10, Some(parent), None, false)
+            .unwrap();
+        assert_eq!(unscoped.len(), scoped.len());
+        for hit in &unscoped {
+            let same = scoped.iter().find(|h| h.path == hit.path).expect("same path");
+            assert_eq!(
+                same.score, hit.score,
+                "folder scope must not change the score of {}",
+                hit.path
             );
         }
     }

@@ -137,9 +137,11 @@ pub(crate) fn events_from_notify(kind: &EventKind, paths: &[PathBuf]) -> Vec<FsE
                 }
                 out
             }
-            // Unpaired rename: the indexer checks whether the path is still on disk.
-            RenameMode::Both | RenameMode::Any => map_paths(paths, FsEvent::Appeared),
-            _ => map_paths(paths, FsEvent::Appeared),
+            // Unpaired rename, or a mode we cannot tell apart: the indexer checks
+            // whether the path is still on disk.
+            RenameMode::Both | RenameMode::Any | RenameMode::Other => {
+                map_paths(paths, FsEvent::Appeared)
+            }
         },
         EventKind::Modify(_) | EventKind::Any => map_paths(paths, FsEvent::Changed),
         EventKind::Access(_) | EventKind::Other => Vec::new(),
