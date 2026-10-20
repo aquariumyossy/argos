@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter};
 
-use crate::indexer::{IndexAction, Indexer};
+use crate::indexer::{FsEvent, Indexer};
 use crate::pathutil;
 
 enum WatcherCmd {
@@ -72,8 +73,8 @@ pub fn start_watcher(
             }
         }
 
-        // Debounce buffer
-        let mut pending: Vec<(PathBuf, bool)> = Vec::new(); // path, removed
+        // Debounce buffer. Rename/move is a remove of the old path plus an appear of the new one.
+        let mut pending: Vec<FsEvent> = Vec::new();
         loop {
             // Apply watch/unwatch commands without waiting for FS events
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -87,13 +88,7 @@ pub fn start_watcher(
 
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Ok(event)) => {
-                    let removed = matches!(
-                        event.kind,
-                        EventKind::Remove(_) | EventKind::Any
-                    );
-                    for path in event.paths {
-                        pending.push((path, removed));
-                    }
+                    pending.extend(events_from_notify(&event.kind, &event.paths));
                 }
                 Ok(Err(e)) => eprintln!("watch error: {e}"),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -102,32 +97,11 @@ pub fn start_watcher(
                     }
                     let batch = std::mem::take(&mut pending);
                     let mut folders_updated = false;
-                    for (path, removed) in batch {
-                        if removed {
-                            if indexer.remove_path(&path).is_ok() {
-                                folders_updated = true;
-                            }
-                            continue;
-                        }
-                        if !path.is_file() {
-                            continue;
-                        }
-                        let event_norm =
-                            pathutil::normalize_for_compare(&path.to_string_lossy());
-                        // Find owning folder prefix (normalized)
-                        let folder = normalized_folders
-                            .iter()
-                            .zip(folders.iter())
-                            .find(|(norm, _)| pathutil::path_starts_with(&event_norm, norm))
-                            .map(|(_, original)| original.clone())
-                            .unwrap_or_default();
-                        if folder.is_empty() {
-                            continue;
-                        }
-                        match indexer.index_path(&folder, &path) {
-                            Ok(IndexAction::Indexed) => folders_updated = true,
-                            Ok(IndexAction::Skipped) => {}
-                            Err(e) => eprintln!("index error {}: {e}", path.display()),
+                    for event in batch {
+                        match indexer.handle_fs_event(event) {
+                            Ok(true) => folders_updated = true,
+                            Ok(false) => {}
+                            Err(e) => eprintln!("index error: {e}"),
                         }
                     }
                     if folders_updated {
@@ -139,6 +113,41 @@ pub fn start_watcher(
         }
     });
     Ok(handle)
+}
+
+/// Map a notify event onto index updates.
+///
+/// Deletes and the old side of a rename drop the path (and, later, everything under it).
+/// Creates and the new side of a rename index a file or crawl a moved folder. A plain
+/// content change does not crawl directories — child files arrive as their own events.
+pub(crate) fn events_from_notify(kind: &EventKind, paths: &[PathBuf]) -> Vec<FsEvent> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    match kind {
+        EventKind::Remove(_) => map_paths(paths, FsEvent::Removed),
+        EventKind::Create(_) => map_paths(paths, FsEvent::Appeared),
+        EventKind::Modify(ModifyKind::Name(mode)) => match mode {
+            RenameMode::From => map_paths(paths, FsEvent::Removed),
+            RenameMode::To => map_paths(paths, FsEvent::Appeared),
+            RenameMode::Both if paths.len() >= 2 => {
+                let mut out = vec![FsEvent::Removed(paths[0].clone())];
+                for to in paths.iter().skip(1) {
+                    out.push(FsEvent::Appeared(to.clone()));
+                }
+                out
+            }
+            // Unpaired rename: the indexer checks whether the path is still on disk.
+            RenameMode::Both | RenameMode::Any => map_paths(paths, FsEvent::Appeared),
+            _ => map_paths(paths, FsEvent::Appeared),
+        },
+        EventKind::Modify(_) | EventKind::Any => map_paths(paths, FsEvent::Changed),
+        EventKind::Access(_) | EventKind::Other => Vec::new(),
+    }
+}
+
+fn map_paths(paths: &[PathBuf], kind: fn(PathBuf) -> FsEvent) -> Vec<FsEvent> {
+    paths.iter().cloned().map(kind).collect()
 }
 
 fn apply_cmd(
@@ -176,5 +185,72 @@ fn apply_cmd(
             folders.remove(idx);
             normalized_folders.remove(idx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
+    use notify::EventKind;
+
+    use super::events_from_notify;
+    use crate::indexer::FsEvent;
+
+    #[test]
+    fn rename_both_drops_old_path_and_adds_new_path() {
+        let events = events_from_notify(
+            &EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[PathBuf::from(r"C:\docs\old.txt"), PathBuf::from(r"C:\docs\new.txt")],
+        );
+        assert_eq!(
+            events,
+            vec![
+                FsEvent::Removed(PathBuf::from(r"C:\docs\old.txt")),
+                FsEvent::Appeared(PathBuf::from(r"C:\docs\new.txt")),
+            ]
+        );
+    }
+
+    #[test]
+    fn rename_from_and_to_are_not_treated_as_edits() {
+        let from = events_from_notify(
+            &EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            &[PathBuf::from(r"C:\docs\sub")],
+        );
+        let to = events_from_notify(
+            &EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            &[PathBuf::from(r"C:\docs\sub2")],
+        );
+        assert_eq!(from, vec![FsEvent::Removed(PathBuf::from(r"C:\docs\sub"))]);
+        assert_eq!(to, vec![FsEvent::Appeared(PathBuf::from(r"C:\docs\sub2"))]);
+    }
+
+    #[test]
+    fn remove_is_a_deletion_and_create_is_an_appear() {
+        assert_eq!(
+            events_from_notify(
+                &EventKind::Remove(RemoveKind::File),
+                &[PathBuf::from("a.txt")]
+            ),
+            vec![FsEvent::Removed(PathBuf::from("a.txt"))]
+        );
+        assert_eq!(
+            events_from_notify(
+                &EventKind::Create(CreateKind::Folder),
+                &[PathBuf::from("dir")]
+            ),
+            vec![FsEvent::Appeared(PathBuf::from("dir"))]
+        );
+    }
+
+    #[test]
+    fn content_change_does_not_crawl_as_a_new_folder() {
+        let events = events_from_notify(
+            &EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            &[PathBuf::from("note.txt")],
+        );
+        assert_eq!(events, vec![FsEvent::Changed(PathBuf::from("note.txt"))]);
     }
 }

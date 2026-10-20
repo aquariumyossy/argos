@@ -4,12 +4,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use parking_lot::Mutex;
 use walkdir::WalkDir;
 
 use crate::db::{Db, FolderRow};
 use crate::extractor::{self, content_hash};
 use crate::pathutil;
 use crate::search::tantivy_backend::TantivyBackend;
+
+/// A filesystem change observed by the watcher, or replayed after a reindex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsEvent {
+    /// Path is gone (delete, or the old side of a rename/move). Drops the path and its children.
+    Removed(PathBuf),
+    /// Content or metadata changed. Directories are ignored; missing paths are removals.
+    Changed(PathBuf),
+    /// Path was created or is the new side of a rename/move. Directories are crawled.
+    Appeared(PathBuf),
+}
 
 /// Minimum interval between intermediate `indexing` progress emits (~10 Hz).
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
@@ -19,6 +31,8 @@ pub struct Indexer {
     backend: Arc<TantivyBackend>,
     /// Blocks watcher updates while a full/folder rebuild holds the index.
     reindex_busy: AtomicBool,
+    /// Events that arrived while `reindex_busy` was set. Applied in `end_reindex`.
+    pending_fs: Mutex<Vec<FsEvent>>,
 }
 
 impl Indexer {
@@ -27,10 +41,12 @@ impl Indexer {
             db,
             backend,
             reindex_busy: AtomicBool::new(false),
+            pending_fs: Mutex::new(Vec::new()),
         }
     }
 
     fn begin_reindex(&self) -> Result<(), String> {
+        let _guard = self.pending_fs.lock();
         if self
             .reindex_busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -42,7 +58,39 @@ impl Indexer {
     }
 
     fn end_reindex(&self) {
-        self.reindex_busy.store(false, Ordering::SeqCst);
+        loop {
+            let batch = {
+                let mut pending = self.pending_fs.lock();
+                std::mem::take(&mut *pending)
+            };
+            if batch.is_empty() {
+                let pending = self.pending_fs.lock();
+                if pending.is_empty() {
+                    self.reindex_busy.store(false, Ordering::SeqCst);
+                    if pending.is_empty() {
+                        return;
+                    }
+                    self.reindex_busy.store(true, Ordering::SeqCst);
+                }
+                continue;
+            }
+            for event in batch {
+                if let Err(e) = self.apply_fs_event_now(event) {
+                    eprintln!("argos: deferred fs event failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Queue `event` when a reindex owns the index. The caller must not apply it.
+    fn defer_if_busy(&self, event: FsEvent) -> bool {
+        let mut pending = self.pending_fs.lock();
+        if self.reindex_busy.load(Ordering::SeqCst) {
+            pending.push(event);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn reindex_all<F>(&self, mut on_progress: F) -> Result<IndexStats, String>
@@ -92,6 +140,24 @@ impl Indexer {
 
             let excludes = self.load_excludes()?;
             Ok(self.crawl_folder(&folder, &excludes, true, &mut on_progress))
+        })();
+        self.end_reindex();
+        result
+    }
+
+    /// Pick up creates, edits, deletes, and moves made while the watcher was not running.
+    /// Same incremental crawl as a per-folder reindex: unchanged files are skipped, paths
+    /// that are no longer on disk are dropped. Does not emit UI progress.
+    pub fn sync_enabled_folders(&self) -> Result<IndexStats, String> {
+        self.begin_reindex()?;
+        let result = (|| {
+            let folders = self.db.list_folders().map_err(|e| e.to_string())?;
+            let excludes = self.load_excludes()?;
+            let mut stats = IndexStats::default();
+            for folder in folders.into_iter().filter(|f| f.enabled) {
+                stats.merge(self.crawl_folder(&folder, &excludes, true, &mut |_| {}));
+            }
+            Ok(stats)
         })();
         self.end_reindex();
         result
@@ -188,9 +254,12 @@ impl Indexer {
         }
 
         if purge_orphans {
-            if let Err(e) = self.purge_folder_orphans(folder.id, &seen) {
-                eprintln!("argos: purge orphans for folder {}: {e}", folder.id);
-                stats.errors += 1;
+            match self.purge_folder_orphans(folder.id, &seen) {
+                Ok(n) => stats.removed += n,
+                Err(e) => {
+                    eprintln!("argos: purge orphans for folder {}: {e}", folder.id);
+                    stats.errors += 1;
+                }
             }
         }
 
@@ -202,7 +271,7 @@ impl Indexer {
         &self,
         folder_id: i64,
         seen: &std::collections::HashSet<String>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let existing = self
             .db
             .list_file_paths_by_folder(folder_id)
@@ -211,57 +280,194 @@ impl Indexer {
             .into_iter()
             .filter(|p| !seen.contains(p))
             .collect();
-        if orphans.is_empty() {
-            return Ok(());
-        }
-        self.backend.delete_paths(&orphans)?;
-        for path in &orphans {
-            self.db
-                .mark_file_deleted(path)
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        let n = orphans.len() as u32;
+        self.delete_indexed_paths(&orphans)?;
+        Ok(n)
     }
 
-    pub fn index_path(&self, folder: &str, path: &Path) -> Result<IndexAction, String> {
-        if self.reindex_busy.load(Ordering::SeqCst) {
-            return Ok(IndexAction::Skipped);
-        }
-        if !path.is_file() || !extractor::is_supported(path) {
-            return Ok(IndexAction::Skipped);
-        }
-        let excludes = self.load_excludes()?;
-        if is_excluded(path, &excludes) {
-            return Ok(IndexAction::Skipped);
-        }
-        let public_path = self
-            .db
-            .get_folder_by_path(folder)
-            .map_err(|e| e.to_string())?
-            .map(|f| f.public_path)
-            .unwrap_or_default();
-        self.index_one(folder, &public_path, path)
+    pub fn index_path(&self, _folder: &str, path: &Path) -> Result<IndexAction, String> {
+        let changed = self.handle_fs_event(FsEvent::Changed(path.to_path_buf()))?;
+        Ok(if changed {
+            IndexAction::Indexed
+        } else {
+            IndexAction::Skipped
+        })
     }
 
     pub fn remove_path(&self, path: &Path) -> Result<(), String> {
-        if self.reindex_busy.load(Ordering::SeqCst) {
-            return Ok(());
+        self.handle_fs_event(FsEvent::Removed(path.to_path_buf()))
+            .map(|_| ())
+    }
+
+    /// Apply one watcher event. Events that arrive during a reindex are queued, not dropped.
+    pub fn handle_fs_event(&self, event: FsEvent) -> Result<bool, String> {
+        if self.defer_if_busy(event.clone()) {
+            return Ok(false);
         }
-        let fs_str = pathutil::simplify_windows_path(&path.to_string_lossy());
-        // Delete both filesystem form and any public-path rewritten form.
-        let mut candidates = vec![fs_str.clone()];
-        if let Ok(folders) = self.db.list_folders() {
-            for folder in folders {
-                let indexed = pathutil::to_indexed_path(&fs_str, &folder.path, &folder.public_path);
-                if indexed != fs_str {
-                    candidates.push(indexed);
+        self.apply_fs_event_now(event)
+    }
+
+    fn apply_fs_event_now(&self, event: FsEvent) -> Result<bool, String> {
+        match event {
+            FsEvent::Removed(path) => self.remove_tree_now(&path),
+            FsEvent::Changed(path) => self.apply_changed(&path),
+            FsEvent::Appeared(path) => self.apply_appeared(&path),
+        }
+    }
+
+    fn apply_changed(&self, path: &Path) -> Result<bool, String> {
+        if !path.exists() {
+            return self.remove_tree_now(path);
+        }
+        if !path.is_file() {
+            return Ok(false);
+        }
+        self.index_if_in_folder(path)
+    }
+
+    fn apply_appeared(&self, path: &Path) -> Result<bool, String> {
+        if !path.exists() {
+            return self.remove_tree_now(path);
+        }
+        if path.is_dir() {
+            let Some(folder) = self.folder_for_path(path)? else {
+                return Ok(false);
+            };
+            return self.index_tree(&folder, path);
+        }
+        self.index_if_in_folder(path)
+    }
+
+    fn index_if_in_folder(&self, path: &Path) -> Result<bool, String> {
+        if !path.is_file() || !extractor::is_supported(path) {
+            return Ok(false);
+        }
+        let excludes = self.load_excludes()?;
+        if is_excluded(path, &excludes) {
+            return Ok(false);
+        }
+        let Some(folder) = self.folder_for_path(path)? else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.index_one(&folder.path, &folder.public_path, path)?,
+            IndexAction::Indexed
+        ))
+    }
+
+    /// Index every supported file under `dir`, then drop indexed descendants that are gone.
+    fn index_tree(&self, folder: &FolderRow, dir: &Path) -> Result<bool, String> {
+        let excludes = self.load_excludes()?;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut changed = false;
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !is_indexable(path, &excludes) {
+                continue;
+            }
+            let store_path =
+                pathutil::to_indexed_path(&path.to_string_lossy(), &folder.path, &folder.public_path);
+            seen.insert(store_path);
+            match self.index_one(&folder.path, &folder.public_path, path)? {
+                IndexAction::Indexed => changed = true,
+                IndexAction::Skipped => {}
+            }
+        }
+        let removed = self.purge_under_prefix(folder, dir, &seen)?;
+        Ok(changed || removed > 0)
+    }
+
+    fn purge_under_prefix(
+        &self,
+        folder: &FolderRow,
+        dir: &Path,
+        seen: &std::collections::HashSet<String>,
+    ) -> Result<u32, String> {
+        let raw = dir.to_string_lossy();
+        let fs_str = pathutil::simplify_windows_path(&raw);
+        let indexed_prefix =
+            pathutil::to_indexed_path(&raw, &folder.path, &folder.public_path);
+        let existing = self
+            .db
+            .list_file_paths_by_folder(folder.id)
+            .map_err(|e| e.to_string())?;
+        let orphans: Vec<String> = existing
+            .into_iter()
+            .filter(|stored| {
+                !seen.contains(stored)
+                    && (pathutil::path_starts_with(stored, &indexed_prefix)
+                        || pathutil::path_starts_with(stored, &fs_str))
+            })
+            .collect();
+        let n = orphans.len() as u32;
+        self.delete_indexed_paths(&orphans)?;
+        Ok(n)
+    }
+
+    fn folder_for_path(&self, path: &Path) -> Result<Option<FolderRow>, String> {
+        let raw = path.to_string_lossy();
+        let mut best: Option<FolderRow> = None;
+        let mut best_len = 0usize;
+        for folder in self.db.list_folders().map_err(|e| e.to_string())? {
+            if !folder.enabled {
+                continue;
+            }
+            if !pathutil::path_starts_with(&raw, &folder.path) {
+                continue;
+            }
+            let len = pathutil::simplify_windows_path(&folder.path).len();
+            if best.is_none() || len >= best_len {
+                best_len = len;
+                best = Some(folder);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Delete `path` and every indexed file under it (a renamed/removed folder).
+    fn remove_tree_now(&self, path: &Path) -> Result<bool, String> {
+        let raw = path.to_string_lossy();
+        let fs_str = pathutil::simplify_windows_path(&raw);
+        let folders = self.db.list_folders().map_err(|e| e.to_string())?;
+        let mut doomed = Vec::new();
+        push_unique_path(&mut doomed, fs_str.clone());
+        let mut from_db = false;
+        for folder in &folders {
+            let indexed = pathutil::to_indexed_path(&raw, &folder.path, &folder.public_path);
+            push_unique_path(&mut doomed, indexed.clone());
+            if !(pathutil::path_starts_with(&raw, &folder.path)
+                || pathutil::path_starts_with(&fs_str, &folder.path))
+            {
+                continue;
+            }
+            let existing = self
+                .db
+                .list_file_paths_by_folder(folder.id)
+                .map_err(|e| e.to_string())?;
+            for stored in existing {
+                if pathutil::path_starts_with(&stored, &indexed)
+                    || pathutil::path_starts_with(&stored, &fs_str)
+                {
+                    from_db = true;
+                    push_unique_path(&mut doomed, stored);
                 }
             }
         }
-        for path_str in candidates {
-            self.backend.delete_by_path(&path_str)?;
+        if doomed.is_empty() {
+            return Ok(false);
+        }
+        self.delete_indexed_paths(&doomed)?;
+        Ok(from_db)
+    }
+
+    fn delete_indexed_paths(&self, paths: &[String]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.backend.delete_paths(paths)?;
+        for path in paths {
             self.db
-                .mark_file_deleted(&path_str)
+                .mark_file_deleted(path)
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -417,6 +623,14 @@ fn is_excluded(path: &Path, excludes: &[String]) -> bool {
     })
 }
 
+fn push_unique_path(paths: &mut Vec<String>, path: String) -> bool {
+    if path.is_empty() || paths.iter().any(|existing| existing.eq_ignore_ascii_case(&path)) {
+        return false;
+    }
+    paths.push(path);
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IndexPhase {
@@ -433,12 +647,15 @@ pub struct IndexProgress {
     pub phase: IndexPhase,
 }
 
-#[derive(Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStats {
     pub indexed: u32,
     pub skipped: u32,
     pub errors: u32,
+    /// Paths dropped because they were not on disk at the end of a crawl.
+    #[serde(default)]
+    pub removed: u32,
 }
 
 impl IndexStats {
@@ -446,10 +663,236 @@ impl IndexStats {
         self.indexed += other.indexed;
         self.skipped += other.skipped;
         self.errors += other.errors;
+        self.removed += other.removed;
     }
 }
 
 pub enum IndexAction {
     Indexed,
     Skipped,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::db::Db;
+    use crate::search::tantivy_backend::TantivyBackend;
+    use crate::search::SearchBackend;
+
+    struct Env {
+        indexer: Option<Arc<Indexer>>,
+        backend: Option<Arc<TantivyBackend>>,
+        db: Option<Arc<Db>>,
+        root: PathBuf,
+        files: PathBuf,
+    }
+
+    impl Env {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("argos-index-{tag}-{nanos}"));
+            let files = root.join("files");
+            fs::create_dir_all(&files).unwrap();
+            let db = Arc::new(Db::open(&root.join("argos.db")).unwrap());
+            db.add_folder(files.to_str().unwrap(), "").unwrap();
+            let backend = Arc::new(
+                TantivyBackend::open(&root.join("index"))
+                    .unwrap()
+                    .backend,
+            );
+            let indexer = Arc::new(Indexer::new(db.clone(), backend.clone()));
+            Self {
+                indexer: Some(indexer),
+                backend: Some(backend),
+                db: Some(db),
+                root,
+                files,
+            }
+        }
+
+        fn indexer(&self) -> &Indexer {
+            self.indexer.as_ref().unwrap()
+        }
+
+        fn backend(&self) -> &TantivyBackend {
+            self.backend.as_ref().unwrap()
+        }
+
+        fn write(&self, rel: &str, body: &str) -> PathBuf {
+            let path = self.files.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, body).unwrap();
+            path
+        }
+
+        fn stored(&self, rel: &str) -> String {
+            pathutil::to_indexed_path(
+                &self.files.join(rel).to_string_lossy(),
+                &self.files.to_string_lossy(),
+                "",
+            )
+        }
+
+        fn index_all(&self) {
+            let id = self.db.as_ref().unwrap().list_folders().unwrap()[0].id;
+            self.indexer().reindex_folder(id, |_| {}).unwrap();
+        }
+
+        fn paths_for(&self, query: &str) -> Vec<String> {
+            self.backend()
+                .search(query, 20, None, None, false)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.path)
+                .collect()
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            self.indexer.take();
+            self.backend.take();
+            self.db.take();
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn move_and_rename_drop_old_paths_and_index_new_ones() {
+        let env = Env::new("move");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.write("old.txt", "損害賠償の対象となる記述。契約にも触れる。");
+        env.write("sub/inner.txt", "契約の下位フォルダにある文書。本文を足す。");
+        env.write("sibling/other.txt", "契約の兄弟フォルダ。これは動かす対象ではない。");
+        env.index_all();
+
+        let old = env.files.join("old.txt");
+        let renamed = env.files.join("renamed.txt");
+        fs::rename(&old, &renamed).unwrap();
+        let sub = env.files.join("sub");
+        let moved = env.files.join("moved");
+        fs::rename(&sub, &moved).unwrap();
+
+        env.indexer()
+            .handle_fs_event(FsEvent::Removed(old))
+            .unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Appeared(renamed))
+            .unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Removed(sub))
+            .unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Appeared(moved))
+            .unwrap();
+
+        assert!(!env.backend().has_path(&env.stored("old.txt")).unwrap());
+        assert!(!env.backend().has_path(&env.stored("sub/inner.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("renamed.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("moved/inner.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("sibling/other.txt")).unwrap());
+
+        let hits = env.paths_for("損害賠償");
+        assert!(
+            hits.iter().any(|p| p == &env.stored("renamed.txt")),
+            "{hits:?}"
+        );
+        assert!(hits.iter().all(|p| p != &env.stored("old.txt")), "{hits:?}");
+
+        let all = env.paths_for("契約");
+        assert!(all.iter().any(|p| p == &env.stored("moved/inner.txt")), "{all:?}");
+        assert!(all.iter().all(|p| p != &env.stored("sub/inner.txt")), "{all:?}");
+        assert!(all.iter().any(|p| p == &env.stored("sibling/other.txt")), "{all:?}");
+        assert!(all.iter().any(|p| p == &env.stored("keep.txt")), "{all:?}");
+    }
+
+    #[test]
+    fn startup_sync_picks_up_changes_made_while_closed() {
+        let env = Env::new("startup");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.write("gone.txt", "慰謝料の請求について記載したメモ。本文を足す。");
+        env.write("move.txt", "損害賠償の対象となる記述。契約にも触れる。");
+        env.write("sub/inner.txt", "契約の下位フォルダにある文書。本文を足す。");
+        env.index_all();
+
+        fs::remove_file(env.files.join("gone.txt")).unwrap();
+        fs::rename(env.files.join("move.txt"), env.files.join("moved.txt")).unwrap();
+        fs::rename(env.files.join("sub"), env.files.join("sub2")).unwrap();
+        fs::write(
+            env.files.join("sub2/inner.txt"),
+            "契約の下位フォルダにある文書。更新済の本文をここに書く。",
+        )
+        .unwrap();
+        env.write("fresh.txt", "契約の新規ファイル。閉じていた間に追加した。");
+
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        assert!(stats.removed >= 1, "{stats:?}");
+        assert!(stats.indexed >= 1, "{stats:?}");
+
+        assert!(!env.backend().has_path(&env.stored("gone.txt")).unwrap());
+        assert!(!env.backend().has_path(&env.stored("move.txt")).unwrap());
+        assert!(!env.backend().has_path(&env.stored("sub/inner.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("moved.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("sub2/inner.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("fresh.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+
+        let damages = env.paths_for("損害賠償");
+        assert!(
+            damages.iter().any(|p| p == &env.stored("moved.txt")),
+            "{damages:?}"
+        );
+        assert!(damages.iter().all(|p| p != &env.stored("move.txt")));
+
+        let condolence = env.paths_for("慰謝料");
+        assert!(condolence.is_empty(), "{condolence:?}");
+
+        let updated = env.paths_for("更新済");
+        assert!(
+            updated.iter().any(|p| p == &env.stored("sub2/inner.txt")),
+            "{updated:?}"
+        );
+    }
+
+    #[test]
+    fn events_during_reindex_are_applied_afterwards() {
+        let env = Env::new("defer");
+        env.write("a.txt", "契約についての最初の文書。本文を足して長さを確保する。");
+        env.index_all();
+        assert!(env.backend().has_path(&env.stored("a.txt")).unwrap());
+
+        env.indexer().begin_reindex().unwrap();
+        let a = env.files.join("a.txt");
+        let b = env.write("b.txt", "損害賠償について後から追加した文書。契約にも触れる。");
+        fs::remove_file(&a).unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Removed(a))
+            .unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Appeared(b))
+            .unwrap();
+
+        assert!(
+            env.backend().has_path(&env.stored("a.txt")).unwrap(),
+            "queued remove must wait until the reindex finishes"
+        );
+        assert!(
+            !env.backend().has_path(&env.stored("b.txt")).unwrap(),
+            "queued add must wait until the reindex finishes"
+        );
+
+        env.indexer().end_reindex();
+        assert!(!env.backend().has_path(&env.stored("a.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("b.txt")).unwrap());
+        let hits = env.paths_for("損害賠償");
+        assert!(hits.iter().any(|p| p == &env.stored("b.txt")), "{hits:?}");
+    }
 }

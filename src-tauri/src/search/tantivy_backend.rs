@@ -8,7 +8,7 @@ use lindera::segmenter::Segmenter;
 use lindera_tantivy::tokenizer::LinderaTokenizer;
 use parking_lot::Mutex;
 use tantivy::collector::{DocSetCollector, TopDocs};
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, RegexQuery, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
 };
@@ -88,6 +88,82 @@ pub struct OpenIndexResult {
     pub backend: TantivyBackend,
     /// True when an older index was wiped; caller should run full reindex.
     pub needs_full_reindex: bool,
+}
+
+/// Restrict a STRING `path` field to `prefix` without a schema change.
+///
+/// The clause is boost 0 so it does not alter BM25. Matching is case-insensitive and
+/// accepts both separators, but `C:\cases\alpha` does not match `C:\cases\alpha2`.
+fn path_prefix_query(field: Field, prefix: &str) -> Result<Box<dyn Query>, String> {
+    let base = scope_base(prefix);
+    if base.is_empty() {
+        return Err("empty scope".into());
+    }
+    let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    // Exact path (a scope that names one file). Case follows the stored term.
+    let mut seen_terms = Vec::new();
+    for variant in [base.clone(), flip_path_seps(&base)] {
+        if seen_terms.iter().any(|s: &String| s == &variant) {
+            continue;
+        }
+        seen_terms.push(variant.clone());
+        let term = Term::from_field_text(field, &variant);
+        shoulds.push((
+            Occur::Should,
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+        ));
+    }
+    // Children. Tantivy rejects `^` / `$` (empty-match operators), so the separator
+    // itself is what keeps `...\alpha` from matching `...\alpha2`. ASCII letters are
+    // folded; `\` and `/` are interchangeable.
+    let pattern = path_scope_regex(&base);
+    let query = RegexQuery::from_pattern(&pattern, field).map_err(|e| format!("{pattern}: {e}"))?;
+    shoulds.push((Occur::Should, Box::new(query)));
+    Ok(Box::new(BoostQuery::new(
+        Box::new(BooleanQuery::new(shoulds)),
+        0.0,
+    )))
+}
+
+fn scope_base(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    let stripped = trimmed.trim_end_matches(['\\', '/']);
+    if stripped.is_empty() {
+        trimmed.chars().take(1).collect()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn flip_path_seps(path: &str) -> String {
+    if path.contains('\\') {
+        path.replace('\\', "/")
+    } else {
+        path.replace('/', "\\")
+    }
+}
+
+fn path_scope_regex(prefix: &str) -> String {
+    let mut body = String::new();
+    for c in prefix.chars() {
+        if c.is_ascii_alphabetic() {
+            body.push('[');
+            body.push(c.to_ascii_lowercase());
+            body.push(c.to_ascii_uppercase());
+            body.push(']');
+        } else if c == '\\' || c == '/' {
+            body.push_str(r"[\\/]");
+        } else if matches!(
+            c,
+            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            body.push('\\');
+            body.push(c);
+        } else {
+            body.push(c);
+        }
+    }
+    format!(r"{body}[\\/].*")
 }
 
 pub struct TantivyBackend {
@@ -1592,6 +1668,18 @@ impl TantivyBackend {
                         })
                         .collect();
                     clauses.push((Occur::Must, Box::new(BooleanQuery::new(shoulds))));
+                }
+            }
+            if let Some(ref prefix) = scope {
+                if !prefix.starts_with("mailfolder:") {
+                    // Zero boost: the clause only restricts which docs are scored.
+                    // BM25 (and the rescore that multiplies it) stays the same.
+                    match path_prefix_query(self.fields.path, prefix) {
+                        Ok(q) => clauses.push((Occur::Must, q)),
+                        Err(e) => {
+                            eprintln!("argos: path scope query skipped ({prefix}): {e}");
+                        }
+                    }
                 }
             }
             if clauses.len() == 1 {
@@ -3462,5 +3550,91 @@ mod tests {
         insert_allow_path(&mut set, r"C:\Docs\A.txt");
         assert!(path_in_allowlist(r"C:\Docs\A.txt", &set));
         assert!(path_in_allowlist(r"c:\docs\a.txt", &set));
+    }
+
+    /// Folder scope used to take the global top ~200–400 hits and then filter.
+    /// A matching file inside the folder, but outside that window, never appeared.
+    #[test]
+    fn scoped_search_finds_doc_outside_global_top_n() {
+        let idx = TestIndex::new("scope-recall");
+        let hot = format!(
+            "{} これは高頻度で契約という語が並ぶ文書です。",
+            "契約 ".repeat(40)
+        );
+        let target_path = r"C:\cases\alpha\nested\target.txt";
+        let sibling_path = r"C:\cases\alpha2\sibling.txt";
+        let target_body = "契約について一度だけ触れる。損害賠償の記載はここだけにする。";
+
+        let mut docs = Vec::with_capacity(422);
+        for i in 0..420 {
+            docs.push((format!(r"C:\noise\n{i}.txt"), hot.clone()));
+        }
+        docs.push((sibling_path.to_string(), hot));
+        docs.push((target_path.to_string(), target_body.to_string()));
+        add_raw_docs(&idx.backend, &docs);
+
+        let global = idx
+            .backend
+            .search("契約", 10, None, None, false)
+            .expect("global");
+        assert!(
+            global.iter().all(|h| h.path != target_path),
+            "the low-scoring folder doc must sit outside the global top hits: {:?}",
+            global.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+
+        let proved = idx
+            .backend
+            .search("損害賠償", 10, None, None, false)
+            .expect("proof");
+        assert!(
+            proved.iter().any(|h| h.path == target_path),
+            "the folder doc must be indexed: {:?}",
+            proved.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+
+        for prefix in [r"C:\cases\alpha", r"c:\CASES\alpha", r"C:/cases/alpha"] {
+            let scoped = idx
+                .backend
+                .search("契約", 10, Some(prefix), None, false)
+                .expect("scoped");
+            assert!(
+                scoped.iter().any(|h| h.path == target_path),
+                "scope {prefix} must return the in-folder doc: {:?}",
+                scoped.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+            assert!(
+                scoped.iter().all(|h| h.path != sibling_path && !h.path.contains(r"\noise\")),
+                "scope {prefix} must not leak sibling or noise hits: {:?}",
+                scoped.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn add_raw_docs(backend: &TantivyBackend, docs: &[(String, String)]) {
+        let mut writer = backend.writer.lock();
+        for (path, body) in docs {
+            let key = format!("{path}#0");
+            writer
+                .add_document(tantivy::doc!(
+                    backend.fields.title => path.as_str(),
+                    backend.fields.body => body.as_str(),
+                    backend.fields.path => path.as_str(),
+                    backend.fields.mtime => "1",
+                    backend.fields.size => "1",
+                    backend.fields.ext => "txt",
+                    backend.fields.folder => r"C:\",
+                    backend.fields.page => "1",
+                    backend.fields.chunk_id => "0",
+                    backend.fields.doc_key => key.as_str(),
+                    backend.fields.unit_id => "0",
+                    backend.fields.unit_label => "",
+                    backend.fields.unit_kind => "paragraph",
+                ))
+                .expect("add raw doc");
+        }
+        writer.commit().expect("commit raw docs");
+        drop(writer);
+        backend.reader.reload().expect("reload");
     }
 }

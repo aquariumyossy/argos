@@ -186,15 +186,42 @@ pub fn run() {
                     "argos: schema migration — starting automatic full reindex (indexes are incompatible)"
                 );
                 let indexer = indexer.clone();
+                let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all(|_| {})).await
                     {
-                        Ok(Ok(stats)) => eprintln!(
-                            "argos: schema reindex done: indexed={} skipped={} errors={}",
-                            stats.indexed, stats.skipped, stats.errors
-                        ),
+                        Ok(Ok(stats)) => {
+                            eprintln!(
+                                "argos: schema reindex done: indexed={} skipped={} removed={} errors={}",
+                                stats.indexed, stats.skipped, stats.removed, stats.errors
+                            );
+                            let _ = app_handle.emit("folders-updated", ());
+                        }
                         Ok(Err(e)) => eprintln!("argos: schema reindex failed: {e}"),
                         Err(e) => eprintln!("argos: schema reindex join failed: {e}"),
+                    }
+                });
+            } else {
+                // Changes made while the process was closed are not in the watcher log.
+                // Crawl in the background; unchanged files are skipped by size/mtime/hash.
+                let indexer = indexer.clone();
+                let app_handle = app.handle().clone();
+                eprintln!("argos: startup sync — picking up changes made while closed");
+                tauri::async_runtime::spawn(async move {
+                    match tauri::async_runtime::spawn_blocking(move || indexer.sync_enabled_folders())
+                        .await
+                    {
+                        Ok(Ok(stats)) => {
+                            eprintln!(
+                                "argos: startup sync done: indexed={} skipped={} removed={} errors={}",
+                                stats.indexed, stats.skipped, stats.removed, stats.errors
+                            );
+                            if stats.indexed > 0 || stats.removed > 0 {
+                                let _ = app_handle.emit("folders-updated", ());
+                            }
+                        }
+                        Ok(Err(e)) => eprintln!("argos: startup sync failed: {e}"),
+                        Err(e) => eprintln!("argos: startup sync join failed: {e}"),
                     }
                 });
             }
