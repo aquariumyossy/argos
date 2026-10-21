@@ -14,9 +14,9 @@ use crate::pathutil;
 enum WatcherCmd {
     Add(String),
     Remove(String),
-    /// Drop the current watch and, when `online`, create it again.
-    /// `online` is false when a timed stat says the root is missing or not a directory,
-    /// so `watch` is not called on a share that would block the watcher thread.
+    /// When `online`, drop the current watch and create it again.
+    /// When `online` is false the root is not a directory we could see. Keep any
+    /// watch that already exists and do not call `watch`.
     Rearm { path: String, online: bool },
 }
 
@@ -43,11 +43,11 @@ impl WatcherHandle {
         let _ = self.cmd_tx.send(WatcherCmd::Remove(path));
     }
 
-    /// Recreate the filesystem watch for one enabled root.
+    /// Recreate the filesystem watch for one enabled root that stat confirmed is online.
     ///
-    /// An offline root is removed from the OS watch list when it had one, and the
-    /// other roots are left alone. A failure to watch this path does not remove it
-    /// from event routing, so a later re-arm can try again.
+    /// `online == false` leaves an existing watch in place and does not call `watch`,
+    /// so a root that is merely unconfirmed cannot drop live updates. A failure to
+    /// watch this path does not remove it from event routing.
     pub fn rearm_folder(&self, path: &str, online: bool) -> Result<(), String> {
         let path = pathutil::simplify_windows_path(path);
         if path.is_empty() {
@@ -246,15 +246,15 @@ fn apply_cmd(
             };
             let stored = folders[idx].clone();
             let pb = PathBuf::from(&stored);
+            if !online {
+                eprintln!("argos: watch rearm skip (not confirmed online): {stored}");
+                return;
+            }
             if armed[idx] {
                 if let Err(e) = watcher.unwatch_root(&pb) {
                     eprintln!("argos: unwatch {stored}: {e}");
                 }
                 armed[idx] = false;
-            }
-            if !online {
-                eprintln!("argos: watch rearm skip (offline): {stored}");
-                return;
             }
             match watcher.watch_root(&pb) {
                 Ok(()) => armed[idx] = true,
@@ -442,7 +442,6 @@ mod tests {
         assert_eq!(
             watcher.calls,
             vec![
-                ("unwatch", "offline".into()),
                 ("unwatch", "flaky".into()),
                 ("watch", "flaky".into()),
                 ("unwatch", "online-a".into()),
@@ -451,7 +450,10 @@ mod tests {
                 ("watch", "fresh".into()),
             ]
         );
-        assert!(!armed[1], "offline root must not stay armed");
+        assert!(
+            armed[1],
+            "a root that is not confirmed online keeps the watch it already has"
+        );
         assert!(!armed[3], "a failed watch must not count as armed");
         assert!(armed[0] && armed[2]);
         assert_eq!(folders.last().map(String::as_str), Some("fresh"));

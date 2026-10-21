@@ -112,6 +112,20 @@ impl Default for WalkIo {
     }
 }
 
+enum RootSeen {
+    Directory,
+    NotDirectory,
+    /// Stat timed out, or the extractor worker was down or crashed.
+    Unknown,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum StatFault {
+    TimedOut,
+    Unavailable,
+}
+
 pub struct Indexer {
     db: Arc<Db>,
     backend: Arc<TantivyBackend>,
@@ -166,6 +180,9 @@ pub struct Indexer {
     test_extract_crash: AtomicBool,
     #[cfg(test)]
     test_io_timeout: Mutex<Option<Duration>>,
+    /// Forces the next root stat to fail before the filesystem is touched.
+    #[cfg(test)]
+    test_stat_fault: Mutex<Option<StatFault>>,
     #[cfg(test)]
     test_max_bytes: AtomicU64,
     #[cfg(test)]
@@ -323,6 +340,8 @@ impl Indexer {
             test_extract_crash: AtomicBool::new(false),
             #[cfg(test)]
             test_io_timeout: Mutex::new(None),
+            #[cfg(test)]
+            test_stat_fault: Mutex::new(None),
             #[cfg(test)]
             test_max_bytes: AtomicU64::new(0),
             #[cfg(test)]
@@ -605,31 +624,39 @@ impl Indexer {
         // Re-arm every root before the crawl. A large folder can take minutes, and a
         // watch that died should be back before that walk so later events are queued
         // instead of disappearing. An offline root must not stop the others.
-        let mut online = Vec::with_capacity(enabled.len());
+        let mut crawl = Vec::with_capacity(enabled.len());
         for folder in &enabled {
             self.wait_if_startup_held();
             if self.note_periodic_preempted() {
                 return Ok(IndexStats::default());
             }
-            let is_dir = self.directory_root(Path::new(&folder.path));
+            match self.probe_root(Path::new(&folder.path)) {
+                RootSeen::Unknown => {
+                    // A timed-out or stopped worker is not "this share is gone".
+                    // Leave the existing watch in place and do not ask for a new one.
+                    let root_display = pathutil::simplify_windows_path(&folder.path);
+                    eprintln!("argos: watch rearm skipped, root stat unknown: {root_display}");
+                    crawl.push(false);
+                }
+                seen => {
+                    let online = matches!(seen, RootSeen::Directory);
+                    if let Err(e) = rearm(&folder.path, online) {
+                        eprintln!("argos: watch rearm {}: {e}", folder.path);
+                    }
+                    crawl.push(online);
+                }
+            }
             if self.note_periodic_preempted() {
                 return Ok(IndexStats::default());
             }
-            if let Err(e) = rearm(&folder.path, is_dir) {
-                eprintln!("argos: watch rearm {}: {e}", folder.path);
-            }
-            if self.note_periodic_preempted() {
-                return Ok(IndexStats::default());
-            }
-            online.push(is_dir);
         }
         let mut stats = IndexStats::default();
-        for (folder, is_dir) in enabled.iter().zip(online) {
+        for (folder, online) in enabled.iter().zip(crawl) {
             self.wait_if_startup_held();
             if self.note_periodic_preempted() {
                 break;
             }
-            if !is_dir {
+            if !online {
                 // Same outcome as `crawl_folder` when the root is missing: count the
                 // miss and do not purge. Skipping the crawl avoids a second timed stat
                 // against a dead share.
@@ -652,12 +679,17 @@ impl Indexer {
         }
     }
 
-    /// `true` when a timed stat says `path` is a directory. A timeout or a missing
-    /// share is `false` — callers must not treat that as an empty tree.
-    fn directory_root(&self, path: &Path) -> bool {
+    /// A directory is safe to re-watch. Anything else that the stat actually
+    /// observed (missing, or not a directory) is not. A timeout, a worker that is
+    /// backing off, or a crash is unknown: the caller must not drop a live watch.
+    fn probe_root(&self, path: &Path) -> RootSeen {
         match self.stat_file(&extended_length_path(path)) {
-            Ok(meta) if meta.is_dir => true,
-            _ => false,
+            Ok(meta) if meta.is_dir => RootSeen::Directory,
+            Ok(_) => RootSeen::NotDirectory,
+            Err(IoFail::TimedOut) | Err(IoFail::Unavailable(_)) | Err(IoFail::Crashed(_)) => {
+                RootSeen::Unknown
+            }
+            Err(IoFail::Failed(_)) => RootSeen::NotDirectory,
         }
     }
 
@@ -1824,6 +1856,15 @@ impl Indexer {
     }
 
     fn stat_file(&self, path: &Path) -> Result<FileStat, IoFail> {
+        #[cfg(test)]
+        if let Some(fault) = *self.test_stat_fault.lock() {
+            return match fault {
+                StatFault::TimedOut => Err(IoFail::TimedOut),
+                StatFault::Unavailable => Err(IoFail::Unavailable(
+                    "extractor worker is backing off after a failed start".into(),
+                )),
+            };
+        }
         self.host_call(true, false, |host, timeout| host.stat(path, timeout))
     }
 
@@ -3827,6 +3868,35 @@ mod tests {
         );
         assert!(env.backend().has_path(&fresh).unwrap(), "{fresh}");
         fs::rename(&aside, &env.files).unwrap();
+    }
+
+    #[test]
+    fn periodic_sync_keeps_the_watch_when_root_stat_is_unknown() {
+        let env = Env::new("periodic-unknown");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.index_all();
+        for fault in [StatFault::TimedOut, StatFault::Unavailable] {
+            *env.indexer().test_stat_fault.lock() = Some(fault);
+            let mut unwatched = false;
+            let outcome = env
+                .indexer()
+                .sync_enabled_folders_periodic(|_path, _online| {
+                    // Any rearm of an unconfirmed root is the path that unwatches
+                    // a live watch. Unknown stat must not ask for one.
+                    unwatched = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(outcome, PeriodicSync::Finished(_)),
+                "{fault:?}: {outcome:?}"
+            );
+            assert!(
+                !unwatched,
+                "{fault:?}: unknown stat unwatched the root"
+            );
+        }
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
     }
 
     #[test]
