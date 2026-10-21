@@ -7,11 +7,22 @@ import {
   scopeChipLabel,
 } from "../preview/hitMeta";
 
-/** Overlay footer while history / term suggestions are open. */
+/** Overlay footer while history / term suggestions are open and Enter only closes. */
 export const SUGGEST_OVERLAY_HINT = "↑↓ で選択 · Enter で閉じる · Tab で確定";
+
+/** Empty query, after the user has moved onto a history item with ↑/↓. */
+export const SUGGEST_OVERLAY_SEARCH_HINT = "↑↓ で選択 · Enter で検索 · Tab で確定";
 
 /** Faint cue inside the query input. Suggestions open with Down, not while typing. */
 export const INPUT_SUGGEST_HINT = "↓で履歴候補";
+
+export function suggestOverlayHint(
+  query: string,
+  suggestionHighlightActive: boolean,
+): string {
+  if (!query.trim() && suggestionHighlightActive) return SUGGEST_OVERLAY_SEARCH_HINT;
+  return SUGGEST_OVERLAY_HINT;
+}
 
 const CRUMB_SEP = " › ";
 
@@ -222,6 +233,13 @@ export type PopupKeyContext = {
   datePickerOpen: boolean;
   suggestOpen: boolean;
   suggestionCount: number;
+  /** Current query text. Empty (after trim) is the history-overlay case. */
+  query: string;
+  /**
+   * True only after ↑/↓ has moved onto a suggestion while the overlay is open.
+   * Opening the overlay does not set this. Hover does not set this.
+   */
+  suggestionHighlightActive: boolean;
   /** Query input is the active element. */
   caretInInput: boolean;
   /**
@@ -247,7 +265,10 @@ export type PopupKeyAction =
   | "suggest-tab"
   | "suggest-down"
   | "suggest-up"
+  | "suggest-highlight-first"
+  | "suggest-highlight-last"
   | "suggest-enter-close"
+  | "suggest-enter-search"
   | "suggest-enter-swallow"
   | "open-suggest"
   | "result-down"
@@ -262,6 +283,28 @@ export function isImeKey(event: PopupKeyEvent, imeComposing: boolean): boolean {
 
 function plainKey(event: PopupKeyEvent): boolean {
   return !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey;
+}
+
+/**
+ * Down from the query input can open suggestions.
+ * False once result navigation has started, and false once this query's list is known to be empty.
+ */
+export function downCanOpenSuggestions(ctx: {
+  resultNavStarted: boolean;
+  suggestionsReady: boolean;
+  suggestionCount: number;
+}): boolean {
+  return !ctx.resultNavStarted && (!ctx.suggestionsReady || ctx.suggestionCount > 0);
+}
+
+/** The 「↓で履歴候補」 cue. Hidden whenever Down would not open the overlay. */
+export function inputSuggestHintVisible(ctx: {
+  overlayVisible: boolean;
+  resultNavStarted: boolean;
+  suggestionsReady: boolean;
+  suggestionCount: number;
+}): boolean {
+  return !ctx.overlayVisible && downCanOpenSuggestions(ctx);
 }
 
 /** Same condition as the suggestion overlay in the popup. */
@@ -288,8 +331,10 @@ export function isSuggestOverlayVisible(ctx: {
  * query input, result keyboard-navigation has not started, and the key is unmodified.
  * Closing the overlay with Enter or Esc counts as navigation having started, so the
  * next Down moves the result selection until the query changes.
- * Enter closes the overlay only while that overlay is actually visible.
- * Enter during IME composition is ignored (does not close the overlay or open a hit).
+ * Enter is handled only while the overlay is actually visible, and never opens the
+ * result behind it. On an empty query, Enter searches the history item only after
+ * ↑/↓ has moved onto it; otherwise Enter closes the overlay. Ctrl/Shift/Alt/Meta+Enter
+ * stay swallowed. Enter during IME composition is ignored.
  */
 export function decidePopupKey(
   event: PopupKeyEvent,
@@ -320,21 +365,26 @@ export function decidePopupKey(
   }
 
   if (event.key === "Enter" && isSuggestOverlayVisible(ctx)) {
-    return plainKey(event) ? "suggest-enter-close" : "suggest-enter-swallow";
+    if (!plainKey(event)) return "suggest-enter-swallow";
+    if (!ctx.query.trim() && ctx.suggestionHighlightActive) return "suggest-enter-search";
+    return "suggest-enter-close";
   }
 
   if (ctx.suggestOpen && ctx.suggestionCount > 0) {
     if (event.key === "Tab") return "suggest-tab";
-    if (event.key === "ArrowDown") return "suggest-down";
-    if (event.key === "ArrowUp") return "suggest-up";
+    if (event.key === "ArrowDown") {
+      return ctx.suggestionHighlightActive ? "suggest-down" : "suggest-highlight-first";
+    }
+    if (event.key === "ArrowUp") {
+      return ctx.suggestionHighlightActive ? "suggest-up" : "suggest-highlight-last";
+    }
   }
 
   if (
     event.key === "ArrowDown" &&
     plainKey(event) &&
     ctx.caretInInput &&
-    !ctx.resultNavStarted &&
-    (!ctx.suggestionsReady || ctx.suggestionCount > 0)
+    downCanOpenSuggestions(ctx)
   ) {
     return "open-suggest";
   }

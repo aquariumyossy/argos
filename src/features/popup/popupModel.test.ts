@@ -7,8 +7,11 @@ import {
   folderFilterLabel,
   hitLocation,
   INPUT_SUGGEST_HINT,
+  inputSuggestHintVisible,
   isInternalIdPath,
   SUGGEST_OVERLAY_HINT,
+  SUGGEST_OVERLAY_SEARCH_HINT,
+  suggestOverlayHint,
   type PopupKeyContext,
   type PopupKeyEvent,
 } from "./popupModel";
@@ -38,6 +41,8 @@ function ctx(partial: Partial<PopupKeyContext> = {}): PopupKeyContext {
     datePickerOpen: false,
     suggestOpen: false,
     suggestionCount: 2,
+    query: "売掛金",
+    suggestionHighlightActive: false,
     caretInInput: true,
     resultNavStarted: false,
     suggestionsReady: true,
@@ -46,33 +51,69 @@ function ctx(partial: Partial<PopupKeyContext> = {}): PopupKeyContext {
 }
 
 describe("suggestion keyboard", () => {
-  it("Enter while the overlay is open only closes it", () => {
+  it("Enter while the overlay is open only closes it when the query is not empty", () => {
     expect(decidePopupKey(key({ key: "Enter" }), ctx({ suggestOpen: true }))).toBe(
       "suggest-enter-close",
     );
+    expect(
+      decidePopupKey(
+        key({ key: "Enter" }),
+        ctx({ suggestOpen: true, suggestionHighlightActive: true }),
+      ),
+    ).toBe("suggest-enter-close");
+  });
+
+  it("empty-query Enter searches only the history item the user moved onto", () => {
+    const open = ctx({ suggestOpen: true, query: "", suggestionHighlightActive: false });
+    expect(decidePopupKey(key({ key: "Enter" }), open)).toBe("suggest-enter-close");
+    expect(decidePopupKey(key({ key: "Enter" }), open)).not.toBe("open-result");
+    expect(
+      decidePopupKey(
+        key({ key: "Enter" }),
+        ctx({ suggestOpen: true, query: "  ", suggestionHighlightActive: true }),
+      ),
+    ).toBe("suggest-enter-search");
+    expect(
+      decidePopupKey(
+        key({ key: "Enter" }),
+        ctx({ suggestOpen: true, query: "", suggestionHighlightActive: true }),
+      ),
+    ).toBe("suggest-enter-search");
   });
 
   it("does not swallow Enter when the overlay is not visible", () => {
     expect(
       decidePopupKey(
         key({ key: "Enter" }),
-        ctx({ suggestOpen: true, suggestionCount: 0 }),
+        ctx({ suggestOpen: true, suggestionCount: 0, query: "", suggestionHighlightActive: true }),
       ),
     ).toBe("open-result");
     expect(
       decidePopupKey(
         key({ key: "Enter" }),
-        ctx({ suggestOpen: true, selectChip: true }),
+        ctx({ suggestOpen: true, selectChip: true, query: "", suggestionHighlightActive: true }),
       ),
     ).toBe("open-result");
   });
 
-  it("modified Enter while the overlay is open does not open a result", () => {
+  it("modified Enter while the overlay is open does not open a result or run a search", () => {
+    const highlighted = ctx({
+      suggestOpen: true,
+      query: "",
+      suggestionHighlightActive: true,
+    });
+    for (const extra of [
+      { ctrlKey: true },
+      { shiftKey: true },
+      { altKey: true },
+      { metaKey: true },
+    ] as const) {
+      expect(decidePopupKey(key({ key: "Enter", ...extra }), highlighted)).toBe(
+        "suggest-enter-swallow",
+      );
+    }
     expect(
       decidePopupKey(key({ key: "Enter", ctrlKey: true }), ctx({ suggestOpen: true })),
-    ).toBe("suggest-enter-swallow");
-    expect(
-      decidePopupKey(key({ key: "Enter", shiftKey: true }), ctx({ suggestOpen: true })),
     ).toBe("suggest-enter-swallow");
   });
 
@@ -80,6 +121,12 @@ describe("suggestion keyboard", () => {
     expect(decidePopupKey(key({ key: "Enter" }), ctx({ suggestOpen: false }))).toBe(
       "open-result",
     );
+    expect(
+      decidePopupKey(
+        key({ key: "Enter" }),
+        ctx({ suggestOpen: false, query: "", suggestionHighlightActive: true }),
+      ),
+    ).toBe("open-result");
   });
 
   it("Down from the input opens suggestions until result navigation starts", () => {
@@ -106,7 +153,7 @@ describe("suggestion keyboard", () => {
     expect(
       decidePopupKey(
         key({ key: "Enter", isComposing: true }),
-        ctx({ suggestOpen: true }),
+        ctx({ suggestOpen: true, query: "", suggestionHighlightActive: true }),
       ),
     ).toBe("ignore");
     expect(
@@ -121,15 +168,57 @@ describe("suggestion keyboard", () => {
   });
 
   it("Tab still confirms a suggestion and arrows move within the overlay", () => {
-    expect(decidePopupKey(key({ key: "Tab" }), ctx({ suggestOpen: true }))).toBe(
-      "suggest-tab",
-    );
-    expect(decidePopupKey(key({ key: "ArrowDown" }), ctx({ suggestOpen: true }))).toBe(
-      "suggest-down",
-    );
-    expect(decidePopupKey(key({ key: "ArrowUp" }), ctx({ suggestOpen: true }))).toBe(
-      "suggest-up",
-    );
+    const open = ctx({ suggestOpen: true, query: "" });
+    expect(decidePopupKey(key({ key: "Tab" }), open)).toBe("suggest-tab");
+    expect(decidePopupKey(key({ key: "ArrowDown" }), open)).toBe("suggest-highlight-first");
+    expect(decidePopupKey(key({ key: "ArrowUp" }), open)).toBe("suggest-highlight-last");
+    const moved = ctx({ suggestOpen: true, query: "", suggestionHighlightActive: true });
+    expect(decidePopupKey(key({ key: "ArrowDown" }), moved)).toBe("suggest-down");
+    expect(decidePopupKey(key({ key: "ArrowUp" }), moved)).toBe("suggest-up");
+    expect(decidePopupKey(key({ key: "Tab" }), moved)).toBe("suggest-tab");
+  });
+});
+
+describe("input suggest hint", () => {
+  it("hides the hint when Down cannot reopen suggestions", () => {
+    expect(
+      inputSuggestHintVisible({
+        overlayVisible: false,
+        resultNavStarted: false,
+        suggestionsReady: true,
+        suggestionCount: 2,
+      }),
+    ).toBe(true);
+    expect(
+      inputSuggestHintVisible({
+        overlayVisible: false,
+        resultNavStarted: true,
+        suggestionsReady: true,
+        suggestionCount: 2,
+      }),
+    ).toBe(false);
+    expect(
+      inputSuggestHintVisible({
+        overlayVisible: false,
+        resultNavStarted: false,
+        suggestionsReady: true,
+        suggestionCount: 0,
+      }),
+    ).toBe(false);
+    expect(
+      inputSuggestHintVisible({
+        overlayVisible: true,
+        resultNavStarted: false,
+        suggestionsReady: false,
+        suggestionCount: 2,
+      }),
+    ).toBe(false);
+  });
+
+  it("says Enter searches only after an empty-query history item is highlighted", () => {
+    expect(suggestOverlayHint("売掛金", true)).toBe(SUGGEST_OVERLAY_HINT);
+    expect(suggestOverlayHint("", false)).toBe(SUGGEST_OVERLAY_HINT);
+    expect(suggestOverlayHint("", true)).toBe(SUGGEST_OVERLAY_SEARCH_HINT);
   });
 });
 

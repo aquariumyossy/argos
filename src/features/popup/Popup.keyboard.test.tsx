@@ -204,4 +204,99 @@ describe("Popup keyboard", () => {
       screen.getByText("訴訟案件 › 4. 訴え提起〜結審前 › 甲野商事 売掛金請求事件"),
     ).toBeTruthy();
   });
+
+  it("empty-query Enter closes until a history item is highlighted, then searches it", async () => {
+    const { default: Popup } = await import("./Popup");
+    render(<Popup />);
+    const input = await typeQuery("売掛金");
+    const searchesBefore = mockInvoke.mock.calls.filter((c) => c[0] === "search_query").length;
+    fireEvent.change(input, { target: { value: "" } });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("listbox", { name: "検索候補" })).toBeTruthy();
+    expect(document.querySelector(".popup-suggest .is-active")).toBeNull();
+
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect((input as HTMLInputElement).value).toBe("");
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "search_query")).toHaveLength(
+      searchesBefore,
+    );
+
+    fireEvent.change(input, { target: { value: " " } });
+    fireEvent.change(input, { target: { value: "" } });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(document.querySelector(".popup-suggest .is-active")?.textContent).toContain(
+      "売掛金残高",
+    );
+    expect(screen.getByText("↑↓ で選択 · Enter で検索 · Tab で確定")).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+    expect(screen.getByRole("listbox", { name: "検索候補" })).toBeTruthy();
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    const searches = mockInvoke.mock.calls.filter((c) => c[0] === "search_query");
+    expect(searches[searches.length - 1]?.[1]).toMatchObject({ query: "売掛金残高" });
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+    expect((input as HTMLInputElement).value).toBe("売掛金残高");
+  });
+
+  it("highlighted Enter on a typed query closes the overlay and does not open the result", async () => {
+    const { default: Popup } = await import("./Popup");
+    render(<Popup />);
+    const input = await typeQuery("売掛金");
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(document.querySelector(".popup-suggest .is-active")?.textContent).toContain(
+      "売掛金残高",
+    );
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect((input as HTMLInputElement).value).toBe("売掛金");
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+  });
+
+  it("Tab inserts the current suggestion into the input", async () => {
+    const { default: Popup } = await import("./Popup");
+    render(<Popup />);
+    const input = await typeQuery("売掛金");
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect((input as HTMLInputElement).value).toBe("売掛金残高");
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+  });
+
+  it("hides the history hint after result navigation until the query changes", async () => {
+    const { default: Popup } = await import("./Popup");
+    render(<Popup />);
+    const input = await typeQuery("売掛金");
+    expect(screen.getByText("↓で履歴候補")).toBeTruthy();
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect(screen.queryByText("↓で履歴候補")).toBeNull();
+    fireEvent.change(input, { target: { value: "売掛金請求" } });
+    expect(screen.getByText("↓で履歴候補")).toBeTruthy();
+  });
 });

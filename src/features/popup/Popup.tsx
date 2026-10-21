@@ -30,12 +30,13 @@ import {
   hitLocation,
   hitTypeLabel,
   INPUT_SUGGEST_HINT,
+  inputSuggestHintVisible,
   isInternalIdPath,
   isSuggestOverlayVisible,
   popupKeyPreventsDefault,
   scoreLevel,
   selectedHitLabel,
-  SUGGEST_OVERLAY_HINT,
+  suggestOverlayHint,
 } from "./popupModel";
 import { loadShotSeed } from "./popupShot";
 import { openPreview } from "../preview/openPreview";
@@ -411,6 +412,7 @@ export default function Popup() {
     shotSeed?.suggestions ?? [],
   );
   const [suggestIndex, setSuggestIndex] = useState(0);
+  const [suggestHighlightActive, setSuggestHighlightActive] = useState(false);
   const [suggestOpen, setSuggestOpen] = useState(shotSeed?.mode === "enter");
   const [searchScopes, setSearchScopes] = useState<SearchScopeRow[]>([]);
   const [recentScopes, setRecentScopes] = useState<SearchScopeRow[]>([]);
@@ -900,6 +902,7 @@ export default function Popup() {
       suggestionsForQueryRef.current = q;
       setSuggestions(next);
       setSuggestIndex(0);
+      setSuggestHighlightActive(false);
       setSuggestOpen((open) => open && next.length > 0);
     } catch (e) {
       console.error(e);
@@ -916,6 +919,7 @@ export default function Popup() {
     if (imeComposingRef.current) return;
     if (suggestionsForQueryRef.current === q && suggestionsRef.current.length > 0) {
       setSuggestIndex(0);
+      setSuggestHighlightActive(false);
       setSelectChip(null);
       setSuggestOpen(true);
       return;
@@ -936,6 +940,7 @@ export default function Popup() {
       suggestionsForQueryRef.current = q;
       setSuggestions(next);
       setSuggestIndex(0);
+      setSuggestHighlightActive(false);
       if (next.length > 0) {
         setSelectChip(null);
         setSuggestOpen(true);
@@ -994,7 +999,9 @@ export default function Popup() {
       }
       setQuery(next);
       setSuggestOpen(false);
+      setSuggestHighlightActive(false);
       setSuggestions([]);
+      resultNavStartedRef.current = false;
       scheduleSearch(next);
       requestAnimationFrame(() => {
         inputRef.current?.focus();
@@ -1406,6 +1413,8 @@ export default function Popup() {
           datePickerOpen,
           suggestOpen,
           suggestionCount: suggestions.length,
+          query,
+          suggestionHighlightActive: suggestHighlightActive,
           caretInInput: document.activeElement === inputRef.current,
           resultNavStarted: resultNavStartedRef.current,
           suggestionsReady: suggestionsForQueryRef.current === query,
@@ -1430,6 +1439,7 @@ export default function Popup() {
           return;
         case "escape-suggest":
           setSuggestOpen(false);
+          setSuggestHighlightActive(false);
           resultNavStartedRef.current = true;
           return;
         case "escape-popup":
@@ -1440,18 +1450,34 @@ export default function Popup() {
           if (sug) applySuggestion(sug);
           return;
         }
+        case "suggest-highlight-first":
+          setSuggestHighlightActive(true);
+          setSuggestIndex(0);
+          return;
+        case "suggest-highlight-last":
+          setSuggestHighlightActive(true);
+          setSuggestIndex(Math.max(suggestions.length - 1, 0));
+          return;
         case "suggest-down":
+          setSuggestHighlightActive(true);
           setSuggestIndex((i) => (i + 1) % suggestions.length);
           return;
         case "suggest-up":
+          setSuggestHighlightActive(true);
           setSuggestIndex(
             (i) => (i - 1 + suggestions.length) % suggestions.length,
           );
           return;
         case "suggest-enter-close":
           setSuggestOpen(false);
+          setSuggestHighlightActive(false);
           resultNavStartedRef.current = true;
           return;
+        case "suggest-enter-search": {
+          const sug = suggestions[suggestIndex];
+          if (sug) applySuggestion(sug);
+          return;
+        }
         case "suggest-enter-swallow":
           return;
         case "open-suggest":
@@ -1498,6 +1524,7 @@ export default function Popup() {
     openSuggestionsFromKey,
     query,
     selectChip,
+    suggestHighlightActive,
     suggestIndex,
     suggestOpen,
     suggestions,
@@ -1576,6 +1603,12 @@ export default function Popup() {
     extPickerOpen,
     datePickerOpen,
     selectChip: selectChip != null,
+  });
+  const suggestHintVisible = inputSuggestHintVisible({
+    overlayVisible: suggestOverlayVisible,
+    resultNavStarted: resultNavStartedRef.current,
+    suggestionsReady: suggestionsForQueryRef.current === query,
+    suggestionCount: suggestions.length,
   });
 
   return (
@@ -1690,9 +1723,9 @@ export default function Popup() {
             <input
               ref={inputRef}
               className={
-                suggestOverlayVisible
-                  ? "popup-query-input"
-                  : "popup-query-input has-suggest-hint"
+                suggestHintVisible
+                  ? "popup-query-input has-suggest-hint"
+                  : "popup-query-input"
               }
               value={query}
               placeholder={'検索 "隣接" -除外'}
@@ -1701,6 +1734,7 @@ export default function Popup() {
                 const next = e.target.value;
                 setQuery(next);
                 setSelectChip(null);
+                setSuggestHighlightActive(false);
                 resultNavStartedRef.current = false;
                 hideHint();
                 scheduleSearch(next);
@@ -1751,11 +1785,11 @@ export default function Popup() {
                 }
               }}
             />
-            {suggestOverlayVisible ? null : (
+            {suggestHintVisible ? (
               <span className="popup-input-suggest-hint" aria-hidden="true">
                 {INPUT_SUGGEST_HINT}
               </span>
-            )}
+            ) : null}
             {selectChip ? (
               <div className="popup-select-chip" role="toolbar" aria-label="選択した語">
                 <button
@@ -1857,8 +1891,12 @@ export default function Popup() {
                     <button
                       type="button"
                       role="option"
-                      aria-selected={i === suggestIndex}
-                      className={i === suggestIndex ? "is-active" : undefined}
+                      aria-selected={suggestHighlightActive && i === suggestIndex}
+                      className={
+                        suggestHighlightActive && i === suggestIndex
+                          ? "is-active"
+                          : undefined
+                      }
                       onMouseEnter={() => setSuggestIndex(i)}
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => applySuggestion(s)}
@@ -1883,7 +1921,9 @@ export default function Popup() {
                   </li>
                 ))}
               </ul>
-              <div className="popup-suggest-hint">{SUGGEST_OVERLAY_HINT}</div>
+              <div className="popup-suggest-hint">
+                {suggestOverlayHint(query, suggestHighlightActive)}
+              </div>
             </div>
           ) : null}
           {folderPickerOpen ? (
