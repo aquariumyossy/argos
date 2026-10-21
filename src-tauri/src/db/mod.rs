@@ -736,6 +736,13 @@ impl Db {
             "ALTER TABLE llm_thread_sources ADD COLUMN unit_body TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Why a file was stored without body text (timeout, extract error, oversize).
+        // Empty for a normal row. Older builds ignore the column; v1.11.9 inserts
+        // list columns explicitly, so adding it is safe to roll back.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let consume_cols_added = conn
             .execute(
                 "ALTER TABLE llm_thread_sources ADD COLUMN injected_user_message_id TEXT NOT NULL DEFAULT ''",
@@ -1769,8 +1776,8 @@ impl Db {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok')
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status, skip_reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok', '')
              ON CONFLICT(path) DO UPDATE SET
                folder_id=excluded.folder_id,
                ext=excluded.ext,
@@ -1778,10 +1785,76 @@ impl Db {
                mtime=excluded.mtime,
                content_hash=excluded.content_hash,
                indexed_at=excluded.indexed_at,
-               status='ok'",
+               status='ok',
+               skip_reason=''",
             rusqlite::params![folder_id, path, ext, size, mtime, content_hash, now],
         )?;
         Ok(())
+    }
+
+    /// Filename-only row. `status` is `ok` (no text, still a normal hit) or `skipped`
+    /// (timeout, panic, extract error, oversize) with `skip_reason` for later inspection.
+    pub fn upsert_file_state(
+        &self,
+        folder_id: i64,
+        path: &str,
+        ext: &str,
+        size: i64,
+        mtime: i64,
+        content_hash: &str,
+        status: &str,
+        skip_reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status, skip_reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+               folder_id=excluded.folder_id,
+               ext=excluded.ext,
+               size=excluded.size,
+               mtime=excluded.mtime,
+               content_hash=excluded.content_hash,
+               indexed_at=excluded.indexed_at,
+               status=excluded.status,
+               skip_reason=excluded.skip_reason",
+            rusqlite::params![
+                folder_id,
+                path,
+                ext,
+                size,
+                mtime,
+                content_hash,
+                now,
+                status,
+                skip_reason
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn file_state(&self, path: &str) -> Result<Option<FileState>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT status, COALESCE(skip_reason, ''), COALESCE(content_hash, ''),
+                    COALESCE(indexed_at, ''), COALESCE(size, 0), COALESCE(mtime, 0)
+             FROM files WHERE path=?1",
+        )?;
+        let mut rows = stmt.query_map([path], |row| {
+            Ok(FileState {
+                status: row.get(0)?,
+                skip_reason: row.get(1)?,
+                content_hash: row.get(2)?,
+                indexed_at: row.get(3)?,
+                size: row.get(4)?,
+                mtime: row.get(5)?,
+            })
+        })?;
+        if let Some(row) = rows.next() {
+            return Ok(Some(row?));
+        }
+        Ok(None)
     }
 
     pub fn mark_file_deleted(&self, path: &str) -> Result<(), rusqlite::Error> {
@@ -4379,6 +4452,16 @@ pub struct FileMeta {
     pub size: i64,
     pub mtime: i64,
     pub content_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileState {
+    pub status: String,
+    pub skip_reason: String,
+    pub content_hash: String,
+    pub indexed_at: String,
+    pub size: i64,
+    pub mtime: i64,
 }
 
 #[cfg(test)]

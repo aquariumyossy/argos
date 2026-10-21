@@ -270,9 +270,18 @@ impl TantivyBackend {
         let morph = MorphAnalyzer::new()?;
 
         let writer = index.writer(50_000_000).map_err(|e| e.to_string())?;
+        // Deleted documents must be merged away. The default ratio is 1.0, so a
+        // segment that is entirely tombstones is never rewritten and the stored
+        // text stays mapped. Small per-file commits then pile up as Windows
+        // commit charge (RADAR_PRE_LEAK).
+        let mut merge_policy = tantivy::indexer::LogMergePolicy::default();
+        merge_policy.set_del_docs_ratio_before_merge(0.2);
+        writer.set_merge_policy(Box::new(merge_policy));
+        // Manual: OnCommitWithDelay reloads on its own thread as well as our
+        // explicit reload, so two generations of segment mmaps stay alive.
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(|e| e.to_string())?;
 
@@ -530,6 +539,167 @@ impl TantivyBackend {
         writer.commit().map_err(|e| e.to_string())?;
         self.reader.reload().map_err(|e| e.to_string())?;
         Ok(units.len())
+    }
+
+    /// One document with the filename in `title` and an empty body, using the same
+    /// fields a normal file uses. Search hits it by name and shows no excerpt.
+    /// Schema is unchanged: an existing index does not need a rebuild.
+    pub fn index_filename_only(
+        &self,
+        fs_path: &Path,
+        store_path: &str,
+        folder: &str,
+        mtime: u64,
+        size: u64,
+        title: &str,
+    ) -> Result<(), String> {
+        let path_str = store_path.to_string();
+        self.delete_by_path(&path_str)?;
+        let ext = fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let key = format!("{path_str}#0");
+        let mut writer = self.writer.lock();
+        writer
+            .add_document(doc!(
+                self.fields.title => title,
+                self.fields.body => "",
+                self.fields.path => path_str.as_str(),
+                self.fields.mtime => mtime.to_string().as_str(),
+                self.fields.size => size.to_string().as_str(),
+                self.fields.ext => ext.as_str(),
+                self.fields.folder => folder,
+                self.fields.page => "",
+                self.fields.chunk_id => "0",
+                self.fields.doc_key => key.as_str(),
+                self.fields.unit_id => "0",
+                self.fields.unit_label => "",
+                self.fields.unit_kind => "file",
+            ))
+            .map_err(|e| e.to_string())?;
+        writer.commit().map_err(|e| e.to_string())?;
+        self.reader.reload().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Queue a delete+add for one file. Nothing is searchable until [`publish_staged`].
+    /// Crawl uses this so a folder does not commit (and mmap) a segment per file.
+    pub fn stage_extracted(
+        &self,
+        fs_path: &Path,
+        store_path: &str,
+        folder: &str,
+        mtime: u64,
+        size: u64,
+        extracted: &crate::extractor::ExtractedDoc,
+    ) -> Result<(), String> {
+        let path_str = store_path.to_string();
+        let ext = fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let units = crate::extractor::segment_pages(&extracted.pages);
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, &path_str));
+        for unit in &units {
+            let key = format!("{}#{}", path_str, unit.unit_id);
+            let page_str = unit.page.map(|p| p.to_string()).unwrap_or_default();
+            let unit_id_str = unit.unit_id.to_string();
+            writer
+                .add_document(doc!(
+                    self.fields.title => extracted.title.as_str(),
+                    self.fields.body => unit.text.as_str(),
+                    self.fields.path => path_str.as_str(),
+                    self.fields.mtime => mtime.to_string().as_str(),
+                    self.fields.size => size.to_string().as_str(),
+                    self.fields.ext => ext.as_str(),
+                    self.fields.folder => folder,
+                    self.fields.page => page_str.as_str(),
+                    self.fields.chunk_id => unit_id_str.as_str(),
+                    self.fields.doc_key => key.as_str(),
+                    self.fields.unit_id => unit_id_str.as_str(),
+                    self.fields.unit_label => unit.label.as_str(),
+                    self.fields.unit_kind => unit.kind.as_str(),
+                ))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Queue a filename-only document. Published with the current batch.
+    pub fn stage_filename_only(
+        &self,
+        fs_path: &Path,
+        store_path: &str,
+        folder: &str,
+        mtime: u64,
+        size: u64,
+        title: &str,
+    ) -> Result<(), String> {
+        let path_str = store_path.to_string();
+        let ext = fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let key = format!("{path_str}#0");
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, &path_str));
+        writer
+            .add_document(doc!(
+                self.fields.title => title,
+                self.fields.body => "",
+                self.fields.path => path_str.as_str(),
+                self.fields.mtime => mtime.to_string().as_str(),
+                self.fields.size => size.to_string().as_str(),
+                self.fields.ext => ext.as_str(),
+                self.fields.folder => folder,
+                self.fields.page => "",
+                self.fields.chunk_id => "0",
+                self.fields.doc_key => key.as_str(),
+                self.fields.unit_id => "0",
+                self.fields.unit_label => "",
+                self.fields.unit_kind => "file",
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Publish staged adds and reload the reader once. If segments have fallen
+    /// behind the merge policy, fold them into one so the process does not keep
+    /// a mmap per file.
+    pub fn publish_staged(&self) -> Result<(), String> {
+        {
+            let mut writer = self.writer.lock();
+            writer.commit().map_err(|e| e.to_string())?;
+            let segment_ids = self
+                .index
+                .searchable_segment_ids()
+                .map_err(|e| e.to_string())?;
+            if segment_ids.len() > 32 {
+                eprintln!(
+                    "argos: merging {} search segments to cap committed memory",
+                    segment_ids.len()
+                );
+                writer
+                    .merge(&segment_ids)
+                    .wait()
+                    .map_err(|e| e.to_string())?;
+                let _ = writer.garbage_collect_files().wait();
+            }
+        }
+        self.reader.reload().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn segment_count(&self) -> Result<usize, String> {
+        self.index
+            .searchable_segment_ids()
+            .map(|ids| ids.len())
+            .map_err(|e| e.to_string())
     }
 
     /// Index an Outlook email into the mail index only.

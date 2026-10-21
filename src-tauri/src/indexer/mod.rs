@@ -1,15 +1,20 @@
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::SystemTime;
 
 use parking_lot::{Condvar, Mutex};
-use walkdir::WalkDir;
 
 use crate::db::{Db, FolderRow};
-use crate::extractor::{self, content_hash};
+use crate::extract_host::{EntryKind, ExtractOutcome, FileStat, IoFail};
+use crate::extractor;
 use crate::pathutil;
 use crate::search::tantivy_backend::TantivyBackend;
 
@@ -26,6 +31,22 @@ pub enum FsEvent {
 
 /// Minimum interval between intermediate `indexing` progress emits (~10 Hz).
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Open, read, and extract each give up after this long. The child process is
+/// killed; it does not keep the file bytes in the indexer.
+const FILE_IO_TIMEOUT: Duration = Duration::from_secs(60);
+/// One directory listing. Longer than a file read: a large share folder can take
+/// more than a minute to enumerate without being stuck on a single entry.
+const DIR_LIST_TIMEOUT: Duration = Duration::from_secs(180);
+/// Do not download a file larger than this. It is stored by filename only.
+const MAX_INDEX_BYTES: u64 = 100 * 1024 * 1024;
+
+const REASON_TIMEOUT_OPEN: &str = "timed out while opening the file";
+const REASON_TIMEOUT_EXTRACT: &str = "timed out while reading or extracting the file";
+const REASON_TIMEOUT_LIST: &str = "timed out while listing the directory";
+const REASON_PANIC: &str = "extract panicked";
+const REASON_CRASH: &str = "extract crashed";
+const REASON_TOO_BIG: &str = "file is larger than 100MB";
 
 /// `reindex_kind` while a startup diff holds the index.
 const KIND_STARTUP: u8 = 1;
@@ -62,6 +83,39 @@ pub struct Indexer {
     reindex_all_leads: AtomicUsize,
     reindex_all_followers: AtomicUsize,
     reindex_folder_followers: AtomicUsize,
+    extract_host: Mutex<crate::extract_host::ExtractHost>,
+    /// DB rows waiting for the current Tantivy batch to commit.
+    staged_rows: Mutex<Vec<StagedRow>>,
+    #[cfg(test)]
+    test_panic_path: Mutex<Option<String>>,
+    #[cfg(test)]
+    test_block_path: Mutex<Option<String>>,
+    #[cfg(test)]
+    test_io_timeout: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    test_max_bytes: AtomicU64,
+    #[cfg(test)]
+    test_abort_after: Mutex<Option<u32>>,
+    #[cfg(test)]
+    files_visited: AtomicUsize,
+    #[cfg(test)]
+    stat_count: AtomicUsize,
+    #[cfg(test)]
+    read_count: AtomicUsize,
+}
+
+/// How many staged files to publish in one Tantivy commit.
+const COMMIT_EVERY: usize = 200;
+
+struct StagedRow {
+    folder_id: i64,
+    path: String,
+    ext: String,
+    size: i64,
+    mtime: i64,
+    hash: String,
+    status: String,
+    reason: String,
 }
 
 struct Flight {
@@ -135,6 +189,24 @@ impl Indexer {
             reindex_all_leads: AtomicUsize::new(0),
             reindex_all_followers: AtomicUsize::new(0),
             reindex_folder_followers: AtomicUsize::new(0),
+            extract_host: Mutex::new(crate::extract_host::ExtractHost::new()),
+            staged_rows: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_panic_path: Mutex::new(None),
+            #[cfg(test)]
+            test_block_path: Mutex::new(None),
+            #[cfg(test)]
+            test_io_timeout: Mutex::new(None),
+            #[cfg(test)]
+            test_max_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            test_abort_after: Mutex::new(None),
+            #[cfg(test)]
+            files_visited: AtomicUsize::new(0),
+            #[cfg(test)]
+            stat_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            read_count: AtomicUsize::new(0),
         }
     }
 
@@ -366,13 +438,16 @@ impl Indexer {
             return stats;
         }
         // Missing, offline, or not a directory: do not treat "nothing listed" as "delete all".
-        if !root.is_dir() {
-            stats.errors += 1;
-            eprintln!(
-                "argos: skip crawl, folder is not a directory: {}",
-                root.display()
-            );
-            return stats;
+        // The stat runs in a worker so a dead SMB share cannot sit here forever.
+        let root_display = pathutil::simplify_windows_path(&root.to_string_lossy());
+        eprintln!("argos: opening {root_display}");
+        match self.stat_file(&extended_length_path(&root)) {
+            Ok(meta) if meta.is_dir => {}
+            Ok(_) | Err(_) => {
+                stats.errors += 1;
+                eprintln!("argos: skip crawl, folder is not a directory: {root_display}");
+                return stats;
+            }
         }
         if self.startup_cancelled() {
             return stats;
@@ -385,8 +460,11 @@ impl Indexer {
             phase: IndexPhase::Counting,
         });
 
-        let total = count_indexable(&root, excludes, &|| self.startup_cancelled());
-        if self.startup_cancelled() {
+        let (total, count_done) =
+            self.count_indexable(&root, excludes, &|| self.startup_cancelled());
+        if !count_done || self.startup_cancelled() {
+            // The count walk stopped early. Do not index a partial tree and do not purge.
+            let _ = self.finish_batch();
             return stats;
         }
 
@@ -404,50 +482,60 @@ impl Indexer {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut aborted = false;
+        let blocked_errors = std::cell::Cell::new(0u32);
 
-        for entry in WalkDir::new(&root).into_iter() {
-            if self.startup_cancelled() {
-                aborted = true;
-                break;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    stats.errors += 1;
-                    eprintln!("argos: walk error under {}: {err}", root.display());
-                    let failed = err.path().unwrap_or(root.as_path());
-                    push_blocked(&mut blocked, failed, &folder.path, &folder.public_path);
-                    continue;
+        let complete = self.visit_tree(
+            &root,
+            &|| self.startup_cancelled(),
+            &mut |failed| {
+                blocked_errors.set(blocked_errors.get().saturating_add(1));
+                push_blocked(&mut blocked, failed, &folder.path, &folder.public_path);
+            },
+            &mut |path| {
+                if self.startup_cancelled() {
+                    aborted = true;
+                    return false;
                 }
-            };
-            let path = entry.path();
-            if !is_indexable(path, entry.file_type(), excludes) {
-                continue;
-            }
-            let store_path =
-                pathutil::to_indexed_path(&path.to_string_lossy(), &folder.path, &folder.public_path);
-            seen.insert(store_path);
-            match self.index_one(&folder.path, &folder.public_path, path) {
-                Ok(IndexAction::Indexed) => stats.indexed += 1,
-                Ok(IndexAction::Skipped) => stats.skipped += 1,
-                Err(e) => {
-                    eprintln!("index error {}: {e}", path.display());
-                    stats.errors += 1;
+                if !should_index(path, excludes) {
+                    return true;
                 }
-            }
-            current += 1;
-            let is_done = current >= total;
-            let due = last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL;
-            if is_done || due {
-                on_progress(IndexProgress {
-                    folder_id: folder.id,
-                    current,
-                    total,
-                    phase: IndexPhase::Indexing,
-                });
-                last_emit = Instant::now();
-            }
+                if self.should_abort_walk() {
+                    aborted = true;
+                    return false;
+                }
+                let store_path = pathutil::to_indexed_path(
+                    &path.to_string_lossy(),
+                    &folder.path,
+                    &folder.public_path,
+                );
+                seen.insert(store_path);
+                match self.index_one(&folder.path, &folder.public_path, path) {
+                    Ok(IndexAction::Indexed) => stats.indexed += 1,
+                    Ok(IndexAction::Skipped) => stats.skipped += 1,
+                    Err(e) => {
+                        eprintln!("index error {}: {e}", path.display());
+                        stats.errors += 1;
+                    }
+                }
+                current += 1;
+                let is_done = current >= total;
+                let due = last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL;
+                if is_done || due {
+                    on_progress(IndexProgress {
+                        folder_id: folder.id,
+                        current,
+                        total,
+                        phase: IndexPhase::Indexing,
+                    });
+                    last_emit = Instant::now();
+                }
+                true
+            },
+        );
+        if !complete {
+            aborted = true;
         }
+        stats.errors += blocked_errors.get();
 
         // Ensure final n/N even when the last intermediate emit was throttled away
         // and total was 0 (empty folder): still report 0/0 once above.
@@ -460,9 +548,15 @@ impl Indexer {
             });
         }
 
+        if let Err(e) = self.finish_batch() {
+            eprintln!("argos: index commit failed, skip orphan purge for folder {}: {e}", folder.id);
+            aborted = true;
+            stats.errors += 1;
+        }
+
         if aborted {
             eprintln!(
-                "argos: startup sync preempted, skip orphan purge for folder {}",
+                "argos: crawl incomplete, skip orphan purge for folder {}",
                 folder.id
             );
         } else if purge_orphans {
@@ -549,10 +643,12 @@ impl Indexer {
         let Some(folder) = self.folder_for_path(path)? else {
             return Ok(false);
         };
-        Ok(matches!(
+        let indexed = matches!(
             self.index_one(&folder.path, &folder.public_path, path)?,
             IndexAction::Indexed
-        ))
+        );
+        self.finish_batch()?;
+        Ok(indexed)
     }
 
     /// Index every supported file under `dir`, then drop indexed descendants that are gone.
@@ -561,27 +657,41 @@ impl Indexer {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut changed = false;
-        for entry in WalkDir::new(dir).into_iter() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    eprintln!("argos: walk error under {}: {err}", dir.display());
-                    let failed = err.path().unwrap_or(dir);
-                    push_blocked(&mut blocked, failed, &folder.path, &folder.public_path);
-                    continue;
+        // Replay must finish the tree. It does not honor the startup cancel flag.
+        let complete = self.visit_tree(
+            dir,
+            &|| false,
+            &mut |failed| {
+                push_blocked(&mut blocked, failed, &folder.path, &folder.public_path);
+            },
+            &mut |path| {
+                if !should_index(path, &excludes) {
+                    return true;
                 }
-            };
-            let path = entry.path();
-            if !is_indexable(path, entry.file_type(), &excludes) {
-                continue;
-            }
-            let store_path =
-                pathutil::to_indexed_path(&path.to_string_lossy(), &folder.path, &folder.public_path);
-            seen.insert(store_path);
-            match self.index_one(&folder.path, &folder.public_path, path)? {
-                IndexAction::Indexed => changed = true,
-                IndexAction::Skipped => {}
-            }
+                if self.should_abort_walk() {
+                    return false;
+                }
+                let store_path = pathutil::to_indexed_path(
+                    &path.to_string_lossy(),
+                    &folder.path,
+                    &folder.public_path,
+                );
+                seen.insert(store_path);
+                match self.index_one(&folder.path, &folder.public_path, path) {
+                    Ok(IndexAction::Indexed) => changed = true,
+                    Ok(IndexAction::Skipped) => {}
+                    Err(e) => eprintln!("index error {}: {e}", path.display()),
+                }
+                true
+            },
+        );
+        self.finish_batch()?;
+        if !complete {
+            eprintln!(
+                "argos: tree walk incomplete, skip orphan purge under {}",
+                dir.display()
+            );
+            return Ok(changed);
         }
         let removed = self.purge_under_prefix(folder, dir, &seen, &blocked)?;
         Ok(changed || removed > 0)
@@ -755,89 +865,471 @@ impl Indexer {
         public_path: &str,
         path: &Path,
     ) -> Result<IndexAction, String> {
-        let meta = fs::metadata(path).map_err(|e| e.to_string())?;
-        let size = meta.len();
-        // `None` means the timestamp could not be read. Treating that as 0 would
-        // skip a later content change whenever the size stayed the same.
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs());
-        let store_path =
-            pathutil::to_indexed_path(&path.to_string_lossy(), folder, public_path);
+        let store_path = pathutil::to_indexed_path(&path.to_string_lossy(), folder, public_path);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.index_one_inner(folder, path, &store_path)
+        }));
+        match caught {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("argos: extract panicked: {}", path.display());
+                self.remember_filename_only(
+                    folder,
+                    path,
+                    &store_path,
+                    0,
+                    0,
+                    "skipped",
+                    REASON_PANIC,
+                )?;
+                Ok(IndexAction::Skipped)
+            }
+        }
+    }
 
-        // Size and mtime are enough to skip the read. Startup walks every registered
-        // file, including UNC folders, and hashing each one pegs the disk at logon.
-        if let Ok(Some(existing)) = self.db.get_file_meta(&store_path) {
+    fn index_one_inner(
+        &self,
+        folder: &str,
+        path: &Path,
+        store_path: &str,
+    ) -> Result<IndexAction, String> {
+        #[cfg(test)]
+        if self.test_panic_path.lock().as_deref().is_some_and(|name| {
+            path.file_name().and_then(|n| n.to_str()) == Some(name)
+        }) {
+            panic!("test panic in index_one");
+        }
+
+        let display = pathutil::simplify_windows_path(&path.to_string_lossy());
+        let io_path = extended_length_path(Path::new(&display));
+        eprintln!("argos: opening {display}");
+        #[cfg(test)]
+        self.stat_count.fetch_add(1, Ordering::SeqCst);
+        self.tune_host();
+        let stat = {
+            let mut host = self.extract_host.lock();
+            host.stat(&io_path, self.io_timeout(false))
+        };
+        let stat = match stat {
+            Ok(stat) => stat,
+            Err(IoFail::TimedOut) => {
+                eprintln!("argos: {REASON_TIMEOUT_OPEN}: {display}");
+                self.remember_filename_only(
+                    folder,
+                    path,
+                    store_path,
+                    0,
+                    0,
+                    "skipped",
+                    REASON_TIMEOUT_OPEN,
+                )?;
+                return Ok(IndexAction::Skipped);
+            }
+            Err(IoFail::Crashed(message)) => {
+                eprintln!("argos: extractor crashed on {display}: {message}");
+                self.remember_filename_only(folder, path, store_path, 0, 0, "skipped", REASON_CRASH)?;
+                return Ok(IndexAction::Skipped);
+            }
+            Err(IoFail::Failed(err)) => {
+                let reason = format!("open failed: {err}");
+                eprintln!("argos: {reason}: {display}");
+                self.remember_filename_only(folder, path, store_path, 0, 0, "skipped", &reason)?;
+                return Ok(IndexAction::Skipped);
+            }
+        };
+        let size = stat.size;
+        let mtime = stat.mtime;
+        if let Ok(Some(existing)) = self.db.get_file_meta(store_path) {
             if metadata_unchanged(existing.size, existing.mtime, size, mtime) {
                 return Ok(IndexAction::Skipped);
             }
         }
         let mtime = mtime.unwrap_or(0);
-
-        let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let hash = content_hash(&bytes);
-
-        if let Ok(Some(existing)) = self.db.get_file_meta(&store_path) {
-            if existing.content_hash == hash {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                let folder_id = self
-                    .db
-                    .folder_id_by_path(folder)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "folder not found".to_string())?;
-                self.db
-                    .upsert_file(
-                        folder_id,
-                        &store_path,
-                        ext,
-                        size as i64,
-                        mtime as i64,
-                        &hash,
-                    )
-                    .map_err(|e| e.to_string())?;
-                return Ok(IndexAction::Skipped);
-            }
+        if size > self.max_index_bytes() {
+            eprintln!("argos: {REASON_TOO_BIG}: {display}");
+            self.remember_filename_only(
+                folder,
+                path,
+                store_path,
+                size,
+                mtime,
+                "skipped",
+                REASON_TOO_BIG,
+            )?;
+            return Ok(IndexAction::Skipped);
         }
 
-        let extracted = match extractor::extract_file(path) {
-            Ok(doc) => doc,
-            Err(e) if extractor::is_skippable_extract_error(&e) => {
-                eprintln!("index skip {}: {e}", path.display());
+        eprintln!("argos: reading {display}");
+        #[cfg(test)]
+        self.read_count.fetch_add(1, Ordering::SeqCst);
+        self.tune_host();
+        let loaded = {
+            let mut host = self.extract_host.lock();
+            host.extract(&io_path, self.io_timeout(false), self.max_index_bytes())
+        };
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(IoFail::TimedOut) => {
+                eprintln!("argos: {REASON_TIMEOUT_EXTRACT}: {display}");
+                self.remember_filename_only(
+                    folder,
+                    path,
+                    store_path,
+                    size,
+                    mtime,
+                    "skipped",
+                    REASON_TIMEOUT_EXTRACT,
+                )?;
                 return Ok(IndexAction::Skipped);
             }
-            Err(e) => return Err(e),
+            Err(IoFail::Crashed(message)) => {
+                eprintln!("argos: extractor crashed on {display}: {message}");
+                self.remember_filename_only(
+                    folder,
+                    path,
+                    store_path,
+                    size,
+                    mtime,
+                    "skipped",
+                    REASON_CRASH,
+                )?;
+                return Ok(IndexAction::Skipped);
+            }
+            Err(IoFail::Failed(err)) => {
+                let reason = format!("open failed: {err}");
+                eprintln!("argos: {reason}: {display}");
+                self.remember_filename_only(folder, path, store_path, size, mtime, "skipped", &reason)?;
+                return Ok(IndexAction::Skipped);
+            }
         };
-        let _chunks = self
-            .backend
-            .index_file(path, &store_path, folder, mtime, size, &extracted)?;
 
-        let folder_id = self
-            .db
-            .folder_id_by_path(folder)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "folder not found".to_string())?;
-
-        self.db
-            .upsert_file(
-                folder_id,
-                &store_path,
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or(""),
-                size as i64,
-                mtime as i64,
-                &hash,
-            )
-            .map_err(|e| e.to_string())?;
-
-        Ok(IndexAction::Indexed)
+        match loaded.outcome {
+            ExtractOutcome::TooBig => {
+                eprintln!("argos: {REASON_TOO_BIG}: {display}");
+                self.remember_filename_only(
+                    folder,
+                    path,
+                    store_path,
+                    loaded.size,
+                    loaded.mtime.unwrap_or(mtime),
+                    "skipped",
+                    REASON_TOO_BIG,
+                )?;
+                Ok(IndexAction::Skipped)
+            }
+            ExtractOutcome::Text { title, pages } => {
+                if let Ok(Some(existing)) = self.db.get_file_meta(store_path) {
+                    if !existing.content_hash.is_empty() && existing.content_hash == loaded.hash {
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                        let folder_id = self.folder_id(folder)?;
+                        self.db
+                            .upsert_file(
+                                folder_id,
+                                store_path,
+                                ext,
+                                size as i64,
+                                mtime as i64,
+                                &loaded.hash,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        return Ok(IndexAction::Skipped);
+                    }
+                }
+                let extracted = extractor::ExtractedDoc { title, pages };
+                self.backend
+                    .stage_extracted(path, store_path, folder, mtime, size, &extracted)?;
+                self.stage_ok(folder, path, store_path, size, mtime, &loaded.hash)?;
+                Ok(IndexAction::Indexed)
+            }
+            ExtractOutcome::NoText => {
+                eprintln!("index skip {display}: no extractable text");
+                self.remember_filename_only(folder, path, store_path, size, mtime, "ok", "")?;
+                Ok(IndexAction::Indexed)
+            }
+            ExtractOutcome::Failed(err) => {
+                let reason = if err == REASON_PANIC || err.starts_with("pdf extract panicked") {
+                    REASON_PANIC.to_string()
+                } else {
+                    format!("extract failed: {err}")
+                };
+                eprintln!("argos: {reason}: {display}");
+                self.remember_filename_only(
+                    folder,
+                    path,
+                    store_path,
+                    size,
+                    mtime,
+                    "skipped",
+                    &reason,
+                )?;
+                Ok(IndexAction::Skipped)
+            }
+        }
     }
 
+    fn remember_filename_only(
+        &self,
+        folder: &str,
+        path: &Path,
+        store_path: &str,
+        size: u64,
+        mtime: u64,
+        status: &str,
+        skip_reason: &str,
+    ) -> Result<(), String> {
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("untitled");
+        self.backend
+            .stage_filename_only(path, store_path, folder, mtime, size, title)?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let folder_id = self.folder_id(folder)?;
+        self.stage_row(StagedRow {
+            folder_id,
+            path: store_path.to_string(),
+            ext: ext.to_string(),
+            size: size as i64,
+            mtime: mtime as i64,
+            hash: String::new(),
+            status: status.to_string(),
+            reason: skip_reason.to_string(),
+        })
+    }
+
+    fn stage_ok(
+        &self,
+        folder: &str,
+        path: &Path,
+        store_path: &str,
+        size: u64,
+        mtime: u64,
+        hash: &str,
+    ) -> Result<(), String> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let folder_id = self.folder_id(folder)?;
+        self.stage_row(StagedRow {
+            folder_id,
+            path: store_path.to_string(),
+            ext: ext.to_string(),
+            size: size as i64,
+            mtime: mtime as i64,
+            hash: hash.to_string(),
+            status: "ok".into(),
+            reason: String::new(),
+        })
+    }
+
+    fn folder_id(&self, folder: &str) -> Result<i64, String> {
+        self.db
+            .folder_id_by_path(folder)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "folder not found".to_string())
+    }
+
+    fn stage_row(&self, row: StagedRow) -> Result<(), String> {
+        let ready = {
+            let mut rows = self.staged_rows.lock();
+            rows.push(row);
+            if rows.len() >= COMMIT_EVERY {
+                std::mem::take(&mut *rows)
+            } else {
+                Vec::new()
+            }
+        };
+        if !ready.is_empty() {
+            self.publish_rows(ready)?;
+        }
+        Ok(())
+    }
+
+    fn finish_batch(&self) -> Result<(), String> {
+        let ready = {
+            let mut rows = self.staged_rows.lock();
+            std::mem::take(&mut *rows)
+        };
+        if ready.is_empty() {
+            return Ok(());
+        }
+        self.publish_rows(ready)
+    }
+
+    fn publish_rows(&self, rows: Vec<StagedRow>) -> Result<(), String> {
+        self.backend.publish_staged()?;
+        for row in rows {
+            if row.status == "ok" {
+                self.db
+                    .upsert_file(
+                        row.folder_id,
+                        &row.path,
+                        &row.ext,
+                        row.size,
+                        row.mtime,
+                        &row.hash,
+                    )
+                    .map_err(|e| e.to_string())?;
+            } else {
+                self.db
+                    .upsert_file_state(
+                        row.folder_id,
+                        &row.path,
+                        &row.ext,
+                        row.size,
+                        row.mtime,
+                        &row.hash,
+                        "skipped",
+                        &row.reason,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn max_index_bytes(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let override_bytes = self.test_max_bytes.load(Ordering::SeqCst);
+            if override_bytes > 0 {
+                return override_bytes;
+            }
+        }
+        MAX_INDEX_BYTES
+    }
+
+    fn io_timeout(&self, listing: bool) -> Duration {
+        #[cfg(test)]
+        if let Some(timeout) = *self.test_io_timeout.lock() {
+            return timeout;
+        }
+        if listing {
+            DIR_LIST_TIMEOUT
+        } else {
+            FILE_IO_TIMEOUT
+        }
+    }
+
+    fn tune_host(&self) {
+        #[cfg(test)]
+        {
+            let name = self.test_block_path.lock().clone();
+            self.extract_host.lock().set_block_name(name);
+        }
+    }
+
+    fn stat_file(&self, path: &Path) -> Result<FileStat, IoFail> {
+        #[cfg(test)]
+        self.stat_count.fetch_add(1, Ordering::SeqCst);
+        self.tune_host();
+        let mut host = self.extract_host.lock();
+        host.stat(path, self.io_timeout(false))
+    }
+
+    fn count_indexable(
+        &self,
+        root: &Path,
+        excludes: &[String],
+        stop: &dyn Fn() -> bool,
+    ) -> (u32, bool) {
+        let mut total = 0u32;
+        let complete = self.visit_tree(
+            root,
+            stop,
+            &mut |_| {},
+            &mut |path| {
+                if stop() {
+                    return false;
+                }
+                if !should_index(path, excludes) {
+                    return true;
+                }
+                if self.should_abort_walk() {
+                    return false;
+                }
+                total = total.saturating_add(1);
+                true
+            },
+        );
+        (total, complete)
+    }
+
+    /// `true` when every directory that could be listed was listed.
+    /// A listing failure blocks that directory only and does not fail the walk.
+    fn visit_tree(
+        &self,
+        root: &Path,
+        stop: &dyn Fn() -> bool,
+        on_blocked: &mut dyn FnMut(&Path),
+        on_file: &mut dyn FnMut(&Path) -> bool,
+    ) -> bool {
+        #[cfg(test)]
+        self.files_visited.store(0, Ordering::SeqCst);
+        let mut stack = vec![PathBuf::from(pathutil::simplify_windows_path(
+            &root.to_string_lossy(),
+        ))];
+        while let Some(dir) = stack.pop() {
+            if stop() {
+                return false;
+            }
+            let display = pathutil::simplify_windows_path(&dir.to_string_lossy());
+            eprintln!("argos: listing {display}");
+            self.tune_host();
+            let listed = {
+                let mut host = self.extract_host.lock();
+                host.list(
+                    &extended_length_path(Path::new(&display)),
+                    self.io_timeout(true),
+                )
+            };
+            let entries = match listed {
+                Ok(entries) => entries,
+                Err(IoFail::TimedOut) => {
+                    eprintln!("argos: {REASON_TIMEOUT_LIST}: {display}");
+                    on_blocked(Path::new(&display));
+                    continue;
+                }
+                Err(IoFail::Crashed(message)) => {
+                    eprintln!("argos: extractor crashed while listing {display}: {message}");
+                    on_blocked(Path::new(&display));
+                    continue;
+                }
+                Err(IoFail::Failed(message)) => {
+                    eprintln!("argos: walk error under {display}: {message}");
+                    on_blocked(Path::new(&display));
+                    continue;
+                }
+            };
+            for ent in entries {
+                let child = dir.join(&ent.name);
+                match ent.kind {
+                    EntryKind::Dir => stack.push(child),
+                    EntryKind::File => {
+                        if !on_file(&child) {
+                            return false;
+                        }
+                    }
+                    EntryKind::Symlink => {}
+                    EntryKind::Other => on_blocked(&child),
+                }
+            }
+        }
+        true
+    }
+
+    fn should_abort_walk(&self) -> bool {
+        #[cfg(test)]
+        {
+            let seen = self.files_visited.fetch_add(1, Ordering::SeqCst);
+            if self
+                .test_abort_after
+                .lock()
+                .is_some_and(|limit| seen >= limit as usize)
+            {
+                return true;
+            }
+        }
+        false
+    }
     fn enter_reindex_all(&self) -> Enter {
         let mut flight = self.reindex_all_flight.lock();
         if flight.running {
@@ -912,17 +1404,28 @@ impl Indexer {
     }
 }
 
-fn count_indexable(root: &Path, excludes: &[String], stop: &dyn Fn() -> bool) -> u32 {
-    let mut total = 0u32;
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if stop() {
-            break;
-        }
-        if is_indexable(entry.path(), entry.file_type(), excludes) {
-            total = total.saturating_add(1);
+/// `\\?\` / `\\?\UNC\` so a child path longer than MAX_PATH can be opened
+/// without the process being longPathAware.
+fn extended_length_path(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        return path.to_path_buf();
+    }
+    #[cfg(windows)]
+    {
+        let simplified = pathutil::simplify_windows_path(&path.to_string_lossy());
+        if simplified.starts_with(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{}", &simplified[2..]))
+        } else if simplified.len() >= 2 && simplified.as_bytes().get(1) == Some(&b':') {
+            PathBuf::from(format!(r"\\?\{simplified}"))
+        } else {
+            PathBuf::from(simplified)
         }
     }
-    total
+}
+
+fn should_index(path: &Path, excludes: &[String]) -> bool {
+    extractor::is_supported(path) && !is_excluded(path, excludes)
 }
 
 fn push_blocked(blocked: &mut Vec<String>, raw: &Path, folder: &str, public_path: &str) {
@@ -946,12 +1449,14 @@ fn path_is_blocked(path: &str, blocked: &[String]) -> bool {
 /// `file_type` comes from the directory listing (`DirEntry::file_type`), which
 /// does not stat again. A share that drops after the listing must not make a
 /// file that was just listed look deleted.
+#[cfg(test)]
 fn is_indexable(path: &Path, file_type: fs::FileType, excludes: &[String]) -> bool {
     listing_is_file(path, file_type)
         && extractor::is_supported(path)
         && !is_excluded(path, excludes)
 }
 
+#[cfg(test)]
 fn listing_is_file(path: &Path, file_type: fs::FileType) -> bool {
     if file_type.is_file() {
         return true;
@@ -1791,6 +2296,288 @@ mod tests {
             .unwrap();
         assert_eq!(db.list_note_items(&note.id).unwrap().len(), 1);
         assert_eq!(db.list_llm_sources(&thread.id).unwrap()[0].body, "引用本文");
+    }
+
+    #[test]
+    fn filename_only_pdf_is_found_and_not_reread_until_mtime_changes() {
+        let env = Env::new("scanpdf");
+        let path = env.files.join("画像のみ契約書.pdf");
+        fs::write(&path, blank_pdf_bytes()).unwrap();
+        env.index_all();
+
+        let hits = env.backend().search("契約書", 10, None, None, false).unwrap();
+        let hit = hits
+            .iter()
+            .find(|hit| hit.path == env.stored("画像のみ契約書.pdf"))
+            .unwrap_or_else(|| panic!("filename search missed the scan: {hits:?}"));
+        assert!(hit.snippet.trim().is_empty(), "no excerpt: {hit:?}");
+        assert!(hit.preview_text.trim().is_empty(), "empty body: {hit:?}");
+
+        let row = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("画像のみ契約書.pdf"))
+            .unwrap()
+            .expect("db row");
+        assert_eq!(row.content_hash, "");
+        assert_eq!(row.status, "ok", "{row:?}");
+        let indexed_at = row.indexed_at.clone();
+        let reads = env.indexer().read_count.load(Ordering::SeqCst);
+
+        let again = env.indexer().sync_enabled_folders().unwrap();
+        assert_eq!(again.indexed, 0, "{again:?}");
+        assert!(again.skipped >= 1, "{again:?}");
+        assert_eq!(env.indexer().read_count.load(Ordering::SeqCst), reads);
+        let row = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("画像のみ契約書.pdf"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.indexed_at, indexed_at);
+        assert_eq!(row.content_hash, "");
+
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + Duration::from_secs(10))
+            .unwrap();
+        let updated = env.indexer().sync_enabled_folders().unwrap();
+        assert!(updated.indexed >= 1, "{updated:?}");
+        assert!(env.indexer().read_count.load(Ordering::SeqCst) > reads);
+        let row = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("画像のみ契約書.pdf"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(row.indexed_at, indexed_at);
+    }
+
+    #[test]
+    fn unsupported_files_are_not_counted_or_opened() {
+        let env = Env::new("ext");
+        env.write("note.txt", "契約のメモ。本文を足して長さを確保する。");
+        fs::write(env.files.join("photo.png"), b"not-a-png").unwrap();
+        fs::write(env.files.join("scan.tif"), b"not-a-tif").unwrap();
+        let id = env.db.as_ref().unwrap().list_folders().unwrap()[0].id;
+        let mut total = None;
+        env.indexer().reindex_folder(id, |progress| {
+            if progress.phase == IndexPhase::Indexing {
+                total = Some(progress.total);
+            }
+        }).unwrap();
+        assert_eq!(total, Some(1), "N counts supported files only");
+        assert!(env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("photo.png"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            env.indexer().read_count.load(Ordering::SeqCst),
+            1,
+            "png and tif must not be read"
+        );
+        // Root directory stat, plus the one supported file. Not the images.
+        assert_eq!(env.indexer().stat_count.load(Ordering::SeqCst), 2);
+        assert!(env.paths_for("photo").is_empty());
+    }
+
+    #[test]
+    fn blocked_open_times_out_and_a_later_file_is_still_indexed() {
+        let env = Env::new("block");
+        env.write(
+            "停止ファイル.txt",
+            "本文アルテミスはタイムアウトしたファイルの中。追加の文字。",
+        );
+        env.write(
+            "later.txt",
+            "後続ファイルの固有語カリストを含む本文です。追加の文字。",
+        );
+        *env.indexer().test_block_path.lock() = Some("停止ファイル.txt".into());
+        *env.indexer().test_io_timeout.lock() = Some(Duration::from_millis(200));
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        assert!(stats.indexed >= 1, "{stats:?}");
+        assert!(stats.skipped >= 1, "{stats:?}");
+        assert!(
+            env.paths_for("カリスト")
+                .iter()
+                .any(|p| p == &env.stored("later.txt")),
+            "later file must be indexed"
+        );
+        assert!(
+            env.paths_for("アルテミス").is_empty(),
+            "timed-out body must not be indexed"
+        );
+        let row = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("停止ファイル.txt"))
+            .unwrap()
+            .expect("timed-out file is recorded");
+        assert_eq!(row.status, "skipped");
+        assert!(
+            row.skip_reason.contains("timed out"),
+            "{}",
+            row.skip_reason
+        );
+        assert!(env.backend().has_path(&env.stored("停止ファイル.txt")).unwrap());
+        let named = env.paths_for("停止ファイル");
+        assert!(
+            named.iter().any(|p| p == &env.stored("停止ファイル.txt")),
+            "filename still matches: {named:?}"
+        );
+    }
+
+    #[test]
+    fn panic_in_one_file_does_not_skip_the_next_folder() {
+        let env = Env::new("panicfile");
+        env.write("boom.txt", "契約のメモ。本文を足して長さを確保する。");
+        env.write("sibling.txt", "兄弟ファイルの固有語ヘリオスを本文に書く。");
+        let other = env.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("next.txt"),
+            "次のフォルダの固有語ポセイドンを本文に書く。",
+        )
+        .unwrap();
+        let db = env.db.as_ref().unwrap();
+        db.add_folder(other.to_str().unwrap(), "").unwrap();
+        *env.indexer().test_panic_path.lock() = Some("boom.txt".into());
+        env.indexer().sync_enabled_folders().unwrap();
+        assert!(env.backend().has_path(&env.stored("sibling.txt")).unwrap());
+        assert!(
+            env.paths_for("ポセイドン")
+                .iter()
+                .any(|p| p.contains("next.txt")),
+            "later folder must be indexed"
+        );
+        let row = db
+            .file_state(&env.stored("boom.txt"))
+            .unwrap()
+            .expect("panicking file is recorded");
+        assert_eq!(row.status, "skipped");
+        assert_eq!(row.skip_reason, "extract panicked");
+        assert!(env.paths_for("ヘリオス").iter().any(|p| p.contains("sibling")));
+    }
+
+    #[test]
+    fn incomplete_walk_does_not_purge_and_a_later_full_walk_does() {
+        let env = Env::new("abort");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.write("gone.txt", "慰謝料の請求について記載したメモ。本文を足す。");
+        env.index_all();
+        fs::remove_file(env.files.join("gone.txt")).unwrap();
+        *env.indexer().test_abort_after.lock() = Some(0);
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        assert!(env.backend().has_path(&env.stored("gone.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+        *env.indexer().test_abort_after.lock() = None;
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        assert!(stats.removed >= 1, "{stats:?}");
+        assert!(!env.backend().has_path(&env.stored("gone.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+    }
+
+    #[test]
+    fn long_child_path_is_indexed() {
+        let env = Env::new("longpath");
+        let part = "訴訟案件ﾌｫﾙﾀﾞ";
+        let mut dir = env.files.clone();
+        loop {
+            let next = dir.join(part);
+            let candidate = next.join("契約書メモ.txt");
+            if candidate.to_string_lossy().encode_utf16().count() > 280 {
+                dir = next;
+                break;
+            }
+            dir = next;
+        }
+        let mut built = env.files.clone();
+        let rel = dir.strip_prefix(&env.files).unwrap().to_path_buf();
+        for comp in rel.components() {
+            built.push(comp);
+            fs::create_dir_all(extended_length_path(&built)).unwrap();
+        }
+        let file = dir.join("契約書メモ.txt");
+        assert!(
+            file.to_string_lossy().encode_utf16().count() > 260,
+            "{}",
+            file.display()
+        );
+        fs::write(
+            extended_length_path(&file),
+            "長いパスの固有語ネメシスを本文に書く。追加の文字。",
+        )
+        .unwrap();
+        env.index_all();
+        let stored = pathutil::to_indexed_path(
+            &file.to_string_lossy(),
+            &env.files.to_string_lossy(),
+            "",
+        );
+        assert!(env.backend().has_path(&stored).unwrap(), "{stored}");
+        assert!(
+            env.paths_for("ネメシス").iter().any(|p| p == &stored),
+            "long path body missing"
+        );
+    }
+
+    #[test]
+    fn many_small_files_stay_in_few_segments() {
+        let env = Env::new("soak");
+        for n in 0..1000 {
+            env.write(
+                &format!("f{n}.txt"),
+                &format!("契約メモ {n} 本文を足して長さを確保する。"),
+            );
+        }
+        let before = crate::extract_host::committed_bytes();
+        env.index_all();
+        let segments = env.backend().segment_count().unwrap();
+        assert!(
+            segments < 32,
+            "1000 files produced {segments} segments; per-file commits would be hundreds"
+        );
+        let Some(before) = before else {
+            panic!("commit charge was not reported; the memory bound was not checked");
+        };
+        let after = crate::extract_host::committed_bytes().expect("commit charge after index");
+        let grew = after.saturating_sub(before);
+        assert!(
+            grew < 250 * 1024 * 1024,
+            "commit charge grew by {grew} bytes indexing 1000 tiny files (before {before}, after {after})"
+        );
+    }
+
+    fn blank_pdf_bytes() -> Vec<u8> {
+        let o1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+        let o2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
+        let o3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n";
+        let header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n";
+        let mut data = Vec::new();
+        data.extend_from_slice(header);
+        let p1 = data.len();
+        data.extend_from_slice(o1);
+        let p2 = data.len();
+        data.extend_from_slice(o2);
+        let p3 = data.len();
+        data.extend_from_slice(o3);
+        let xref_pos = data.len();
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{p1:010} 00000 n \n{p2:010} 00000 n \n{p3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n"
+        );
+        data.extend_from_slice(xref.as_bytes());
+        data
     }
 
     fn wait_until(limit: Duration, message: &str, mut ready: impl FnMut() -> bool) {
