@@ -596,7 +596,9 @@ impl Indexer {
     /// run holds the index, a user reindex, folder load, or relink preempts it the
     /// same way as the startup sync. `rearm` runs for every enabled root before any
     /// crawl starts. A `rearm` error is logged and the other roots still run.
-    /// An offline root is not crawled and its rows are left in place.
+    /// A root that is not crawled (confirmed missing, or a stat that timed out or
+    /// could not be taken) is marked unreachable. Its last success time and its
+    /// rows stay. A finished crawl records ok and a new success time.
     pub fn sync_enabled_folders_periodic<F>(
         &self,
         mut rearm: F,
@@ -625,9 +627,14 @@ impl Indexer {
         // watch that died should be back before that walk so later events are queued
         // instead of disappearing. An offline root must not stop the others.
         let mut crawl = Vec::with_capacity(enabled.len());
-        for folder in &enabled {
+        for (i, folder) in enabled.iter().enumerate() {
+            // Mark before the hold so a paused periodic sync is visible as in progress.
+            self.mark_folder_updating(folder.id);
             self.wait_if_startup_held();
             if self.note_periodic_preempted() {
+                for left in &enabled[..=i] {
+                    self.clear_folder_busy(left.id);
+                }
                 return Ok(IndexStats::default());
             }
             match self.probe_root(Path::new(&folder.path)) {
@@ -647,22 +654,33 @@ impl Indexer {
                 }
             }
             if self.note_periodic_preempted() {
+                for left in &enabled[..=i] {
+                    self.clear_folder_busy(left.id);
+                }
                 return Ok(IndexStats::default());
             }
         }
         let mut stats = IndexStats::default();
-        for (folder, online) in enabled.iter().zip(crawl) {
+        for (i, (folder, online)) in enabled.iter().zip(crawl).enumerate() {
+            self.mark_folder_updating(folder.id);
             self.wait_if_startup_held();
             if self.note_periodic_preempted() {
+                for left in &enabled[i..] {
+                    self.clear_folder_busy(left.id);
+                }
                 break;
             }
             if !online {
-                // Same outcome as `crawl_folder` when the root is missing: count the
-                // miss and do not purge. Skipping the crawl avoids a second timed stat
-                // against a dead share.
+                // Confirmed not-a-directory and unknown stat (timeout, worker down,
+                // crash) both skip the crawl: no second stat, and no purge. The
+                // folder is unreachable, same as `crawl_folder`, and the last
+                // success time stays.
                 stats.errors += 1;
                 let root_display = pathutil::simplify_windows_path(&folder.path);
                 eprintln!("argos: skip crawl, folder is not a directory: {root_display}");
+                if !self.mark_folder_unreachable(folder.id) {
+                    self.clear_folder_busy(folder.id);
+                }
                 continue;
             }
             stats.merge(self.crawl_folder(folder, &excludes, true, &mut |_| {}));
@@ -3867,6 +3885,50 @@ mod tests {
             "",
         );
         assert!(env.backend().has_path(&fresh).unwrap(), "{fresh}");
+        fs::rename(&aside, &env.files).unwrap();
+    }
+
+    #[test]
+    fn periodic_offline_skip_leaves_the_folder_unreachable() {
+        let env = Env::new("periodic-offline-status");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.index_all();
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        db.set_folder_index_outcome(id, FOLDER_INDEX_OK, Some(1_600_000_000))
+            .unwrap();
+        let aside = env.root.join("aside");
+        fs::rename(&env.files, &aside).unwrap();
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let sink = Arc::clone(&events);
+        env.indexer().set_status_hook(move |event| {
+            sink.lock().unwrap().push((event.busy, event.status));
+        });
+
+        let outcome = env
+            .indexer()
+            .sync_enabled_folders_periodic(|_, _| Ok(()))
+            .unwrap();
+        let PeriodicSync::Finished(stats) = outcome else {
+            panic!("periodic sync did not run: {outcome:?}");
+        };
+        assert!(stats.errors >= 1, "{stats:?}");
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert!(!row.index_busy);
+        assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(row.index_updated_at, Some(1_600_000_000));
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+        let got = events.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|(busy, _)| *busy),
+            "periodic skip should show in progress: {got:?}"
+        );
+        assert_eq!(
+            got.last().map(|(busy, status)| (*busy, status.as_str())),
+            Some((false, FOLDER_INDEX_UNREACHABLE))
+        );
         fs::rename(&aside, &env.files).unwrap();
     }
 
