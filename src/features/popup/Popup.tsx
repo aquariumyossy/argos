@@ -14,8 +14,6 @@ import ChatDestPicker, { attachToChat } from "../chat/ChatDestPicker";
 import NoteDestPicker, { keepToNote } from "../notes/NoteDestPicker";
 import { highlightText } from "../search/highlightText";
 import {
-  formatMailDateYmd,
-  formatMailFolderMeta,
   formatMailScopeLabel,
   isOutlookHit,
   isRemoteOnlyScope,
@@ -23,6 +21,22 @@ import {
   REMOTE_ONLY_SCOPE,
   scopeChipLabel,
 } from "../preview/hitMeta";
+import {
+  decidePopupKey,
+  effectivePublicRoot,
+  extFilterShortLabel,
+  folderFilterLabel,
+  hitDateLabel,
+  hitLocation,
+  hitTypeLabel,
+  INPUT_SUGGEST_HINT,
+  isInternalIdPath,
+  popupKeyPreventsDefault,
+  scoreLevel,
+  selectedHitLabel,
+  SUGGEST_OVERLAY_HINT,
+} from "./popupModel";
+import { loadShotSeed } from "./popupShot";
 import { openPreview } from "../preview/openPreview";
 import { IconPreview } from "../preview/previewIcons";
 import type {
@@ -233,39 +247,6 @@ function IconCalendar() {
   );
 }
 
-/** 16×16 paw-print pip for match score. */
-function IconScoreDog({ filled }: { filled: boolean }) {
-  return (
-    <svg
-      className={filled ? "hit-score-dog filled" : "hit-score-dog"}
-      viewBox="0 0 16 16"
-      width="16"
-      height="16"
-      aria-hidden="true"
-    >
-      {/* toe pads */}
-      <ellipse
-        cx="3.15"
-        cy="5.15"
-        rx="1.5"
-        ry="2"
-        transform="rotate(-30 3.15 5.15)"
-      />
-      <ellipse cx="6.1" cy="3.1" rx="1.4" ry="1.9" />
-      <ellipse cx="9.9" cy="3.1" rx="1.4" ry="1.9" />
-      <ellipse
-        cx="12.85"
-        cy="5.15"
-        rx="1.5"
-        ry="2"
-        transform="rotate(30 12.85 5.15)"
-      />
-      {/* main pad: rounded △, point toward toes, wide base below */}
-      <path d="M8 7.15c.85 0 2.1.75 3.25 2.05 1.9 1.7 2.3 3.95 1.55 5.15-.7.55-2.15.95-3.4.25-.4-.22-.7-.6-1.4-.6s-1 .38-1.4.6c-1.25.7-2.7.3-3.4-.25C2.45 13.15 2.85 10.9 4.75 9.2 5.9 7.9 7.15 7.15 8 7.15Z" />
-    </svg>
-  );
-}
-
 type ResizeDirection =
   | "East"
   | "North"
@@ -295,6 +276,8 @@ type SearchTermSuggestion = {
 };
 
 type SearchScopeRow = { path: string; label: string; isRoot: boolean };
+
+type IndexedFolder = { path: string; publicPath?: string; enabled: boolean };
 
 type SearchScopesResult = { recent: SearchScopeRow[]; scopes: SearchScopeRow[] };
 
@@ -385,21 +368,6 @@ function truncateChipLabel(label: string, max = SCOPE_CHIP_LABEL_MAX): string {
 /** Shared highlighter (Popup + Notes). */
 const highlight = highlightText;
 
-/** File extension from a hit path (e.g. "html", "pdf"). */
-function extFromPath(path: string): string {
-  const base = path.replace(/\\/g, "/").split("/").pop() ?? "";
-  const i = base.lastIndexOf(".");
-  if (i <= 0 || i === base.length - 1) return "";
-  return base.slice(i + 1).toLowerCase();
-}
-
-/** Relative match strength within the current result set (1–5). */
-function scoreLevel(score: number, maxScore: number): number {
-  if (maxScore <= 0) return 1;
-  const ratio = score / maxScore;
-  return Math.min(5, Math.max(1, Math.ceil(ratio * 5)));
-}
-
 type RelatedEvent = {
   start: string;
   end: string;
@@ -415,8 +383,9 @@ type RelatedEvent = {
 };
 
 export default function Popup() {
-  const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[]>([]);
+  const [shotSeed] = useState(() => loadShotSeed());
+  const [query, setQuery] = useState(shotSeed?.query ?? "");
+  const [hits, setHits] = useState<SearchHit[]>(shotSeed?.hits ?? []);
   const [related, setRelated] = useState<RelatedEvent[]>([]);
   const [relatedOpen, setRelatedOpen] = useState(false);
   const [relatedRow, setRelatedRow] = useState<number | null>(null);
@@ -437,16 +406,23 @@ export default function Popup() {
     end: number;
   } | null>(null);
   const [searchWords, setSearchWords] = useState<SearchWordRow[]>([]);
-  const [suggestions, setSuggestions] = useState<SearchTermSuggestion[]>([]);
+  const [suggestions, setSuggestions] = useState<SearchTermSuggestion[]>(
+    shotSeed?.suggestions ?? [],
+  );
   const [suggestIndex, setSuggestIndex] = useState(0);
-  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [suggestOpen, setSuggestOpen] = useState(shotSeed?.mode === "enter");
   const [searchScopes, setSearchScopes] = useState<SearchScopeRow[]>([]);
   const [recentScopes, setRecentScopes] = useState<SearchScopeRow[]>([]);
   const [remoteScopeAvailable, setRemoteScopeAvailable] = useState(false);
   const [scopeFilter, setScopeFilter] = useState("");
-  const [scopePath, setScopePath] = useState<string | null>(null);
-  const [scopeLabel, setScopeLabel] = useState<string | null>(null);
-  const [extFilterKeys, setExtFilterKeys] = useState<string[]>([]);
+  const [scopePath, setScopePath] = useState<string | null>(shotSeed?.scopePath ?? null);
+  const [scopeLabel, setScopeLabel] = useState<string | null>(
+    shotSeed?.scopeLabel ?? null,
+  );
+  const [extFilterKeys, setExtFilterKeys] = useState<string[]>(
+    shotSeed?.extFilterKeys ?? [],
+  );
+  const [folderRoots, setFolderRoots] = useState<string[]>(shotSeed?.roots ?? []);
   const [expandedParas, setExpandedParas] = useState<
     Record<string, ParagraphHit[]>
   >({});
@@ -464,6 +440,13 @@ export default function Popup() {
   const dateBeforeRef = useRef<string | null>(null);
   const imeComposingRef = useRef(false);
   const skipSelectChipRef = useRef(false);
+  const suggestionsRef = useRef<SearchTermSuggestion[]>(shotSeed?.suggestions ?? []);
+  const suggestionsForQueryRef = useRef<string | null>(shotSeed ? shotSeed.query : null);
+  const hitsRef = useRef<SearchHit[]>(shotSeed?.hits ?? []);
+  const resultNavStartedRef = useRef(false);
+  const suggestSeq = useRef(0);
+  suggestionsRef.current = suggestions;
+  hitsRef.current = hits;
 
   useEffect(() => {
     scopePathRef.current = scopePath;
@@ -482,6 +465,7 @@ export default function Popup() {
   }, [dateBefore]);
 
   useEffect(() => {
+    if (shotSeed) return;
     const win = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     void win.isMaximized().then(setMaximized).catch(() => {});
@@ -498,6 +482,7 @@ export default function Popup() {
   }, []);
 
   useEffect(() => {
+    if (shotSeed) return;
     let unlisten: (() => void) | undefined;
     listen("search-words-updated", () => {
       void invoke<SearchWordRow[]>("list_search_words")
@@ -702,6 +687,7 @@ export default function Popup() {
   applyScopeRef.current = applyScope;
 
   useEffect(() => {
+    if (shotSeed) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listen<PreviewRescopePayload>("preview-rescope", (event) => {
@@ -738,6 +724,7 @@ export default function Popup() {
   );
 
   useEffect(() => {
+    if (shotSeed) return;
     let unlisten: (() => void) | undefined;
     listen<SearchPayload>("search-results", (event) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -754,6 +741,7 @@ export default function Popup() {
       const seq = searchSeq.current;
       void loadRelated(event.payload.query, seq, null, null);
       setIndex(0);
+      resultNavStartedRef.current = false;
       setActionError("");
       setSearching(Boolean(event.payload.searching));
       setFolderPickerOpen(false);
@@ -777,10 +765,29 @@ export default function Popup() {
   }, [clearScope, clearExtFilter, loadRelated]);
 
   useEffect(() => {
+    if (shotSeed) return;
     void invoke<SearchWordRow[]>("list_search_words")
       .then(setSearchWords)
       .catch(console.error);
-  }, []);
+  }, [shotSeed]);
+
+  useEffect(() => {
+    if (shotSeed) return;
+    let cancelled = false;
+    void invoke<IndexedFolder[]>("list_folders")
+      .then((rows) => {
+        if (cancelled) return;
+        setFolderRoots(
+          rows
+            .filter((row) => row.enabled)
+            .map((row) => effectivePublicRoot(row.path, row.publicPath ?? "")),
+        );
+      })
+      .catch((e) => console.error(e));
+    return () => {
+      cancelled = true;
+    };
+  }, [shotSeed]);
 
   useEffect(() => {
     if (!folderPickerOpen && !extPickerOpen && !datePickerOpen && !suggestOpen) {
@@ -875,7 +882,10 @@ export default function Popup() {
   }, [query, scheduleSearch, selectChip]);
 
   const refreshSuggestions = useCallback(async (q: string) => {
+    const seq = ++suggestSeq.current;
     if (imeComposingRef.current) {
+      suggestionsRef.current = [];
+      suggestionsForQueryRef.current = q;
       setSuggestOpen(false);
       setSuggestions([]);
       return;
@@ -884,13 +894,57 @@ export default function Popup() {
       const next = await invoke<SearchTermSuggestion[]>("suggest_search_terms", {
         query: q,
       });
+      if (seq !== suggestSeq.current) return;
+      suggestionsRef.current = next;
+      suggestionsForQueryRef.current = q;
       setSuggestions(next);
       setSuggestIndex(0);
-      setSuggestOpen(next.length > 0);
+      setSuggestOpen((open) => open && next.length > 0);
     } catch (e) {
       console.error(e);
+      if (seq !== suggestSeq.current) return;
+      suggestionsRef.current = [];
+      suggestionsForQueryRef.current = q;
       setSuggestions([]);
       setSuggestOpen(false);
+    }
+  }, []);
+
+  const openSuggestionsFromKey = useCallback(async () => {
+    const q = inputRef.current?.value ?? "";
+    if (imeComposingRef.current) return;
+    if (suggestionsForQueryRef.current === q && suggestionsRef.current.length > 0) {
+      setSuggestIndex(0);
+      setSelectChip(null);
+      setSuggestOpen(true);
+      return;
+    }
+    if (suggestionsForQueryRef.current === q) {
+      resultNavStartedRef.current = true;
+      setIndex((i) => Math.min(i + 1, Math.max(hitsRef.current.length - 1, 0)));
+      return;
+    }
+    const seq = ++suggestSeq.current;
+    try {
+      const next = await invoke<SearchTermSuggestion[]>("suggest_search_terms", {
+        query: q,
+      });
+      if (seq !== suggestSeq.current) return;
+      if ((inputRef.current?.value ?? "") !== q) return;
+      suggestionsRef.current = next;
+      suggestionsForQueryRef.current = q;
+      setSuggestions(next);
+      setSuggestIndex(0);
+      if (next.length > 0) {
+        setSelectChip(null);
+        setSuggestOpen(true);
+      } else {
+        setSuggestOpen(false);
+        resultNavStartedRef.current = true;
+        setIndex((i) => Math.min(i + 1, Math.max(hitsRef.current.length - 1, 0)));
+      }
+    } catch (e) {
+      console.error(e);
     }
   }, []);
 
@@ -1328,94 +1382,101 @@ export default function Popup() {
 
   useEffect(() => {
     const active = listRef.current?.querySelector<HTMLElement>(".hit.active");
-    active?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    active?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
   }, [index, hits]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        if (selectChip) {
+      const action = decidePopupKey(
+        {
+          key: e.key,
+          ctrlKey: e.ctrlKey,
+          metaKey: e.metaKey,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          isComposing: e.isComposing,
+          keyCode: e.keyCode,
+        },
+        {
+          imeComposing: imeComposingRef.current,
+          selectChip: selectChip != null,
+          folderPickerOpen,
+          extPickerOpen,
+          datePickerOpen,
+          suggestOpen,
+          suggestionCount: suggestions.length,
+          caretInInput: document.activeElement === inputRef.current,
+          resultNavStarted: resultNavStartedRef.current,
+          suggestionsReady: suggestionsForQueryRef.current === query,
+        },
+      );
+      if (popupKeyPreventsDefault(action)) e.preventDefault();
+      switch (action) {
+        case "ignore":
+        case "picker-swallow":
+          return;
+        case "escape-select-chip":
           setSelectChip(null);
           return;
-        }
-        if (folderPickerOpen) {
+        case "escape-folder":
           setFolderPickerOpen(false);
           return;
-        }
-        if (extPickerOpen) {
+        case "escape-ext":
           setExtPickerOpen(false);
           return;
-        }
-        if (datePickerOpen) {
+        case "escape-date":
           setDatePickerOpen(false);
           return;
-        }
-        if (suggestOpen) {
+        case "escape-suggest":
           setSuggestOpen(false);
           return;
-        }
-        void hidePopup();
-        return;
-      }
-      if (folderPickerOpen || extPickerOpen || datePickerOpen) return;
-
-      if (
-        suggestOpen &&
-        suggestions.length > 0 &&
-        !imeComposingRef.current
-      ) {
-        if (e.key === "Tab") {
-          e.preventDefault();
+        case "escape-popup":
+          void hidePopup();
+          return;
+        case "suggest-tab": {
           const sug = suggestions[suggestIndex] ?? suggestions[0];
           if (sug) applySuggestion(sug);
           return;
         }
-        if (e.key === "ArrowDown") {
-          e.preventDefault();
+        case "suggest-down":
           setSuggestIndex((i) => (i + 1) % suggestions.length);
           return;
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault();
+        case "suggest-up":
           setSuggestIndex(
             (i) => (i - 1 + suggestions.length) % suggestions.length,
           );
           return;
-        }
-        if (e.key === "Enter" && !query.trim()) {
-          e.preventDefault();
-          const sug = suggestions[suggestIndex] ?? suggestions[0];
-          if (sug) applySuggestion(sug);
+        case "suggest-enter-close":
+          setSuggestOpen(false);
+          return;
+        case "suggest-enter-swallow":
+          return;
+        case "open-suggest":
+          void openSuggestionsFromKey();
+          return;
+        case "result-down":
+          resultNavStartedRef.current = true;
+          setIndex((i) => Math.min(i + 1, Math.max(hits.length - 1, 0)));
+          return;
+        case "result-up":
+          resultNavStartedRef.current = true;
+          setIndex((i) => Math.max(i - 1, 0));
+          return;
+        case "preview": {
+          const hit = hits[index];
+          if (hit) openHitPreview(hit);
           return;
         }
-      }
-
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setIndex((i) => Math.min(i + 1, Math.max(hits.length - 1, 0)));
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setIndex((i) => Math.max(i - 1, 0));
-        return;
-      }
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        const hit = hits[index];
-        if (hit) openHitPreview(hit);
-        return;
-      }
-      if (e.key === "Enter" && e.shiftKey) {
-        e.preventDefault();
-        const hit = hits[index];
-        if (!hit || !isOutlookHit(hit)) void openFolder();
-        return;
-      }
-      if (e.key === "Enter") {
-        e.preventDefault();
-        void openSelected();
+        case "open-folder": {
+          const hit = hits[index];
+          if (!hit || !isOutlookHit(hit)) void openFolder();
+          return;
+        }
+        case "open-result":
+          void openSelected();
+          return;
+        default:
+          return;
       }
     };
     window.addEventListener("keydown", onKey);
@@ -1431,6 +1492,7 @@ export default function Popup() {
     openFolder,
     openHitPreview,
     openSelected,
+    openSuggestionsFromKey,
     query,
     selectChip,
     suggestIndex,
@@ -1504,6 +1566,13 @@ export default function Popup() {
 
   const currentHit = hits[index];
   const currentIsMail = currentHit ? isOutlookHit(currentHit) : false;
+  const suggestOverlayVisible =
+    suggestOpen &&
+    suggestions.length > 0 &&
+    !folderPickerOpen &&
+    !extPickerOpen &&
+    !datePickerOpen &&
+    !selectChip;
 
   return (
     <div className="popup">
@@ -1616,7 +1685,11 @@ export default function Popup() {
             ) : null}
             <input
               ref={inputRef}
-              className="popup-query-input"
+              className={
+                suggestOverlayVisible
+                  ? "popup-query-input"
+                  : "popup-query-input has-suggest-hint"
+              }
               value={query}
               placeholder={'検索 "隣接" -除外'}
               spellCheck={false}
@@ -1624,6 +1697,7 @@ export default function Popup() {
                 const next = e.target.value;
                 setQuery(next);
                 setSelectChip(null);
+                resultNavStartedRef.current = false;
                 hideHint();
                 scheduleSearch(next);
                 if (!folderPickerOpen && !extPickerOpen && !datePickerOpen) {
@@ -1673,6 +1747,11 @@ export default function Popup() {
                 }
               }}
             />
+            {suggestOverlayVisible ? null : (
+              <span className="popup-input-suggest-hint" aria-hidden="true">
+                {INPUT_SUGGEST_HINT}
+              </span>
+            )}
             {selectChip ? (
               <div className="popup-select-chip" role="toolbar" aria-label="選択した語">
                 <button
@@ -1758,12 +1837,7 @@ export default function Popup() {
           >
             <IconCalendar />
           </button>
-          {suggestOpen &&
-          suggestions.length > 0 &&
-          !folderPickerOpen &&
-          !extPickerOpen &&
-          !datePickerOpen &&
-          !selectChip ? (
+          {suggestOverlayVisible ? (
             <div
               className="popup-suggest"
               role="listbox"
@@ -1805,11 +1879,7 @@ export default function Popup() {
                   </li>
                 ))}
               </ul>
-              <div className="popup-suggest-hint">
-                {!query.trim()
-                  ? "↑↓ で選択 · Enter で検索 · × または Esc で閉じる"
-                  : "↑↓ で選択 · Tab で確定 · × または Esc で閉じる"}
-              </div>
+              <div className="popup-suggest-hint">{SUGGEST_OVERLAY_HINT}</div>
             </div>
           ) : null}
           {folderPickerOpen ? (
@@ -1854,7 +1924,7 @@ export default function Popup() {
                         type="button"
                         role="option"
                         className="scope-recent"
-                        title={s.path}
+                        title={isInternalIdPath(s.path) ? s.label : s.path}
                         onClick={() => applyScope(s.path, s.label)}
                       >
                         <span className="scope-kind">直近</span>
@@ -1871,7 +1941,7 @@ export default function Popup() {
                         type="button"
                         role="option"
                         className={s.isRoot ? "scope-root" : "scope-sub"}
-                        title={s.path}
+                        title={isInternalIdPath(s.path) ? s.label : s.path}
                         onClick={() => applyScope(s.path, s.label)}
                       >
                         {s.isRoot ? (
@@ -2002,11 +2072,15 @@ export default function Popup() {
             {scopePath ? (
               <span
                 className="popup-scope-chip"
-                title={scopeChipLabel(scopePath, scopeLabel)}
+                title={
+                  isInternalIdPath(scopePath)
+                    ? folderFilterLabel(scopePath, scopeLabel)
+                    : scopePath
+                }
               >
-                <span className="popup-scope-chip-at">@</span>
+                <span className="popup-scope-chip-at">フォルダ:</span>
                 <span className="popup-scope-chip-text">
-                  {truncateChipLabel(scopeChipLabel(scopePath, scopeLabel))}
+                  {truncateChipLabel(folderFilterLabel(scopePath, scopeLabel))}
                 </span>
                 <button
                   type="button"
@@ -2025,9 +2099,9 @@ export default function Popup() {
                 className="popup-scope-chip popup-ext-chip"
                 title={extFilterChipLabel(extFilterKeys)}
               >
-                <span className="popup-scope-chip-at">種別</span>
+                <span className="popup-scope-chip-at">種類:</span>
                 <span className="popup-scope-chip-text">
-                  {truncateChipLabel(extFilterChipLabel(extFilterKeys))}
+                  {truncateChipLabel(extFilterShortLabel(extFilterKeys))}
                 </span>
                 <button
                   type="button"
@@ -2046,7 +2120,7 @@ export default function Popup() {
                 className="popup-scope-chip popup-date-chip"
                 title={dateChipLabel(dateAfter, dateBefore, datePreset)}
               >
-                <span className="popup-scope-chip-at">時期</span>
+                <span className="popup-scope-chip-at">時期:</span>
                 <span className="popup-scope-chip-text">
                   {truncateChipLabel(
                     dateChipLabel(dateAfter, dateBefore, datePreset),
@@ -2107,7 +2181,10 @@ export default function Popup() {
           ) : null}
         </div>
       ) : null}
-      <ul className="hit-list" ref={listRef}>
+      <ul
+        className={suggestOverlayVisible ? "hit-list is-behind-overlay" : "hit-list"}
+        ref={listRef}
+      >
           {hits.length === 0 ? (
             <li className="empty">
               {searching
@@ -2125,73 +2202,57 @@ export default function Popup() {
                 const nestParagraphs =
                   (hit.paragraphs?.length ?? 0) > 0 &&
                   !(mailHit && (hit.paragraphs?.length ?? 0) <= 1);
+                const location = hitLocation(hit, folderRoots);
+                const dateLabel = shotSeed?.dates[hit.path] || hitDateLabel(hit);
+                const threadNote =
+                  mailHit && (hit.matchCount ?? 0) > 1
+                    ? `スレッド ${hit.matchCount} 通`
+                    : "";
                 return (
                   <li
                     key={`${hit.source}-${hit.id}`}
-                    className={i === index ? "hit active" : "hit"}
+                    className={
+                      i === index && !suggestOverlayVisible ? "hit active" : "hit"
+                    }
                     onMouseEnter={() => setIndex(i)}
                     onDoubleClick={() => void openSelected()}
                   >
                     <div className="hit-main">
-                      <div className="hit-title-row">
-                        <div className="hit-title">
-                          {hit.source === "remote" ? (
-                            <span className="hit-source" title="リモート">
-                              リモート
-                            </span>
-                          ) : null}
-                          {isOutlookHit(hit) ? (
-                            <span className="hit-source" title="Outlook メール">
-                              メール
-                            </span>
-                          ) : null}
-                          {isOutlookHit(hit)
-                            ? (() => {
-                                const ymd = formatMailDateYmd(hit.mailDate);
-                                return ymd ? (
-                                  <span
-                                    className="hit-mail-date"
-                                    title="受信日"
-                                  >
-                                    {ymd}
-                                  </span>
-                                ) : null;
-                              })()
-                            : null}
-                          {(() => {
-                            if (isOutlookHit(hit)) return null;
-                            const ext = extFromPath(hit.path);
-                            return ext ? (
-                              <span className="hit-ext" title={hit.path}>
-                                {ext}
-                              </span>
-                            ) : null;
-                          })()}
-                          {highlight(hit.title, query, hit.highlightTerms)}
-                        </div>
+                      <div className="hit-meta">
+                        {hit.source === "remote" ? (
+                          <span className="hit-type" title="リモート">
+                            リモート
+                          </span>
+                        ) : null}
+                        <span className="hit-type">{hitTypeLabel(hit)}</span>
+                        {dateLabel ? (
+                          <span className="hit-date">{dateLabel}</span>
+                        ) : null}
                         <div
                           className="hit-score"
-                          aria-label={`マッチ度 ${level}/5`}
-                          title={`マッチ度 ${level}/5`}
+                          aria-label={`関連度 ${level}/5`}
+                          title={`関連度 ${level}/5`}
                         >
-                          {[1, 2, 3, 4, 5].map((n) => (
-                            <IconScoreDog key={n} filled={n <= level} />
-                          ))}
+                          <span className="hit-score-label">関連度</span>
+                          <span className="hit-score-bar" aria-hidden="true">
+                            <span style={{ width: `${(level / 5) * 100}%` }} />
+                          </span>
                         </div>
                       </div>
-                      {isOutlookHit(hit) ? (
-                        <div className="hit-mail-meta muted">
-                          {[
-                            hit.mailFrom,
-                            hit.mailFolder
-                              ? formatMailFolderMeta(hit.mailFolder)
-                              : "",
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")}
-                          {(hit.matchCount ?? 0) > 1
-                            ? ` · スレッド ${hit.matchCount} 通`
-                            : ""}
+                      <div className="hit-title">
+                        {highlight(hit.title, query, hit.highlightTerms)}
+                      </div>
+                      {location.text || threadNote ? (
+                        <div
+                          className="hit-crumb"
+                          title={location.title || undefined}
+                        >
+                          <span className="hit-crumb-icon" aria-hidden="true">
+                            <IconFolder />
+                          </span>
+                          <span className="hit-crumb-text">
+                            {[location.text, threadNote].filter(Boolean).join(" · ")}
+                          </span>
                         </div>
                       ) : null}
                       {mailHit ? (
@@ -2299,12 +2360,9 @@ export default function Popup() {
                           {highlight(hit.snippet, query, hit.highlightTerms)}
                         </div>
                       )}
-                      <div className="hit-path" title={hit.path}>
-                        {!mailHit && hit.matchCount && hit.matchCount > 1
-                          ? `マッチ ${hit.matchCount} 段落 · `
-                          : null}
-                        {hit.path}
-                      </div>
+                      {!mailHit && hit.matchCount && hit.matchCount > 1 ? (
+                        <div className="hit-match-count">マッチ {hit.matchCount} 段落</div>
+                      ) : null}
                     </div>
                     <div className="hit-actions">
                       <button
@@ -2382,44 +2440,40 @@ export default function Popup() {
       ) : null}
 
       <footer className="popup-footer">
-        <span>↑↓ 移動</span>
-        <button
-          type="button"
-          className="popup-footer-action"
-          title={currentIsMail ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
-          onClick={() => void openSelected()}
-        >
-          Enter 開く
-        </button>
-        {!currentIsMail ? (
+        <span className="popup-selection-name">
+          {currentHit ? `選択中: ${selectedHitLabel(currentHit)}` : ""}
+        </span>
+        <div className="popup-footer-hints">
           <button
             type="button"
             className="popup-footer-action"
-            title="フォルダを開く (Shift+Enter)"
-            onClick={() => void openFolder()}
+            title={currentIsMail ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
+            onClick={() => void openSelected()}
           >
-            Shift+Enter フォルダ
+            Enter 開く
           </button>
-        ) : null}
-        <button
-          type="button"
-          className="popup-footer-action"
-          title="プレビュー (Ctrl+Enter)"
-          onClick={() => {
-            const hit = hits[index];
-            if (hit) openHitPreview(hit);
-          }}
-        >
-          Ctrl+Enter プレビュー
-        </button>
-        <button
-          type="button"
-          className="popup-footer-action"
-          title="閉じる (Esc)"
-          onClick={() => void hidePopup()}
-        >
-          Esc 閉じる
-        </button>
+          {!currentIsMail ? (
+            <button
+              type="button"
+              className="popup-footer-action"
+              title="フォルダを開く (Shift+Enter)"
+              onClick={() => void openFolder()}
+            >
+              Shift+Enter フォルダ
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="popup-footer-action"
+            title="プレビュー (Ctrl+Enter)"
+            onClick={() => {
+              const hit = hits[index];
+              if (hit) openHitPreview(hit);
+            }}
+          >
+            Ctrl+Enter プレビュー
+          </button>
+        </div>
         <div className="popup-footer-windows">
           <button
             type="button"
