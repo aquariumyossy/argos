@@ -6,6 +6,12 @@ import PreviewWindow from "./features/preview/PreviewWindow";
 import Settings from "./features/settings/Settings";
 
 function App() {
+  if (import.meta.env.DEV && typeof window !== "undefined") {
+    const shot = new URLSearchParams(window.location.search).get("popup-shot");
+    if (shot === "enter" || shot === "layout") {
+      return <Popup />;
+    }
+  }
   const label = getCurrentWindow().label;
   if (label === "popup") {
     return <Popup />;
