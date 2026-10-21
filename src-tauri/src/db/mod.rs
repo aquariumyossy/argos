@@ -1326,6 +1326,7 @@ impl Db {
     }
 
     /// `updated_at` of `None` leaves the previous success time in place.
+    /// Clears `index_busy`. Callers are the crawl, reindex, or relink that owns that flag.
     pub fn set_folder_index_outcome(
         &self,
         id: i64,
@@ -1344,6 +1345,20 @@ impl Db {
                 rusqlite::params![status, id],
             )?;
         }
+        Ok(())
+    }
+
+    /// Watcher success time. Does not touch `index_busy`; the crawl or `index_tree` that set it clears it.
+    pub fn set_folder_index_watcher_ok(
+        &self,
+        id: i64,
+        updated_at: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE folders SET index_status=?1, index_updated_at=?2 WHERE id=?3",
+            rusqlite::params![FOLDER_INDEX_OK, updated_at, id],
+        )?;
         Ok(())
     }
 
