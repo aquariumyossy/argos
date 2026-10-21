@@ -58,7 +58,7 @@ const REASON_PANIC: &str = "extract panicked";
 const REASON_CRASH: &str = "extract crashed";
 const REASON_TOO_BIG: &str = "file is larger than 100MB";
 
-/// `reindex_kind` while a startup diff holds the index.
+/// `reindex_kind` while a startup or periodic diff holds the index.
 const KIND_STARTUP: u8 = 1;
 /// `reindex_kind` while a user reindex, folder load, or relink holds the index.
 const KIND_USER: u8 = 2;
@@ -72,6 +72,11 @@ pub struct FolderIndexStatusEvent {
     pub updated_at: Option<i64>,
     pub busy: bool,
 }
+
+/// Gap after one periodic folder diff returns before the next one starts.
+/// Fixed: there is no setting. The wait is measured from the end of the previous
+/// tick, so a long crawl does not overlap the next tick.
+pub const PERIODIC_FOLDER_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Consecutive timeouts in one walk. Not shared across folders: two crawls can run at once.
 struct WalkIo {
@@ -107,6 +112,20 @@ impl Default for WalkIo {
     }
 }
 
+enum RootSeen {
+    Directory,
+    NotDirectory,
+    /// Stat timed out, or the extractor worker was down or crashed.
+    Unknown,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum StatFault {
+    TimedOut,
+    Unavailable,
+}
+
 pub struct Indexer {
     db: Arc<Db>,
     backend: Arc<TantivyBackend>,
@@ -115,7 +134,7 @@ pub struct Indexer {
     reindex_busy: Arc<AtomicBool>,
     /// `KIND_STARTUP` or `KIND_USER` while `reindex_busy` is set.
     reindex_kind: AtomicU8,
-    /// Set when a user operation wants the startup diff to stop and get out of the way.
+    /// Set when a user operation wants the startup or periodic diff to stop and get out of the way.
     cancel_startup: AtomicBool,
     /// Events that arrived while `reindex_busy` was set. Applied in `end_reindex`.
     pending_fs: Mutex<Vec<FsEvent>>,
@@ -161,6 +180,9 @@ pub struct Indexer {
     test_extract_crash: AtomicBool,
     #[cfg(test)]
     test_io_timeout: Mutex<Option<Duration>>,
+    /// Forces the next root stat to fail before the filesystem is touched.
+    #[cfg(test)]
+    test_stat_fault: Mutex<Option<StatFault>>,
     #[cfg(test)]
     test_max_bytes: AtomicU64,
     #[cfg(test)]
@@ -319,6 +341,8 @@ impl Indexer {
             #[cfg(test)]
             test_io_timeout: Mutex::new(None),
             #[cfg(test)]
+            test_stat_fault: Mutex::new(None),
+            #[cfg(test)]
             test_max_bytes: AtomicU64::new(0),
             #[cfg(test)]
             test_abort_after: Mutex::new(None),
@@ -364,6 +388,19 @@ impl Indexer {
                 self.reindex_cv.wait(&mut gate);
             }
         }
+    }
+
+    /// Take the index if it is free. Does not wait, and does not cancel a running diff.
+    fn try_begin_reindex(&self, kind: u8) -> Option<ReindexGuard<'_>> {
+        let _gate = self.reindex_gate.lock();
+        let _pending = self.pending_fs.lock();
+        if self.reindex_busy.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.cancel_startup.store(false, Ordering::SeqCst);
+        self.reindex_kind.store(kind, Ordering::SeqCst);
+        self.reindex_busy.store(true, Ordering::SeqCst);
+        Some(ReindexGuard { indexer: self })
     }
 
     fn startup_cancelled(&self) -> bool {
@@ -550,6 +587,128 @@ impl Indexer {
             Ok(stats)
         })();
         result
+    }
+
+    /// Same incremental crawl as [`Self::sync_enabled_folders`], on a fixed cadence.
+    ///
+    /// Returns [`PeriodicSync::Skipped`] immediately when a startup sync or a user
+    /// reindex already holds the index — it does not wait behind them. Once this
+    /// run holds the index, a user reindex, folder load, or relink preempts it the
+    /// same way as the startup sync. `rearm` runs for every enabled root before any
+    /// crawl starts. A `rearm` error is logged and the other roots still run.
+    /// A root that is not crawled (confirmed missing, or a stat that timed out or
+    /// could not be taken) is marked unreachable. Its last success time and its
+    /// rows stay. A finished crawl records ok and a new success time.
+    pub fn sync_enabled_folders_periodic<F>(
+        &self,
+        mut rearm: F,
+    ) -> Result<PeriodicSync, String>
+    where
+        F: FnMut(&str, bool) -> Result<(), String>,
+    {
+        let _guard = match self.try_begin_reindex(KIND_STARTUP) {
+            Some(guard) => guard,
+            None => {
+                eprintln!("argos: periodic sync skipped; a folder sync is already running");
+                return Ok(PeriodicSync::Skipped);
+            }
+        };
+        Ok(PeriodicSync::Finished(self.crawl_enabled_for_periodic(&mut rearm)?))
+    }
+
+    fn crawl_enabled_for_periodic<F>(&self, rearm: &mut F) -> Result<IndexStats, String>
+    where
+        F: FnMut(&str, bool) -> Result<(), String>,
+    {
+        let folders = self.db.list_folders().map_err(|e| e.to_string())?;
+        let excludes = self.load_excludes()?;
+        let enabled: Vec<_> = folders.into_iter().filter(|f| f.enabled).collect();
+        // Re-arm every root before the crawl. A large folder can take minutes, and a
+        // watch that died should be back before that walk so later events are queued
+        // instead of disappearing. An offline root must not stop the others.
+        let mut crawl = Vec::with_capacity(enabled.len());
+        for (i, folder) in enabled.iter().enumerate() {
+            // Mark before the hold so a paused periodic sync is visible as in progress.
+            self.mark_folder_updating(folder.id);
+            self.wait_if_startup_held();
+            if self.note_periodic_preempted() {
+                for left in &enabled[..=i] {
+                    self.clear_folder_busy(left.id);
+                }
+                return Ok(IndexStats::default());
+            }
+            match self.probe_root(Path::new(&folder.path)) {
+                RootSeen::Unknown => {
+                    // A timed-out or stopped worker is not "this share is gone".
+                    // Leave the existing watch in place and do not ask for a new one.
+                    let root_display = pathutil::simplify_windows_path(&folder.path);
+                    eprintln!("argos: watch rearm skipped, root stat unknown: {root_display}");
+                    crawl.push(false);
+                }
+                seen => {
+                    let online = matches!(seen, RootSeen::Directory);
+                    if let Err(e) = rearm(&folder.path, online) {
+                        eprintln!("argos: watch rearm {}: {e}", folder.path);
+                    }
+                    crawl.push(online);
+                }
+            }
+            if self.note_periodic_preempted() {
+                for left in &enabled[..=i] {
+                    self.clear_folder_busy(left.id);
+                }
+                return Ok(IndexStats::default());
+            }
+        }
+        let mut stats = IndexStats::default();
+        for (i, (folder, online)) in enabled.iter().zip(crawl).enumerate() {
+            self.mark_folder_updating(folder.id);
+            self.wait_if_startup_held();
+            if self.note_periodic_preempted() {
+                for left in &enabled[i..] {
+                    self.clear_folder_busy(left.id);
+                }
+                break;
+            }
+            if !online {
+                // Confirmed not-a-directory and unknown stat (timeout, worker down,
+                // crash) both skip the crawl: no second stat, and no purge. The
+                // folder is unreachable, same as `crawl_folder`, and the last
+                // success time stays.
+                stats.errors += 1;
+                let root_display = pathutil::simplify_windows_path(&folder.path);
+                eprintln!("argos: skip crawl, folder is not a directory: {root_display}");
+                if !self.mark_folder_unreachable(folder.id) {
+                    self.clear_folder_busy(folder.id);
+                }
+                continue;
+            }
+            stats.merge(self.crawl_folder(folder, &excludes, true, &mut |_| {}));
+        }
+        Ok(stats)
+    }
+
+    fn note_periodic_preempted(&self) -> bool {
+        if self.startup_cancelled() {
+            eprintln!("argos: periodic sync preempted by a user reindex or relink");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A directory is safe to re-watch. Anything else that the stat actually
+    /// observed (missing, or not a directory) is not. A timeout, a worker that is
+    /// backing off, or a crash is unknown: the caller must not drop a live watch.
+    fn probe_root(&self, path: &Path) -> RootSeen {
+        match self.stat_file(&extended_length_path(path)) {
+            Ok(meta) if meta.is_dir => RootSeen::Directory,
+            Ok(_) => RootSeen::NotDirectory,
+            Err(IoFail::TimedOut) | Err(IoFail::Unavailable(_)) | Err(IoFail::Crashed(_)) => {
+                RootSeen::Unknown
+            }
+            Err(IoFail::Failed(_)) => RootSeen::NotDirectory,
+        }
     }
 
     fn load_excludes(&self) -> Result<Vec<String>, String> {
@@ -960,7 +1119,8 @@ impl Indexer {
         Ok(n)
     }
 
-    /// Apply one watcher event. Events that arrive during a reindex are queued, not dropped.
+    /// Apply one watcher event. Events that arrive during a reindex, a startup sync,
+    /// or a periodic diff are queued, not dropped.
     pub fn handle_fs_event(&self, event: FsEvent) -> Result<bool, String> {
         if self.defer_if_busy(event.clone()) {
             return Ok(false);
@@ -1714,6 +1874,15 @@ impl Indexer {
     }
 
     fn stat_file(&self, path: &Path) -> Result<FileStat, IoFail> {
+        #[cfg(test)]
+        if let Some(fault) = *self.test_stat_fault.lock() {
+            return match fault {
+                StatFault::TimedOut => Err(IoFail::TimedOut),
+                StatFault::Unavailable => Err(IoFail::Unavailable(
+                    "extractor worker is backing off after a failed start".into(),
+                )),
+            };
+        }
         self.host_call(true, false, |host, timeout| host.stat(path, timeout))
     }
 
@@ -2160,6 +2329,29 @@ pub struct IndexProgress {
     pub current: u32,
     pub total: u32,
     pub phase: IndexPhase,
+}
+
+/// One periodic tick. `Skipped` means the index was already held; watches were not re-armed.
+#[derive(Debug)]
+pub enum PeriodicSync {
+    Skipped,
+    Finished(IndexStats),
+}
+
+/// `wait` then `tick`, `ticks` times.
+///
+/// The app loop uses the same order: sleep [`PERIODIC_FOLDER_SYNC_INTERVAL`], then
+/// run one tick, and only then sleep again. The interval is measured from the end
+/// of the previous tick, including a tick that skipped because a sync was running.
+pub fn drive_periodic_folder_sync(
+    ticks: usize,
+    mut wait: impl FnMut(Duration),
+    mut tick: impl FnMut(),
+) {
+    for _ in 0..ticks {
+        wait(PERIODIC_FOLDER_SYNC_INTERVAL);
+        tick();
+    }
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -3558,6 +3750,301 @@ mod tests {
             hits.iter().any(|p| p == &env.stored("locked/secret.txt")),
             "{hits:?}"
         );
+    }
+
+    #[test]
+    fn periodic_tick_skips_when_a_sync_already_holds_the_index() {
+        let env = Env::new("periodic-skip");
+        env.write("a.txt", "契約についての最初の文書。本文を足して長さを確保する。");
+        let indexer = Arc::clone(env.indexer.as_ref().unwrap());
+        for kind in [KIND_STARTUP, KIND_USER] {
+            let guard = indexer.begin_reindex(kind);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let worker = Arc::clone(&indexer);
+            let calls_worker = Arc::clone(&calls);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let result = worker.sync_enabled_folders_periodic(|_, _| {
+                    calls_worker.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+                let _ = tx.send(result);
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+                panic!("periodic tick waited while kind {kind} held the index")
+            });
+            match result {
+                Ok(PeriodicSync::Skipped) => {}
+                other => panic!("kind {kind}: {other:?}"),
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "kind {kind} re-armed");
+            assert!(indexer.reindex_busy.load(Ordering::SeqCst));
+            drop(guard);
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn periodic_sync_yields_to_a_folder_reindex_and_runs_again_afterwards() {
+        let env = Env::new("periodic-yield");
+        env.write("a.txt", "契約のメモ。本文を足して長さを確保する。");
+        env.index_all();
+        let indexer = Arc::clone(env.indexer.as_ref().unwrap());
+        indexer.startup_test_hold.store(true, Ordering::SeqCst);
+        let _release = ReleaseStartupHold(&indexer);
+
+        let worker = Arc::clone(&indexer);
+        let sync_thread = std::thread::spawn(move || {
+            worker.sync_enabled_folders_periodic(|_, _| Ok(()))
+        });
+        wait_until(
+            Duration::from_secs(5),
+            "periodic sync did not take the index",
+            || indexer.reindex_busy.load(Ordering::SeqCst),
+        );
+
+        let follow = Arc::clone(&indexer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        indexer.set_schedule_sync(move || {
+            follow.startup_test_hold.store(false, Ordering::SeqCst);
+            let _ = tx.send(follow.sync_enabled_folders());
+        });
+
+        let id = env.db.as_ref().unwrap().list_folders().unwrap()[0].id;
+        let user_indexer = Arc::clone(&indexer);
+        let user = std::thread::spawn(move || user_indexer.reindex_folder(id, |_| {}));
+        let follow_stats = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a preempted periodic sync should run again after 読込 releases the index")
+            .unwrap();
+        assert!(
+            follow_stats.skipped >= 1 || follow_stats.indexed >= 1,
+            "{follow_stats:?}"
+        );
+        assert_eq!(follow_stats.removed, 0, "{follow_stats:?}");
+
+        let preempted = sync_thread.join().unwrap().unwrap();
+        match preempted {
+            PeriodicSync::Finished(stats) => {
+                assert_eq!(
+                    (stats.indexed, stats.skipped, stats.removed),
+                    (0, 0, 0),
+                    "{stats:?}"
+                );
+            }
+            PeriodicSync::Skipped => panic!("periodic sync skipped instead of yielding"),
+        }
+        user.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn periodic_sync_rearms_every_enabled_root_and_keeps_an_offline_root() {
+        let env = Env::new("periodic-rearm");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.index_all();
+        let aside = env.root.join("aside");
+        fs::rename(&env.files, &aside).unwrap();
+
+        let other = env.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("fresh.txt"),
+            "契約の別フォルダ。本文を足して長さを確保する。",
+        )
+        .unwrap();
+        env.db
+            .as_ref()
+            .unwrap()
+            .add_folder(other.to_str().unwrap(), "")
+            .unwrap();
+
+        let mut calls: Vec<(String, bool)> = Vec::new();
+        let outcome = env
+            .indexer()
+            .sync_enabled_folders_periodic(|path, online| {
+                calls.push((path.to_string(), online));
+                if online {
+                    Ok(())
+                } else {
+                    Err("share offline".into())
+                }
+            })
+            .unwrap();
+        let PeriodicSync::Finished(stats) = outcome else {
+            panic!("periodic sync did not run: {outcome:?}");
+        };
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(!calls[0].1, "the missing root should be reported offline: {calls:?}");
+        assert!(calls[1].1, "the live root should be re-armed: {calls:?}");
+        assert!(stats.indexed >= 1, "{stats:?}");
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+        let fresh = pathutil::to_indexed_path(
+            &other.join("fresh.txt").to_string_lossy(),
+            &other.to_string_lossy(),
+            "",
+        );
+        assert!(env.backend().has_path(&fresh).unwrap(), "{fresh}");
+        fs::rename(&aside, &env.files).unwrap();
+    }
+
+    #[test]
+    fn periodic_offline_skip_leaves_the_folder_unreachable() {
+        let env = Env::new("periodic-offline-status");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.index_all();
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        db.set_folder_index_outcome(id, FOLDER_INDEX_OK, Some(1_600_000_000))
+            .unwrap();
+        let aside = env.root.join("aside");
+        fs::rename(&env.files, &aside).unwrap();
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<(bool, String)>::new()));
+        let sink = Arc::clone(&events);
+        env.indexer().set_status_hook(move |event| {
+            sink.lock().unwrap().push((event.busy, event.status));
+        });
+
+        let outcome = env
+            .indexer()
+            .sync_enabled_folders_periodic(|_, _| Ok(()))
+            .unwrap();
+        let PeriodicSync::Finished(stats) = outcome else {
+            panic!("periodic sync did not run: {outcome:?}");
+        };
+        assert!(stats.errors >= 1, "{stats:?}");
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert!(!row.index_busy);
+        assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(row.index_updated_at, Some(1_600_000_000));
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+        let got = events.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|(busy, _)| *busy),
+            "periodic skip should show in progress: {got:?}"
+        );
+        assert_eq!(
+            got.last().map(|(busy, status)| (*busy, status.as_str())),
+            Some((false, FOLDER_INDEX_UNREACHABLE))
+        );
+        fs::rename(&aside, &env.files).unwrap();
+    }
+
+    #[test]
+    fn periodic_sync_keeps_the_watch_when_root_stat_is_unknown() {
+        let env = Env::new("periodic-unknown");
+        env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.index_all();
+        for fault in [StatFault::TimedOut, StatFault::Unavailable] {
+            *env.indexer().test_stat_fault.lock() = Some(fault);
+            let mut unwatched = false;
+            let outcome = env
+                .indexer()
+                .sync_enabled_folders_periodic(|_path, _online| {
+                    // Any rearm of an unconfirmed root is the path that unwatches
+                    // a live watch. Unknown stat must not ask for one.
+                    unwatched = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                matches!(outcome, PeriodicSync::Finished(_)),
+                "{fault:?}: {outcome:?}"
+            );
+            assert!(
+                !unwatched,
+                "{fault:?}: unknown stat unwatched the root"
+            );
+        }
+        assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+    }
+
+    #[test]
+    fn events_during_a_periodic_sync_are_applied_afterwards() {
+        let env = Env::new("periodic-events");
+        env.write("a.txt", "契約についての最初の文書。本文を足して長さを確保する。");
+        env.index_all();
+        let indexer = Arc::clone(env.indexer.as_ref().unwrap());
+        indexer.startup_test_hold.store(true, Ordering::SeqCst);
+        let _release = ReleaseStartupHold(&indexer);
+
+        let worker = Arc::clone(&indexer);
+        let sync_thread = std::thread::spawn(move || {
+            worker.sync_enabled_folders_periodic(|_, _| Ok(()))
+        });
+        wait_until(
+            Duration::from_secs(5),
+            "periodic sync did not take the index",
+            || indexer.reindex_busy.load(Ordering::SeqCst),
+        );
+
+        let a = env.files.join("a.txt");
+        let b = env.write("b.txt", "損害賠償について後から追加した文書。契約にも触れる。");
+        fs::remove_file(&a).unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Removed(a))
+            .unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Appeared(b))
+            .unwrap();
+        assert!(
+            env.backend().has_path(&env.stored("a.txt")).unwrap(),
+            "a remove during the periodic sync must wait until it finishes"
+        );
+        assert!(
+            !env.backend().has_path(&env.stored("b.txt")).unwrap(),
+            "an add during the periodic sync must wait until it finishes"
+        );
+
+        // Stop before the crawl. The queued events have to land on replay,
+        // which is what a diff that already walked past the path would miss.
+        indexer.cancel_startup.store(true, Ordering::SeqCst);
+        indexer.startup_test_hold.store(false, Ordering::SeqCst);
+        let outcome = sync_thread.join().unwrap().unwrap();
+        match outcome {
+            PeriodicSync::Finished(stats) => {
+                assert_eq!((stats.indexed, stats.removed), (0, 0), "{stats:?}");
+            }
+            PeriodicSync::Skipped => panic!("periodic sync was skipped"),
+        }
+        assert!(!env.backend().has_path(&env.stored("a.txt")).unwrap());
+        assert!(env.backend().has_path(&env.stored("b.txt")).unwrap());
+        let hits = env.paths_for("損害賠償");
+        assert!(hits.iter().any(|p| p == &env.stored("b.txt")), "{hits:?}");
+    }
+
+    #[test]
+    fn periodic_interval_is_one_hour_measured_from_the_end_of_the_previous_tick() {
+        assert_eq!(
+            PERIODIC_FOLDER_SYNC_INTERVAL,
+            Duration::from_secs(60 * 60)
+        );
+        let now = AtomicU64::new(0);
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        drive_periodic_folder_sync(
+            3,
+            |delay| {
+                assert_eq!(delay, PERIODIC_FOLDER_SYNC_INTERVAL);
+                now.fetch_add(delay.as_secs(), Ordering::SeqCst);
+            },
+            || {
+                let start = now.load(Ordering::SeqCst);
+                starts.push(start);
+                if starts.len() != 2 {
+                    now.fetch_add(7 * 60, Ordering::SeqCst);
+                }
+                ends.push(now.load(Ordering::SeqCst));
+            },
+        );
+        assert_eq!(starts[0], 60 * 60);
+        assert_eq!(ends[0] - starts[0], 7 * 60);
+        assert_eq!(starts[1] - ends[0], 60 * 60);
+        assert_eq!(ends[1], starts[1], "a skipped tick must not look like a crawl");
+        assert_eq!(starts[2] - ends[1], 60 * 60);
+        assert_eq!(ends[2] - starts[2], 7 * 60);
     }
 
     #[test]
