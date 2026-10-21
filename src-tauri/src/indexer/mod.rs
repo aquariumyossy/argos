@@ -35,9 +35,14 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 /// Open, read, and extract each give up after this long. The child process is
 /// killed; it does not keep the file bytes in the indexer.
 const FILE_IO_TIMEOUT: Duration = Duration::from_secs(60);
-/// A timeout is tried this many times before it is recorded. The first try
-/// plus two retries.
+/// Extract is tried this many times in one run. Stat is not retried: a dead
+/// share must not spend three minutes on every remaining file.
 const IO_ATTEMPTS: u32 = 3;
+/// Timeouts or `Unavailable` results in a row. The walk stops and purges nothing.
+const WALK_IO_BREAK: u32 = 3;
+/// Extract timeouts or crashes against one existing file before we stop reading
+/// it until its size or mtime changes.
+const EXTRACT_GIVE_UP_AFTER: i64 = 3;
 /// One directory listing. Longer than a file read: a large share folder can take
 /// more than a minute to enumerate without being stuck on a single entry.
 const DIR_LIST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -55,6 +60,40 @@ const REASON_TOO_BIG: &str = "file is larger than 100MB";
 const KIND_STARTUP: u8 = 1;
 /// `reindex_kind` while a user reindex, folder load, or relink holds the index.
 const KIND_USER: u8 = 2;
+
+/// Consecutive timeouts in one walk. Not shared across folders: two crawls can run at once.
+struct WalkIo {
+    consecutive: std::cell::Cell<u32>,
+}
+
+impl WalkIo {
+    fn note_stall(&self) -> bool {
+        let n = self.consecutive.get().saturating_add(1);
+        self.consecutive.set(n);
+        if n == WALK_IO_BREAK {
+            eprintln!(
+                "argos: {WALK_IO_BREAK} consecutive timeouts or extractor outages; leaving the rest of this folder for the next run"
+            );
+        }
+        n >= WALK_IO_BREAK
+    }
+
+    fn note_progress(&self) {
+        self.consecutive.set(0);
+    }
+
+    fn tripped(&self) -> bool {
+        self.consecutive.get() >= WALK_IO_BREAK
+    }
+}
+
+impl Default for WalkIo {
+    fn default() -> Self {
+        Self {
+            consecutive: std::cell::Cell::new(0),
+        }
+    }
+}
 
 pub struct Indexer {
     db: Arc<Db>,
@@ -93,6 +132,12 @@ pub struct Indexer {
     test_panic_path: Mutex<Option<String>>,
     #[cfg(test)]
     test_block_path: Mutex<Option<String>>,
+    /// Hang extract only. Stat still returns, so a timeout is an extract timeout.
+    #[cfg(test)]
+    test_block_extract_only: AtomicBool,
+    /// The next extract returns a worker crash without reading.
+    #[cfg(test)]
+    test_extract_crash: AtomicBool,
     #[cfg(test)]
     test_io_timeout: Mutex<Option<Duration>>,
     #[cfg(test)]
@@ -198,6 +243,10 @@ impl Indexer {
             test_panic_path: Mutex::new(None),
             #[cfg(test)]
             test_block_path: Mutex::new(None),
+            #[cfg(test)]
+            test_block_extract_only: AtomicBool::new(false),
+            #[cfg(test)]
+            test_extract_crash: AtomicBool::new(false),
             #[cfg(test)]
             test_io_timeout: Mutex::new(None),
             #[cfg(test)]
@@ -486,16 +535,17 @@ impl Indexer {
         let mut blocked: Vec<String> = Vec::new();
         let mut aborted = false;
         let blocked_errors = std::cell::Cell::new(0u32);
+        let io = WalkIo::default();
 
         let complete = self.visit_tree(
             &root,
-            &|| self.startup_cancelled(),
+            &|| self.startup_cancelled() || io.tripped(),
             &mut |failed| {
                 blocked_errors.set(blocked_errors.get().saturating_add(1));
                 push_blocked(&mut blocked, failed, &folder.path, &folder.public_path);
             },
             &mut |path| {
-                if self.startup_cancelled() {
+                if self.startup_cancelled() || io.tripped() {
                     aborted = true;
                     return false;
                 }
@@ -512,13 +562,17 @@ impl Indexer {
                     &folder.public_path,
                 );
                 seen.insert(store_path);
-                match self.index_one(&folder.path, &folder.public_path, path) {
+                match self.index_one(&folder.path, &folder.public_path, path, &io) {
                     Ok(IndexAction::Indexed) => stats.indexed += 1,
                     Ok(IndexAction::Skipped) => stats.skipped += 1,
                     Err(e) => {
                         eprintln!("index error {}: {e}", path.display());
                         stats.errors += 1;
                     }
+                }
+                if io.tripped() {
+                    aborted = true;
+                    return false;
                 }
                 current += 1;
                 let is_done = current >= total;
@@ -534,6 +588,7 @@ impl Indexer {
                 }
                 true
             },
+            &io,
         );
         if !complete {
             aborted = true;
@@ -646,7 +701,8 @@ impl Indexer {
         let Some(folder) = self.folder_for_path(path)? else {
             return Ok(false);
         };
-        let indexed = self.index_one(&folder.path, &folder.public_path, path);
+        let io = WalkIo::default();
+        let indexed = self.index_one(&folder.path, &folder.public_path, path, &io);
         if let Err(err) = self.finish_batch() {
             return Err(match indexed {
                 Err(index_err) => format!("{index_err}; {err}"),
@@ -662,10 +718,12 @@ impl Indexer {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut changed = false;
-        // Replay must finish the tree. It does not honor the startup cancel flag.
+        let io = WalkIo::default();
+        // Replay does not honor the startup cancel flag. A run of timeouts still
+        // stops the walk, and the purge below does not run.
         let complete = self.visit_tree(
             dir,
-            &|| false,
+            &|| io.tripped(),
             &mut |failed| {
                 push_blocked(&mut blocked, failed, &folder.path, &folder.public_path);
             },
@@ -673,7 +731,7 @@ impl Indexer {
                 if !should_index(path, &excludes) {
                     return true;
                 }
-                if self.should_abort_walk() {
+                if self.should_abort_walk() || io.tripped() {
                     return false;
                 }
                 let store_path = pathutil::to_indexed_path(
@@ -682,13 +740,14 @@ impl Indexer {
                     &folder.public_path,
                 );
                 seen.insert(store_path);
-                match self.index_one(&folder.path, &folder.public_path, path) {
+                match self.index_one(&folder.path, &folder.public_path, path, &io) {
                     Ok(IndexAction::Indexed) => changed = true,
                     Ok(IndexAction::Skipped) => {}
                     Err(e) => eprintln!("index error {}: {e}", path.display()),
                 }
-                true
+                !io.tripped()
             },
+            &io,
         );
         self.finish_batch()?;
         if !complete {
@@ -869,15 +928,17 @@ impl Indexer {
         folder: &str,
         public_path: &str,
         path: &Path,
+        io: &WalkIo,
     ) -> Result<IndexAction, String> {
         let store_path = pathutil::to_indexed_path(&path.to_string_lossy(), folder, public_path);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.index_one_inner(folder, path, &store_path)
+            self.index_one_inner(folder, path, &store_path, io)
         }));
         match caught {
             Ok(result) => result,
             Err(_) => {
                 eprintln!("argos: extract panicked: {}", path.display());
+                io.note_progress();
                 if self.file_row(&store_path)?.is_some() {
                     return Err(REASON_PANIC.into());
                 }
@@ -900,6 +961,7 @@ impl Indexer {
         folder: &str,
         path: &Path,
         store_path: &str,
+        io: &WalkIo,
     ) -> Result<IndexAction, String> {
         #[cfg(test)]
         if self.test_panic_path.lock().as_deref().is_some_and(|name| {
@@ -911,28 +973,49 @@ impl Indexer {
         let display = pathutil::simplify_windows_path(&path.to_string_lossy());
         let io_path = extended_length_path(Path::new(&display));
         eprintln!("argos: opening {display}");
-        let stat = self.host_call(true, |host, timeout| host.stat(&io_path, timeout));
+        let stat = self.host_call(true, false, |host, timeout| host.stat(&io_path, timeout));
         let stat = match stat {
             Ok(stat) => stat,
             Err(IoFail::TimedOut) => {
                 eprintln!("argos: {REASON_TIMEOUT_OPEN}: {display}");
-                return self.note_transient(folder, path, store_path, &display, REASON_TIMEOUT_OPEN);
+                return Self::mark(
+                    io,
+                    true,
+                    self.note_transient(folder, path, store_path, &display, REASON_TIMEOUT_OPEN),
+                );
             }
             Err(IoFail::Crashed(message)) => {
                 eprintln!("argos: extractor crashed on {display}: {message}");
-                return self.note_transient(folder, path, store_path, &display, REASON_CRASH);
+                return Self::mark(
+                    io,
+                    false,
+                    self.note_transient(folder, path, store_path, &display, REASON_CRASH),
+                );
             }
-            Err(IoFail::Failed(err)) | Err(IoFail::Unavailable(err)) => {
+            Err(IoFail::Unavailable(err)) => {
                 let reason = format!("open failed: {err}");
                 eprintln!("argos: {reason}: {display}");
-                return self.note_transient(folder, path, store_path, &display, &reason);
+                return Self::mark(
+                    io,
+                    true,
+                    self.note_transient(folder, path, store_path, &display, &reason),
+                );
+            }
+            Err(IoFail::Failed(err)) => {
+                let reason = format!("open failed: {err}");
+                eprintln!("argos: {reason}: {display}");
+                return Self::mark(
+                    io,
+                    false,
+                    self.note_transient(folder, path, store_path, &display, &reason),
+                );
             }
         };
         let size = stat.size;
         let mtime = stat.mtime;
         if let Ok(Some(existing)) = self.db.get_file_meta(store_path) {
             if metadata_unchanged(existing.size, existing.mtime, size, mtime) {
-                return Ok(IndexAction::Skipped);
+                return Self::mark(io, false, Ok(IndexAction::Skipped));
             }
         }
         let mtime = mtime.unwrap_or(0);
@@ -947,45 +1030,69 @@ impl Indexer {
                 "skipped",
                 REASON_TOO_BIG,
             )?;
-            return Ok(IndexAction::Skipped);
+            return Self::mark(io, false, Ok(IndexAction::Skipped));
         }
 
         eprintln!("argos: reading {display}");
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::SeqCst);
         let max_bytes = self.max_index_bytes();
-        let loaded = self.host_call(false, |host, timeout| {
+        let loaded = self.host_call(false, true, |host, timeout| {
             host.extract(&io_path, timeout, max_bytes)
         });
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(IoFail::TimedOut) => {
                 eprintln!("argos: {REASON_TIMEOUT_EXTRACT}: {display}");
-                return self.note_extract_timeout(
-                    folder,
-                    path,
-                    store_path,
-                    size,
-                    mtime,
-                    &display,
+                return Self::mark(
+                    io,
+                    true,
+                    self.note_extract_failure(
+                        folder,
+                        path,
+                        store_path,
+                        size,
+                        mtime,
+                        &display,
+                        REASON_TIMEOUT_EXTRACT,
+                    ),
                 );
             }
             Err(IoFail::Crashed(message)) => {
                 eprintln!("argos: extractor crashed on {display}: {message}");
-                return self.sticky_skip(
-                    folder,
-                    path,
-                    store_path,
-                    size,
-                    mtime,
-                    &display,
-                    REASON_CRASH,
+                // A crash is one file, not a dead share, so it does not trip the walk breaker.
+                // It still counts toward the per-file give-up, and it does not replace a real row.
+                return Self::mark(
+                    io,
+                    false,
+                    self.note_extract_failure(
+                        folder,
+                        path,
+                        store_path,
+                        size,
+                        mtime,
+                        &display,
+                        REASON_CRASH,
+                    ),
                 );
             }
-            Err(IoFail::Failed(err)) | Err(IoFail::Unavailable(err)) => {
+            Err(IoFail::Unavailable(err)) => {
                 let reason = format!("open failed: {err}");
                 eprintln!("argos: {reason}: {display}");
-                return self.note_transient(folder, path, store_path, &display, &reason);
+                return Self::mark(
+                    io,
+                    true,
+                    self.note_transient(folder, path, store_path, &display, &reason),
+                );
+            }
+            Err(IoFail::Failed(err)) => {
+                let reason = format!("open failed: {err}");
+                eprintln!("argos: {reason}: {display}");
+                return Self::mark(
+                    io,
+                    false,
+                    self.note_transient(folder, path, store_path, &display, &reason),
+                );
             }
         };
 
@@ -1001,7 +1108,7 @@ impl Indexer {
                     "skipped",
                     REASON_TOO_BIG,
                 )?;
-                Ok(IndexAction::Skipped)
+                Self::mark(io, false, Ok(IndexAction::Skipped))
             }
             ExtractOutcome::Text { title, pages } => {
                 if let Ok(Some(existing)) = self.db.get_file_meta(store_path) {
@@ -1018,19 +1125,19 @@ impl Indexer {
                                 &loaded.hash,
                             )
                             .map_err(|e| e.to_string())?;
-                        return Ok(IndexAction::Skipped);
+                        return Self::mark(io, false, Ok(IndexAction::Skipped));
                     }
                 }
                 let extracted = extractor::ExtractedDoc { title, pages };
                 self.backend
                     .stage_extracted(path, store_path, folder, mtime, size, &extracted)?;
                 self.stage_ok(folder, path, store_path, size, mtime, &loaded.hash)?;
-                Ok(IndexAction::Indexed)
+                Self::mark(io, false, Ok(IndexAction::Indexed))
             }
             ExtractOutcome::NoText => {
                 eprintln!("index skip {display}: no extractable text");
                 self.remember_filename_only(folder, path, store_path, size, mtime, "ok", "")?;
-                Ok(IndexAction::Indexed)
+                Self::mark(io, false, Ok(IndexAction::Indexed))
             }
             ExtractOutcome::Failed(err) => {
                 let reason = if err == REASON_PANIC || err.starts_with("pdf extract panicked") {
@@ -1048,9 +1155,22 @@ impl Indexer {
                     "skipped",
                     &reason,
                 )?;
-                Ok(IndexAction::Skipped)
+                Self::mark(io, false, Ok(IndexAction::Skipped))
             }
         }
+    }
+
+    fn mark(
+        io: &WalkIo,
+        stalled: bool,
+        result: Result<IndexAction, String>,
+    ) -> Result<IndexAction, String> {
+        if stalled {
+            io.note_stall();
+        } else {
+            io.note_progress();
+        }
+        result
     }
 
     fn remember_filename_only(
@@ -1142,10 +1262,14 @@ impl Indexer {
 
     fn publish_rows(&self, rows: Vec<StagedRow>) -> Result<(), String> {
         if let Err(err) = self.backend.publish_staged() {
-            let mut queued = self.staged_rows.lock();
-            let mut restored = rows;
-            restored.append(&mut *queued);
-            *queued = restored;
+            // tantivy 0.25 `prepare_commit` drops the in-flight documents when
+            // commit fails. Putting these rows back would record `ok` with nothing
+            // behind them. Drop them so the next crawl reads the files again.
+            eprintln!(
+                "argos: index commit failed ({err}); dropping {} rows so those files are read again",
+                rows.len()
+            );
+            drop(rows);
             return Err(err);
         }
         for row in rows {
@@ -1205,25 +1329,30 @@ impl Indexer {
         #[cfg(test)]
         {
             let name = self.test_block_path.lock().clone();
-            self.extract_host.lock().set_block_name(name);
+            let mut host = self.extract_host.lock();
+            host.set_block_name(name);
+            host.set_block_extract_only(self.test_block_extract_only.load(Ordering::SeqCst));
+            host.set_extract_crash(self.test_extract_crash.load(Ordering::SeqCst));
         }
     }
 
     fn stat_file(&self, path: &Path) -> Result<FileStat, IoFail> {
-        self.host_call(true, |host, timeout| host.stat(path, timeout))
+        self.host_call(true, false, |host, timeout| host.stat(path, timeout))
     }
 
-    /// Retry a timeout twice. Other failures return on the first attempt.
+    /// `retry_timeout` retries an extract timeout. Stat passes `false`: one try.
     fn host_call<T>(
         &self,
         count_stat: bool,
+        retry_timeout: bool,
         mut op: impl FnMut(&mut crate::extract_host::ExtractHost, Duration) -> Result<T, IoFail>,
     ) -> Result<T, IoFail> {
         #[cfg(not(test))]
         let _ = count_stat;
         let timeout = self.io_timeout(false);
+        let attempts = if retry_timeout { IO_ATTEMPTS } else { 1 };
         let mut last = IoFail::TimedOut;
-        for attempt in 0..IO_ATTEMPTS {
+        for attempt in 0..attempts {
             #[cfg(test)]
             if count_stat {
                 self.stat_count.fetch_add(1, Ordering::SeqCst);
@@ -1234,11 +1363,11 @@ impl Indexer {
                 op(&mut host, timeout)
             };
             match result {
-                Err(IoFail::TimedOut) if attempt + 1 < IO_ATTEMPTS => {
+                Err(IoFail::TimedOut) if attempt + 1 < attempts => {
                     eprintln!(
                         "argos: timed out, retrying ({}/{})",
                         attempt + 1,
-                        IO_ATTEMPTS
+                        attempts
                     );
                     last = IoFail::TimedOut;
                 }
@@ -1250,12 +1379,6 @@ impl Indexer {
 
     fn file_row(&self, store_path: &str) -> Result<Option<crate::db::FileState>, String> {
         self.db.file_state(store_path).map_err(|e| e.to_string())
-    }
-
-    fn has_real_row(&self, store_path: &str) -> Result<bool, String> {
-        Ok(self
-            .file_row(store_path)?
-            .is_some_and(|row| row.size != 0 || row.mtime != 0))
     }
 
     /// A stat, open, read, or worker-start failure. An existing row is left as it
@@ -1276,9 +1399,16 @@ impl Indexer {
         Ok(IndexAction::Skipped)
     }
 
-    /// Extract timed out after retries. A real row stays. Otherwise pin the size
-    /// and mtime we already read so the next crawl does not wait again.
-    fn note_extract_timeout(
+    /// Extract timed out or the worker died while reading this file.
+    ///
+    /// No real row yet: pin the size and mtime we already stat'd (filename-only)
+    /// so the next crawl does not wait again. A real row is kept, and its search
+    /// document is kept, for `EXTRACT_GIVE_UP_AFTER` runs. On the last run, a
+    /// document that has text stays in the index and only the size and mtime are
+    /// updated. A filename-only row is written again at the new size and mtime.
+    /// The counter resets when that pin is written, so a later size or mtime
+    /// change gets a fresh set of tries.
+    fn note_extract_failure(
         &self,
         folder: &str,
         path: &Path,
@@ -1286,20 +1416,32 @@ impl Indexer {
         size: u64,
         mtime: u64,
         display: &str,
+        reason: &str,
     ) -> Result<IndexAction, String> {
-        if self.has_real_row(store_path)? {
-            eprintln!("argos: keep existing row after {REASON_TIMEOUT_EXTRACT}: {display}");
-            return Err(REASON_TIMEOUT_EXTRACT.into());
+        let row = self.file_row(store_path)?;
+        let real = row
+            .as_ref()
+            .is_some_and(|row| row.size != 0 || row.mtime != 0);
+        if !real {
+            return self.sticky_skip(folder, path, store_path, size, mtime, display, reason);
         }
-        self.sticky_skip(
-            folder,
-            path,
-            store_path,
-            size,
-            mtime,
-            display,
-            REASON_TIMEOUT_EXTRACT,
-        )
+        let row = row.expect("real row");
+        let attempts = row.fail_count.saturating_add(1);
+        if attempts >= EXTRACT_GIVE_UP_AFTER {
+            eprintln!("argos: {reason}: {display} (giving up after {attempts} runs)");
+            if !row.content_hash.is_empty() {
+                self.db
+                    .pin_skipped_file(store_path, size as i64, mtime as i64, reason)
+                    .map_err(|e| e.to_string())?;
+                return Ok(IndexAction::Skipped);
+            }
+            return self.sticky_skip(folder, path, store_path, size, mtime, display, reason);
+        }
+        eprintln!("argos: keep existing row after {reason}: {display} (attempt {attempts})");
+        self.db
+            .bump_fail_count(store_path)
+            .map_err(|e| e.to_string())?;
+        Err(reason.to_string())
     }
 
     fn sticky_skip(
@@ -1321,14 +1463,27 @@ impl Indexer {
     fn follow_symlink_file(
         &self,
         path: &Path,
+        io: &WalkIo,
         on_file: &mut dyn FnMut(&Path) -> bool,
         on_blocked: &mut dyn FnMut(&Path),
     ) -> bool {
         match self.stat_file(&extended_length_path(path)) {
-            Ok(stat) if stat.is_file => on_file(path),
-            Ok(_) => true,
+            Ok(stat) if stat.is_file => {
+                io.note_progress();
+                on_file(path)
+            }
+            Ok(_) => {
+                io.note_progress();
+                true
+            }
+            Err(IoFail::TimedOut) | Err(IoFail::Unavailable(_)) => {
+                eprintln!("argos: symlink stat failed: {}", path.display());
+                on_blocked(path);
+                !io.note_stall()
+            }
             Err(_) => {
                 eprintln!("argos: symlink stat failed: {}", path.display());
+                io.note_progress();
                 on_blocked(path);
                 true
             }
@@ -1342,12 +1497,13 @@ impl Indexer {
         stop: &dyn Fn() -> bool,
     ) -> (u32, bool) {
         let mut total = 0u32;
+        let io = WalkIo::default();
         let complete = self.visit_tree(
             root,
-            stop,
+            &|| stop() || io.tripped(),
             &mut |_| {},
             &mut |path| {
-                if stop() {
+                if stop() || io.tripped() {
                     return false;
                 }
                 if !should_index(path, excludes) {
@@ -1359,18 +1515,21 @@ impl Indexer {
                 total = total.saturating_add(1);
                 true
             },
+            &io,
         );
         (total, complete)
     }
 
     /// `true` when every directory that could be listed was listed.
-    /// A listing failure blocks that directory only and does not fail the walk.
+    /// One directory that cannot be listed is blocked. Enough timeouts in a row
+    /// abort the whole walk so a dead share is not waited out file by file.
     fn visit_tree(
         &self,
         root: &Path,
         stop: &dyn Fn() -> bool,
         on_blocked: &mut dyn FnMut(&Path),
         on_file: &mut dyn FnMut(&Path) -> bool,
+        io: &WalkIo,
     ) -> bool {
         #[cfg(test)]
         self.files_visited.store(0, Ordering::SeqCst);
@@ -1392,19 +1551,35 @@ impl Indexer {
                 )
             };
             let entries = match listed {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    io.note_progress();
+                    entries
+                }
                 Err(IoFail::TimedOut) => {
                     eprintln!("argos: {REASON_TIMEOUT_LIST}: {display}");
                     on_blocked(Path::new(&display));
+                    if io.note_stall() {
+                        return false;
+                    }
+                    continue;
+                }
+                Err(IoFail::Unavailable(message)) => {
+                    eprintln!("argos: walk error under {display}: {message}");
+                    on_blocked(Path::new(&display));
+                    if io.note_stall() {
+                        return false;
+                    }
                     continue;
                 }
                 Err(IoFail::Crashed(message)) => {
                     eprintln!("argos: extractor crashed while listing {display}: {message}");
+                    io.note_progress();
                     on_blocked(Path::new(&display));
                     continue;
                 }
-                Err(IoFail::Failed(message)) | Err(IoFail::Unavailable(message)) => {
+                Err(IoFail::Failed(message)) => {
                     eprintln!("argos: walk error under {display}: {message}");
+                    io.note_progress();
                     on_blocked(Path::new(&display));
                     continue;
                 }
@@ -1419,7 +1594,7 @@ impl Indexer {
                         }
                     }
                     EntryKind::Symlink => {
-                        if !self.follow_symlink_file(&child, on_file, on_blocked) {
+                        if !self.follow_symlink_file(&child, io, on_file, on_blocked) {
                             return false;
                         }
                     }
@@ -1997,12 +2172,210 @@ mod tests {
         assert_eq!(after.content_hash, before.content_hash);
         assert_eq!(after.size, before.size);
         assert_eq!(after.mtime, before.mtime);
+        assert_eq!(after.fail_count, 0, "a stat timeout is not an extract attempt");
         assert!(
             env.paths_for("カロン")
                 .iter()
                 .any(|p| p == &env.stored("keep.txt")),
             "existing body was replaced"
         );
+    }
+
+    #[test]
+    fn consecutive_timeouts_stop_the_walk_without_purging() {
+        let env = Env::new("breaker");
+        env.write("keep.txt", "残す本文の固有語デメテル。追加の文字を足す。");
+        env.index_all();
+        fs::remove_file(env.files.join("keep.txt")).unwrap();
+        for name in ["hang-a.txt", "hang-b.txt", "hang-c.txt", "hang-d.txt"] {
+            env.write(name, "止まっているファイルの本文。追加の文字。");
+        }
+        let before = env.indexer().stat_count.load(Ordering::SeqCst);
+        *env.indexer().test_block_path.lock() = Some("hang*".into());
+        *env.indexer().test_io_timeout.lock() = Some(Duration::from_millis(200));
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        let delta = env.indexer().stat_count.load(Ordering::SeqCst) - before;
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        assert_eq!(delta, 4, "root stat plus three file stats, then stop; delta {delta}");
+        assert!(
+            env.backend().has_path(&env.stored("keep.txt")).unwrap(),
+            "incomplete walk purged a file that was not visited"
+        );
+        let recorded = ["hang-a.txt", "hang-b.txt", "hang-c.txt", "hang-d.txt"]
+            .into_iter()
+            .filter(|name| {
+                env.db
+                    .as_ref()
+                    .unwrap()
+                    .file_state(&env.stored(name))
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+        assert_eq!(recorded, 3, "the fourth hung file must not be visited");
+    }
+
+    #[test]
+    fn extract_timeout_keeps_real_text_until_three_runs() {
+        let env = Env::new("giveup");
+        let path = env.write(
+            "slow.txt",
+            "既存本文の固有語ヘスティアを残す。追加の文字を足す。",
+        );
+        env.index_all();
+        let before = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("slow.txt"))
+            .unwrap()
+            .unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + Duration::from_secs(30))
+            .unwrap();
+        env.indexer()
+            .test_block_extract_only
+            .store(true, Ordering::SeqCst);
+        *env.indexer().test_block_path.lock() = Some("slow.txt".into());
+        *env.indexer().test_io_timeout.lock() = Some(Duration::from_millis(200));
+        for attempt in 1..=2 {
+            let stats = env.indexer().sync_enabled_folders().unwrap();
+            assert!(stats.errors >= 1, "{stats:?}");
+            let row = env
+                .db
+                .as_ref()
+                .unwrap()
+                .file_state(&env.stored("slow.txt"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.fail_count, attempt);
+            assert_eq!(row.status, before.status);
+            assert_eq!(row.content_hash, before.content_hash);
+            assert_eq!(row.size, before.size);
+            assert_eq!(row.mtime, before.mtime);
+            assert!(
+                env.paths_for("ヘスティア")
+                    .iter()
+                    .any(|p| p == &env.stored("slow.txt")),
+                "body was dropped on attempt {attempt}"
+            );
+        }
+        env.indexer().sync_enabled_folders().unwrap();
+        let pinned = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("slow.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.fail_count, 0);
+        assert_eq!(pinned.status, "skipped");
+        assert!(
+            pinned.skip_reason.contains("timed out"),
+            "{}",
+            pinned.skip_reason
+        );
+        assert_eq!(pinned.content_hash, before.content_hash);
+        assert_ne!(pinned.mtime, before.mtime);
+        assert!(
+            env.paths_for("ヘスティア")
+                .iter()
+                .any(|p| p == &env.stored("slow.txt")),
+            "real text was replaced with an empty body"
+        );
+        let reads = env.indexer().read_count.load(Ordering::SeqCst);
+        env.indexer().sync_enabled_folders().unwrap();
+        assert_eq!(
+            env.indexer().read_count.load(Ordering::SeqCst),
+            reads,
+            "pinned file was read again"
+        );
+    }
+
+    #[test]
+    fn extract_crash_does_not_replace_an_existing_document() {
+        let env = Env::new("crashrow");
+        let path = env.write(
+            "boom.txt",
+            "既存本文の固有語アレスを残す。追加の文字を足す。",
+        );
+        env.index_all();
+        let before = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("boom.txt"))
+            .unwrap()
+            .unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + Duration::from_secs(30))
+            .unwrap();
+        env.indexer()
+            .test_extract_crash
+            .store(true, Ordering::SeqCst);
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        assert!(stats.errors >= 1, "{stats:?}");
+        let row = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("boom.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.fail_count, 1);
+        assert_eq!(row.status, before.status);
+        assert_eq!(row.content_hash, before.content_hash);
+        assert_eq!(row.size, before.size);
+        assert_eq!(row.mtime, before.mtime);
+        assert!(
+            env.paths_for("アレス")
+                .iter()
+                .any(|p| p == &env.stored("boom.txt")),
+            "crash replaced the existing document"
+        );
+    }
+
+    #[test]
+    fn first_extract_timeout_without_a_row_pins_the_filename() {
+        let env = Env::new("firsthang");
+        let path = env.write(
+            "slow.txt",
+            "本文アルテミスはタイムアウトするので索引されない。追加の文字。",
+        );
+        env.indexer()
+            .test_block_extract_only
+            .store(true, Ordering::SeqCst);
+        *env.indexer().test_block_path.lock() = Some("slow.txt".into());
+        *env.indexer().test_io_timeout.lock() = Some(Duration::from_millis(200));
+        env.indexer().sync_enabled_folders().unwrap();
+        let row = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("slow.txt"))
+            .unwrap()
+            .expect("timed-out file is recorded");
+        assert_eq!(row.status, "skipped");
+        assert!(row.skip_reason.contains("timed out"), "{}", row.skip_reason);
+        assert!(row.size > 0, "size was stat'd and must be stored");
+        assert_eq!(row.content_hash, "");
+        assert!(env.paths_for("アルテミス").is_empty());
+        assert!(env
+            .paths_for("slow")
+            .iter()
+            .any(|p| p == &env.stored("slow.txt")));
+        let reads = env.indexer().read_count.load(Ordering::SeqCst);
+        let _ = fs::metadata(&path).unwrap();
+        env.indexer().sync_enabled_folders().unwrap();
+        assert_eq!(env.indexer().read_count.load(Ordering::SeqCst), reads);
     }
 
     #[test]

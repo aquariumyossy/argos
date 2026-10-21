@@ -137,6 +137,90 @@ fn worker_frames_survive_pdf_extract_stdout_warning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+
+extern "system" {
+    fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+    fn SetStdHandle(n_std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
+}
+
+struct RestoreStderr(*mut core::ffi::c_void);
+
+impl Drop for RestoreStderr {
+    fn drop(&mut self) {
+        unsafe {
+            SetStdHandle(STD_ERROR_HANDLE, self.0);
+        }
+    }
+}
+
+/// The GUI parent has no stderr handle. Spawn the worker that way and require
+/// the same PDF to come back as a frame, not as `println!` bytes on stdout.
+#[test]
+fn worker_frames_survive_null_stderr() {
+    let dir = std::env::temp_dir().join(format!(
+        "argos-worker-null-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf = dir.join("widths.pdf");
+    std::fs::write(&pdf, pdf_custom_font()).unwrap();
+
+    let mut child = unsafe {
+        let old = GetStdHandle(STD_ERROR_HANDLE);
+        let _restore = RestoreStderr(old);
+        assert_ne!(
+            SetStdHandle(STD_ERROR_HANDLE, core::ptr::null_mut()),
+            0,
+            "could not clear the test process stderr handle"
+        );
+        Command::new(worker_bin())
+            .arg("--extract-worker")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap()
+    };
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+
+    let ping = serde_json::to_vec(&serde_json::json!("Ping")).unwrap();
+    write_frame(&mut stdin, &ping);
+    let pong = read_frame(&mut stdout);
+    assert_eq!(pong, br#""Pong""#);
+
+    let req = serde_json::to_vec(&serde_json::json!({
+        "Extract": {
+            "path": pdf.to_string_lossy(),
+            "max_bytes": 100_000_000u64
+        }
+    }))
+    .unwrap();
+    write_frame(&mut stdin, &req);
+    let extracted = read_frame(&mut stdout);
+    let value: serde_json::Value = serde_json::from_slice(&extracted)
+        .unwrap_or_else(|err| panic!("frame was not json ({err}): {extracted:?}"));
+    let rendered = value["Extracted"]["outcome"]["Text"]["pages"].to_string();
+    assert!(
+        rendered.contains("HelloWidth"),
+        "null stderr let the pdf warning into the frame: {value}"
+    );
+
+    write_frame(&mut stdin, &ping);
+    let pong = read_frame(&mut stdout);
+    assert_eq!(
+        pong, br#""Pong""#,
+        "stream misaligned after the pdf warning with null stderr"
+    );
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn worker_timeout_kills_the_child() {
     let dir = std::env::temp_dir().join(format!("argos-worker-kill-{}", std::process::id()));

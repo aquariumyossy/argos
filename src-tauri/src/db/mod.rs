@@ -743,6 +743,12 @@ impl Db {
             "ALTER TABLE files ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Extract timeouts and crashes against one path. Reset when the file is
+        // indexed or when we stop retrying it. Older builds ignore the column.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let consume_cols_added = conn
             .execute(
                 "ALTER TABLE llm_thread_sources ADD COLUMN injected_user_message_id TEXT NOT NULL DEFAULT ''",
@@ -1786,7 +1792,8 @@ impl Db {
                content_hash=excluded.content_hash,
                indexed_at=excluded.indexed_at,
                status='ok',
-               skip_reason=''",
+               skip_reason='',
+               fail_count=0",
             rusqlite::params![folder_id, path, ext, size, mtime, content_hash, now],
         )?;
         Ok(())
@@ -1818,7 +1825,8 @@ impl Db {
                content_hash=excluded.content_hash,
                indexed_at=excluded.indexed_at,
                status=excluded.status,
-               skip_reason=excluded.skip_reason",
+               skip_reason=excluded.skip_reason,
+               fail_count=0",
             rusqlite::params![
                 folder_id,
                 path,
@@ -1838,7 +1846,8 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT status, COALESCE(skip_reason, ''), COALESCE(content_hash, ''),
-                    COALESCE(indexed_at, ''), COALESCE(size, 0), COALESCE(mtime, 0)
+                    COALESCE(indexed_at, ''), COALESCE(size, 0), COALESCE(mtime, 0),
+                    COALESCE(fail_count, 0)
              FROM files WHERE path=?1",
         )?;
         let mut rows = stmt.query_map([path], |row| {
@@ -1849,12 +1858,44 @@ impl Db {
                 indexed_at: row.get(3)?,
                 size: row.get(4)?,
                 mtime: row.get(5)?,
+                fail_count: row.get(6)?,
             })
         })?;
         if let Some(row) = rows.next() {
             return Ok(Some(row?));
         }
         Ok(None)
+    }
+
+    /// Count one extract timeout or crash. Size, mtime, hash, and status stay put,
+    /// and the search document is not touched.
+    pub fn bump_fail_count(&self, path: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE files SET fail_count = COALESCE(fail_count, 0) + 1 WHERE path=?1",
+            [path],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the size and mtime we just saw so the next crawl does not read the
+    /// file again. `content_hash` and the search document are left alone.
+    pub fn pin_skipped_file(
+        &self,
+        path: &str,
+        size: i64,
+        mtime: i64,
+        skip_reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE files
+             SET size=?1, mtime=?2, status='skipped', skip_reason=?3, fail_count=0, indexed_at=?4
+             WHERE path=?5",
+            rusqlite::params![size, mtime, skip_reason, now, path],
+        )?;
+        Ok(())
     }
 
     pub fn mark_file_deleted(&self, path: &str) -> Result<(), rusqlite::Error> {
@@ -4462,6 +4503,8 @@ pub struct FileState {
     pub indexed_at: String,
     pub size: i64,
     pub mtime: i64,
+    /// Extract timeouts and crashes since the file was last indexed or pinned.
+    pub fail_count: i64,
 }
 
 #[cfg(test)]

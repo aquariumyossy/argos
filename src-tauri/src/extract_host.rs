@@ -117,6 +117,12 @@ enum WireOutcome {
 pub struct ExtractHost {
     #[cfg(test)]
     block_name: Option<String>,
+    /// When set, `stat` does not sleep. Tests use this to hang extract only.
+    #[cfg(test)]
+    block_extract_only: bool,
+    /// Next `extract` returns `IoFail::Crashed` without reading the file.
+    #[cfg(test)]
+    extract_crash: bool,
     #[cfg(not(test))]
     worker: Option<Worker>,
     /// Next time a failed spawn may be tried. Unset while a worker is healthy.
@@ -131,6 +137,10 @@ impl ExtractHost {
         Self {
             #[cfg(test)]
             block_name: None,
+            #[cfg(test)]
+            block_extract_only: false,
+            #[cfg(test)]
+            extract_crash: false,
             #[cfg(not(test))]
             worker: None,
             #[cfg(not(test))]
@@ -145,11 +155,25 @@ impl ExtractHost {
         self.block_name = name;
     }
 
+    #[cfg(test)]
+    pub fn set_block_extract_only(&mut self, only: bool) {
+        self.block_extract_only = only;
+    }
+
+    #[cfg(test)]
+    pub fn set_extract_crash(&mut self, crash: bool) {
+        self.extract_crash = crash;
+    }
+
     pub fn stat(&mut self, path: &Path, timeout: Duration) -> Result<FileStat, IoFail> {
         #[cfg(test)]
         {
             let path = path.to_path_buf();
-            let block = self.block_name.clone();
+            let block = if self.block_extract_only {
+                None
+            } else {
+                self.block_name.clone()
+            };
             return run_timeout(timeout, move || stat_path(&path, block.as_deref()));
         }
         #[cfg(not(test))]
@@ -186,6 +210,9 @@ impl ExtractHost {
     ) -> Result<LoadedFile, IoFail> {
         #[cfg(test)]
         {
+            if self.extract_crash {
+                return Err(IoFail::Crashed("test crash".into()));
+            }
             let path = path.to_path_buf();
             let block = self.block_name.clone();
             return run_timeout(timeout, move || {
@@ -378,6 +405,8 @@ impl ExtractHost {
 
 #[cfg(not(test))]
 fn worker_program() -> Result<PathBuf, String> {
+    // Debug and `cargo test` only. A release build always uses this executable.
+    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("ARGOS_EXTRACT_WORKER") {
         if !path.is_empty() {
             return Ok(PathBuf::from(path));
@@ -389,11 +418,14 @@ fn worker_program() -> Result<PathBuf, String> {
 #[cfg(not(test))]
 fn spawn_worker() -> Result<Worker, String> {
     let exe = worker_program()?;
+    // A GUI process has no stderr handle. Inheriting it passes NULL, and the
+    // child then has nowhere safe to send pdf-extract's println!. NUL is a real
+    // handle, so those warnings cannot land on the frame pipe.
     let mut child = std::process::Command::new(exe)
         .arg("--extract-worker")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| e.to_string())?;
     let stdin = child
@@ -535,19 +567,20 @@ fn serve_on(mut frame_out: impl Write) {
     }
 }
 
-/// Keep the pipe the parent reads, and send `println!` (pdf-extract, lopdf) to stderr.
+/// Keep the pipe the parent reads, and send `println!` (pdf-extract, lopdf) elsewhere.
+///
+/// A release GUI process has no stderr: `GetStdHandle(STD_ERROR_HANDLE)` is NULL.
+/// `_dup2(2, 1)` is undefined in that case, so this never uses it. Stdout is
+/// pointed at the real stderr handle, or at a `NUL` handle opened here.
 #[cfg(windows)]
 fn claim_frame_stdout() -> io::Result<FrameOut> {
     const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
     const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
     const O_BINARY: i32 = 0x8000;
-    extern "system" {
-        fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
-        fn SetStdHandle(n_std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
-        fn _dup(fd: i32) -> i32;
-        fn _dup2(src: i32, dst: i32) -> i32;
-        fn _setmode(fd: i32, mode: i32) -> i32;
-    }
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
     unsafe {
         let frame_fd = _dup(1);
         if frame_fd < 0 {
@@ -555,12 +588,32 @@ fn claim_frame_stdout() -> io::Result<FrameOut> {
         }
         _setmode(frame_fd, O_BINARY);
         _setmode(0, O_BINARY);
-        let err_handle = GetStdHandle(STD_ERROR_HANDLE);
         let invalid = -1isize as *mut core::ffi::c_void;
-        if !err_handle.is_null() && err_handle != invalid {
-            SetStdHandle(STD_OUTPUT_HANDLE, err_handle);
-        }
-        if _dup2(2, 1) != 0 {
+        let stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
+        let sink = if stderr_handle.is_null() || stderr_handle == invalid {
+            let mut name: Vec<u16> = "NUL".encode_utf16().collect();
+            name.push(0);
+            let nul = CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                core::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                core::ptr::null_mut(),
+            );
+            if nul.is_null() || nul == invalid {
+                let err = io::Error::last_os_error();
+                _close(frame_fd);
+                return Err(err);
+            }
+            // eprintln uses this handle. Leave it open for the process lifetime.
+            SetStdHandle(STD_ERROR_HANDLE, nul);
+            nul
+        } else {
+            stderr_handle
+        };
+        if SetStdHandle(STD_OUTPUT_HANDLE, sink) == 0 {
             let err = io::Error::last_os_error();
             _close(frame_fd);
             return Err(err);
@@ -604,6 +657,23 @@ impl Drop for FrameOut {
 
 #[cfg(windows)]
 extern "system" {
+    fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+    fn SetStdHandle(n_std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *mut core::ffi::c_void,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+}
+
+#[cfg(windows)]
+extern "C" {
+    fn _dup(fd: i32) -> i32;
+    fn _setmode(fd: i32, mode: i32) -> i32;
     fn _write(fd: i32, buf: *const core::ffi::c_void, count: u32) -> i32;
     fn _close(fd: i32) -> i32;
 }
@@ -711,14 +781,17 @@ pub(crate) fn list_path(path: &Path, block: Option<&str>) -> Result<Vec<ListedEn
     let rd = fs::read_dir(path).map_err(|e| IoFail::Failed(e.to_string()))?;
     let mut entries = Vec::new();
     for ent in rd {
+        // `ReadDir::next` fails only when `FindNextFileW` fails. That is the
+        // enumeration itself, not one bad name. A partial list would look complete
+        // and the orphan purge would delete every file after the break.
         let ent = match ent {
             Ok(ent) => ent,
             Err(err) => {
                 eprintln!(
-                    "argos: skip directory entry under {}: {err}",
+                    "argos: directory listing failed under {}: {err}",
                     path.display()
                 );
-                continue;
+                return Err(IoFail::Failed(err.to_string()));
             }
         };
         let kind = match ent.file_type() {
@@ -736,18 +809,50 @@ pub(crate) fn list_path(path: &Path, block: Option<&str>) -> Result<Vec<ListedEn
 }
 
 fn child_block_name() -> Option<String> {
-    std::env::var("ARGOS_EXTRACT_BLOCK")
-        .ok()
-        .filter(|name| !name.is_empty())
+    // Release builds ignore the hook so a launched app cannot be stalled by the environment.
+    #[cfg(debug_assertions)]
+    {
+        return std::env::var("ARGOS_EXTRACT_BLOCK")
+            .ok()
+            .filter(|name| !name.is_empty());
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
 }
 
 fn maybe_block(path: &Path, block: Option<&str>) {
-    if block.is_some_and(|name| path.file_name().and_then(|n| n.to_str()) == Some(name)) {
+    let Some(block) = block else {
+        return;
+    };
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (path, block);
+        return;
+    }
+    #[cfg(debug_assertions)]
+    {
+        if !blocked_name(path, block) {
+            return;
+        }
         let secs = std::env::var("ARGOS_EXTRACT_BLOCK_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
         std::thread::sleep(Duration::from_secs(secs));
+    }
+}
+
+/// `name*` matches a prefix. Used by tests that hang several files in one directory.
+#[cfg(debug_assertions)]
+fn blocked_name(path: &Path, block: &str) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    match block.strip_suffix('*') {
+        Some(prefix) if !prefix.is_empty() => name.starts_with(prefix),
+        _ => name == block,
     }
 }
 
