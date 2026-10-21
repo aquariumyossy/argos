@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod db;
+pub mod extract_host;
 pub mod extractor;
 pub mod indexer;
 pub mod llm;
