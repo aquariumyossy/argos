@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "argos"
-version = "1.11.9"
+version = "1.12.0"
 dependencies = [
  "arboard",
  "axum",
