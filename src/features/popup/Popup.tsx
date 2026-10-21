@@ -31,6 +31,7 @@ import {
   hitTypeLabel,
   INPUT_SUGGEST_HINT,
   isInternalIdPath,
+  isSuggestOverlayVisible,
   popupKeyPreventsDefault,
   scoreLevel,
   selectedHitLabel,
@@ -1429,6 +1430,7 @@ export default function Popup() {
           return;
         case "escape-suggest":
           setSuggestOpen(false);
+          resultNavStartedRef.current = true;
           return;
         case "escape-popup":
           void hidePopup();
@@ -1448,6 +1450,7 @@ export default function Popup() {
           return;
         case "suggest-enter-close":
           setSuggestOpen(false);
+          resultNavStartedRef.current = true;
           return;
         case "suggest-enter-swallow":
           return;
@@ -1566,13 +1569,14 @@ export default function Popup() {
 
   const currentHit = hits[index];
   const currentIsMail = currentHit ? isOutlookHit(currentHit) : false;
-  const suggestOverlayVisible =
-    suggestOpen &&
-    suggestions.length > 0 &&
-    !folderPickerOpen &&
-    !extPickerOpen &&
-    !datePickerOpen &&
-    !selectChip;
+  const suggestOverlayVisible = isSuggestOverlayVisible({
+    suggestOpen,
+    suggestionCount: suggestions.length,
+    folderPickerOpen,
+    extPickerOpen,
+    datePickerOpen,
+    selectChip: selectChip != null,
+  });
 
   return (
     <div className="popup">
@@ -2208,6 +2212,7 @@ export default function Popup() {
                   mailHit && (hit.matchCount ?? 0) > 1
                     ? `スレッド ${hit.matchCount} 通`
                     : "";
+                const showCrumb = Boolean(location.text || threadNote);
                 return (
                   <li
                     key={`${hit.source}-${hit.id}`}
@@ -2239,10 +2244,15 @@ export default function Popup() {
                           </span>
                         </div>
                       </div>
-                      <div className="hit-title">
+                      <div
+                        className="hit-title"
+                        title={
+                          showCrumb ? undefined : location.title || undefined
+                        }
+                      >
                         {highlight(hit.title, query, hit.highlightTerms)}
                       </div>
-                      {location.text || threadNote ? (
+                      {showCrumb ? (
                         <div
                           className="hit-crumb"
                           title={location.title || undefined}
@@ -2441,9 +2451,12 @@ export default function Popup() {
 
       <footer className="popup-footer">
         <span className="popup-selection-name">
-          {currentHit ? `選択中: ${selectedHitLabel(currentHit)}` : ""}
+          {currentHit && !suggestOverlayVisible
+            ? `選択中: ${selectedHitLabel(currentHit)}`
+            : ""}
         </span>
         <div className="popup-footer-hints">
+          <span>↑↓ 選択</span>
           <button
             type="button"
             className="popup-footer-action"
@@ -2472,6 +2485,14 @@ export default function Popup() {
             }}
           >
             Ctrl+Enter プレビュー
+          </button>
+          <button
+            type="button"
+            className="popup-footer-action"
+            title="閉じる (Esc)"
+            onClick={() => void hidePopup()}
+          >
+            Esc 閉じる
           </button>
         </div>
         <div className="popup-footer-windows">

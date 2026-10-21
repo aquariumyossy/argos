@@ -50,12 +50,21 @@ describe("suggestion keyboard", () => {
     expect(decidePopupKey(key({ key: "Enter" }), ctx({ suggestOpen: true }))).toBe(
       "suggest-enter-close",
     );
+  });
+
+  it("does not swallow Enter when the overlay is not visible", () => {
     expect(
       decidePopupKey(
         key({ key: "Enter" }),
         ctx({ suggestOpen: true, suggestionCount: 0 }),
       ),
-    ).toBe("suggest-enter-close");
+    ).toBe("open-result");
+    expect(
+      decidePopupKey(
+        key({ key: "Enter" }),
+        ctx({ suggestOpen: true, selectChip: true }),
+      ),
+    ).toBe("open-result");
   });
 
   it("modified Enter while the overlay is open does not open a result", () => {

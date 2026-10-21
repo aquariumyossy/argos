@@ -146,6 +146,37 @@ describe("Popup keyboard", () => {
     expect(opened[0]?.[1]).toMatchObject({ path: FILE });
   });
 
+  it("Down after Enter-close moves to result 2", async () => {
+    const { default: Popup } = await import("./Popup");
+    render(<Popup />);
+    const input = await typeQuery("売掛金");
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("listbox", { name: "検索候補" })).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect(document.querySelector(".hit.active")?.textContent).toContain("売掛金の件");
+    expect(mockInvoke.mock.calls.filter((c) => c[0] === "open_hit")).toHaveLength(0);
+  });
+
+  it("Down after Esc-close moves to result 2", async () => {
+    const { default: Popup } = await import("./Popup");
+    render(<Popup />);
+    const input = await typeQuery("売掛金");
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("listbox", { name: "検索候補" })).toBeTruthy();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    input.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.queryByRole("listbox", { name: "検索候補" })).toBeNull();
+    expect(document.querySelector(".hit.active")?.textContent).toContain("売掛金の件");
+  });
+
   it("ignores Enter during IME composition", async () => {
     const { default: Popup } = await import("./Popup");
     render(<Popup />);

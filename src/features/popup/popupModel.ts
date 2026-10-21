@@ -225,9 +225,10 @@ export type PopupKeyContext = {
   /** Query input is the active element. */
   caretInInput: boolean;
   /**
-   * True after Up/Down has moved the result highlight while the overlay is closed.
+   * True after Up/Down has moved the result highlight while the overlay is closed,
+   * or after that overlay was closed with Enter or Esc.
    * Hover does not set this. Reset when the query text changes or a new external
-   * search arrives.
+   * search arrives. While this is true, Down moves the result selection.
    */
   resultNavStarted: boolean;
   /** Suggestions in memory were fetched for the current query. */
@@ -263,11 +264,31 @@ function plainKey(event: PopupKeyEvent): boolean {
   return !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey;
 }
 
+/** Same condition as the suggestion overlay in the popup. */
+export function isSuggestOverlayVisible(ctx: {
+  suggestOpen: boolean;
+  suggestionCount: number;
+  folderPickerOpen: boolean;
+  extPickerOpen: boolean;
+  datePickerOpen: boolean;
+  selectChip: boolean;
+}): boolean {
+  return (
+    ctx.suggestOpen &&
+    ctx.suggestionCount > 0 &&
+    !ctx.folderPickerOpen &&
+    !ctx.extPickerOpen &&
+    !ctx.datePickerOpen &&
+    !ctx.selectChip
+  );
+}
+
 /**
  * Down opens suggestions only when the overlay is closed, the caret is in the
  * query input, result keyboard-navigation has not started, and the key is unmodified.
- * Otherwise Up/Down move the result selection, as before.
- * Enter while the suggestion overlay is open only closes it.
+ * Closing the overlay with Enter or Esc counts as navigation having started, so the
+ * next Down moves the result selection until the query changes.
+ * Enter closes the overlay only while that overlay is actually visible.
  * Enter during IME composition is ignored (does not close the overlay or open a hit).
  */
 export function decidePopupKey(
@@ -298,7 +319,7 @@ export function decidePopupKey(
     return "picker-swallow";
   }
 
-  if (ctx.suggestOpen && event.key === "Enter") {
+  if (event.key === "Enter" && isSuggestOverlayVisible(ctx)) {
     return plainKey(event) ? "suggest-enter-close" : "suggest-enter-swallow";
   }
 
