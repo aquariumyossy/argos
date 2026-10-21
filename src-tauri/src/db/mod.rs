@@ -736,6 +736,19 @@ impl Db {
             "ALTER TABLE llm_thread_sources ADD COLUMN unit_body TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Why a file was stored without body text (timeout, extract error, oversize).
+        // Empty for a normal row. Older builds ignore the column; v1.11.9 inserts
+        // list columns explicitly, so adding it is safe to roll back.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Extract timeouts and crashes against one path. Reset when the file is
+        // indexed or when we stop retrying it. Older builds ignore the column.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let consume_cols_added = conn
             .execute(
                 "ALTER TABLE llm_thread_sources ADD COLUMN injected_user_message_id TEXT NOT NULL DEFAULT ''",
@@ -1332,7 +1345,7 @@ impl Db {
     }
 
     /// Indexed files whose `mtime` falls in `[after_unix, before_unix]` (inclusive).
-    /// Unbounded sides are `None`. Status is `ok` (not `indexed`).
+    /// Unbounded sides are `None`. Filename-only rows (`ok` and `skipped`) are included.
     pub fn list_ok_file_paths_in_range(
         &self,
         after_unix: Option<i64>,
@@ -1342,7 +1355,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path FROM files
-             WHERE status='ok' AND mtime > 0
+             WHERE status IN ('ok', 'skipped') AND mtime > 0
                AND (?1 IS NULL OR mtime >= ?1)
                AND (?2 IS NULL OR mtime <= ?2)
              ORDER BY mtime DESC
@@ -1374,7 +1387,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path FROM files
-             WHERE status='ok' AND path LIKE ?1 ESCAPE '|'
+             WHERE status IN ('ok', 'skipped') AND path LIKE ?1 ESCAPE '|'
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
@@ -1769,8 +1782,8 @@ impl Db {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok')
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status, skip_reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok', '')
              ON CONFLICT(path) DO UPDATE SET
                folder_id=excluded.folder_id,
                ext=excluded.ext,
@@ -1778,8 +1791,109 @@ impl Db {
                mtime=excluded.mtime,
                content_hash=excluded.content_hash,
                indexed_at=excluded.indexed_at,
-               status='ok'",
+               status='ok',
+               skip_reason='',
+               fail_count=0",
             rusqlite::params![folder_id, path, ext, size, mtime, content_hash, now],
+        )?;
+        Ok(())
+    }
+
+    /// Filename-only row. `status` is `ok` (no text, still a normal hit) or `skipped`
+    /// (timeout, panic, extract error, oversize) with `skip_reason` for later inspection.
+    pub fn upsert_file_state(
+        &self,
+        folder_id: i64,
+        path: &str,
+        ext: &str,
+        size: i64,
+        mtime: i64,
+        content_hash: &str,
+        status: &str,
+        skip_reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status, skip_reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+               folder_id=excluded.folder_id,
+               ext=excluded.ext,
+               size=excluded.size,
+               mtime=excluded.mtime,
+               content_hash=excluded.content_hash,
+               indexed_at=excluded.indexed_at,
+               status=excluded.status,
+               skip_reason=excluded.skip_reason,
+               fail_count=0",
+            rusqlite::params![
+                folder_id,
+                path,
+                ext,
+                size,
+                mtime,
+                content_hash,
+                now,
+                status,
+                skip_reason
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn file_state(&self, path: &str) -> Result<Option<FileState>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT status, COALESCE(skip_reason, ''), COALESCE(content_hash, ''),
+                    COALESCE(indexed_at, ''), COALESCE(size, 0), COALESCE(mtime, 0),
+                    COALESCE(fail_count, 0)
+             FROM files WHERE path=?1",
+        )?;
+        let mut rows = stmt.query_map([path], |row| {
+            Ok(FileState {
+                status: row.get(0)?,
+                skip_reason: row.get(1)?,
+                content_hash: row.get(2)?,
+                indexed_at: row.get(3)?,
+                size: row.get(4)?,
+                mtime: row.get(5)?,
+                fail_count: row.get(6)?,
+            })
+        })?;
+        if let Some(row) = rows.next() {
+            return Ok(Some(row?));
+        }
+        Ok(None)
+    }
+
+    /// Count one extract timeout or crash. Size, mtime, hash, and status stay put,
+    /// and the search document is not touched.
+    pub fn bump_fail_count(&self, path: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE files SET fail_count = COALESCE(fail_count, 0) + 1 WHERE path=?1",
+            [path],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the size and mtime we just saw so the next crawl does not read the
+    /// file again. `content_hash` and the search document are left alone.
+    pub fn pin_skipped_file(
+        &self,
+        path: &str,
+        size: i64,
+        mtime: i64,
+        skip_reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE files
+             SET size=?1, mtime=?2, status='skipped', skip_reason=?3, fail_count=0, indexed_at=?4
+             WHERE path=?5",
+            rusqlite::params![size, mtime, skip_reason, now, path],
         )?;
         Ok(())
     }
@@ -4381,6 +4495,18 @@ pub struct FileMeta {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileState {
+    pub status: String,
+    pub skip_reason: String,
+    pub content_hash: String,
+    pub indexed_at: String,
+    pub size: i64,
+    pub mtime: i64,
+    /// Extract timeouts and crashes since the file was last indexed or pinned.
+    pub fail_count: i64,
+}
+
 #[cfg(test)]
 mod date_range_tests {
     use super::*;
@@ -4409,21 +4535,29 @@ mod date_range_tests {
     }
 
     #[test]
-    fn file_range_keeps_ok_and_drops_other_status() {
+    fn file_range_keeps_ok_and_skipped() {
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\docs", "").unwrap();
         let in_range = 1_700_000_100;
         let out_range = 1_600_000_000;
         db.upsert_file(folder.id, r"C:\docs\ok.txt", "txt", 1, in_range, "h")
             .unwrap();
+        insert_file_status(&db, folder.id, r"C:\docs\skipped.txt", in_range, "skipped");
         insert_file_status(&db, folder.id, r"C:\docs\pending.txt", in_range, "pending");
         insert_file_status(&db, folder.id, r"C:\docs\old.txt", out_range, "ok");
         insert_file_status(&db, folder.id, r"C:\docs\zero.txt", 0, "ok");
 
-        let paths = db
+        let mut paths = db
             .list_ok_file_paths_in_range(Some(1_700_000_000), Some(1_700_000_200), 100)
             .unwrap();
-        assert_eq!(paths, vec![r"C:\docs\ok.txt".to_string()]);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                r"C:\docs\ok.txt".to_string(),
+                r"C:\docs\skipped.txt".to_string(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

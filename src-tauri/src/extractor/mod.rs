@@ -20,37 +20,43 @@ pub struct ExtractedDoc {
 }
 
 pub fn extract_file(path: &Path) -> Result<ExtractedDoc, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    extract_loaded(path, &bytes)
+}
+
+/// Extract from bytes already read by the indexer. Docx and spreadsheets still
+/// open `path` themselves; the caller keeps that open inside its timeout.
+pub fn extract_loaded(path: &Path, bytes: &[u8]) -> Result<ExtractedDoc, String> {
+    let ext = extension_of(path);
     match ext.as_str() {
-        "txt" | "md" | "markdown" | "json" => extract_text(path),
-        "html" | "htm" => extract_html(path),
-        "pdf" => extract_pdf(path),
+        "txt" | "md" | "markdown" | "json" => extract_text_bytes(path, bytes),
+        "html" | "htm" => extract_html_bytes(path, bytes),
+        "pdf" => extract_pdf_bytes(path, bytes),
         "docx" => extract_docx(path),
-        "doc" => extract_doc(path),
-        "jtd" => extract_jtd(path),
+        "doc" => extract_doc_bytes(path, bytes),
+        "jtd" => extract_jtd_bytes(path, bytes),
         "xls" | "xlsx" => extract_spreadsheet(path),
         _ => Err(format!("unsupported extension: {ext}")),
     }
 }
 
+fn extension_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
 pub fn is_supported(path: &Path) -> bool {
     matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase()
-            .as_str(),
+        extension_of(path).as_str(),
         "txt" | "md" | "markdown" | "json" | "html" | "htm" | "pdf" | "docx" | "doc" | "jtd"
             | "xls" | "xlsx"
     )
 }
 
-fn extract_text(path: &Path) -> Result<ExtractedDoc, String> {
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+fn extract_text_bytes(path: &Path, bytes: &[u8]) -> Result<ExtractedDoc, String> {
+    let content = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
     let title = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -62,9 +68,8 @@ fn extract_text(path: &Path) -> Result<ExtractedDoc, String> {
     })
 }
 
-fn extract_html(path: &Path) -> Result<ExtractedDoc, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let decoded = html::decode_html_bytes(&bytes);
+fn extract_html_bytes(path: &Path, bytes: &[u8]) -> Result<ExtractedDoc, String> {
+    let decoded = html::decode_html_bytes(bytes);
     let (doc_title, text) = html::html_to_text(&decoded);
     if !text.chars().any(|c| !c.is_whitespace()) {
         return Err(SKIP_NO_TEXT.into());
@@ -82,9 +87,8 @@ fn extract_html(path: &Path) -> Result<ExtractedDoc, String> {
     })
 }
 
-fn extract_pdf(path: &Path) -> Result<ExtractedDoc, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let pages = extract_pdf_pages_from_bytes(&bytes)?;
+fn extract_pdf_bytes(path: &Path, bytes: &[u8]) -> Result<ExtractedDoc, String> {
+    let pages = extract_pdf_pages_from_bytes(bytes)?;
     let title = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -130,18 +134,16 @@ pub fn is_skippable_extract_error(err: &str) -> bool {
     err == SKIP_NO_TEXT || err.starts_with("pdf extract panicked")
 }
 
-fn extract_doc(path: &Path) -> Result<ExtractedDoc, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let text = rwml::extract_text(&bytes).map_err(|e| e.to_string())?;
+fn extract_doc_bytes(path: &Path, bytes: &[u8]) -> Result<ExtractedDoc, String> {
+    let text = rwml::extract_text(bytes).map_err(|e| e.to_string())?;
     Ok(ExtractedDoc {
         title: file_title(path),
         pages: vec![text],
     })
 }
 
-fn extract_jtd(path: &Path) -> Result<ExtractedDoc, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let text = rjtd_core::document_text::extract_document_text(&bytes);
+fn extract_jtd_bytes(path: &Path, bytes: &[u8]) -> Result<ExtractedDoc, String> {
+    let text = rjtd_core::document_text::extract_document_text(bytes);
     if text.trim().is_empty() {
         return Err("jtd: no extractable text".to_string());
     }

@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod db;
+pub mod extract_host;
 pub mod extractor;
 pub mod indexer;
 pub mod llm;
@@ -34,6 +35,24 @@ static APP_READY: AtomicBool = AtomicBool::new(false);
 static SETUP_DONE: AtomicBool = AtomicBool::new(false);
 /// Show the settings window once setup can do so (user launch or a second instance).
 static OPEN_SETTINGS: AtomicBool = AtomicBool::new(false);
+
+fn spawn_folder_sync(indexer: Arc<crate::indexer::Indexer>, app_handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        match tauri::async_runtime::spawn_blocking(move || indexer.sync_enabled_folders()).await {
+            Ok(Ok(stats)) => {
+                eprintln!(
+                    "argos: startup sync done: indexed={} skipped={} removed={} errors={}",
+                    stats.indexed, stats.skipped, stats.removed, stats.errors
+                );
+                if stats.indexed > 0 || stats.removed > 0 {
+                    let _ = app_handle.emit("folders-updated", ());
+                }
+            }
+            Ok(Err(e)) => eprintln!("argos: startup sync failed: {e}"),
+            Err(e) => eprintln!("argos: startup sync join failed: {e}"),
+        }
+    });
+}
 
 fn sync_due(enabled: bool, interval: u64, last: &str) -> bool {
     if !enabled || interval == 0 {
@@ -181,22 +200,39 @@ pub fn run() {
                 state.sync_remote_server();
             }
 
+            {
+                let indexer_for_hook = indexer.clone();
+                let app_for_hook = app.handle().clone();
+                indexer.set_schedule_sync(move || {
+                    spawn_folder_sync(indexer_for_hook.clone(), app_for_hook.clone());
+                });
+            }
+
             if needs_full_reindex {
                 eprintln!(
                     "argos: schema migration — starting automatic full reindex (indexes are incompatible)"
                 );
                 let indexer = indexer.clone();
+                let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     match tauri::async_runtime::spawn_blocking(move || indexer.reindex_all(|_| {})).await
                     {
-                        Ok(Ok(stats)) => eprintln!(
-                            "argos: schema reindex done: indexed={} skipped={} errors={}",
-                            stats.indexed, stats.skipped, stats.errors
-                        ),
+                        Ok(Ok(stats)) => {
+                            eprintln!(
+                                "argos: schema reindex done: indexed={} skipped={} removed={} errors={}",
+                                stats.indexed, stats.skipped, stats.removed, stats.errors
+                            );
+                            let _ = app_handle.emit("folders-updated", ());
+                        }
                         Ok(Err(e)) => eprintln!("argos: schema reindex failed: {e}"),
                         Err(e) => eprintln!("argos: schema reindex join failed: {e}"),
                     }
                 });
+            } else {
+                // Changes made while the process was closed are not in the watcher log.
+                // Crawl in the background; unchanged files are skipped by size/mtime/hash.
+                eprintln!("argos: startup sync — picking up changes made while closed");
+                spawn_folder_sync(indexer.clone(), app.handle().clone());
             }
 
             // Periodic Outlook mail sync (dedicated interval; 0 = manual only).

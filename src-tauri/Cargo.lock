@@ -166,7 +166,6 @@ dependencies = [
  "tower",
  "tower-http",
  "uuid",
- "walkdir",
  "windows 0.62.2",
  "xxhash-rust",
  "zip 2.4.2",

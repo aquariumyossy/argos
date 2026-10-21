@@ -221,15 +221,12 @@ pub fn build_search_filter(
 /// Narrow an existing filter to a preferred folder, for the scoped half of a folder-biased
 /// search.
 ///
-/// A path allowlist reaches the retrieval query as a `Must` clause, so the strict rung of
-/// the ladder can find in-folder paragraphs directly. The prefix post-filter cannot: it
-/// runs after retrieval, so a folder whose paragraphs miss the global top-N only surfaces
-/// once the ladder has relaxed the query, which returns *looser* matches than an unscoped
-/// search would.
-///
-/// Returns the filter unchanged when the folder holds more files than
-/// [`tantivy_backend::PATH_OR_CAP`]; a `Must` clause of that many terms costs more than it
-/// buys, and the caller still passes the prefix for post-filtering.
+/// A path allowlist reaches the retrieval query as a `Must` clause of exact paths. That
+/// matters when a date filter already produced an allowlist: intersecting it keeps the
+/// date window inside the folder. Folder scope itself is a path-prefix clause on the
+/// retrieval query (see `path_prefix_query`), so a document outside the global top-N
+/// is still found. This returns the filter unchanged when the folder holds more files
+/// than [`tantivy_backend::PATH_OR_CAP`]; the prefix clause covers that case.
 pub fn narrow_filter_to_prefix(
     db: &Db,
     base: &SearchFilter,

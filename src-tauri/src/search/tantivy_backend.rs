@@ -8,7 +8,7 @@ use lindera::segmenter::Segmenter;
 use lindera_tantivy::tokenizer::LinderaTokenizer;
 use parking_lot::Mutex;
 use tantivy::collector::{DocSetCollector, TopDocs};
-use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, RegexQuery, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING,
 };
@@ -88,6 +88,60 @@ pub struct OpenIndexResult {
     pub backend: TantivyBackend,
     /// True when an older index was wiped; caller should run full reindex.
     pub needs_full_reindex: bool,
+}
+
+/// Restrict a STRING `path` field to `prefix` without a schema change.
+///
+/// The clause is boost 0 so it does not alter BM25. Matching is case-insensitive and
+/// accepts both separators, but `C:\cases\alpha` does not match `C:\cases\alpha2`.
+/// `\\?\` and `\\?\UNC\` prefixes are stripped the same way `path_starts_with` does,
+/// so an extended path still finds the simplified path stored in the index.
+fn path_prefix_query(field: Field, prefix: &str) -> Result<Box<dyn Query>, String> {
+    let simplified = pathutil::simplify_windows_path(prefix);
+    let base = scope_base(&simplified);
+    if base.is_empty() {
+        return Err("empty scope".into());
+    }
+    // One regex covers the folder itself and its children. Tantivy rejects `^` / `$`.
+    // The optional separator is what lets a case-changed file path match, while still
+    // refusing `...\alpha2` for a scope of `...\alpha` (the pattern must match the
+    // whole term, so leftover characters do not fit).
+    let pattern = path_scope_regex(&base);
+    let query = RegexQuery::from_pattern(&pattern, field).map_err(|e| format!("{pattern}: {e}"))?;
+    Ok(Box::new(BoostQuery::new(Box::new(query), 0.0)))
+}
+
+fn scope_base(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    let stripped = trimmed.trim_end_matches(['\\', '/']);
+    if stripped.is_empty() {
+        trimmed.chars().take(1).collect()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn path_scope_regex(prefix: &str) -> String {
+    let mut body = String::new();
+    for c in prefix.chars() {
+        if c.is_ascii_alphabetic() {
+            body.push('[');
+            body.push(c.to_ascii_lowercase());
+            body.push(c.to_ascii_uppercase());
+            body.push(']');
+        } else if c == '\\' || c == '/' {
+            body.push_str(r"[\\/]");
+        } else if matches!(
+            c,
+            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            body.push('\\');
+            body.push(c);
+        } else {
+            body.push(c);
+        }
+    }
+    format!(r"{body}([\\/].*)?")
 }
 
 pub struct TantivyBackend {
@@ -216,9 +270,18 @@ impl TantivyBackend {
         let morph = MorphAnalyzer::new()?;
 
         let writer = index.writer(50_000_000).map_err(|e| e.to_string())?;
+        // Deleted documents must be merged away. The default ratio is 1.0, so a
+        // segment that is entirely tombstones is never rewritten and the stored
+        // text stays mapped. Small per-file commits then pile up as Windows
+        // commit charge (RADAR_PRE_LEAK).
+        let mut merge_policy = tantivy::indexer::LogMergePolicy::default();
+        merge_policy.set_del_docs_ratio_before_merge(0.2);
+        writer.set_merge_policy(Box::new(merge_policy));
+        // Manual: OnCommitWithDelay reloads on its own thread as well as our
+        // explicit reload, so two generations of segment mmaps stay alive.
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(|e| e.to_string())?;
 
@@ -476,6 +539,157 @@ impl TantivyBackend {
         writer.commit().map_err(|e| e.to_string())?;
         self.reader.reload().map_err(|e| e.to_string())?;
         Ok(units.len())
+    }
+
+    /// One document with the filename in `title` and an empty body, using the same
+    /// fields a normal file uses. Search hits it by name and shows no excerpt.
+    /// Schema is unchanged: an existing index does not need a rebuild.
+    pub fn index_filename_only(
+        &self,
+        fs_path: &Path,
+        store_path: &str,
+        folder: &str,
+        mtime: u64,
+        size: u64,
+        title: &str,
+    ) -> Result<(), String> {
+        let path_str = store_path.to_string();
+        self.delete_by_path(&path_str)?;
+        let ext = fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let key = format!("{path_str}#0");
+        let mut writer = self.writer.lock();
+        writer
+            .add_document(doc!(
+                self.fields.title => title,
+                self.fields.body => "",
+                self.fields.path => path_str.as_str(),
+                self.fields.mtime => mtime.to_string().as_str(),
+                self.fields.size => size.to_string().as_str(),
+                self.fields.ext => ext.as_str(),
+                self.fields.folder => folder,
+                self.fields.page => "",
+                self.fields.chunk_id => "0",
+                self.fields.doc_key => key.as_str(),
+                self.fields.unit_id => "0",
+                self.fields.unit_label => "",
+                self.fields.unit_kind => "file",
+            ))
+            .map_err(|e| e.to_string())?;
+        writer.commit().map_err(|e| e.to_string())?;
+        self.reader.reload().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Queue a delete+add for one file. Nothing is searchable until [`publish_staged`].
+    /// Crawl uses this so a folder does not commit (and mmap) a segment per file.
+    pub fn stage_extracted(
+        &self,
+        fs_path: &Path,
+        store_path: &str,
+        folder: &str,
+        mtime: u64,
+        size: u64,
+        extracted: &crate::extractor::ExtractedDoc,
+    ) -> Result<(), String> {
+        let path_str = store_path.to_string();
+        let ext = fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let units = crate::extractor::segment_pages(&extracted.pages);
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, &path_str));
+        for unit in &units {
+            let key = format!("{}#{}", path_str, unit.unit_id);
+            let page_str = unit.page.map(|p| p.to_string()).unwrap_or_default();
+            let unit_id_str = unit.unit_id.to_string();
+            writer
+                .add_document(doc!(
+                    self.fields.title => extracted.title.as_str(),
+                    self.fields.body => unit.text.as_str(),
+                    self.fields.path => path_str.as_str(),
+                    self.fields.mtime => mtime.to_string().as_str(),
+                    self.fields.size => size.to_string().as_str(),
+                    self.fields.ext => ext.as_str(),
+                    self.fields.folder => folder,
+                    self.fields.page => page_str.as_str(),
+                    self.fields.chunk_id => unit_id_str.as_str(),
+                    self.fields.doc_key => key.as_str(),
+                    self.fields.unit_id => unit_id_str.as_str(),
+                    self.fields.unit_label => unit.label.as_str(),
+                    self.fields.unit_kind => unit.kind.as_str(),
+                ))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Queue a filename-only document. Published with the current batch.
+    pub fn stage_filename_only(
+        &self,
+        fs_path: &Path,
+        store_path: &str,
+        folder: &str,
+        mtime: u64,
+        size: u64,
+        title: &str,
+    ) -> Result<(), String> {
+        let path_str = store_path.to_string();
+        let ext = fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let key = format!("{path_str}#0");
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, &path_str));
+        writer
+            .add_document(doc!(
+                self.fields.title => title,
+                self.fields.body => "",
+                self.fields.path => path_str.as_str(),
+                self.fields.mtime => mtime.to_string().as_str(),
+                self.fields.size => size.to_string().as_str(),
+                self.fields.ext => ext.as_str(),
+                self.fields.folder => folder,
+                self.fields.page => "",
+                self.fields.chunk_id => "0",
+                self.fields.doc_key => key.as_str(),
+                self.fields.unit_id => "0",
+                self.fields.unit_label => "",
+                self.fields.unit_kind => "file",
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Publish staged adds and reload the reader once. Background merges keep
+    /// the segment count down. A forced merge races those merges and must not
+    /// fail the batch: the commit is what makes the rows durable.
+    pub fn publish_staged(&self) -> Result<(), String> {
+        {
+            let mut writer = self.writer.lock();
+            writer.commit().map_err(|e| e.to_string())?;
+        }
+        if let Err(err) = self.reader.reload() {
+            eprintln!("argos: search reader reload failed, retrying: {err}");
+            if let Err(err) = self.reader.reload() {
+                eprintln!("argos: search reader reload failed: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn segment_count(&self) -> Result<usize, String> {
+        self.index
+            .searchable_segment_ids()
+            .map(|ids| ids.len())
+            .map_err(|e| e.to_string())
     }
 
     /// Index an Outlook email into the mail index only.
@@ -1594,6 +1808,18 @@ impl TantivyBackend {
                     clauses.push((Occur::Must, Box::new(BooleanQuery::new(shoulds))));
                 }
             }
+            if let Some(ref prefix) = scope {
+                if !prefix.starts_with("mailfolder:") {
+                    // Zero boost: the clause only restricts which docs are scored.
+                    // BM25 (and the rescore that multiplies it) stays the same.
+                    match path_prefix_query(self.fields.path, prefix) {
+                        Ok(q) => clauses.push((Occur::Must, q)),
+                        Err(e) => {
+                            eprintln!("argos: path scope query skipped ({prefix}): {e}");
+                        }
+                    }
+                }
+            }
             if clauses.len() == 1 {
                 clauses.remove(0).1
             } else {
@@ -1608,7 +1834,9 @@ impl TantivyBackend {
             limit.max(50).min(80)
         } else if allow_or.is_some() {
             (limit * 2).max(40).min(400)
-        } else if scope.is_some() || ext_filter.is_some() || allow_set.is_some() || share.is_some() {
+        } else if ext_filter.is_some() || allow_set.is_some() || share.is_some() {
+            // Scope is already a retrieval clause, so it uses the same cap as an
+            // unscoped search. Extension, allowlist, and share can still drop hits after.
             (limit * 5).max(80).min(400)
         } else {
             (limit * 2).max(40).min(200)
@@ -3462,5 +3690,165 @@ mod tests {
         insert_allow_path(&mut set, r"C:\Docs\A.txt");
         assert!(path_in_allowlist(r"C:\Docs\A.txt", &set));
         assert!(path_in_allowlist(r"c:\docs\a.txt", &set));
+    }
+
+    /// Folder scope used to take the global top ~200–400 hits and then filter.
+    /// A matching file inside the folder, but outside that window, never appeared.
+    #[test]
+    fn scoped_search_finds_doc_outside_global_top_n() {
+        let idx = TestIndex::new("scope-recall");
+        let hot = format!(
+            "{} これは高頻度で契約という語が並ぶ文書です。",
+            "契約 ".repeat(40)
+        );
+        let target_path = r"C:\cases\alpha\nested\target.txt";
+        let sibling_path = r"C:\cases\alpha2\sibling.txt";
+        let target_body = "契約について一度だけ触れる。損害賠償の記載はここだけにする。";
+
+        let mut docs = Vec::with_capacity(422);
+        for i in 0..420 {
+            docs.push((format!(r"C:\noise\n{i}.txt"), hot.clone()));
+        }
+        docs.push((sibling_path.to_string(), hot));
+        docs.push((target_path.to_string(), target_body.to_string()));
+        add_raw_docs(&idx.backend, &docs);
+
+        let global = idx
+            .backend
+            .search("契約", 10, None, None, false)
+            .expect("global");
+        assert!(
+            global.iter().all(|h| h.path != target_path),
+            "the low-scoring folder doc must sit outside the global top hits: {:?}",
+            global.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+
+        let proved = idx
+            .backend
+            .search("損害賠償", 10, None, None, false)
+            .expect("proof");
+        assert!(
+            proved.iter().any(|h| h.path == target_path),
+            "the folder doc must be indexed: {:?}",
+            proved.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+
+        for prefix in [r"C:\cases\alpha", r"c:\CASES\alpha", r"C:/cases/alpha"] {
+            let scoped = idx
+                .backend
+                .search("契約", 10, Some(prefix), None, false)
+                .expect("scoped");
+            assert!(
+                scoped.iter().any(|h| h.path == target_path),
+                "scope {prefix} must return the in-folder doc: {:?}",
+                scoped.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+            assert!(
+                scoped.iter().all(|h| h.path != sibling_path && !h.path.contains(r"\noise\")),
+                "scope {prefix} must not leak sibling or noise hits: {:?}",
+                scoped.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn case_and_extended_path_still_match_and_scores_stay_put() {
+        let idx = TestIndex::new("scope-norm");
+        let body = "契約について一度だけ触れる。損害賠償の記載はここだけにする。";
+        add_raw_docs(
+            &idx.backend,
+            &[
+                (r"C:\Cases\Alpha\File.txt".into(), body.into()),
+                (r"C:\Cases\Alpha2\Sibling.txt".into(), body.into()),
+                (r"\\server\share\Cases\Public.txt".into(), body.into()),
+                (r"\\server\share\Cases2\Other.txt".into(), body.into()),
+            ],
+        );
+
+        let case_hits = idx
+            .backend
+            .matches_for_path("損害賠償", r"c:\cases\alpha\file.txt", 5, false)
+            .unwrap();
+        assert_eq!(
+            case_hits.len(),
+            1,
+            "case-only path fallback: {:?}",
+            case_hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert_eq!(case_hits[0].path, r"C:\Cases\Alpha\File.txt");
+
+        let extended = idx
+            .backend
+            .matches_for_path("損害賠償", r"\\?\C:\Cases\Alpha\File.txt", 5, false)
+            .unwrap();
+        assert_eq!(extended.len(), 1, "{:?}", extended.iter().map(|h| &h.path).collect::<Vec<_>>());
+        assert_eq!(extended[0].path, r"C:\Cases\Alpha\File.txt");
+
+        for prefix in [
+            r"\\server\share\Cases",
+            r"\\?\UNC\server\share\Cases",
+            r"//server/share/cases",
+        ] {
+            let hits = idx
+                .backend
+                .search("損害賠償", 10, Some(prefix), None, false)
+                .unwrap();
+            assert!(
+                hits.iter().any(|h| h.path.ends_with(r"Public.txt")),
+                "scope {prefix}: {:?}",
+                hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+            assert!(
+                hits.iter().all(|h| !h.path.contains("Cases2") && !h.path.contains("Alpha2")),
+                "scope {prefix} leaked a sibling: {:?}",
+                hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
+        }
+
+        let scored = TestIndex::new("score-same");
+        scored.add("one", "契約について詳しく述べた文書。本文を足して長さを確保する。");
+        scored.add("two", "契約に一度だけ触れる短いメモ。別の話題が中心で長さを足す。");
+        let unscoped = scored.backend.search("契約", 10, None, None, false).unwrap();
+        let parent = scored.dir.to_str().unwrap();
+        let scoped = scored
+            .backend
+            .search("契約", 10, Some(parent), None, false)
+            .unwrap();
+        assert_eq!(unscoped.len(), scoped.len());
+        for hit in &unscoped {
+            let same = scoped.iter().find(|h| h.path == hit.path).expect("same path");
+            assert_eq!(
+                same.score, hit.score,
+                "folder scope must not change the score of {}",
+                hit.path
+            );
+        }
+    }
+
+    fn add_raw_docs(backend: &TantivyBackend, docs: &[(String, String)]) {
+        let mut writer = backend.writer.lock();
+        for (path, body) in docs {
+            let key = format!("{path}#0");
+            writer
+                .add_document(tantivy::doc!(
+                    backend.fields.title => path.as_str(),
+                    backend.fields.body => body.as_str(),
+                    backend.fields.path => path.as_str(),
+                    backend.fields.mtime => "1",
+                    backend.fields.size => "1",
+                    backend.fields.ext => "txt",
+                    backend.fields.folder => r"C:\",
+                    backend.fields.page => "1",
+                    backend.fields.chunk_id => "0",
+                    backend.fields.doc_key => key.as_str(),
+                    backend.fields.unit_id => "0",
+                    backend.fields.unit_label => "",
+                    backend.fields.unit_kind => "paragraph",
+                ))
+                .expect("add raw doc");
+        }
+        writer.commit().expect("commit raw docs");
+        drop(writer);
+        backend.reader.reload().expect("reload");
     }
 }
