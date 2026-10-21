@@ -668,30 +668,20 @@ impl TantivyBackend {
         Ok(())
     }
 
-    /// Publish staged adds and reload the reader once. If segments have fallen
-    /// behind the merge policy, fold them into one so the process does not keep
-    /// a mmap per file.
+    /// Publish staged adds and reload the reader once. Background merges keep
+    /// the segment count down. A forced merge races those merges and must not
+    /// fail the batch: the commit is what makes the rows durable.
     pub fn publish_staged(&self) -> Result<(), String> {
         {
             let mut writer = self.writer.lock();
             writer.commit().map_err(|e| e.to_string())?;
-            let segment_ids = self
-                .index
-                .searchable_segment_ids()
-                .map_err(|e| e.to_string())?;
-            if segment_ids.len() > 32 {
-                eprintln!(
-                    "argos: merging {} search segments to cap committed memory",
-                    segment_ids.len()
-                );
-                writer
-                    .merge(&segment_ids)
-                    .wait()
-                    .map_err(|e| e.to_string())?;
-                let _ = writer.garbage_collect_files().wait();
+        }
+        if let Err(err) = self.reader.reload() {
+            eprintln!("argos: search reader reload failed, retrying: {err}");
+            if let Err(err) = self.reader.reload() {
+                eprintln!("argos: search reader reload failed: {err}");
             }
         }
-        self.reader.reload().map_err(|e| e.to_string())?;
         Ok(())
     }
 

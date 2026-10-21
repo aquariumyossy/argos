@@ -35,6 +35,9 @@ const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 /// Open, read, and extract each give up after this long. The child process is
 /// killed; it does not keep the file bytes in the indexer.
 const FILE_IO_TIMEOUT: Duration = Duration::from_secs(60);
+/// A timeout is tried this many times before it is recorded. The first try
+/// plus two retries.
+const IO_ATTEMPTS: u32 = 3;
 /// One directory listing. Longer than a file read: a large share folder can take
 /// more than a minute to enumerate without being stuck on a single entry.
 const DIR_LIST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -643,12 +646,14 @@ impl Indexer {
         let Some(folder) = self.folder_for_path(path)? else {
             return Ok(false);
         };
-        let indexed = matches!(
-            self.index_one(&folder.path, &folder.public_path, path)?,
-            IndexAction::Indexed
-        );
-        self.finish_batch()?;
-        Ok(indexed)
+        let indexed = self.index_one(&folder.path, &folder.public_path, path);
+        if let Err(err) = self.finish_batch() {
+            return Err(match indexed {
+                Err(index_err) => format!("{index_err}; {err}"),
+                Ok(_) => err,
+            });
+        }
+        indexed.map(|action| matches!(action, IndexAction::Indexed))
     }
 
     /// Index every supported file under `dir`, then drop indexed descendants that are gone.
@@ -873,6 +878,9 @@ impl Indexer {
             Ok(result) => result,
             Err(_) => {
                 eprintln!("argos: extract panicked: {}", path.display());
+                if self.file_row(&store_path)?.is_some() {
+                    return Err(REASON_PANIC.into());
+                }
                 self.remember_filename_only(
                     folder,
                     path,
@@ -903,38 +911,21 @@ impl Indexer {
         let display = pathutil::simplify_windows_path(&path.to_string_lossy());
         let io_path = extended_length_path(Path::new(&display));
         eprintln!("argos: opening {display}");
-        #[cfg(test)]
-        self.stat_count.fetch_add(1, Ordering::SeqCst);
-        self.tune_host();
-        let stat = {
-            let mut host = self.extract_host.lock();
-            host.stat(&io_path, self.io_timeout(false))
-        };
+        let stat = self.host_call(true, |host, timeout| host.stat(&io_path, timeout));
         let stat = match stat {
             Ok(stat) => stat,
             Err(IoFail::TimedOut) => {
                 eprintln!("argos: {REASON_TIMEOUT_OPEN}: {display}");
-                self.remember_filename_only(
-                    folder,
-                    path,
-                    store_path,
-                    0,
-                    0,
-                    "skipped",
-                    REASON_TIMEOUT_OPEN,
-                )?;
-                return Ok(IndexAction::Skipped);
+                return self.note_transient(folder, path, store_path, &display, REASON_TIMEOUT_OPEN);
             }
             Err(IoFail::Crashed(message)) => {
                 eprintln!("argos: extractor crashed on {display}: {message}");
-                self.remember_filename_only(folder, path, store_path, 0, 0, "skipped", REASON_CRASH)?;
-                return Ok(IndexAction::Skipped);
+                return self.note_transient(folder, path, store_path, &display, REASON_CRASH);
             }
-            Err(IoFail::Failed(err)) => {
+            Err(IoFail::Failed(err)) | Err(IoFail::Unavailable(err)) => {
                 let reason = format!("open failed: {err}");
                 eprintln!("argos: {reason}: {display}");
-                self.remember_filename_only(folder, path, store_path, 0, 0, "skipped", &reason)?;
-                return Ok(IndexAction::Skipped);
+                return self.note_transient(folder, path, store_path, &display, &reason);
             }
         };
         let size = stat.size;
@@ -962,44 +953,39 @@ impl Indexer {
         eprintln!("argos: reading {display}");
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::SeqCst);
-        self.tune_host();
-        let loaded = {
-            let mut host = self.extract_host.lock();
-            host.extract(&io_path, self.io_timeout(false), self.max_index_bytes())
-        };
+        let max_bytes = self.max_index_bytes();
+        let loaded = self.host_call(false, |host, timeout| {
+            host.extract(&io_path, timeout, max_bytes)
+        });
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(IoFail::TimedOut) => {
                 eprintln!("argos: {REASON_TIMEOUT_EXTRACT}: {display}");
-                self.remember_filename_only(
+                return self.note_extract_timeout(
                     folder,
                     path,
                     store_path,
                     size,
                     mtime,
-                    "skipped",
-                    REASON_TIMEOUT_EXTRACT,
-                )?;
-                return Ok(IndexAction::Skipped);
+                    &display,
+                );
             }
             Err(IoFail::Crashed(message)) => {
                 eprintln!("argos: extractor crashed on {display}: {message}");
-                self.remember_filename_only(
+                return self.sticky_skip(
                     folder,
                     path,
                     store_path,
                     size,
                     mtime,
-                    "skipped",
+                    &display,
                     REASON_CRASH,
-                )?;
-                return Ok(IndexAction::Skipped);
+                );
             }
-            Err(IoFail::Failed(err)) => {
+            Err(IoFail::Failed(err)) | Err(IoFail::Unavailable(err)) => {
                 let reason = format!("open failed: {err}");
                 eprintln!("argos: {reason}: {display}");
-                self.remember_filename_only(folder, path, store_path, size, mtime, "skipped", &reason)?;
-                return Ok(IndexAction::Skipped);
+                return self.note_transient(folder, path, store_path, &display, &reason);
             }
         };
 
@@ -1155,7 +1141,13 @@ impl Indexer {
     }
 
     fn publish_rows(&self, rows: Vec<StagedRow>) -> Result<(), String> {
-        self.backend.publish_staged()?;
+        if let Err(err) = self.backend.publish_staged() {
+            let mut queued = self.staged_rows.lock();
+            let mut restored = rows;
+            restored.append(&mut *queued);
+            *queued = restored;
+            return Err(err);
+        }
         for row in rows {
             if row.status == "ok" {
                 self.db
@@ -1218,11 +1210,129 @@ impl Indexer {
     }
 
     fn stat_file(&self, path: &Path) -> Result<FileStat, IoFail> {
-        #[cfg(test)]
-        self.stat_count.fetch_add(1, Ordering::SeqCst);
-        self.tune_host();
-        let mut host = self.extract_host.lock();
-        host.stat(path, self.io_timeout(false))
+        self.host_call(true, |host, timeout| host.stat(path, timeout))
+    }
+
+    /// Retry a timeout twice. Other failures return on the first attempt.
+    fn host_call<T>(
+        &self,
+        count_stat: bool,
+        mut op: impl FnMut(&mut crate::extract_host::ExtractHost, Duration) -> Result<T, IoFail>,
+    ) -> Result<T, IoFail> {
+        #[cfg(not(test))]
+        let _ = count_stat;
+        let timeout = self.io_timeout(false);
+        let mut last = IoFail::TimedOut;
+        for attempt in 0..IO_ATTEMPTS {
+            #[cfg(test)]
+            if count_stat {
+                self.stat_count.fetch_add(1, Ordering::SeqCst);
+            }
+            self.tune_host();
+            let result = {
+                let mut host = self.extract_host.lock();
+                op(&mut host, timeout)
+            };
+            match result {
+                Err(IoFail::TimedOut) if attempt + 1 < IO_ATTEMPTS => {
+                    eprintln!(
+                        "argos: timed out, retrying ({}/{})",
+                        attempt + 1,
+                        IO_ATTEMPTS
+                    );
+                    last = IoFail::TimedOut;
+                }
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
+    fn file_row(&self, store_path: &str) -> Result<Option<crate::db::FileState>, String> {
+        self.db.file_state(store_path).map_err(|e| e.to_string())
+    }
+
+    fn has_real_row(&self, store_path: &str) -> Result<bool, String> {
+        Ok(self
+            .file_row(store_path)?
+            .is_some_and(|row| row.size != 0 || row.mtime != 0))
+    }
+
+    /// A stat, open, read, or worker-start failure. An existing row is left as it
+    /// is. A file we have never recorded is stored as 0/0 so the next crawl retries.
+    fn note_transient(
+        &self,
+        folder: &str,
+        path: &Path,
+        store_path: &str,
+        display: &str,
+        reason: &str,
+    ) -> Result<IndexAction, String> {
+        if self.file_row(store_path)?.is_some() {
+            eprintln!("argos: keep existing row after {reason}: {display}");
+            return Err(reason.to_string());
+        }
+        self.remember_filename_only(folder, path, store_path, 0, 0, "skipped", reason)?;
+        Ok(IndexAction::Skipped)
+    }
+
+    /// Extract timed out after retries. A real row stays. Otherwise pin the size
+    /// and mtime we already read so the next crawl does not wait again.
+    fn note_extract_timeout(
+        &self,
+        folder: &str,
+        path: &Path,
+        store_path: &str,
+        size: u64,
+        mtime: u64,
+        display: &str,
+    ) -> Result<IndexAction, String> {
+        if self.has_real_row(store_path)? {
+            eprintln!("argos: keep existing row after {REASON_TIMEOUT_EXTRACT}: {display}");
+            return Err(REASON_TIMEOUT_EXTRACT.into());
+        }
+        self.sticky_skip(
+            folder,
+            path,
+            store_path,
+            size,
+            mtime,
+            display,
+            REASON_TIMEOUT_EXTRACT,
+        )
+    }
+
+    fn sticky_skip(
+        &self,
+        folder: &str,
+        path: &Path,
+        store_path: &str,
+        size: u64,
+        mtime: u64,
+        _display: &str,
+        reason: &str,
+    ) -> Result<IndexAction, String> {
+        self.remember_filename_only(folder, path, store_path, size, mtime, "skipped", reason)?;
+        Ok(IndexAction::Skipped)
+    }
+
+    /// Symlink files are indexed. Symlink directories are not descended. A stat
+    /// failure blocks that path so a later purge does not drop it.
+    fn follow_symlink_file(
+        &self,
+        path: &Path,
+        on_file: &mut dyn FnMut(&Path) -> bool,
+        on_blocked: &mut dyn FnMut(&Path),
+    ) -> bool {
+        match self.stat_file(&extended_length_path(path)) {
+            Ok(stat) if stat.is_file => on_file(path),
+            Ok(_) => true,
+            Err(_) => {
+                eprintln!("argos: symlink stat failed: {}", path.display());
+                on_blocked(path);
+                true
+            }
+        }
     }
 
     fn count_indexable(
@@ -1293,7 +1403,7 @@ impl Indexer {
                     on_blocked(Path::new(&display));
                     continue;
                 }
-                Err(IoFail::Failed(message)) => {
+                Err(IoFail::Failed(message)) | Err(IoFail::Unavailable(message)) => {
                     eprintln!("argos: walk error under {display}: {message}");
                     on_blocked(Path::new(&display));
                     continue;
@@ -1308,7 +1418,11 @@ impl Indexer {
                             return false;
                         }
                     }
-                    EntryKind::Symlink => {}
+                    EntryKind::Symlink => {
+                        if !self.follow_symlink_file(&child, on_file, on_blocked) {
+                            return false;
+                        }
+                    }
                     EntryKind::Other => on_blocked(&child),
                 }
             }
@@ -1444,26 +1558,6 @@ fn path_is_blocked(path: &str, blocked: &[String]) -> bool {
     blocked
         .iter()
         .any(|prefix| pathutil::path_starts_with(path, prefix))
-}
-
-/// `file_type` comes from the directory listing (`DirEntry::file_type`), which
-/// does not stat again. A share that drops after the listing must not make a
-/// file that was just listed look deleted.
-#[cfg(test)]
-fn is_indexable(path: &Path, file_type: fs::FileType, excludes: &[String]) -> bool {
-    listing_is_file(path, file_type)
-        && extractor::is_supported(path)
-        && !is_excluded(path, excludes)
-}
-
-#[cfg(test)]
-fn listing_is_file(path: &Path, file_type: fs::FileType) -> bool {
-    if file_type.is_file() {
-        return true;
-    }
-    // Symlinks are not files in the listing. Stat only those, so a normal file
-    // never depends on a second stat that fails when the share drops.
-    file_type.is_symlink() && path.is_file()
 }
 
 fn metadata_unchanged(
@@ -1833,21 +1927,82 @@ mod tests {
 
     #[test]
     fn directory_listing_type_is_what_makes_a_path_indexable() {
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+        let env = Env::new("ftype");
+        env.write("a.txt", "契約のメモ。本文を足して長さを確保する。");
+        fs::create_dir_all(env.files.join("sub")).unwrap();
+        let listed = crate::extract_host::list_path(&env.files, None).unwrap();
+        let file = listed.iter().find(|ent| ent.name == "a.txt").unwrap();
+        let dir = listed.iter().find(|ent| ent.name == "sub").unwrap();
+        assert_eq!(file.kind, crate::extract_host::EntryKind::File);
+        assert_eq!(dir.kind, crate::extract_host::EntryKind::Dir);
+        env.index_all();
+        assert!(env.backend().has_path(&env.stored("a.txt")).unwrap());
+        assert!(!env.backend().has_path(&env.stored("sub")).unwrap());
+        // Root stat plus the file. The directory entry is not stat'd to classify it.
+        assert_eq!(env.indexer().stat_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn symlink_file_is_indexed_and_kept() {
+        let env = Env::new("symlink");
+        let target = env.write("target.txt", "リンク先の固有語オリオンを本文に書く。追加の文字。");
+        let link = env.files.join("link.txt");
+        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        // This Wine build reports success and does not leave a reparse point.
+        if fs::symlink_metadata(&link).is_err() {
+            return;
+        }
+        env.index_all();
+        assert!(env.backend().has_path(&env.stored("link.txt")).unwrap());
+        assert!(
+            env.paths_for("オリオン")
+                .iter()
+                .any(|p| p == &env.stored("link.txt")),
+            "symlink body missing"
+        );
+        env.index_all();
+        assert!(
+            env.backend().has_path(&env.stored("link.txt")).unwrap(),
+            "second crawl purged the symlink"
+        );
+    }
+
+    #[test]
+    fn timeout_keeps_an_existing_document() {
+        let env = Env::new("keepdoc");
+        env.write(
+            "keep.txt",
+            "既存本文の固有語カロンを残す。追加の文字を足す。",
+        );
+        env.index_all();
+        let before = env
+            .db
+            .as_ref()
             .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("argos-ftype-{nanos}"));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("a.txt");
-        fs::write(&file, "契約").unwrap();
-        let file_type = fs::metadata(&file).unwrap().file_type();
-        let dir_type = fs::metadata(&dir).unwrap().file_type();
-        assert!(is_indexable(&file, file_type, &[]));
-        // The path still names a file. A directory type from the listing must not
-        // be replaced by a fresh stat, or a dropped share looks like a deletion.
-        assert!(!is_indexable(&file, dir_type, &[]));
-        let _ = fs::remove_dir_all(&dir);
+            .file_state(&env.stored("keep.txt"))
+            .unwrap()
+            .unwrap();
+        *env.indexer().test_block_path.lock() = Some("keep.txt".into());
+        *env.indexer().test_io_timeout.lock() = Some(Duration::from_millis(200));
+        let stats = env.indexer().sync_enabled_folders().unwrap();
+        assert!(stats.errors >= 1, "{stats:?}");
+        let after = env
+            .db
+            .as_ref()
+            .unwrap()
+            .file_state(&env.stored("keep.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.mtime, before.mtime);
+        assert!(
+            env.paths_for("カロン")
+                .iter()
+                .any(|p| p == &env.stored("keep.txt")),
+            "existing body was replaced"
+        );
     }
 
     #[test]
@@ -2429,11 +2584,22 @@ mod tests {
             "{}",
             row.skip_reason
         );
+        assert_eq!(row.size, 0);
+        assert_eq!(row.mtime, 0);
         assert!(env.backend().has_path(&env.stored("停止ファイル.txt")).unwrap());
         let named = env.paths_for("停止ファイル");
         assert!(
             named.iter().any(|p| p == &env.stored("停止ファイル.txt")),
             "filename still matches: {named:?}"
+        );
+        *env.indexer().test_block_path.lock() = None;
+        *env.indexer().test_io_timeout.lock() = None;
+        env.indexer().sync_enabled_folders().unwrap();
+        assert!(
+            env.paths_for("アルテミス")
+                .iter()
+                .any(|p| p == &env.stored("停止ファイル.txt")),
+            "0/0 row must be read on the next crawl"
         );
     }
 

@@ -1339,7 +1339,7 @@ impl Db {
     }
 
     /// Indexed files whose `mtime` falls in `[after_unix, before_unix]` (inclusive).
-    /// Unbounded sides are `None`. Status is `ok` (not `indexed`).
+    /// Unbounded sides are `None`. Filename-only rows (`ok` and `skipped`) are included.
     pub fn list_ok_file_paths_in_range(
         &self,
         after_unix: Option<i64>,
@@ -1349,7 +1349,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path FROM files
-             WHERE status='ok' AND mtime > 0
+             WHERE status IN ('ok', 'skipped') AND mtime > 0
                AND (?1 IS NULL OR mtime >= ?1)
                AND (?2 IS NULL OR mtime <= ?2)
              ORDER BY mtime DESC
@@ -1381,7 +1381,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path FROM files
-             WHERE status='ok' AND path LIKE ?1 ESCAPE '|'
+             WHERE status IN ('ok', 'skipped') AND path LIKE ?1 ESCAPE '|'
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
@@ -4492,21 +4492,29 @@ mod date_range_tests {
     }
 
     #[test]
-    fn file_range_keeps_ok_and_drops_other_status() {
+    fn file_range_keeps_ok_and_skipped() {
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\docs", "").unwrap();
         let in_range = 1_700_000_100;
         let out_range = 1_600_000_000;
         db.upsert_file(folder.id, r"C:\docs\ok.txt", "txt", 1, in_range, "h")
             .unwrap();
+        insert_file_status(&db, folder.id, r"C:\docs\skipped.txt", in_range, "skipped");
         insert_file_status(&db, folder.id, r"C:\docs\pending.txt", in_range, "pending");
         insert_file_status(&db, folder.id, r"C:\docs\old.txt", out_range, "ok");
         insert_file_status(&db, folder.id, r"C:\docs\zero.txt", 0, "ok");
 
-        let paths = db
+        let mut paths = db
             .list_ok_file_paths_in_range(Some(1_700_000_000), Some(1_700_000_200), 100)
             .unwrap();
-        assert_eq!(paths, vec![r"C:\docs\ok.txt".to_string()]);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                r"C:\docs\ok.txt".to_string(),
+                r"C:\docs\skipped.txt".to_string(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
