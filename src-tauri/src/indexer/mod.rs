@@ -1192,7 +1192,20 @@ impl Indexer {
         self.delete_indexed_paths(&doomed)?;
         if from_db {
             for id in touched {
-                self.note_watcher_success(id);
+                let Some(folder) = folders.iter().find(|folder| folder.id == id) else {
+                    continue;
+                };
+                // A missing path is also what a dead share looks like. Do not record
+                // success unless the registered root is still a directory.
+                let root = PathBuf::from(&folder.path);
+                match self.stat_file(&extended_length_path(&root)) {
+                    Ok(meta) if meta.is_dir => {
+                        self.note_watcher_success(id);
+                    }
+                    Ok(_) | Err(_) => {
+                        let _ = self.mark_folder_unreachable(id);
+                    }
+                }
             }
         }
         Ok(from_db)
@@ -2547,6 +2560,31 @@ mod tests {
         assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
         assert_eq!(row.index_updated_at, ts);
         assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
+        fs::rename(&aside, &env.files).unwrap();
+    }
+
+    #[test]
+    fn removal_while_the_root_is_unreachable_does_not_stamp_success() {
+        let env = Env::new("status-remove-offline");
+        let path = env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        env.indexer().reindex_folder(id, |_| {}).unwrap();
+        db.set_folder_index_outcome(id, FOLDER_INDEX_OK, Some(1_600_000_000))
+            .unwrap();
+        let aside = env.root.join("aside");
+        fs::rename(&env.files, &aside).unwrap();
+        assert_eq!(
+            env.indexer()
+                .handle_fs_event(FsEvent::Changed(path))
+                .unwrap(),
+            true
+        );
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert!(!row.index_busy);
+        assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(row.index_updated_at, Some(1_600_000_000));
+        assert!(!env.backend().has_path(&env.stored("keep.txt")).unwrap());
         fs::rename(&aside, &env.files).unwrap();
     }
 
