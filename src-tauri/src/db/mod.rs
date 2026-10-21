@@ -980,9 +980,12 @@ impl Db {
                         s.calendar_sync_interval_secs = row.1.parse().unwrap_or(3600)
                     }
                     "calendar_last_sync_at" => s.calendar_last_sync_at = row.1,
-                    "calendar_truncated" => s.calendar_truncated = row.1 == "1" || row.1 == "true",
+                    "calendar_truncated" => {
+                        s.calendar_truncated = row.1 == "1" || row.1 == "true"
+                    }
                     "calendar_ical_feeds" => {
-                        s.calendar_ical_feeds = serde_json::from_str(&row.1).unwrap_or_default()
+                        s.calendar_ical_feeds =
+                            serde_json::from_str(&row.1).unwrap_or_default()
                     }
                     "llm_base_url" => {
                         s.llm_base_url = if row.1.trim().is_empty() {
@@ -2177,8 +2180,7 @@ impl Db {
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.flatten().collect()
         };
-        let had_any: i64 =
-            conn.query_row("SELECT COUNT(*) FROM calendar_folders", [], |r| r.get(0))?;
+        let had_any: i64 = conn.query_row("SELECT COUNT(*) FROM calendar_folders", [], |r| r.get(0))?;
         conn.execute("DELETE FROM calendar_folders", [])?;
         for f in folders {
             let mut is_selected = selected.contains(&(f.store_id.clone(), f.entry_id.clone()));
@@ -2226,9 +2228,7 @@ impl Db {
         Ok(rows.flatten().collect())
     }
 
-    pub fn list_selected_calendar_folders(
-        &self,
-    ) -> Result<Vec<CalendarFolderRow>, rusqlite::Error> {
+    pub fn list_selected_calendar_folders(&self) -> Result<Vec<CalendarFolderRow>, rusqlite::Error> {
         Ok(self
             .list_calendar_folders()?
             .into_iter()
@@ -2320,7 +2320,10 @@ impl Db {
     ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock();
         if keep_folder_ids.is_empty() {
-            conn.execute("DELETE FROM calendar_events WHERE store_id != 'ical'", [])?;
+            conn.execute(
+                "DELETE FROM calendar_events WHERE store_id != 'ical'",
+                [],
+            )?;
             return Ok(());
         }
         let mut sql = String::from(
@@ -2632,7 +2635,11 @@ impl Db {
         }
     }
 
-    fn set_llm_review_base(&self, id: &str, base: Option<&str>) -> Result<(), rusqlite::Error> {
+    fn set_llm_review_base(
+        &self,
+        id: &str,
+        base: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock();
         match base {
             Some(b) => {
@@ -2642,7 +2649,10 @@ impl Db {
                 )?;
             }
             None => {
-                conn.execute("UPDATE notes SET llm_review_base=NULL WHERE id=?1", [id])?;
+                conn.execute(
+                    "UPDATE notes SET llm_review_base=NULL WHERE id=?1",
+                    [id],
+                )?;
             }
         }
         Ok(())
@@ -2680,7 +2690,8 @@ impl Db {
             match notes_md::find_section(&secs, h) {
                 Ok(s) => {
                     let new_text = notes_md::normalize_section_text(h, memo, s.level);
-                    notes_md::replace_section(&note.memo, h, &new_text).map_err(|e| e.message(h))?
+                    notes_md::replace_section(&note.memo, h, &new_text)
+                        .map_err(|e| e.message(h))?
                 }
                 Err(notes_md::SectionError::Duplicate) => {
                     return Err(notes_md::SectionError::Duplicate.message(h));
@@ -4109,10 +4120,7 @@ impl Db {
              ORDER BY p.created_at ASC",
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            rusqlite::params![thread_id, request_id],
-            Self::map_note_proposal,
-        )?;
+        let rows = stmt.query_map(rusqlite::params![thread_id, request_id], Self::map_note_proposal)?;
         Ok(rows.flatten().collect())
     }
 
@@ -4121,7 +4129,9 @@ impl Db {
         note_id: &str,
     ) -> Result<Vec<LlmNoteProposalRow>, rusqlite::Error> {
         let conn = self.conn.lock();
-        let sql = Self::proposal_select_sql("WHERE p.note_id=?1 ORDER BY p.created_at DESC");
+        let sql = Self::proposal_select_sql(
+            "WHERE p.note_id=?1 ORDER BY p.created_at DESC",
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([note_id], Self::map_note_proposal)?;
         Ok(rows.flatten().collect())
@@ -4169,7 +4179,8 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         drop(conn);
-        self.get_note_proposal(id).map_err(|e| e.to_string())
+        self.get_note_proposal(id)
+            .map_err(|e| e.to_string())
     }
 
     pub fn apply_note_proposal(&self, id: &str) -> Result<NoteRow, String> {
@@ -4228,8 +4239,9 @@ impl Db {
             .get_note(&row.note_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        let next = undo_proposal_on_memo(&note.memo, &row)
-            .ok_or_else(|| "メモが人がさらに変えたため取り消せません。".to_string())?;
+        let next = undo_proposal_on_memo(&note.memo, &row).ok_or_else(|| {
+            "メモが人がさらに変えたため取り消せません。".to_string()
+        })?;
         self.update_note_memo(&note.id, &next)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "ノートが見つかりません".to_string())?;
@@ -4264,10 +4276,12 @@ fn apply_proposal_to_memo(memo: &str, row: &LlmNoteProposalRow) -> Result<String
         "replace" => {
             let secs = notes_md::split_sections(memo);
             match notes_md::find_section(&secs, &row.heading) {
-                Ok(s) if s.text == row.old_text => {
-                    notes_md::replace_section(memo, &row.heading, &row.new_text)
-                        .map_err(|_| "stale")
-                }
+                Ok(s) if s.text == row.old_text => notes_md::replace_section(
+                    memo,
+                    &row.heading,
+                    &row.new_text,
+                )
+                .map_err(|_| "stale"),
                 _ => Err("stale"),
             }
         }
@@ -4291,10 +4305,12 @@ fn apply_proposal_to_memo(memo: &str, row: &LlmNoteProposalRow) -> Result<String
             } else {
                 let secs = notes_md::split_sections(memo);
                 match notes_md::find_section(&secs, &row.heading) {
-                    Ok(s) if s.text == row.old_text => {
-                        notes_md::append_chunk(memo, Some(row.heading.as_str()), &row.chunk)
-                            .map_err(|_| "stale")
-                    }
+                    Ok(s) if s.text == row.old_text => notes_md::append_chunk(
+                        memo,
+                        Some(row.heading.as_str()),
+                        &row.chunk,
+                    )
+                    .map_err(|_| "stale"),
                     _ => Err("stale"),
                 }
             }
@@ -4331,10 +4347,7 @@ fn undo_proposal_on_memo(memo: &str, row: &LlmNoteProposalRow) -> Option<String>
             let piece = if memo.ends_with(&row.new_text) {
                 row.new_text.clone()
             } else {
-                let formatted = notes_md::format_insert_section(
-                    &row.heading,
-                    insert_body_from_new_text(&row.heading, &row.new_text),
-                );
+                let formatted = notes_md::format_insert_section(&row.heading, insert_body_from_new_text(&row.heading, &row.new_text));
                 if memo.ends_with(&formatted) {
                     formatted
                 } else {
@@ -5043,9 +5056,7 @@ mod note_review_tests {
     fn empty_memo_is_rejected() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
-        let err = db
-            .apply_llm_note_write(&note.id, "  \n", None, None)
-            .unwrap_err();
+        let err = db.apply_llm_note_write(&note.id, "  \n", None, None).unwrap_err();
         assert!(err.contains("空"));
         let _ = std::fs::remove_dir_all(&dir);
     }

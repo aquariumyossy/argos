@@ -50,7 +50,8 @@ pub struct Indexer {
     db: Arc<Db>,
     backend: Arc<TantivyBackend>,
     /// Blocks watcher updates while a full/folder rebuild holds the index.
-    reindex_busy: AtomicBool,
+    /// Shared with the trailing status writer so it can wait out a crawl.
+    reindex_busy: Arc<AtomicBool>,
     /// `KIND_STARTUP` or `KIND_USER` while `reindex_busy` is set.
     reindex_kind: AtomicU8,
     /// Set when a user operation wants the startup diff to stop and get out of the way.
@@ -58,7 +59,8 @@ pub struct Indexer {
     /// Events that arrived while `reindex_busy` was set. Applied in `end_reindex`.
     pending_fs: Mutex<Vec<FsEvent>>,
     /// Held together with the busy-flag update. Waiters sleep on `reindex_cv`.
-    reindex_gate: Mutex<()>,
+    /// Shared so a trailing status write cannot land in the middle of taking the gate.
+    reindex_gate: Arc<Mutex<()>>,
     reindex_cv: Condvar,
     /// A user operation cancelled a startup sync that still had folders left.
     /// Consumed when that user operation finishes, then the app hook runs the rest.
@@ -77,9 +79,12 @@ pub struct Indexer {
     reindex_all_followers: AtomicUsize,
     reindex_folder_followers: AtomicUsize,
     /// Host hook that emits `folder-index-status`. Empty in tests unless a test sets it.
-    status_hook: Mutex<Option<Arc<dyn Fn(FolderIndexStatusEvent) + Send + Sync>>>,
+    status_hook: Arc<Mutex<Option<Arc<dyn Fn(FolderIndexStatusEvent) + Send + Sync>>>>,
     /// Last time a watcher-driven success was written, per folder.
-    watcher_status_at: Mutex<HashMap<i64, Instant>>,
+    watcher_status_at: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Unix time of the latest watcher event skipped by the throttle, per folder.
+    /// Absent means no trailing write is waiting.
+    watcher_trailing: Arc<Mutex<HashMap<i64, i64>>>,
 }
 
 struct Flight {
@@ -159,16 +164,31 @@ impl Drop for FolderBusy<'_> {
     }
 }
 
+/// Clears in-progress for every folder a full rebuild marked, including panic
+/// and an error return before those folders are crawled.
+struct BusySetGuard<'a> {
+    indexer: &'a Indexer,
+    ids: Vec<i64>,
+}
+
+impl Drop for BusySetGuard<'_> {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            self.indexer.clear_folder_busy(*id);
+        }
+    }
+}
+
 impl Indexer {
     pub fn new(db: Arc<Db>, backend: Arc<TantivyBackend>) -> Self {
         Self {
             db,
             backend,
-            reindex_busy: AtomicBool::new(false),
+            reindex_busy: Arc::new(AtomicBool::new(false)),
             reindex_kind: AtomicU8::new(0),
             cancel_startup: AtomicBool::new(false),
             pending_fs: Mutex::new(Vec::new()),
-            reindex_gate: Mutex::new(()),
+            reindex_gate: Arc::new(Mutex::new(())),
             reindex_cv: Condvar::new(),
             resync_after_user: AtomicBool::new(false),
             schedule_sync: Mutex::new(None),
@@ -183,8 +203,9 @@ impl Indexer {
             reindex_all_leads: AtomicUsize::new(0),
             reindex_all_followers: AtomicUsize::new(0),
             reindex_folder_followers: AtomicUsize::new(0),
-            status_hook: Mutex::new(None),
-            watcher_status_at: Mutex::new(HashMap::new()),
+            status_hook: Arc::new(Mutex::new(None)),
+            watcher_status_at: Arc::new(Mutex::new(HashMap::new())),
+            watcher_trailing: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -306,16 +327,28 @@ impl Indexer {
         F: FnMut(IndexProgress),
     {
         let _guard = self.begin_reindex(KIND_USER);
+        let folders = self.db.list_folders().map_err(|e| e.to_string())?;
+        let enabled: Vec<FolderRow> = folders.into_iter().filter(|f| f.enabled).collect();
+        // The file table is cleared before later folders are crawled. Mark every
+        // enabled folder in progress first so a waiting row does not keep a stale time.
+        let ids: Vec<i64> = enabled.iter().map(|f| f.id).collect();
+        for id in &ids {
+            self.mark_folder_updating(*id);
+        }
+        let _busy = BusySetGuard {
+            indexer: self,
+            ids,
+        };
+
         // Full rebuild so removed folders / orphaned chunks disappear
         self.backend.clear_all()?;
         self.db.clear_all_files().map_err(|e| e.to_string())?;
 
-        let folders = self.db.list_folders().map_err(|e| e.to_string())?;
         let excludes = self.load_excludes()?;
 
         let mut stats = IndexStats::default();
-        for folder in folders.into_iter().filter(|f| f.enabled) {
-            stats.merge(self.crawl_folder(&folder, &excludes, false, on_progress));
+        for folder in &enabled {
+            stats.merge(self.crawl_folder(folder, &excludes, false, on_progress));
         }
         Ok(stats)
     }
@@ -442,16 +475,22 @@ impl Indexer {
 
     fn mark_folder_ok(&self, folder_id: i64) -> bool {
         let now = unix_now();
-        if self
-            .db
-            .set_folder_index_outcome(folder_id, FOLDER_INDEX_OK, Some(now))
-            .is_err()
         {
-            return false;
+            // Same gate as the trailing flush, so a delayed watcher write cannot
+            // land over a crawl or relink that just changed the status.
+            let _gate = self.reindex_gate.lock();
+            if self
+                .db
+                .set_folder_index_outcome(folder_id, FOLDER_INDEX_OK, Some(now))
+                .is_err()
+            {
+                return false;
+            }
+            self.watcher_trailing.lock().remove(&folder_id);
+            self.watcher_status_at
+                .lock()
+                .insert(folder_id, Instant::now());
         }
-        self.watcher_status_at
-            .lock()
-            .insert(folder_id, Instant::now());
         self.emit_status(FolderIndexStatusEvent {
             folder_id,
             status: FOLDER_INDEX_OK.to_string(),
@@ -462,29 +501,113 @@ impl Indexer {
     }
 
     fn mark_folder_unreachable(&self, folder_id: i64) -> bool {
-        if self
-            .db
-            .set_folder_index_outcome(folder_id, FOLDER_INDEX_UNREACHABLE, None)
-            .is_err()
         {
-            return false;
+            let _gate = self.reindex_gate.lock();
+            if self
+                .db
+                .set_folder_index_outcome(folder_id, FOLDER_INDEX_UNREACHABLE, None)
+                .is_err()
+            {
+                return false;
+            }
+            self.watcher_trailing.lock().remove(&folder_id);
         }
         self.emit_freshness(folder_id);
         true
     }
 
-    /// Record a watcher-applied file change. Bursts share one SQLite write.
-    fn note_watcher_success(&self, folder_id: i64) {
-        {
-            let last = self.watcher_status_at.lock();
-            if last
-                .get(&folder_id)
-                .is_some_and(|at| at.elapsed() < WATCHER_STATUS_MIN_INTERVAL)
-            {
-                return;
-            }
+    /// Watcher events may refresh an ok or not-yet-recorded folder.
+    /// They must not hide `unreachable`: only a crawl or a successful relink does that.
+    fn watcher_may_refresh(&self, folder_id: i64) -> bool {
+        match self.db.folder_index_freshness(folder_id) {
+            Ok(Some(state)) => state.status.is_empty() || state.status == FOLDER_INDEX_OK,
+            _ => false,
         }
-        let _ = self.mark_folder_ok(folder_id);
+    }
+
+    /// Record a watcher-applied file change. Bursts share one SQLite write,
+    /// and the last event in the burst is written when the interval elapses.
+    /// Returns whether this call itself recorded a success time.
+    fn note_watcher_success(&self, folder_id: i64) -> bool {
+        if !self.watcher_may_refresh(folder_id) {
+            return false;
+        }
+        let throttled = {
+            let last = self.watcher_status_at.lock();
+            last.get(&folder_id)
+                .is_some_and(|at| at.elapsed() < WATCHER_STATUS_MIN_INTERVAL)
+        };
+        if throttled {
+            self.arm_watcher_trailing(folder_id, unix_now());
+            return false;
+        }
+        self.mark_folder_ok(folder_id)
+    }
+
+    /// Remember the latest event time and write it once the throttle window ends.
+    fn arm_watcher_trailing(&self, folder_id: i64, at: i64) {
+        let spawn = {
+            let mut pending = self.watcher_trailing.lock();
+            let spawn = !pending.contains_key(&folder_id);
+            pending.insert(folder_id, at);
+            spawn
+        };
+        if !spawn {
+            return;
+        }
+        let wait = {
+            let map = self.watcher_status_at.lock();
+            map.get(&folder_id)
+                .map(|seen| WATCHER_STATUS_MIN_INTERVAL.saturating_sub(seen.elapsed()))
+                .unwrap_or(Duration::ZERO)
+        };
+        let db = Arc::clone(&self.db);
+        let busy = Arc::clone(&self.reindex_busy);
+        let gate = Arc::clone(&self.reindex_gate);
+        let status_at = Arc::clone(&self.watcher_status_at);
+        let trailing = Arc::clone(&self.watcher_trailing);
+        let hook = Arc::clone(&self.status_hook);
+        std::thread::spawn(move || {
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+            let event = loop {
+                while busy.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _held = gate.lock();
+                if busy.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let Ok(Some(state)) = db.folder_index_freshness(folder_id) else {
+                    trailing.lock().remove(&folder_id);
+                    return;
+                };
+                if !(state.status.is_empty() || state.status == FOLDER_INDEX_OK) {
+                    trailing.lock().remove(&folder_id);
+                    return;
+                }
+                let Some(updated_at) = trailing.lock().remove(&folder_id) else {
+                    return;
+                };
+                if db
+                    .set_folder_index_outcome(folder_id, FOLDER_INDEX_OK, Some(updated_at))
+                    .is_err()
+                {
+                    return;
+                }
+                status_at.lock().insert(folder_id, Instant::now());
+                break FolderIndexStatusEvent {
+                    folder_id,
+                    status: FOLDER_INDEX_OK.to_string(),
+                    updated_at: Some(updated_at),
+                    busy: false,
+                };
+            };
+            if let Some(hook) = hook.lock().clone() {
+                hook(event);
+            }
+        });
     }
 
     fn crawl_folder<F>(
@@ -566,11 +689,8 @@ impl Indexer {
             if !is_indexable(path, entry.file_type(), excludes) {
                 continue;
             }
-            let store_path = pathutil::to_indexed_path(
-                &path.to_string_lossy(),
-                &folder.path,
-                &folder.public_path,
-            );
+            let store_path =
+                pathutil::to_indexed_path(&path.to_string_lossy(), &folder.path, &folder.public_path);
             seen.insert(store_path);
             match self.index_one(&folder.path, &folder.public_path, path) {
                 Ok(IndexAction::Indexed) => stats.indexed += 1,
@@ -739,11 +859,8 @@ impl Indexer {
             if !is_indexable(path, entry.file_type(), &excludes) {
                 continue;
             }
-            let store_path = pathutil::to_indexed_path(
-                &path.to_string_lossy(),
-                &folder.path,
-                &folder.public_path,
-            );
+            let store_path =
+                pathutil::to_indexed_path(&path.to_string_lossy(), &folder.path, &folder.public_path);
             seen.insert(store_path);
             match self.index_one(&folder.path, &folder.public_path, path) {
                 Ok(IndexAction::Indexed) => changed = true,
@@ -768,7 +885,9 @@ impl Indexer {
                 busy.finish();
             }
         } else if changed || removed > 0 {
-            if self.mark_folder_ok(folder.id) {
+            // A directory the watcher crawled. Same rule as a single file:
+            // do not clear unreachable, and do not refresh its timestamp.
+            if self.note_watcher_success(folder.id) {
                 busy.finish();
             }
         }
@@ -784,7 +903,8 @@ impl Indexer {
     ) -> Result<u32, String> {
         let raw = dir.to_string_lossy();
         let fs_str = pathutil::simplify_windows_path(&raw);
-        let indexed_prefix = pathutil::to_indexed_path(&raw, &folder.path, &folder.public_path);
+        let indexed_prefix =
+            pathutil::to_indexed_path(&raw, &folder.path, &folder.public_path);
         let existing = self
             .db
             .list_file_paths_by_folder(folder.id)
@@ -874,13 +994,19 @@ impl Indexer {
         }
         self.backend.delete_paths(paths)?;
         for path in paths {
-            self.db.mark_file_deleted(path).map_err(|e| e.to_string())?;
+            self.db
+                .mark_file_deleted(path)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
 
     /// Rebind a registered folder to a new filesystem path without re-extracting content.
-    pub fn rebind_folder_path(&self, folder_id: i64, new_path: &str) -> Result<FolderRow, String> {
+    pub fn rebind_folder_path(
+        &self,
+        folder_id: i64,
+        new_path: &str,
+    ) -> Result<FolderRow, String> {
         let _guard = self.begin_reindex(KIND_USER);
         let result = (|| {
             let folder = self
@@ -899,8 +1025,10 @@ impl Indexer {
                 return Ok(folder);
             }
 
-            let old_indexed = pathutil::effective_public_root(&folder.path, &folder.public_path);
-            let new_indexed = pathutil::effective_public_root(&new_path, &folder.public_path);
+            let old_indexed =
+                pathutil::effective_public_root(&folder.path, &folder.public_path);
+            let new_indexed =
+                pathutil::effective_public_root(&new_path, &folder.public_path);
 
             // Tantivy first while docs still key off the old `folder` field.
             self.backend.remap_folder_prefix(
@@ -932,6 +1060,13 @@ impl Indexer {
                 "argos: rebound folder '{}' -> '{}' (indexed root '{}' -> '{}')",
                 folder.path, new_path, old_indexed, new_indexed
             );
+            // The new location was a directory and the index binding was rewritten.
+            // A follow-up crawl is not always scheduled, so clear a stale unreachable here.
+            if self.mark_folder_ok(folder_id) {
+                if let Ok(Some(fresh)) = self.db.get_folder(folder_id) {
+                    return Ok(fresh);
+                }
+            }
             Ok(updated)
         })();
         result
@@ -952,7 +1087,8 @@ impl Indexer {
             .ok()
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        let store_path = pathutil::to_indexed_path(&path.to_string_lossy(), folder, public_path);
+        let store_path =
+            pathutil::to_indexed_path(&path.to_string_lossy(), folder, public_path);
 
         // Size and mtime are enough to skip the read. Startup walks every registered
         // file, including UNC folders, and hashing each one pegs the disk at logon.
@@ -968,7 +1104,10 @@ impl Indexer {
 
         if let Ok(Some(existing)) = self.db.get_file_meta(&store_path) {
             if existing.content_hash == hash {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
                 let folder_id = self
                     .db
                     .folder_id_by_path(folder)
@@ -996,9 +1135,9 @@ impl Indexer {
             }
             Err(e) => return Err(e),
         };
-        let _chunks =
-            self.backend
-                .index_file(path, &store_path, folder, mtime, size, &extracted)?;
+        let _chunks = self
+            .backend
+            .index_file(path, &store_path, folder, mtime, size, &extracted)?;
 
         let folder_id = self
             .db
@@ -1010,7 +1149,9 @@ impl Indexer {
             .upsert_file(
                 folder_id,
                 &store_path,
-                path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or(""),
                 size as i64,
                 mtime as i64,
                 &hash,
@@ -1164,17 +1305,13 @@ fn metadata_unchanged(
 
 fn is_excluded(path: &Path, excludes: &[String]) -> bool {
     let s = pathutil::simplify_windows_path(&path.to_string_lossy());
-    excludes
-        .iter()
-        .any(|ex| pathutil::path_starts_with(&s, &pathutil::simplify_windows_path(ex)))
+    excludes.iter().any(|ex| {
+        pathutil::path_starts_with(&s, &pathutil::simplify_windows_path(ex))
+    })
 }
 
 fn push_unique_path(paths: &mut Vec<String>, path: String) -> bool {
-    if path.is_empty()
-        || paths
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&path))
-    {
+    if path.is_empty() || paths.iter().any(|existing| existing.eq_ignore_ascii_case(&path)) {
         return false;
     }
     paths.push(path);
@@ -1226,8 +1363,8 @@ pub enum IndexAction {
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
     use super::{path_is_blocked, KIND_STARTUP, KIND_USER};
+    use super::*;
     use crate::db::{Db, FOLDER_INDEX_OK, FOLDER_INDEX_UNREACHABLE};
     use crate::search::tantivy_backend::TantivyBackend;
     use crate::search::SearchBackend;
@@ -1251,7 +1388,11 @@ mod tests {
             fs::create_dir_all(&files).unwrap();
             let db = Arc::new(Db::open(&root.join("argos.db")).unwrap());
             db.add_folder(files.to_str().unwrap(), "").unwrap();
-            let backend = Arc::new(TantivyBackend::open(&root.join("index")).unwrap().backend);
+            let backend = Arc::new(
+                TantivyBackend::open(&root.join("index"))
+                    .unwrap()
+                    .backend,
+            );
             let indexer = Arc::new(Indexer::new(db.clone(), backend.clone()));
             Self {
                 indexer: Some(indexer),
@@ -1316,14 +1457,8 @@ mod tests {
         let env = Env::new("move");
         env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
         env.write("old.txt", "損害賠償の対象となる記述。契約にも触れる。");
-        env.write(
-            "sub/inner.txt",
-            "契約の下位フォルダにある文書。本文を足す。",
-        );
-        env.write(
-            "sibling/other.txt",
-            "契約の兄弟フォルダ。これは動かす対象ではない。",
-        );
+        env.write("sub/inner.txt", "契約の下位フォルダにある文書。本文を足す。");
+        env.write("sibling/other.txt", "契約の兄弟フォルダ。これは動かす対象ではない。");
         env.index_all();
 
         let old = env.files.join("old.txt");
@@ -1347,20 +1482,11 @@ mod tests {
             .unwrap();
 
         assert!(!env.backend().has_path(&env.stored("old.txt")).unwrap());
-        assert!(!env
-            .backend()
-            .has_path(&env.stored("sub/inner.txt"))
-            .unwrap());
+        assert!(!env.backend().has_path(&env.stored("sub/inner.txt")).unwrap());
         assert!(env.backend().has_path(&env.stored("renamed.txt")).unwrap());
-        assert!(env
-            .backend()
-            .has_path(&env.stored("moved/inner.txt"))
-            .unwrap());
+        assert!(env.backend().has_path(&env.stored("moved/inner.txt")).unwrap());
         assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
-        assert!(env
-            .backend()
-            .has_path(&env.stored("sibling/other.txt"))
-            .unwrap());
+        assert!(env.backend().has_path(&env.stored("sibling/other.txt")).unwrap());
 
         let hits = env.paths_for("損害賠償");
         assert!(
@@ -1370,18 +1496,9 @@ mod tests {
         assert!(hits.iter().all(|p| p != &env.stored("old.txt")), "{hits:?}");
 
         let all = env.paths_for("契約");
-        assert!(
-            all.iter().any(|p| p == &env.stored("moved/inner.txt")),
-            "{all:?}"
-        );
-        assert!(
-            all.iter().all(|p| p != &env.stored("sub/inner.txt")),
-            "{all:?}"
-        );
-        assert!(
-            all.iter().any(|p| p == &env.stored("sibling/other.txt")),
-            "{all:?}"
-        );
+        assert!(all.iter().any(|p| p == &env.stored("moved/inner.txt")), "{all:?}");
+        assert!(all.iter().all(|p| p != &env.stored("sub/inner.txt")), "{all:?}");
+        assert!(all.iter().any(|p| p == &env.stored("sibling/other.txt")), "{all:?}");
         assert!(all.iter().any(|p| p == &env.stored("keep.txt")), "{all:?}");
     }
 
@@ -1391,10 +1508,7 @@ mod tests {
         env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
         env.write("gone.txt", "慰謝料の請求について記載したメモ。本文を足す。");
         env.write("move.txt", "損害賠償の対象となる記述。契約にも触れる。");
-        env.write(
-            "sub/inner.txt",
-            "契約の下位フォルダにある文書。本文を足す。",
-        );
+        env.write("sub/inner.txt", "契約の下位フォルダにある文書。本文を足す。");
         env.index_all();
 
         fs::remove_file(env.files.join("gone.txt")).unwrap();
@@ -1413,15 +1527,9 @@ mod tests {
 
         assert!(!env.backend().has_path(&env.stored("gone.txt")).unwrap());
         assert!(!env.backend().has_path(&env.stored("move.txt")).unwrap());
-        assert!(!env
-            .backend()
-            .has_path(&env.stored("sub/inner.txt"))
-            .unwrap());
+        assert!(!env.backend().has_path(&env.stored("sub/inner.txt")).unwrap());
         assert!(env.backend().has_path(&env.stored("moved.txt")).unwrap());
-        assert!(env
-            .backend()
-            .has_path(&env.stored("sub2/inner.txt"))
-            .unwrap());
+        assert!(env.backend().has_path(&env.stored("sub2/inner.txt")).unwrap());
         assert!(env.backend().has_path(&env.stored("fresh.txt")).unwrap());
         assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
 
@@ -1445,22 +1553,20 @@ mod tests {
     #[test]
     fn events_during_reindex_are_applied_afterwards() {
         let env = Env::new("defer");
-        env.write(
-            "a.txt",
-            "契約についての最初の文書。本文を足して長さを確保する。",
-        );
+        env.write("a.txt", "契約についての最初の文書。本文を足して長さを確保する。");
         env.index_all();
         assert!(env.backend().has_path(&env.stored("a.txt")).unwrap());
 
         let guard = env.indexer().begin_reindex(KIND_USER);
         let a = env.files.join("a.txt");
-        let b = env.write(
-            "b.txt",
-            "損害賠償について後から追加した文書。契約にも触れる。",
-        );
+        let b = env.write("b.txt", "損害賠償について後から追加した文書。契約にも触れる。");
         fs::remove_file(&a).unwrap();
-        env.indexer().handle_fs_event(FsEvent::Removed(a)).unwrap();
-        env.indexer().handle_fs_event(FsEvent::Appeared(b)).unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Removed(a))
+            .unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Appeared(b))
+            .unwrap();
 
         assert!(
             env.backend().has_path(&env.stored("a.txt")).unwrap(),
@@ -1502,14 +1608,8 @@ mod tests {
             .unwrap();
         let skipped = env.indexer().sync_enabled_folders().unwrap();
         assert_eq!(skipped.indexed, 0, "{skipped:?}");
-        assert!(env
-            .paths_for("契約")
-            .iter()
-            .any(|p| p == &env.stored("a.txt")));
-        assert!(
-            env.paths_for("別件").is_empty(),
-            "same size and mtime must not reindex"
-        );
+        assert!(env.paths_for("契約").iter().any(|p| p == &env.stored("a.txt")));
+        assert!(env.paths_for("別件").is_empty(), "same size and mtime must not reindex");
 
         let later = mtime + Duration::from_secs(10);
         fs::File::options()
@@ -1520,10 +1620,7 @@ mod tests {
             .unwrap();
         let updated = env.indexer().sync_enabled_folders().unwrap();
         assert!(updated.indexed >= 1, "{updated:?}");
-        assert!(env
-            .paths_for("別件")
-            .iter()
-            .any(|p| p == &env.stored("a.txt")));
+        assert!(env.paths_for("別件").iter().any(|p| p == &env.stored("a.txt")));
     }
 
     #[test]
@@ -1763,6 +1860,7 @@ mod tests {
 
         db.set_folder_index_outcome(id, FOLDER_INDEX_OK, Some(2))
             .unwrap();
+        let before = unix_now();
         fs::write(&path, "契約のメモ。本文を足して長さを確保する。更新二。").unwrap();
         assert_eq!(
             env.indexer()
@@ -1773,6 +1871,228 @@ mod tests {
         let row = db.list_folders().unwrap().into_iter().next().unwrap();
         assert_eq!(row.index_updated_at, Some(2));
         assert_eq!(row.index_status, FOLDER_INDEX_OK);
+
+        // The burst does not write immediately, but the last event is stored
+        // once the throttle window ends, with that event's own time.
+        let db_wait = Arc::clone(&db);
+        wait_until(
+            WATCHER_STATUS_MIN_INTERVAL + Duration::from_secs(3),
+            "trailing watcher timestamp was not written",
+            || {
+                db_wait.list_folders().unwrap()[0]
+                    .index_updated_at
+                    .unwrap_or(0)
+                    > 2
+            },
+        );
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        let stamped = row.index_updated_at.expect("trailing success time");
+        assert_eq!(row.index_status, FOLDER_INDEX_OK);
+        assert!(!row.index_busy);
+        assert!(
+            stamped >= before && stamped <= before + 2,
+            "trailing time {stamped} should be the event time around {before}"
+        );
+    }
+
+    #[test]
+    fn watcher_does_not_clear_an_unreachable_folder() {
+        let env = Env::new("status-watch-unreach");
+        let path = env.write("keep.txt", "契約のメモ。本文を足して長さを確保する。");
+        env.write("sub/old.txt", "損害賠償の下位文書。本文を足して長さを確保する。");
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        env.indexer().reindex_folder(id, |_| {}).unwrap();
+        db.set_folder_index_outcome(id, FOLDER_INDEX_UNREACHABLE, Some(1_600_000_000))
+            .unwrap();
+        env.indexer().watcher_status_at.lock().clear();
+
+        fs::write(&path, "契約のメモ。本文を足して長さを確保する。更新。").unwrap();
+        assert_eq!(
+            env.indexer()
+                .handle_fs_event(FsEvent::Changed(path))
+                .unwrap(),
+            true
+        );
+        let extra = env.write("sub/new.txt", "慰謝料の下位文書。本文を足して長さを確保する。");
+        assert_eq!(
+            env.indexer()
+                .handle_fs_event(FsEvent::Appeared(extra.parent().unwrap().to_path_buf()))
+                .unwrap(),
+            true
+        );
+        std::thread::sleep(WATCHER_STATUS_MIN_INTERVAL + Duration::from_millis(400));
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(row.index_updated_at, Some(1_600_000_000));
+        assert!(!row.index_busy);
+        assert!(env.backend().has_path(&env.stored("sub/new.txt")).unwrap());
+    }
+
+    #[test]
+    fn replayed_watcher_event_after_unreachable_keeps_the_status() {
+        let env = Env::new("status-replay");
+        let path = env.write("keep.txt", "契約のメモ。本文を足して長さを確保する。");
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        env.indexer().reindex_folder(id, |_| {}).unwrap();
+        db.set_folder_index_outcome(id, FOLDER_INDEX_UNREACHABLE, Some(1_600_000_000))
+            .unwrap();
+        env.indexer().watcher_status_at.lock().clear();
+
+        // The crawl has already recorded unreachable. Events queued while that
+        // reindex still holds the gate are replayed in end_reindex.
+        let guard = env.indexer().begin_reindex(KIND_STARTUP);
+        fs::write(&path, "更新済のメモ。本文を足して長さを確保する。").unwrap();
+        env.indexer()
+            .handle_fs_event(FsEvent::Changed(path.clone()))
+            .unwrap();
+        let mid = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert_eq!(mid.index_status, FOLDER_INDEX_UNREACHABLE);
+        drop(guard);
+
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(row.index_updated_at, Some(1_600_000_000));
+        assert!(!row.index_busy);
+        assert!(env.paths_for("更新済").iter().any(|p| p == &env.stored("keep.txt")));
+    }
+
+    #[test]
+    fn startup_sync_replay_does_not_hide_unreachable() {
+        let env = Env::new("status-startup-replay");
+        let path = env.write("keep.txt", "契約のメモ。このファイルは残す。追加の本文。");
+        env.write(
+            "locked/secret.txt",
+            "損害賠償は読めないフォルダの中。本文を足す。",
+        );
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        env.indexer().reindex_folder(id, |_| {}).unwrap();
+        db.set_folder_index_outcome(id, FOLDER_INDEX_OK, Some(1_600_000_000))
+            .unwrap();
+
+        let indexer = Arc::clone(env.indexer.as_ref().unwrap());
+        indexer.startup_test_hold.store(true, Ordering::SeqCst);
+        let _release = ReleaseStartupHold(&indexer);
+        let worker = Arc::clone(&indexer);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(worker.sync_enabled_folders());
+        });
+        wait_until(
+            Duration::from_secs(5),
+            "startup sync did not mark the folder in progress",
+            || db.list_folders().unwrap()[0].index_busy,
+        );
+
+        // Queue a removal while the crawl still holds the index. The file stays on
+        // disk, so the crawl indexes it, then end_reindex replays the removal.
+        indexer
+            .handle_fs_event(FsEvent::Removed(path))
+            .unwrap();
+
+        let locked = env.files.join("locked");
+        if !deny_directory_listing(&locked) {
+            indexer.startup_test_hold.store(false, Ordering::SeqCst);
+            let _ = rx.recv_timeout(Duration::from_secs(30));
+            if wine_can_launch_unix_program() {
+                panic!(
+                    "could not revoke listing of {} (Wine start /unix chmod failed)",
+                    locked.display()
+                );
+            }
+            eprintln!(
+                "skipped: startup_sync_replay_does_not_hide_unreachable: directory listing could not be revoked"
+            );
+            return;
+        }
+        let _restore = RestoreListing(&locked);
+
+        indexer.startup_test_hold.store(false, Ordering::SeqCst);
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("startup sync")
+            .unwrap();
+        std::thread::sleep(WATCHER_STATUS_MIN_INTERVAL + Duration::from_millis(400));
+        let row = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert!(!row.index_busy);
+        assert_eq!(row.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(row.index_updated_at, Some(1_600_000_000));
+        assert!(
+            !env.backend().has_path(&env.stored("keep.txt")).unwrap(),
+            "the replayed removal should still be applied"
+        );
+        assert!(env
+            .backend()
+            .has_path(&env.stored("locked/secret.txt"))
+            .unwrap());
+    }
+
+    #[test]
+    fn reindex_all_marks_waiting_folders_in_progress() {
+        let env = Env::new("status-all");
+        env.write("a.txt", "契約のメモ。本文を足して長さを確保する。");
+        let other = env.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("b.txt"), "損害賠償のメモ。本文を足して長さを確保する。").unwrap();
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        db.add_folder(other.to_str().unwrap(), "").unwrap();
+        env.indexer().reindex_all(|_| {}).unwrap();
+        for row in db.list_folders().unwrap() {
+            db.set_folder_index_outcome(row.id, FOLDER_INDEX_OK, Some(1_600_000_000))
+                .unwrap();
+        }
+
+        let mut saw_both_busy = false;
+        env.indexer()
+            .reindex_all(|progress| {
+                if progress.phase != IndexPhase::Indexing {
+                    return;
+                }
+                let rows = db.list_folders().unwrap();
+                if rows.len() == 2 && rows.iter().all(|row| row.index_busy) {
+                    saw_both_busy = true;
+                }
+            })
+            .unwrap();
+        assert!(saw_both_busy, "a folder still waiting should already say in progress");
+        for row in db.list_folders().unwrap() {
+            assert!(!row.index_busy, "{row:?}");
+            assert_eq!(row.index_status, FOLDER_INDEX_OK);
+            let stamped = row.index_updated_at.expect("refreshed");
+            assert!(stamped > 1_600_000_000, "{stamped}");
+        }
+    }
+
+    #[test]
+    fn rebind_clears_an_unreachable_status() {
+        let env = Env::new("status-rebind");
+        let path = env.write("a.txt", "契約のメモ。本文を足して長さを確保する。");
+        let db = Arc::clone(env.db.as_ref().unwrap());
+        let id = db.list_folders().unwrap()[0].id;
+        env.indexer().reindex_folder(id, |_| {}).unwrap();
+        db.set_folder_index_outcome(id, FOLDER_INDEX_UNREACHABLE, Some(50))
+            .unwrap();
+
+        let stored_path = db.list_folders().unwrap()[0].path.clone();
+        let same = env.indexer().rebind_folder_path(id, &stored_path).unwrap();
+        assert_eq!(same.index_status, FOLDER_INDEX_UNREACHABLE);
+        assert_eq!(same.index_updated_at, Some(50));
+
+        let dest = env.root.join("relinked");
+        fs::create_dir_all(&dest).unwrap();
+        fs::copy(&path, dest.join("a.txt")).unwrap();
+        let row = env
+            .indexer()
+            .rebind_folder_path(id, dest.to_str().unwrap())
+            .unwrap();
+        assert_eq!(row.index_status, FOLDER_INDEX_OK);
+        assert!(!row.index_busy);
+        let stamped = row.index_updated_at.expect("relink success time");
+        assert!(stamped > 50, "{stamped}");
+        let stored = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert_eq!(stored.index_status, FOLDER_INDEX_OK);
+        assert_eq!(stored.index_updated_at, Some(stamped));
     }
 
     #[test]
@@ -2045,10 +2365,7 @@ mod tests {
         assert!(stats.removed >= 1, "{stats:?}");
         assert!(stats.errors >= 1, "{stats:?}");
         assert!(!env.backend().has_path(&env.stored("gone.txt")).unwrap());
-        assert!(env
-            .backend()
-            .has_path(&env.stored("locked/secret.txt"))
-            .unwrap());
+        assert!(env.backend().has_path(&env.stored("locked/secret.txt")).unwrap());
         assert!(env.backend().has_path(&env.stored("keep.txt")).unwrap());
         let hits = env.paths_for("損害賠償");
         assert!(
@@ -2060,10 +2377,7 @@ mod tests {
     #[test]
     fn user_reindex_waits_for_startup_instead_of_failing() {
         let env = Env::new("wait");
-        env.write(
-            "a.txt",
-            "契約についての最初の文書。本文を足して長さを確保する。",
-        );
+        env.write("a.txt", "契約についての最初の文書。本文を足して長さを確保する。");
         env.index_all();
         let indexer = Arc::clone(env.indexer.as_ref().unwrap());
         let guard = indexer.begin_reindex(KIND_STARTUP);
@@ -2100,10 +2414,7 @@ mod tests {
     #[test]
     fn case_only_rename_drops_the_old_spelling() {
         let env = Env::new("case");
-        let path = env.write(
-            "Note.txt",
-            "契約の大文字ファイル。本文を足して長さを確保する。",
-        );
+        let path = env.write("Note.txt", "契約の大文字ファイル。本文を足して長さを確保する。");
         env.index_all();
         let old = env.stored("Note.txt");
         let renamed = env.files.join("note.txt");
@@ -2132,10 +2443,7 @@ mod tests {
         let folder = db.list_folders().unwrap().into_iter().next().unwrap();
         db.update_folder_public_path(folder.id, r"\\server\share\cases")
             .unwrap();
-        env.write(
-            "memo.txt",
-            "契約の公開パスにある文書。本文を足して長さを確保する。",
-        );
+        env.write("memo.txt", "契約の公開パスにある文書。本文を足して長さを確保する。");
         let private_dir = env.root.join("private");
         fs::create_dir_all(private_dir.join("nested")).unwrap();
         fs::write(
@@ -2152,7 +2460,10 @@ mod tests {
             &folder.path,
             r"\\server\share\cases",
         );
-        assert!(stored.starts_with(r"\\server\share\cases\"), "{stored}");
+        assert!(
+            stored.starts_with(r"\\server\share\cases\"),
+            "{stored}"
+        );
         assert!(env.backend().has_path(&stored).unwrap());
 
         for prefix in [
@@ -2207,10 +2518,7 @@ mod tests {
             )
             .unwrap();
         assert!(remote.iter().any(|h| h.path == stored), "{remote:?}");
-        assert!(
-            remote.iter().all(|h| !h.path.contains("secret")),
-            "{remote:?}"
-        );
+        assert!(remote.iter().all(|h| !h.path.contains("secret")), "{remote:?}");
 
         let hidden = env
             .backend()
@@ -2240,13 +2548,8 @@ mod tests {
         let db = env.db.as_ref().unwrap();
         let stored = env.stored("a.txt");
         let note = db.create_note("検討メモ").unwrap();
-        db.insert_note_item(
-            &note.id,
-            "契約",
-            "p1",
-            &format!("{{\"path\":\"{stored}\"}}"),
-        )
-        .unwrap();
+        db.insert_note_item(&note.id, "契約", "p1", &format!("{{\"path\":\"{stored}\"}}"))
+            .unwrap();
         let thread = db.create_llm_thread("会話", true).unwrap();
         db.insert_llm_source(&thread.id, "attach", &stored, "a", "p1", "引用本文", "契約")
             .unwrap();
@@ -2337,10 +2640,7 @@ mod tests {
         {
             out.push(format!("{prefix}/drive_c/{rel}"));
         }
-        if let Some(home) = std::env::var("HOME")
-            .ok()
-            .filter(|home| home.starts_with('/'))
-        {
+        if let Some(home) = std::env::var("HOME").ok().filter(|home| home.starts_with('/')) {
             out.push(format!("{home}/.wine/drive_c/{rel}"));
         }
         if let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("USERNAME")) {

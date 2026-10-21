@@ -138,7 +138,10 @@ pub fn path_is_remotely_shared(path: &str, snap: &RemoteShareSnapshot) -> bool {
     snap.shared_ids.contains(&id)
 }
 
-pub fn filter_hits_by_share(hits: Vec<SearchHit>, snap: &RemoteShareSnapshot) -> Vec<SearchHit> {
+pub fn filter_hits_by_share(
+    hits: Vec<SearchHit>,
+    snap: &RemoteShareSnapshot,
+) -> Vec<SearchHit> {
     hits.into_iter()
         .filter(|h| path_is_remotely_shared(&h.path, snap))
         .collect()
@@ -207,7 +210,10 @@ mod tests {
     #[test]
     fn nested_child_toggle_wins() {
         let s = snap(
-            &[folder(1, r"C:\Work", ""), folder(2, r"C:\Work\secret", "")],
+            &[
+                folder(1, r"C:\Work", ""),
+                folder(2, r"C:\Work\secret", ""),
+            ],
             &[1],
         );
         assert!(path_is_remotely_shared(r"C:\Work\open.txt", &s));

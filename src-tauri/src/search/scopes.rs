@@ -2,9 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{run_search, RemoteShareSnapshot, SearchHit, TantivyBackend, UserDictMatcher};
 use crate::db::{Db, FolderRow, Settings};
 use crate::pathutil;
+use super::{
+    run_search, RemoteShareSnapshot, SearchHit, TantivyBackend, UserDictMatcher,
+};
 
 /// Wider than typical UI `max_results` so the picker can see more matching folders.
 const SCOPE_QUERY_HIT_LIMIT: usize = 200;
@@ -215,7 +217,11 @@ pub fn assemble_search_scopes(
 
     let mut scopes: Vec<SearchScopeRow> = filtered
         .into_iter()
-        .filter(|scope| !recent.iter().any(|r| same_scope_path(&r.path, &scope.path)))
+        .filter(|scope| {
+            !recent
+                .iter()
+                .any(|r| same_scope_path(&r.path, &scope.path))
+        })
         .collect();
 
     if opts.include_mail {
@@ -258,8 +264,9 @@ fn mail_scope_rows(
             let Some(folder) = row.path.strip_prefix("mailfolder:") else {
                 return false;
             };
-            hits.iter()
-                .any(|h| h.doc_kind == "email" && h.mail_folder.eq_ignore_ascii_case(folder))
+            hits.iter().any(|h| {
+                h.doc_kind == "email" && h.mail_folder.eq_ignore_ascii_case(folder)
+            })
         })
         .collect())
 }
