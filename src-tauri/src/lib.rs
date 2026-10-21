@@ -200,6 +200,13 @@ pub fn run() {
             }
 
             {
+                let app_for_status = app.handle().clone();
+                indexer.set_status_hook(move |event| {
+                    let _ = app_for_status.emit("folder-index-status", &event);
+                });
+            }
+
+            {
                 let indexer_for_hook = indexer.clone();
                 let app_for_hook = app.handle().clone();
                 indexer.set_schedule_sync(move || {
