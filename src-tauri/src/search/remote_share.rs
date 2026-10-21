@@ -268,6 +268,9 @@ mod tests {
             indexed_count: 0,
             exists: true,
             share_remote: true,
+            index_status: String::new(),
+            index_updated_at: None,
+            index_busy: false,
         }];
         let s = RemoteShareSnapshot::from_folders(&folders);
         assert!(s.shared_ids.contains(&3));

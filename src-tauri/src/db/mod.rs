@@ -383,6 +383,11 @@ pub struct EmailThreadWinner {
     pub date_unix: i64,
 }
 
+/// Last completed folder crawl. Empty means this install has not recorded one yet.
+pub const FOLDER_INDEX_OK: &str = "ok";
+/// The root was missing or a walk could not read a directory, so the purge was incomplete.
+pub const FOLDER_INDEX_UNREACHABLE: &str = "unreachable";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderRow {
@@ -399,7 +404,31 @@ pub struct FolderRow {
     /// LAN remote share (from settings KV, not a folders column).
     #[serde(default)]
     pub share_remote: bool,
+    /// `ok`, `unreachable`, or empty when no crawl has been recorded.
+    #[serde(default)]
+    pub index_status: String,
+    /// Unix seconds of the last crawl that fully succeeded. Unchanged when a later attempt fails.
+    #[serde(default)]
+    pub index_updated_at: Option<i64>,
+    /// True while a crawl of this folder is in progress. Cleared on process start.
+    #[serde(default)]
+    pub index_busy: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderIndexFreshness {
+    pub status: String,
+    pub updated_at: Option<i64>,
+    pub busy: bool,
+}
+
+const FOLDER_ROW_SQL: &str = "\
+SELECT f.id, f.path, COALESCE(f.public_path, ''), f.enabled,
+       COALESCE((SELECT COUNT(*) FROM files WHERE folder_id = f.id), 0),
+       COALESCE(f.index_status, ''),
+       f.index_updated_at,
+       COALESCE(f.index_busy, 0)
+FROM folders f";
 
 /// Neutralize `LIKE` wildcards in a literal operand. Uses `|` as the escape character
 /// because Windows forbids it in a path, unlike the backslash that fills every path.
@@ -450,6 +479,9 @@ fn folder_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<FolderRow> {
         indexed_count: row.get::<_, i64>(4)? as u32,
         exists: false,
         share_remote: false,
+        index_status: row.get(5)?,
+        index_updated_at: row.get(6)?,
+        index_busy: row.get::<_, i64>(7)? != 0,
     })
 }
 
@@ -562,7 +594,10 @@ impl Db {
               path TEXT NOT NULL UNIQUE,
               public_path TEXT NOT NULL DEFAULT '',
               enabled INTEGER NOT NULL DEFAULT 1,
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              index_status TEXT NOT NULL DEFAULT '',
+              index_updated_at INTEGER,
+              index_busy INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS files (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -715,6 +750,22 @@ impl Db {
             "ALTER TABLE folders ADD COLUMN public_path TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Per-folder index freshness. Column adds only — does not rewrite notes, chat, or file rows,
+        // and does not change the Tantivy schema (so it does not force a full reindex).
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN index_status TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN index_updated_at INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN index_busy INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // A crawl that died with the process is not still running.
+        conn.execute("UPDATE folders SET index_busy=0 WHERE index_busy!=0", [])?;
         // User-dictionary metadata columns (CSV import).
         let _ = conn.execute(
             "ALTER TABLE search_words ADD COLUMN reading TEXT NOT NULL DEFAULT ''",
@@ -734,6 +785,19 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE llm_thread_sources ADD COLUMN unit_body TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Why a file was stored without body text (timeout, extract error, oversize).
+        // Empty for a normal row. Older builds ignore the column; v1.11.9 inserts
+        // list columns explicitly, so adding it is safe to roll back.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Extract timeouts and crashes against one path. Reset when the file is
+        // indexed or when we stop retrying it. Older builds ignore the column.
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0",
             [],
         );
         let consume_cols_added = conn
@@ -1088,12 +1152,7 @@ impl Db {
 
     pub fn list_folders(&self) -> Result<Vec<FolderRow>, rusqlite::Error> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT f.id, f.path, COALESCE(f.public_path, ''), f.enabled,
-                    COALESCE((SELECT COUNT(*) FROM files WHERE folder_id = f.id), 0)
-             FROM folders f
-             ORDER BY f.id",
-        )?;
+        let mut stmt = conn.prepare(&format!("{FOLDER_ROW_SQL} ORDER BY f.id"))?;
         let rows = stmt.query_map([], folder_row_from_sql)?;
         let folders: Vec<FolderRow> = rows.flatten().map(FolderRow::with_exists).collect();
         drop(stmt);
@@ -1125,6 +1184,9 @@ impl Db {
                 indexed_count: 0,
                 exists: false,
                 share_remote: false,
+                index_status: String::new(),
+                index_updated_at: None,
+                index_busy: false,
             }
             .with_exists(),
         ))
@@ -1226,12 +1288,7 @@ impl Db {
 
     pub fn get_folder(&self, id: i64) -> Result<Option<FolderRow>, rusqlite::Error> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT f.id, f.path, COALESCE(f.public_path, ''), f.enabled,
-                    COALESCE((SELECT COUNT(*) FROM files WHERE folder_id = f.id), 0)
-             FROM folders f
-             WHERE f.id=?1",
-        )?;
+        let mut stmt = conn.prepare(&format!("{FOLDER_ROW_SQL} WHERE f.id=?1"))?;
         let mut rows = stmt.query_map([id], folder_row_from_sql)?;
         let row = rows.next().transpose()?;
         drop(rows);
@@ -1242,18 +1299,80 @@ impl Db {
 
     pub fn get_folder_by_path(&self, path: &str) -> Result<Option<FolderRow>, rusqlite::Error> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT f.id, f.path, COALESCE(f.public_path, ''), f.enabled,
-                    COALESCE((SELECT COUNT(*) FROM files WHERE folder_id = f.id), 0)
-             FROM folders f
-             WHERE f.path=?1",
-        )?;
+        let mut stmt = conn.prepare(&format!("{FOLDER_ROW_SQL} WHERE f.path=?1"))?;
         let mut rows = stmt.query_map([path], folder_row_from_sql)?;
         let row = rows.next().transpose()?;
         drop(rows);
         drop(stmt);
         drop(conn);
         Ok(row.map(|r| self.overlay_share_remote_one(r.with_exists())))
+    }
+
+    /// Status columns only. Does not stat the folder path (an offline UNC must not block this).
+    pub fn folder_index_freshness(
+        &self,
+        id: i64,
+    ) -> Result<Option<FolderIndexFreshness>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(index_status, ''), index_updated_at, COALESCE(index_busy, 0)
+             FROM folders WHERE id=?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(FolderIndexFreshness {
+            status: row.get(0)?,
+            updated_at: row.get(1)?,
+            busy: row.get::<_, i64>(2)? != 0,
+        }))
+    }
+
+    pub fn set_folder_index_busy(&self, id: i64, busy: bool) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE folders SET index_busy=?1 WHERE id=?2",
+            rusqlite::params![if busy { 1i64 } else { 0i64 }, id],
+        )?;
+        Ok(())
+    }
+
+    /// `updated_at` of `None` leaves the previous success time in place.
+    /// Clears `index_busy`. Callers are the crawl, reindex, or relink that owns that flag.
+    pub fn set_folder_index_outcome(
+        &self,
+        id: i64,
+        status: &str,
+        updated_at: Option<i64>,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        if let Some(updated_at) = updated_at {
+            conn.execute(
+                "UPDATE folders SET index_status=?1, index_updated_at=?2, index_busy=0 WHERE id=?3",
+                rusqlite::params![status, updated_at, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE folders SET index_status=?1, index_busy=0 WHERE id=?2",
+                rusqlite::params![status, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Watcher success time. Does not touch `index_busy`; the crawl or `index_tree` that set it clears it.
+    pub fn set_folder_index_watcher_ok(
+        &self,
+        id: i64,
+        updated_at: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE folders SET index_status=?1, index_updated_at=?2 WHERE id=?3",
+            rusqlite::params![FOLDER_INDEX_OK, updated_at, id],
+        )?;
+        Ok(())
     }
 
     pub fn list_file_paths_by_folder(
@@ -1332,7 +1451,7 @@ impl Db {
     }
 
     /// Indexed files whose `mtime` falls in `[after_unix, before_unix]` (inclusive).
-    /// Unbounded sides are `None`. Status is `ok` (not `indexed`).
+    /// Unbounded sides are `None`. Filename-only rows (`ok` and `skipped`) are included.
     pub fn list_ok_file_paths_in_range(
         &self,
         after_unix: Option<i64>,
@@ -1342,7 +1461,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path FROM files
-             WHERE status='ok' AND mtime > 0
+             WHERE status IN ('ok', 'skipped') AND mtime > 0
                AND (?1 IS NULL OR mtime >= ?1)
                AND (?2 IS NULL OR mtime <= ?2)
              ORDER BY mtime DESC
@@ -1374,7 +1493,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT path FROM files
-             WHERE status='ok' AND path LIKE ?1 ESCAPE '|'
+             WHERE status IN ('ok', 'skipped') AND path LIKE ?1 ESCAPE '|'
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
@@ -1769,8 +1888,8 @@ impl Db {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok')
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status, skip_reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok', '')
              ON CONFLICT(path) DO UPDATE SET
                folder_id=excluded.folder_id,
                ext=excluded.ext,
@@ -1778,8 +1897,109 @@ impl Db {
                mtime=excluded.mtime,
                content_hash=excluded.content_hash,
                indexed_at=excluded.indexed_at,
-               status='ok'",
+               status='ok',
+               skip_reason='',
+               fail_count=0",
             rusqlite::params![folder_id, path, ext, size, mtime, content_hash, now],
+        )?;
+        Ok(())
+    }
+
+    /// Filename-only row. `status` is `ok` (no text, still a normal hit) or `skipped`
+    /// (timeout, panic, extract error, oversize) with `skip_reason` for later inspection.
+    pub fn upsert_file_state(
+        &self,
+        folder_id: i64,
+        path: &str,
+        ext: &str,
+        size: i64,
+        mtime: i64,
+        content_hash: &str,
+        status: &str,
+        skip_reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO files(folder_id, path, ext, size, mtime, content_hash, indexed_at, status, skip_reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+               folder_id=excluded.folder_id,
+               ext=excluded.ext,
+               size=excluded.size,
+               mtime=excluded.mtime,
+               content_hash=excluded.content_hash,
+               indexed_at=excluded.indexed_at,
+               status=excluded.status,
+               skip_reason=excluded.skip_reason,
+               fail_count=0",
+            rusqlite::params![
+                folder_id,
+                path,
+                ext,
+                size,
+                mtime,
+                content_hash,
+                now,
+                status,
+                skip_reason
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn file_state(&self, path: &str) -> Result<Option<FileState>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT status, COALESCE(skip_reason, ''), COALESCE(content_hash, ''),
+                    COALESCE(indexed_at, ''), COALESCE(size, 0), COALESCE(mtime, 0),
+                    COALESCE(fail_count, 0)
+             FROM files WHERE path=?1",
+        )?;
+        let mut rows = stmt.query_map([path], |row| {
+            Ok(FileState {
+                status: row.get(0)?,
+                skip_reason: row.get(1)?,
+                content_hash: row.get(2)?,
+                indexed_at: row.get(3)?,
+                size: row.get(4)?,
+                mtime: row.get(5)?,
+                fail_count: row.get(6)?,
+            })
+        })?;
+        if let Some(row) = rows.next() {
+            return Ok(Some(row?));
+        }
+        Ok(None)
+    }
+
+    /// Count one extract timeout or crash. Size, mtime, hash, and status stay put,
+    /// and the search document is not touched.
+    pub fn bump_fail_count(&self, path: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE files SET fail_count = COALESCE(fail_count, 0) + 1 WHERE path=?1",
+            [path],
+        )?;
+        Ok(())
+    }
+
+    /// Remember the size and mtime we just saw so the next crawl does not read the
+    /// file again. `content_hash` and the search document are left alone.
+    pub fn pin_skipped_file(
+        &self,
+        path: &str,
+        size: i64,
+        mtime: i64,
+        skip_reason: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE files
+             SET size=?1, mtime=?2, status='skipped', skip_reason=?3, fail_count=0, indexed_at=?4
+             WHERE path=?5",
+            rusqlite::params![size, mtime, skip_reason, now, path],
         )?;
         Ok(())
     }
@@ -4381,6 +4601,18 @@ pub struct FileMeta {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileState {
+    pub status: String,
+    pub skip_reason: String,
+    pub content_hash: String,
+    pub indexed_at: String,
+    pub size: i64,
+    pub mtime: i64,
+    /// Extract timeouts and crashes since the file was last indexed or pinned.
+    pub fail_count: i64,
+}
+
 #[cfg(test)]
 mod date_range_tests {
     use super::*;
@@ -4409,21 +4641,29 @@ mod date_range_tests {
     }
 
     #[test]
-    fn file_range_keeps_ok_and_drops_other_status() {
+    fn file_range_keeps_ok_and_skipped() {
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\docs", "").unwrap();
         let in_range = 1_700_000_100;
         let out_range = 1_600_000_000;
         db.upsert_file(folder.id, r"C:\docs\ok.txt", "txt", 1, in_range, "h")
             .unwrap();
+        insert_file_status(&db, folder.id, r"C:\docs\skipped.txt", in_range, "skipped");
         insert_file_status(&db, folder.id, r"C:\docs\pending.txt", in_range, "pending");
         insert_file_status(&db, folder.id, r"C:\docs\old.txt", out_range, "ok");
         insert_file_status(&db, folder.id, r"C:\docs\zero.txt", 0, "ok");
 
-        let paths = db
+        let mut paths = db
             .list_ok_file_paths_in_range(Some(1_700_000_000), Some(1_700_000_200), 100)
             .unwrap();
-        assert_eq!(paths, vec![r"C:\docs\ok.txt".to_string()]);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                r"C:\docs\ok.txt".to_string(),
+                r"C:\docs\skipped.txt".to_string(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5018,6 +5258,114 @@ mod note_review_tests {
         let r = db.get_note_review(&note.id).unwrap().unwrap();
         assert_eq!(r.hunks.len(), 1);
         assert_eq!(r.base, "a\nX\nb\nc\nd\ny\ne\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod folder_index_status_tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-fresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn migration_adds_status_columns_and_keeps_notes_and_chat() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE folders (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  path TEXT NOT NULL UNIQUE,
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO folders(path, enabled, created_at)
+                  VALUES ('C:\docs', 1, '2020-01-01T00:00:00Z');
+                CREATE TABLE notes (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL DEFAULT '',
+                  memo TEXT NOT NULL DEFAULT '',
+                  view_mode TEXT NOT NULL DEFAULT 'list',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO notes(id, title, memo, view_mode, created_at, updated_at)
+                  VALUES ('n1', '検討メモ', '本文は残る', 'list', 10, 20);
+                CREATE TABLE llm_threads (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL DEFAULT '',
+                  search_enabled INTEGER NOT NULL DEFAULT 1,
+                  path_prefix TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_threads(id, title, search_enabled, path_prefix, created_at, updated_at)
+                  VALUES ('t1', '会話', 1, '', 10, 20);
+                CREATE TABLE llm_messages (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_messages(id, thread_id, role, content, created_at)
+                  VALUES ('m1', 't1', 'user', 'こんにちは', 30);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let folder = db.list_folders().unwrap().into_iter().next().unwrap();
+        assert_eq!(folder.path, r"C:\docs");
+        assert_eq!(folder.index_status, "");
+        assert_eq!(folder.index_updated_at, None);
+        assert!(!folder.index_busy);
+        let notes = db.list_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "検討メモ");
+        assert_eq!(notes[0].memo, "本文は残る");
+        let threads = db.list_llm_threads().unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].title, "会話");
+        let messages = db.list_llm_messages("t1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "こんにちは");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn success_time_survives_reopen_and_stale_busy_is_cleared() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        let id = {
+            let db = Db::open(&path).unwrap();
+            let folder = db.add_folder(r"C:\docs", "").unwrap();
+            db.set_folder_index_outcome(folder.id, FOLDER_INDEX_OK, Some(1_700_000_000))
+                .unwrap();
+            db.set_folder_index_busy(folder.id, true).unwrap();
+            let row = db.get_folder(folder.id).unwrap().unwrap();
+            assert!(row.index_busy);
+            assert_eq!(row.index_updated_at, Some(1_700_000_000));
+            folder.id
+        };
+        let db = Db::open(&path).unwrap();
+        let row = db.get_folder(id).unwrap().unwrap();
+        assert_eq!(row.index_status, FOLDER_INDEX_OK);
+        assert_eq!(row.index_updated_at, Some(1_700_000_000));
+        assert!(!row.index_busy);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

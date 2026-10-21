@@ -285,6 +285,9 @@ mod tests {
             indexed_count: 0,
             exists: false,
             share_remote: false,
+            index_status: String::new(),
+            index_updated_at: None,
+            index_busy: false,
         }
     }
 

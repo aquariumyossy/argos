@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "argos"
-version = "1.11.9"
+version = "1.13.0"
 dependencies = [
  "arboard",
  "axum",
@@ -166,7 +166,6 @@ dependencies = [
  "tower",
  "tower-http",
  "uuid",
- "walkdir",
  "windows 0.62.2",
  "xxhash-rust",
  "zip 2.4.2",

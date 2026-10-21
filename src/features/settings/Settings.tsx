@@ -74,7 +74,31 @@ type FolderRow = {
   indexedCount: number;
   exists?: boolean;
   shareRemote?: boolean;
+  indexStatus?: string;
+  indexUpdatedAt?: number | null;
+  indexBusy?: boolean;
 };
+
+type FolderIndexStatusPayload = {
+  folderId: number;
+  status: string;
+  updatedAt: number | null;
+  busy: boolean;
+};
+
+function formatFolderIndexFreshness(folder: FolderRow): string | null {
+  if (folder.indexBusy) return "更新中…";
+  if (folder.indexStatus === "unreachable") return "未完了（接続できず）";
+  if (folder.indexUpdatedAt != null && folder.indexUpdatedAt > 0) {
+    const d = new Date(folder.indexUpdatedAt * 1000);
+    const month = d.getMonth() + 1;
+    const day = d.getDate();
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `最終更新 ${month}/${day} ${hh}:${mm}`;
+  }
+  return null;
+}
 type ExcludePathRow = { id: number; path: string };
 type SearchWordRow = {
   id: number;
@@ -185,7 +209,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: "credits", label: "クレジット" },
 ];
 
-const APP_VERSION = "1.11.9";
+const APP_VERSION = "1.13.0";
 
 /** Direct runtime dependencies shown for attribution (not an exhaustive transitive list). */
 const THIRD_PARTY_LICENSES: { name: string; license: string; note?: string }[] = [
@@ -609,6 +633,30 @@ export default function Settings() {
       void invoke<FolderRow[]>("list_folders")
         .then(setFolders)
         .catch(console.error);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<FolderIndexStatusPayload>("folder-index-status", (event) => {
+      const p = event.payload;
+      setFolders((prev) =>
+        prev.map((folder) =>
+          folder.id === p.folderId
+            ? {
+                ...folder,
+                indexStatus: p.status,
+                indexUpdatedAt: p.updatedAt,
+                indexBusy: p.busy,
+              }
+            : folder,
+        ),
+      );
     }).then((fn) => {
       unlisten = fn;
     });
@@ -1849,6 +1897,9 @@ export default function Settings() {
                   const hasPublicPath = publicDraft.trim().length > 0;
                   const isBusy = busyFolderId === f.id;
                   const isMissing = f.exists === false;
+                  const freshness = formatFolderIndexFreshness(f);
+                  const freshnessUnreachable =
+                    !f.indexBusy && f.indexStatus === "unreachable";
                   const shareHint = f.shareRemote
                     ? "このフォルダは共有中です"
                     : "このフォルダは共有オフです。";
@@ -1871,6 +1922,17 @@ export default function Settings() {
                           <span className="folder-count">
                             {f.indexedCount.toLocaleString()} 件
                           </span>
+                          {freshness ? (
+                            <span
+                              className={
+                                freshnessUnreachable
+                                  ? "folder-freshness is-unreachable"
+                                  : "folder-freshness"
+                              }
+                            >
+                              {freshness}
+                            </span>
+                          ) : null}
                         </span>
                         {isBusy ? (
                           <span
