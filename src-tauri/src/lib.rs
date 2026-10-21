@@ -54,6 +54,47 @@ fn spawn_folder_sync(indexer: Arc<crate::indexer::Indexer>, app_handle: AppHandl
     });
 }
 
+/// Hourly diff. Same order as `indexer::drive_periodic_folder_sync`: wait the full
+/// interval, then run one tick. The next wait starts only after that tick returns,
+/// so a long crawl never overlaps the next one. A tick that finds a startup sync
+/// or a user reindex already running returns immediately and still waits the full hour.
+fn spawn_periodic_folder_sync(indexer: Arc<crate::indexer::Indexer>, app_handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(crate::indexer::PERIODIC_FOLDER_SYNC_INTERVAL).await;
+            let indexer = indexer.clone();
+            let app_handle = app_handle.clone();
+            let joined = tauri::async_runtime::spawn_blocking(move || {
+                run_periodic_folder_tick(&indexer, &app_handle)
+            })
+            .await;
+            if let Err(e) = joined {
+                eprintln!("argos: periodic sync join failed: {e}");
+            }
+        }
+    });
+}
+
+fn run_periodic_folder_tick(indexer: &crate::indexer::Indexer, app: &AppHandle) {
+    let watcher = app.state::<Arc<AppState>>().watcher.read().clone();
+    match indexer.sync_enabled_folders_periodic(|path, online| match &watcher {
+        Some(handle) => handle.rearm_folder(path, online),
+        None => Err("watcher is not running".into()),
+    }) {
+        Ok(crate::indexer::PeriodicSync::Skipped) => {}
+        Ok(crate::indexer::PeriodicSync::Finished(stats)) => {
+            eprintln!(
+                "argos: periodic sync done: indexed={} skipped={} removed={} errors={}",
+                stats.indexed, stats.skipped, stats.removed, stats.errors
+            );
+            if stats.indexed > 0 || stats.removed > 0 {
+                let _ = app.emit("folders-updated", ());
+            }
+        }
+        Err(e) => eprintln!("argos: periodic sync failed: {e}"),
+    }
+}
+
 fn sync_due(enabled: bool, interval: u64, last: &str) -> bool {
     if !enabled || interval == 0 {
         return false;
@@ -241,6 +282,8 @@ pub fn run() {
                 eprintln!("argos: startup sync — picking up changes made while closed");
                 spawn_folder_sync(indexer.clone(), app.handle().clone());
             }
+
+            spawn_periodic_folder_sync(indexer.clone(), app.handle().clone());
 
             // Periodic Outlook mail sync (dedicated interval; 0 = manual only).
             {

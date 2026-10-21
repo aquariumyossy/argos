@@ -14,6 +14,10 @@ use crate::pathutil;
 enum WatcherCmd {
     Add(String),
     Remove(String),
+    /// Drop the current watch and, when `online`, create it again.
+    /// `online` is false when a timed stat says the root is missing or not a directory,
+    /// so `watch` is not called on a share that would block the watcher thread.
+    Rearm { path: String, online: bool },
 }
 
 /// Handle for adding/removing watch roots after the watcher thread has started.
@@ -37,6 +41,36 @@ impl WatcherHandle {
             return;
         }
         let _ = self.cmd_tx.send(WatcherCmd::Remove(path));
+    }
+
+    /// Recreate the filesystem watch for one enabled root.
+    ///
+    /// An offline root is removed from the OS watch list when it had one, and the
+    /// other roots are left alone. A failure to watch this path does not remove it
+    /// from event routing, so a later re-arm can try again.
+    pub fn rearm_folder(&self, path: &str, online: bool) -> Result<(), String> {
+        let path = pathutil::simplify_windows_path(path);
+        if path.is_empty() {
+            return Ok(());
+        }
+        self.cmd_tx
+            .send(WatcherCmd::Rearm { path, online })
+            .map_err(|_| "watcher stopped".to_string())
+    }
+}
+
+trait RootWatch {
+    fn watch_root(&mut self, path: &std::path::Path) -> Result<(), String>;
+    fn unwatch_root(&mut self, path: &std::path::Path) -> Result<(), String>;
+}
+
+impl RootWatch for RecommendedWatcher {
+    fn watch_root(&mut self, path: &std::path::Path) -> Result<(), String> {
+        Watcher::watch(self, path, RecursiveMode::Recursive).map_err(|e| e.to_string())
+    }
+
+    fn unwatch_root(&mut self, path: &std::path::Path) -> Result<(), String> {
+        Watcher::unwatch(self, path).map_err(|e| e.to_string())
     }
 }
 
@@ -63,14 +97,18 @@ pub fn start_watcher(
             .iter()
             .map(|f| pathutil::normalize_for_compare(f))
             .collect();
+        let mut armed = Vec::with_capacity(folders.len());
 
         for folder in &folders {
             let path = PathBuf::from(folder);
+            let mut is_armed = false;
             if path.exists() {
-                if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
-                    eprintln!("watch {}: {e}", path.display());
+                match watcher.watch_root(&path) {
+                    Ok(()) => is_armed = true,
+                    Err(e) => eprintln!("watch {}: {e}", path.display()),
                 }
             }
+            armed.push(is_armed);
         }
 
         // Debounce buffer. Rename/move is a remove of the old path plus an appear of the new one.
@@ -82,6 +120,7 @@ pub fn start_watcher(
                     &mut watcher,
                     &mut folders,
                     &mut normalized_folders,
+                    &mut armed,
                     cmd,
                 );
             }
@@ -153,11 +192,14 @@ fn map_paths(paths: &[PathBuf], kind: fn(PathBuf) -> FsEvent) -> Vec<FsEvent> {
 }
 
 fn apply_cmd(
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut dyn RootWatch,
     folders: &mut Vec<String>,
     normalized_folders: &mut Vec<String>,
+    armed: &mut Vec<bool>,
     cmd: WatcherCmd,
 ) {
+    debug_assert_eq!(folders.len(), normalized_folders.len());
+    debug_assert_eq!(folders.len(), armed.len());
     match cmd {
         WatcherCmd::Add(path) => {
             let norm = pathutil::normalize_for_compare(&path);
@@ -165,27 +207,62 @@ fn apply_cmd(
                 return;
             }
             let pb = PathBuf::from(&path);
+            let mut is_armed = false;
             if pb.exists() {
-                if let Err(e) = watcher.watch(&pb, RecursiveMode::Recursive) {
-                    eprintln!("watch {}: {e}", pb.display());
+                match watcher.watch_root(&pb) {
+                    Ok(()) => is_armed = true,
+                    Err(e) => eprintln!("watch {}: {e}", pb.display()),
                 }
             } else {
                 eprintln!("watch skip (missing): {path}");
             }
             folders.push(path);
             normalized_folders.push(norm);
+            armed.push(is_armed);
         }
         WatcherCmd::Remove(path) => {
             let norm = pathutil::normalize_for_compare(&path);
             let Some(idx) = normalized_folders.iter().position(|n| n == &norm) else {
                 return;
             };
-            let pb = PathBuf::from(&path);
-            if let Err(e) = watcher.unwatch(&pb) {
-                eprintln!("unwatch {}: {e}", pb.display());
+            let stored = folders[idx].clone();
+            let pb = PathBuf::from(&stored);
+            if let Err(e) = watcher.unwatch_root(&pb) {
+                eprintln!("unwatch {stored}: {e}");
             }
             folders.remove(idx);
             normalized_folders.remove(idx);
+            armed.remove(idx);
+        }
+        WatcherCmd::Rearm { path, online } => {
+            let norm = pathutil::normalize_for_compare(&path);
+            let idx = if let Some(idx) = normalized_folders.iter().position(|n| n == &norm) {
+                idx
+            } else {
+                folders.push(path.clone());
+                normalized_folders.push(norm);
+                armed.push(false);
+                folders.len() - 1
+            };
+            let stored = folders[idx].clone();
+            let pb = PathBuf::from(&stored);
+            if armed[idx] {
+                if let Err(e) = watcher.unwatch_root(&pb) {
+                    eprintln!("argos: unwatch {stored}: {e}");
+                }
+                armed[idx] = false;
+            }
+            if !online {
+                eprintln!("argos: watch rearm skip (offline): {stored}");
+                return;
+            }
+            match watcher.watch_root(&pb) {
+                Ok(()) => armed[idx] = true,
+                Err(e) => {
+                    eprintln!("argos: watch rearm {stored}: {e}");
+                    armed[idx] = false;
+                }
+            }
         }
     }
 }
@@ -254,5 +331,135 @@ mod tests {
             &[PathBuf::from("note.txt")],
         );
         assert_eq!(events, vec![FsEvent::Changed(PathBuf::from("note.txt"))]);
+    }
+
+    #[derive(Default)]
+    struct FakeWatch {
+        calls: Vec<(&'static str, String)>,
+        fail_watch: Vec<String>,
+    }
+
+    impl super::RootWatch for FakeWatch {
+        fn watch_root(&mut self, path: &std::path::Path) -> Result<(), String> {
+            let path = path.to_string_lossy().to_string();
+            self.calls.push(("watch", path.clone()));
+            if self.fail_watch.iter().any(|fail| fail == &path) {
+                Err("share disconnected".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unwatch_root(&mut self, path: &std::path::Path) -> Result<(), String> {
+            self.calls.push(("unwatch", path.to_string_lossy().to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rearm_refreshes_each_root_and_an_offline_or_failed_root_does_not_stop_the_next() {
+        let mut watcher = FakeWatch {
+            fail_watch: vec!["flaky".into()],
+            ..FakeWatch::default()
+        };
+        let mut folders = vec![
+            "online-a".to_string(),
+            "offline".to_string(),
+            "online-b".to_string(),
+            "flaky".to_string(),
+        ];
+        let mut norms = folders
+            .iter()
+            .map(|p| crate::pathutil::normalize_for_compare(p))
+            .collect();
+        // online-b was offline at startup, so it has no OS watch yet.
+        let mut armed = vec![true, true, false, true];
+
+        super::apply_cmd(
+            &mut watcher,
+            &mut folders,
+            &mut norms,
+            &mut armed,
+            super::WatcherCmd::Add("online-a".into()),
+        );
+        assert!(
+            watcher.calls.is_empty(),
+            "adding a root that is already routed must not refresh it: {:?}",
+            watcher.calls
+        );
+
+        super::apply_cmd(
+            &mut watcher,
+            &mut folders,
+            &mut norms,
+            &mut armed,
+            super::WatcherCmd::Rearm {
+                path: "offline".into(),
+                online: false,
+            },
+        );
+        super::apply_cmd(
+            &mut watcher,
+            &mut folders,
+            &mut norms,
+            &mut armed,
+            super::WatcherCmd::Rearm {
+                path: "flaky".into(),
+                online: true,
+            },
+        );
+        super::apply_cmd(
+            &mut watcher,
+            &mut folders,
+            &mut norms,
+            &mut armed,
+            super::WatcherCmd::Rearm {
+                path: "online-a".into(),
+                online: true,
+            },
+        );
+        super::apply_cmd(
+            &mut watcher,
+            &mut folders,
+            &mut norms,
+            &mut armed,
+            super::WatcherCmd::Rearm {
+                path: "online-b".into(),
+                online: true,
+            },
+        );
+        super::apply_cmd(
+            &mut watcher,
+            &mut folders,
+            &mut norms,
+            &mut armed,
+            super::WatcherCmd::Rearm {
+                path: "fresh".into(),
+                online: true,
+            },
+        );
+
+        assert_eq!(
+            watcher.calls,
+            vec![
+                ("unwatch", "offline".into()),
+                ("unwatch", "flaky".into()),
+                ("watch", "flaky".into()),
+                ("unwatch", "online-a".into()),
+                ("watch", "online-a".into()),
+                ("watch", "online-b".into()),
+                ("watch", "fresh".into()),
+            ]
+        );
+        assert!(!armed[1], "offline root must not stay armed");
+        assert!(!armed[3], "a failed watch must not count as armed");
+        assert!(armed[0] && armed[2]);
+        assert_eq!(folders.last().map(String::as_str), Some("fresh"));
+        assert!(armed.last().copied().unwrap_or(false));
+        assert!(
+            folders.iter().any(|p| p == "offline"),
+            "an offline root stays registered so the next re-arm can try it"
+        );
+        assert!(folders.iter().any(|p| p == "flaky"));
     }
 }
