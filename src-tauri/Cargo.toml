@@ -35,7 +35,7 @@ icalendar = "0.16"
 rrule = "0.13"
 tantivy = "0.25"
 xxhash-rust = { version = "0.8.18", features = ["xxh64"] }
-pdf-extract = "0.8"
+pdf-extract = "0.12"
 zip = "2"
 quick-xml = "0.37"
 # Legacy Word 97 E003 (.doc); default-features off to skip .docx (we already handle that)

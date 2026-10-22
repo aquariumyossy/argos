@@ -34,7 +34,10 @@ fn read_frame(reader: &mut impl Read) -> Vec<u8> {
     buf
 }
 
-/// Type1 font with no Widths. pdf-extract prints "no widths and not core font" to stdout.
+/// Type1 font with no Widths. pdf-extract 0.12 reports "no widths and not core font"
+/// with `log::warn!` rather than `println!`, so the warning is not written to
+/// stdout or stderr unless a logger is installed. The worker must still return
+/// the page text inside a frame.
 fn pdf_custom_font() -> Vec<u8> {
     let data = b"BT /F1 12 Tf 36 100 Td (HelloWidth) Tj ET\n";
     let stream = format!(
@@ -131,8 +134,8 @@ fn worker_frames_survive_pdf_extract_stdout_warning() {
     let mut err_text = String::new();
     stderr.read_to_string(&mut err_text).unwrap();
     assert!(
-        err_text.contains("no widths and not core font"),
-        "expected the pdf-extract stdout warning on stderr, got {err_text:?}"
+        !err_text.contains("HelloWidth"),
+        "extracted text leaked to stderr: {err_text:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
