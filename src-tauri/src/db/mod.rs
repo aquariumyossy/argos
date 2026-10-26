@@ -905,21 +905,26 @@ impl Db {
             "ALTER TABLE llm_messages ADD COLUMN tool_name TEXT NOT NULL DEFAULT ''",
             [],
         );
-        let _ = conn.execute(
-            "ALTER TABLE llm_messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        // Stamp assistant rows written before `kind` existed. Later reads use the column only.
-        let _ = conn.execute(
-            "UPDATE llm_messages SET kind = 'notice'
-             WHERE kind = ''
-               AND role = 'assistant'
-               AND (
-                 content LIKE 'ツール往復が上限の %回に達したため%'
-                 OR content LIKE 'MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。%'
-               )",
-            [],
-        );
+        let kind_col_added = conn
+            .execute(
+                "ALTER TABLE llm_messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .is_ok();
+        // Stamp assistant rows written before `kind` existed. Only on the startup that
+        // adds the column, so a later answer with the same opening stays a normal turn.
+        if kind_col_added {
+            conn.execute(
+                "UPDATE llm_messages SET kind = 'notice'
+                 WHERE kind = ''
+                   AND role = 'assistant'
+                   AND (
+                     content LIKE 'ツール往復が上限の %回に達したため%'
+                     OR content LIKE 'MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。%'
+                   )",
+                [],
+            )?;
+        }
         if consume_cols_added {
             conn.execute_batch(
                 "UPDATE llm_thread_sources
@@ -5738,6 +5743,31 @@ mod folder_index_status_tests {
         assert_eq!(messages.last().unwrap().content, "新しい案内");
         assert_eq!(messages.last().unwrap().kind, "notice");
         assert_eq!(messages[messages.len() - 2].kind, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notice_wording_saved_after_the_column_stays_unflagged() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        let (thread_id, echoed_id) = {
+            let db = Db::open(&path).unwrap();
+            let thread = db.create_llm_thread("会話", true).unwrap();
+            let echoed = db
+                .insert_llm_message(
+                    &thread.id,
+                    "assistant",
+                    "ツール往復が上限の 8 回に達したため、これはモデルの本文です。",
+                )
+                .unwrap();
+            assert_eq!(echoed.kind, "");
+            (thread.id, echoed.id)
+        };
+        let db = Db::open(&path).unwrap();
+        let messages = db.list_llm_messages(&thread_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, echoed_id);
+        assert_eq!(messages[0].kind, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
