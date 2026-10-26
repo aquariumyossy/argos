@@ -20,6 +20,7 @@ import { AssistantBody } from "./AssistantBody";
 import {
   CHARS_PER_TOKEN,
   contextIsNearLimit,
+  contextMeterLabel,
   contextUsageTokens,
 } from "./contextEstimate";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -2009,7 +2010,7 @@ export default function Chat() {
                 className={nearBudget ? "chat-char-meter warn" : "chat-char-meter"}
                 title="この会話を送るときの目安です。上限を超えると古いやり取りから落ちます。"
               >
-                {estimatedTokens.toLocaleString()} / {maxContextTokens.toLocaleString()}
+                {contextMeterLabel(estimatedTokens, maxContextTokens)}
               </span>
               {nearBudget ? (
                 <span className="chat-char-meter warn">

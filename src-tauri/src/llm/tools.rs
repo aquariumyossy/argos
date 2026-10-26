@@ -19,11 +19,39 @@ pub const TOOL_CREATE_NOTE: &str = "create_note";
 pub const TOOL_WRITE_NOTE: &str = "write_note";
 pub const MAX_TOOL_ROUNDS: usize = 8;
 
-/// Shown in the chat when a turn hits the configured tool-round cap.
+/// Shown alone when the no-tools final call fails or comes back empty.
 pub fn tool_round_limit_notice(max_rounds: usize) -> String {
     format!(
         "ツール往復が上限の {max_rounds} 回に達したため、残りの操作はしていません。続きはもう一度指示するか、設定の「ツール往復の上限」を上げてください。"
     )
+}
+
+/// Shown with the answer after that final call succeeds.
+pub fn tool_round_limit_short_notice(max_rounds: usize) -> String {
+    format!(
+        "ツール往復が上限の {max_rounds} 回に達したため、続きの操作はせず、ここまでの資料で答えています。"
+    )
+}
+
+pub struct RoundLimitAnswer {
+    pub text: String,
+    /// Set only when `text` is the model's answer, not the fallback notice.
+    pub notice: Option<String>,
+}
+
+/// Keep a real answer and a short notice. An empty or missing body is the long notice alone.
+pub fn round_limit_answer(body: Option<&str>, max_rounds: usize) -> RoundLimitAnswer {
+    if let Some(text) = body.filter(|text| !text.trim().is_empty()) {
+        RoundLimitAnswer {
+            text: text.to_string(),
+            notice: Some(tool_round_limit_short_notice(max_rounds)),
+        }
+    } else {
+        RoundLimitAnswer {
+            text: tool_round_limit_notice(max_rounds),
+            notice: None,
+        }
+    }
 }
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
@@ -2529,6 +2557,18 @@ mod tests {
         assert_eq!(max_tool_rounds(3), MAX_TOOL_ROUNDS);
         assert!(tool_round_limit_notice(8).contains("上限の 8 回"));
         assert!(tool_round_limit_notice(8).contains("ツール往復の上限"));
+        let answered = round_limit_answer(Some("ここまでの結論です。"), 8);
+        assert_eq!(answered.text, "ここまでの結論です。");
+        let short = answered.notice.expect("short notice");
+        assert!(short.contains("上限の 8 回"));
+        assert!(short.contains("ここまでの資料"));
+        assert_ne!(short, tool_round_limit_notice(8));
+        assert!(short.chars().count() < tool_round_limit_notice(8).chars().count());
+        for body in [None, Some(""), Some("  \n")] {
+            let fallback = round_limit_answer(body, 16);
+            assert_eq!(fallback.text, tool_round_limit_notice(16));
+            assert!(fallback.notice.is_none());
+        }
         assert!(on.contains(TOOL_WRITE_NOTE));
         assert!(off.contains("ノートの id・題名・更新日時"));
     }

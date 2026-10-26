@@ -671,12 +671,34 @@ pub async fn llm_send(
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
     let mut final_reasoning = String::new();
+    let mut round_limit_final = false;
+    let mut round_limit_aside: Option<String> = None;
     let result_text;
 
     loop {
         if use_tools && !unlimited_rounds && rounds >= max_rounds {
-            result_text = tools::tool_round_limit_notice(max_rounds);
-            break;
+            // One answer from what this turn already collected. No further tool calls.
+            use_tools = false;
+            round_limit_final = true;
+            if !source_turn_injected {
+                let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                source_turn_injected =
+                    inject_final_source_turn(&mut current_turns, &all, &consumed, true);
+            }
+            if !source_turn_injected {
+                current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
+                source_turn_injected = true;
+            }
+            let _ = app.emit(
+                "llm-chat-delta",
+                LlmChatDelta {
+                    request_id: request_id.clone(),
+                    thread_id: thread.id.clone(),
+                    text: String::new(),
+                    kind: "reset".into(),
+                },
+            );
+            continue;
         }
         let with_tools = use_tools;
         let turns_now = current_turns.clone();
@@ -761,6 +783,12 @@ pub async fn llm_send(
                     note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
             }
+            Err(e) if round_limit_final => {
+                let finished = tools::round_limit_answer(None, max_rounds);
+                result_text = finished.text;
+                round_limit_aside = finished.notice;
+                break;
+            }
             Err(e)
                 if use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&e) =>
             {
@@ -811,6 +839,15 @@ pub async fn llm_send(
                 });
             }
             Ok(out) => {
+                if round_limit_final {
+                    let finished = tools::round_limit_answer(Some(&out.content), max_rounds);
+                    if finished.notice.is_some() {
+                        final_reasoning = out.reasoning;
+                    }
+                    result_text = finished.text;
+                    round_limit_aside = finished.notice;
+                    break;
+                }
                 if with_tools
                     && llm::thinking::thinking_enabled(&settings)
                     && !out.request_id.is_empty()
@@ -1007,6 +1044,11 @@ pub async fn llm_send(
                 .map_err(|e| e.to_string())?,
         )
     };
+    if let Some(notice) = round_limit_aside.as_deref() {
+        let _ = state
+            .db
+            .insert_llm_message(&thread.id, "assistant", notice);
+    }
     let unset_notice = llm::thinking::thinking_budget_unset_notice();
     let already_told = history.iter().any(|message| message.content == unset_notice)
         || result_text == unset_notice;

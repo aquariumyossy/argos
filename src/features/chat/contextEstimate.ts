@@ -38,3 +38,8 @@ export function contextUsageTokens(parts: {
 export function contextIsNearLimit(tokens: number, limit: number): boolean {
   return limit > 0 && tokens / limit >= WARN_RATIO;
 }
+
+export function contextMeterLabel(tokens: number, limit: number): string {
+  const jp = (n: number) => n.toLocaleString("ja-JP");
+  return `${jp(tokens)} / ${jp(limit)} トークン`;
+}

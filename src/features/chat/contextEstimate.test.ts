@@ -3,6 +3,7 @@ import {
   CHARS_PER_TOKEN,
   WARN_RATIO,
   contextIsNearLimit,
+  contextMeterLabel,
   contextUsageTokens,
   estimateTokens,
   messageTokens,
@@ -42,5 +43,9 @@ describe("context tokens", () => {
     expect(contextIsNearLimit(79, 100)).toBe(false);
     expect(contextIsNearLimit(80, 100)).toBe(true);
     expect(contextIsNearLimit(10, 0)).toBe(false);
+  });
+
+  it("labels the meter in tokens", () => {
+    expect(contextMeterLabel(12345, 131072)).toBe("12,345 / 131,072 トークン");
   });
 });
