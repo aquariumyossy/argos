@@ -905,12 +905,12 @@ impl Db {
                    injected_user_message_id = COALESCE((
                      SELECT id FROM llm_messages
                      WHERE thread_id = llm_thread_sources.thread_id AND role = 'user'
-                     ORDER BY created_at ASC, id ASC LIMIT 1
+                     ORDER BY created_at ASC, rowid ASC LIMIT 1
                    ), ''),
                    cited_assistant_message_id = COALESCE((
                      SELECT id FROM llm_messages
                      WHERE thread_id = llm_thread_sources.thread_id AND role = 'assistant'
-                     ORDER BY created_at ASC, id ASC LIMIT 1
+                     ORDER BY created_at ASC, rowid ASC LIMIT 1
                    ), ''),
                    cite_no = CASE WHEN cite_no = 0 THEN sort_order + 1 ELSE cite_no END
                  WHERE injected_user_message_id = ''
@@ -3442,7 +3442,7 @@ impl Db {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name
-             FROM llm_messages WHERE thread_id=?1 ORDER BY created_at ASC, id ASC",
+             FROM llm_messages WHERE thread_id=?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map([thread_id], |row| {
             Ok(LlmMessageRow {
@@ -5573,6 +5573,58 @@ mod folder_index_status_tests {
         assert_eq!(s.llm_max_tool_rounds, 0);
         assert_eq!(s.llm_system_prompt, DEFAULT_LLM_SYSTEM_PROMPT);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn messages_in_the_same_second_stay_in_insertion_order() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        let db = Db::open(&path).unwrap();
+        let thread = db.create_llm_thread("会話", true).unwrap();
+        // Ids sort the opposite of insertion. created_at is the same second.
+        let rows = [
+            ("z-user", "user", "質問", "", "", ""),
+            ("a-call", "assistant", "", r#"[{"id":"c1"}]"#, "", ""),
+            ("m-tool", "tool", "検索結果", "", "c1", "search_index"),
+            ("b-answer", "assistant", "答え", "", "", ""),
+        ];
+        {
+            let conn = db.conn.lock();
+            for (id, role, content, tool_calls, tool_call_id, tool_name) in rows {
+                conn.execute(
+                    "INSERT INTO llm_messages(
+                        id, thread_id, role, content, created_at,
+                        reasoning, tool_calls, tool_call_id, tool_name
+                     ) VALUES(?1, ?2, ?3, ?4, 100, '', ?5, ?6, ?7)",
+                    rusqlite::params![
+                        id,
+                        &thread.id,
+                        role,
+                        content,
+                        tool_calls,
+                        tool_call_id,
+                        tool_name
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let ids: Vec<String> = db
+            .list_llm_messages(&thread.id)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "z-user".to_string(),
+                "a-call".to_string(),
+                "m-tool".to_string(),
+                "b-answer".to_string()
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

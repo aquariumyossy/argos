@@ -86,7 +86,7 @@ pub fn thinking_enabled(settings: &Settings) -> bool {
 
 pub fn thinking_budget_unset_notice() -> String {
     format!(
-        "MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。上限がないと思考が長く続くことがあるため、作業ウィンドウは思考が {} 字を超えたところでターンを止めます。MTPLX の起動設定で上限を指定してください。",
+        "MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。上限がないと思考が長く続くことがあるため、チャットは思考が {} 字を超えたところでターンを止めます。MTPLX の起動設定で上限を指定してください。",
         format_ja_int(runaway_thinking_chars(None) as u64)
     )
 }
@@ -174,6 +174,9 @@ mod tests {
     fn runaway_uses_eight_chars_per_token_or_the_fallback() {
         assert_eq!(runaway_thinking_chars(Some(2048)), 16_384);
         assert_eq!(runaway_thinking_chars(None), 24_576);
-        assert!(thinking_budget_unset_notice().contains("24,576"));
+        let notice = thinking_budget_unset_notice();
+        assert!(notice.contains("24,576"));
+        assert!(notice.contains("チャット"));
+        assert!(!notice.contains("作業ウィンドウ"));
     }
 }
