@@ -17,8 +17,14 @@ pub const TOOL_LIST_NOTES: &str = "list_notes";
 pub const TOOL_READ_NOTE: &str = "read_note";
 pub const TOOL_CREATE_NOTE: &str = "create_note";
 pub const TOOL_WRITE_NOTE: &str = "write_note";
-pub const MAX_TOOL_ROUNDS: usize = 4;
-pub const MAX_TOOL_ROUNDS_WEB: usize = 4;
+pub const MAX_TOOL_ROUNDS: usize = 8;
+
+/// Shown in the chat when a turn hits the configured tool-round cap.
+pub fn tool_round_limit_notice(max_rounds: usize) -> String {
+    format!(
+        "ツール往復が上限の {max_rounds} 回に達したため、残りの操作はしていません。続きはもう一度指示するか、設定の「ツール往復の上限」を上げてください。"
+    )
+}
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
 /// Body length per search hit. Deliberately small: a search round returns up to `k`
@@ -224,12 +230,8 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
     Value::Array(tools)
 }
 
-pub fn max_tool_rounds(web_search: bool) -> usize {
-    if web_search {
-        MAX_TOOL_ROUNDS_WEB
-    } else {
-        MAX_TOOL_ROUNDS
-    }
+pub fn max_tool_rounds(rounds: u32) -> usize {
+    crate::db::normalize_tool_rounds(rounds) as usize
 }
 
 /// Marker the tool description points at, so the model knows `read_unit` can fetch the
@@ -2522,8 +2524,11 @@ mod tests {
         assert!(on.contains("公開ウェブも同時に検索"));
         assert!(on.contains(TOOL_READ_URL));
         assert!(on.contains("read_url"));
-        assert_eq!(max_tool_rounds(false), MAX_TOOL_ROUNDS);
-        assert_eq!(max_tool_rounds(true), MAX_TOOL_ROUNDS_WEB);
+        assert_eq!(max_tool_rounds(8), MAX_TOOL_ROUNDS);
+        assert_eq!(max_tool_rounds(0), 0);
+        assert_eq!(max_tool_rounds(3), MAX_TOOL_ROUNDS);
+        assert!(tool_round_limit_notice(8).contains("上限の 8 回"));
+        assert!(tool_round_limit_notice(8).contains("ツール往復の上限"));
         assert!(on.contains(TOOL_WRITE_NOTE));
         assert!(off.contains("ノートの id・題名・更新日時"));
     }

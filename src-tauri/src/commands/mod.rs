@@ -188,19 +188,14 @@ pub fn update_settings(
         settings.llm_base_url = crate::db::DEFAULT_LLM_BASE_URL.into();
     }
     settings.llm_timeout_ms = settings.llm_timeout_ms.clamp(5_000, 600_000);
-    settings.llm_max_context_chars = settings.llm_max_context_chars.clamp(4_000, 200_000);
+    settings.llm_max_context_tokens =
+        crate::db::clamp_context_tokens(settings.llm_max_context_tokens);
     settings.llm_search_top_k = settings.llm_search_top_k.clamp(1, 16);
     settings.searxng_url = crate::llm::searxng::normalize_base_url(&settings.searxng_url);
     settings.searxng_timeout_ms = settings.searxng_timeout_ms.clamp(5_000, 30_000);
     settings.llm_web_search_top_k = settings.llm_web_search_top_k.clamp(1, 8);
-    settings.llm_thinking = match settings.llm_thinking.trim() {
-        "auto" | "brief" | "off" => settings.llm_thinking.trim().to_string(),
-        _ => crate::db::DEFAULT_LLM_THINKING.into(),
-    };
-    settings.llm_thinking_budget = settings.llm_thinking_budget.min(32_000);
-    if settings.llm_thinking == "brief" && settings.llm_thinking_budget == 0 {
-        settings.llm_thinking_budget = crate::db::DEFAULT_LLM_THINKING_BUDGET;
-    }
+    settings.llm_thinking = crate::db::migrate_llm_thinking(&settings.llm_thinking);
+    settings.llm_max_tool_rounds = crate::db::normalize_tool_rounds(settings.llm_max_tool_rounds);
     if settings.llm_system_prompt.trim().is_empty() {
         settings.llm_system_prompt = crate::db::DEFAULT_LLM_SYSTEM_PROMPT.into();
     }

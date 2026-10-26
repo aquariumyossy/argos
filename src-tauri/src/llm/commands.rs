@@ -7,9 +7,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
-    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer,
-    final_source_turn, sources_for_consumed, ChatTurn, PHANTOM_CITE_HINT, REASONING_CARRY_CAP,
-    STOP_TOOLS_HINT,
+    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, estimate_tokens,
+    final_source_turn, fit_tool_text, silent_end_notice, sources_for_consumed, ChatTurn,
+    PHANTOM_CITE_HINT, REASONING_CARRY_CAP, STOP_TOOLS_HINT, TOOL_RESULT_BUDGET_RATIO,
 };
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
@@ -48,7 +48,9 @@ pub struct LlmSendResult {
     pub cancelled: bool,
     pub error: Option<String>,
     pub truncated: bool,
-    pub context_chars: usize,
+    pub context_tokens: usize,
+    pub thinking_budget_state: String,
+    pub thinking_budget_tokens: Option<u32>,
     pub warning: Option<String>,
     #[serde(default)]
     pub note_writes: Vec<NoteWriteNotice>,
@@ -149,19 +151,31 @@ async fn execute_tool_off_runtime(
     }
 }
 
-/// Trim one tool result to what is left of the reserve, keeping the head (the highest
-/// scoring hits) and telling the model the rest was cut.
-fn fit_tool_content(content: String, budget: usize, used: usize) -> String {
-    let left = budget.saturating_sub(used);
-    if left == 0 {
-        return "（文脈の上限に達したため、この結果は省略しました）".into();
+fn store_turn(db: &crate::db::Db, thread_id: &str, turn: &ChatTurn) -> Result<(), String> {
+    let calls = turn
+        .tool_calls
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    db.insert_llm_message_full(
+        thread_id,
+        &turn.role,
+        &turn.content,
+        turn.reasoning.as_deref().unwrap_or(""),
+        &calls,
+        turn.tool_call_id.as_deref().unwrap_or(""),
+        turn.name.as_deref().unwrap_or(""),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn budget_fields(base: &str) -> (String, Option<u32>) {
+    match llm::thinking::known_budget_for(&llm::normalize_base_url(base)) {
+        llm::thinking::KnownBudget::Tokens(n) => ("set".into(), Some(n)),
+        llm::thinking::KnownBudget::Unset => ("unset".into(), None),
+        llm::thinking::KnownBudget::Unknown => ("unknown".into(), None),
     }
-    if content.chars().count() <= left {
-        return content;
-    }
-    let mut out: String = content.chars().take(left).collect();
-    out.push_str("\n（以下、文脈の上限により省略）");
-    out
 }
 
 /// Put this-turn hits on a user turn so the model sees a real 出典 block (not only `role: tool`).
@@ -462,6 +476,29 @@ pub async fn llm_test_connection(state: State<'_, Arc<AppState>>) -> Result<LlmT
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgetStatus {
+    /// "set" | "unset" | "unknown"
+    pub state: String,
+    pub tokens: Option<u32>,
+}
+
+/// Read MTPLX `GET /metrics` and return the remembered thinking budget.
+/// Does not count or cut the budget; that stays on the server.
+#[tauri::command]
+pub async fn llm_thinking_budget(
+    state: State<'_, Arc<AppState>>,
+) -> Result<ThinkingBudgetStatus, String> {
+    let settings = state.settings.read().clone();
+    let _ = llm::refresh_thinking_budget(&settings, None).await;
+    let (state_name, tokens) = budget_fields(&settings.llm_base_url);
+    Ok(ThinkingBudgetStatus {
+        state: state_name,
+        tokens,
+    })
+}
+
 #[tauri::command]
 pub async fn llm_list_models(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmModelInfo>, String> {
     let settings = state.settings.read().clone();
@@ -552,7 +589,7 @@ pub async fn llm_send(
         .list_llm_sources(&thread.id)
         .map_err(|e| e.to_string())?;
     let settings = state.settings.read().clone();
-    let max_chars = settings.llm_max_context_chars as usize;
+    let max_tokens = settings.llm_max_context_tokens as usize;
     let thread_scope = Some(thread.path_prefix.trim().to_string()).filter(|s| !s.is_empty());
     let mut system = llm::system_for_request(&settings);
     llm::append_diagram_hint(&mut system, &content);
@@ -588,10 +625,10 @@ pub async fn llm_send(
     if let Some(line) = paste.system_line() {
         system.push_str(&line);
     }
-    let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
-    let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
+    let (assembled, stats) = assemble_turns(&system, &sources, &history, max_tokens);
+    let turns_for_plain = assembled.clone();
     let truncated = stats.truncated;
-    let context_chars = stats.total_chars;
+    let context_tokens = stats.total_tokens;
     let mut consumed: Vec<(String, i64)> = stats
         .consumed
         .iter()
@@ -623,25 +660,32 @@ pub async fn llm_send(
     let mut extra_final = false;
     let mut phantom_retried = false;
     let mut rounds = 0usize;
-    let max_rounds = tools::max_tool_rounds(web_search);
+    let max_rounds = tools::max_tool_rounds(settings.llm_max_tool_rounds);
+    let unlimited_rounds = max_rounds == 0;
     let mut current_turns = assembled;
     let mut source_turn_injected = false;
     // Tool output is appended after the context was already sized, so it needs its own
     // allowance. A quarter of the window leaves room for the history and the answer.
-    let tool_budget = (max_chars / 4).max(2_000);
+    let tool_budget = ((max_tokens as f64) * TOOL_RESULT_BUDGET_RATIO).floor() as usize;
     let mut tool_used = 0usize;
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
+    let mut final_reasoning = String::new();
     let result_text;
 
     loop {
+        if use_tools && !unlimited_rounds && rounds >= max_rounds {
+            result_text = tools::tool_round_limit_notice(max_rounds);
+            break;
+        }
         let with_tools = use_tools;
-        let turns_now = llm::apply_thinking_to_turns(current_turns.clone(), &settings);
-        let outcome = {
+        let turns_now = current_turns.clone();
+        let mut bridge_retried = false;
+        let outcome = loop {
             let app2 = app.clone();
             let req = request_id.clone();
             let tid = thread.id.clone();
-            llm::stream_chat(
+            let streamed = llm::stream_chat(
                 &settings,
                 &turns_now,
                 cancel.clone(),
@@ -650,6 +694,7 @@ pub async fn llm_send(
                 } else {
                     None
                 },
+                llm::runaway_chars_for(&settings.llm_base_url),
                 move |kind, delta| {
                     let _ = app2.emit(
                         "llm-chat-delta",
@@ -662,7 +707,33 @@ pub async fn llm_send(
                     );
                 },
             )
-            .await
+            .await;
+            match streamed {
+                Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR && !bridge_retried => {
+                    bridge_retried = true;
+                    let _ = app.emit(
+                        "llm-chat-delta",
+                        LlmChatDelta {
+                            request_id: request_id.clone(),
+                            thread_id: thread.id.clone(),
+                            text: String::new(),
+                            kind: "reset".into(),
+                        },
+                    );
+                    continue;
+                }
+                Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR => {
+                    break Err(llm::thinking::thinking_bridge_error());
+                }
+                Err(e) if e.starts_with(llm::thinking::THINKING_RUNAWAY_PREFIX) => {
+                    let chars = e
+                        .strip_prefix(llm::thinking::THINKING_RUNAWAY_PREFIX)
+                        .unwrap_or("");
+                    let n: usize = chars.parse().unwrap_or(0);
+                    break Err(llm::thinking::runaway_thinking_error(n));
+                }
+                other => break other,
+            }
         };
 
         match outcome {
@@ -683,7 +754,9 @@ pub async fn llm_send(
                     cancelled: true,
                     error: None,
                     truncated,
-                    context_chars,
+                    context_tokens,
+                    thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                    thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
                     note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
@@ -730,13 +803,21 @@ pub async fn llm_send(
                     cancelled: false,
                     error: Some(e),
                     truncated,
-                    context_chars,
+                    context_tokens,
+                    thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                    thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
                     note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
             }
             Ok(out) => {
-                if use_tools && !out.tool_calls.is_empty() && rounds < max_rounds {
+                if with_tools
+                    && llm::thinking::thinking_enabled(&settings)
+                    && !out.request_id.is_empty()
+                {
+                    let _ = llm::refresh_thinking_budget(&settings, Some(&out.request_id)).await;
+                }
+                if use_tools && !out.tool_calls.is_empty() {
                     rounds += 1;
                     let tool_calls_json = serde_json::json!(out
                         .tool_calls
@@ -757,14 +838,16 @@ pub async fn llm_send(
                             Some(cap_chars(r, REASONING_CARRY_CAP))
                         }
                     };
-                    current_turns.push(ChatTurn {
+                    let assistant_turn = ChatTurn {
                         role: "assistant".into(),
                         content: out.content,
                         name: None,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls_json),
                         reasoning,
-                    });
+                    };
+                    store_turn(&state.db, &thread.id, &assistant_turn)?;
+                    current_turns.push(assistant_turn);
                     let mut read_url_in_round = 0usize;
                     for tc in out.tool_calls {
                         let hint = if web_search && tc.name == tools::TOOL_SEARCH {
@@ -784,21 +867,23 @@ pub async fn llm_send(
                         if tc.name == tools::TOOL_READ_URL
                             && read_url_in_round >= tools::MAX_READ_URL_PER_ROUND
                         {
-                            let content = fit_tool_content(
+                            let content = fit_tool_text(
                                 "一度に読める URL は 2 件までです。必要なものから順に read_url してください。"
                                     .into(),
                                 tool_budget,
                                 tool_used,
                             );
-                            tool_used += content.chars().count();
-                            current_turns.push(ChatTurn {
+                            tool_used += estimate_tokens(&content);
+                            let tool_turn = ChatTurn {
                                 role: "tool".into(),
                                 content,
                                 name: Some(tc.name),
                                 tool_call_id: Some(tc.id),
                                 tool_calls: None,
                                 reasoning: None,
-                            });
+                            };
+                            store_turn(&state.db, &thread.id, &tool_turn)?;
+                            current_turns.push(tool_turn);
                             continue;
                         }
                         if tc.name == tools::TOOL_READ_URL {
@@ -836,17 +921,19 @@ pub async fn llm_send(
                         let content = if tc.name == tools::TOOL_READ_NOTE {
                             content
                         } else {
-                            fit_tool_content(content, tool_budget, tool_used)
+                            fit_tool_text(content, tool_budget, tool_used)
                         };
-                        tool_used += content.chars().count();
-                        current_turns.push(ChatTurn {
+                        tool_used += estimate_tokens(&content);
+                        let tool_turn = ChatTurn {
                             role: "tool".into(),
                             content,
                             name: Some(tc.name),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
                             reasoning: None,
-                        });
+                        };
+                        store_turn(&state.db, &thread.id, &tool_turn)?;
+                        current_turns.push(tool_turn);
                     }
                     // The reserve is spent; answer from what the rounds already produced.
                     if tool_used >= tool_budget {
@@ -861,24 +948,6 @@ pub async fn llm_send(
                             current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
                             source_turn_injected = true;
                         }
-                    }
-                    continue;
-                }
-                if use_tools
-                    && !out.tool_calls.is_empty()
-                    && rounds >= max_rounds
-                    && !extra_final
-                {
-                    extra_final = true;
-                    use_tools = false;
-                    if !source_turn_injected {
-                        let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
-                        source_turn_injected =
-                            inject_final_source_turn(&mut current_turns, &all, &consumed, true);
-                    }
-                    if !source_turn_injected {
-                        current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
-                        source_turn_injected = true;
                     }
                     continue;
                 }
@@ -906,7 +975,12 @@ pub async fn llm_send(
                         continue;
                     }
                 }
-                result_text = out.content;
+                final_reasoning = out.reasoning;
+                result_text = if out.content.trim().is_empty() {
+                    silent_end_notice(&out.finish_reason)
+                } else {
+                    out.content
+                };
                 break;
             }
         }
@@ -921,10 +995,27 @@ pub async fn llm_send(
         Some(
             state
                 .db
-                .insert_llm_message(&thread.id, "assistant", &result_text)
+                .insert_llm_message_full(
+                    &thread.id,
+                    "assistant",
+                    &result_text,
+                    &final_reasoning,
+                    "",
+                    "",
+                    "",
+                )
                 .map_err(|e| e.to_string())?,
         )
     };
+    let unset_notice = llm::thinking::thinking_budget_unset_notice();
+    let already_told = history.iter().any(|message| message.content == unset_notice)
+        || result_text == unset_notice;
+    if llm::thinking::known_budget_for(&llm::normalize_base_url(&settings.llm_base_url))
+        == llm::thinking::KnownBudget::Unset
+        && !already_told
+    {
+        let _ = state.db.insert_llm_message(&thread.id, "assistant", &unset_notice);
+    }
     if let Some(assistant) = assistant_message.as_ref() {
         let cited = consumed_cited_in_answer(&consumed, &result_text);
         if !cited.is_empty() {
@@ -946,16 +1037,11 @@ pub async fn llm_send(
         user_message,
         assistant_message,
         cancelled: false,
-        error: if result_text.trim().is_empty() {
-            Some(
-                "モデルが本文を返しませんでした。思考を「オフ」にするか、検索窓から出典を送ってください。"
-                    .into(),
-            )
-        } else {
-            None
-        },
+        error: None,
         truncated,
-        context_chars,
+        context_tokens,
+        thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+        thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
         warning,
         note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
     })
@@ -1969,19 +2055,19 @@ mod tests {
     fn tool_results_are_trimmed_to_the_reserve() {
         let body = "あ".repeat(100);
         assert_eq!(
-            fit_tool_content(body.clone(), 500, 0),
+            fit_tool_text(body.clone(), 500, 0),
             body,
             "content within the reserve passes through untouched"
         );
 
-        let trimmed = fit_tool_content(body.clone(), 60, 0);
+        let trimmed = fit_tool_text(body.clone(), 20, 0);
         assert!(trimmed.chars().count() < body.chars().count());
         assert!(
             trimmed.contains("省略"),
             "the model must be told the result was cut: {trimmed}"
         );
 
-        let exhausted = fit_tool_content(body, 60, 60);
+        let exhausted = fit_tool_text(body, 20, 20);
         assert!(
             exhausted.contains("省略"),
             "a spent reserve yields a notice, not silence: {exhausted}"
