@@ -61,6 +61,8 @@ type LlmMessageRow = {
   toolCalls?: string;
   toolCallId?: string;
   toolName?: string;
+  /** "notice" is shown in the chat and left out of the token estimate. */
+  kind?: string;
 };
 
 type LlmSourceRow = {
@@ -799,6 +801,7 @@ export default function Chat() {
         messages: messages.map((m) => ({
           content: m.content,
           toolCalls: m.toolCalls,
+          kind: m.kind,
         })),
         sources: sources.map((s) => ({ body: s.body, title: s.title })),
         draft,

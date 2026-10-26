@@ -547,6 +547,9 @@ pub fn assemble_turns(
 /// Past turns keep tool calls and tool results, and drop the reasoning channel.
 /// A tool message with an empty body is still a reply the server expects.
 fn message_is_replayed(message: &LlmMessageRow) -> bool {
+    if message.kind == crate::db::LLM_MESSAGE_NOTICE {
+        return false;
+    }
     match message.role.as_str() {
         "user" | "system" => !message.content.is_empty(),
         "assistant" => !message.content.is_empty() || !message.tool_calls.trim().is_empty(),
@@ -744,7 +747,69 @@ mod tests {
             tool_calls: String::new(),
             tool_call_id: String::new(),
             tool_name: String::new(),
+            kind: String::new(),
         }
+    }
+
+    #[test]
+    fn notices_stay_out_of_later_turns() {
+        let mut short = msg(
+            "n1",
+            "assistant",
+            "ツール往復が上限の 8 回に達したため、続きの操作はせず、ここまでの資料で答えています。",
+        );
+        short.kind = crate::db::LLM_MESSAGE_NOTICE.into();
+        let mut long = msg(
+            "n2",
+            "assistant",
+            "ツール往復が上限の 8 回に達したため、残りの操作はしていません。",
+        );
+        long.kind = crate::db::LLM_MESSAGE_NOTICE.into();
+        let mut unset = msg("n3", "assistant", "上限未設定の案内");
+        unset.kind = crate::db::LLM_MESSAGE_NOTICE.into();
+        let history = vec![
+            msg("u1", "user", "調べて"),
+            msg("a1", "assistant", "途中の答え"),
+            short,
+            long,
+            unset,
+            msg("u2", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[], &history, 80_000);
+        let roles: Vec<&str> = turns.iter().map(|turn| turn.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(turns[2].content, "途中の答え");
+        assert!(turns[3].content.contains("続き"));
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!blob.contains("ツール往復"));
+        assert!(!blob.contains("上限未設定"));
+        let (_, stats) = assemble_turns("役割", &[], &history, 80_000);
+        let without = vec![
+            msg("u1", "user", "調べて"),
+            msg("a1", "assistant", "途中の答え"),
+            msg("u2", "user", "続き"),
+        ];
+        let (_, plain) = assemble_turns("役割", &[], &without, 80_000);
+        assert_eq!(stats.total_tokens, plain.total_tokens);
+    }
+
+    #[test]
+    fn notice_wording_without_the_flag_stays_in_context() {
+        let history = vec![
+            msg("u1", "user", "調べて"),
+            msg(
+                "a1",
+                "assistant",
+                "ツール往復が上限の 8 回に達したため、残りの操作はしていません。",
+            ),
+            msg("u2", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[], &history, 80_000);
+        assert!(turns.iter().any(|turn| turn.content.contains("ツール往復")));
     }
 
     #[test]

@@ -231,7 +231,13 @@ pub struct LlmMessageRow {
     pub tool_call_id: String,
     #[serde(default)]
     pub tool_name: String,
+    /// Empty for a normal turn. "notice" is an app message: shown in the chat, not sent to the model.
+    #[serde(default)]
+    pub kind: String,
 }
+
+/// App-generated chat row. Saved and shown, but left out of later model context.
+pub const LLM_MESSAGE_NOTICE: &str = "notice";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -770,6 +776,7 @@ impl Db {
               tool_calls TEXT NOT NULL DEFAULT '',
               tool_call_id TEXT NOT NULL DEFAULT '',
               tool_name TEXT NOT NULL DEFAULT '',
+              kind TEXT NOT NULL DEFAULT '',
               created_at INTEGER NOT NULL,
               FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE
             );
@@ -896,6 +903,21 @@ impl Db {
         );
         let _ = conn.execute(
             "ALTER TABLE llm_messages ADD COLUMN tool_name TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Stamp assistant rows written before `kind` existed. Later reads use the column only.
+        let _ = conn.execute(
+            "UPDATE llm_messages SET kind = 'notice'
+             WHERE kind = ''
+               AND role = 'assistant'
+               AND (
+                 content LIKE 'ツール往復が上限の %回に達したため%'
+                 OR content LIKE 'MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。%'
+               )",
             [],
         );
         if consume_cols_added {
@@ -3441,7 +3463,7 @@ impl Db {
     ) -> Result<Vec<LlmMessageRow>, rusqlite::Error> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name
+            "SELECT id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name, kind
              FROM llm_messages WHERE thread_id=?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map([thread_id], |row| {
@@ -3455,6 +3477,7 @@ impl Db {
                 tool_calls: row.get(6)?,
                 tool_call_id: row.get(7)?,
                 tool_name: row.get(8)?,
+                kind: row.get(9)?,
             })
         })?;
         Ok(rows.flatten().collect())
@@ -3466,7 +3489,24 @@ impl Db {
         role: &str,
         content: &str,
     ) -> Result<LlmMessageRow, rusqlite::Error> {
-        self.insert_llm_message_full(thread_id, role, content, "", "", "", "")
+        self.insert_llm_message_full(thread_id, role, content, "", "", "", "", "")
+    }
+
+    pub fn insert_llm_notice(
+        &self,
+        thread_id: &str,
+        content: &str,
+    ) -> Result<LlmMessageRow, rusqlite::Error> {
+        self.insert_llm_message_full(
+            thread_id,
+            "assistant",
+            content,
+            "",
+            "",
+            "",
+            "",
+            LLM_MESSAGE_NOTICE,
+        )
     }
 
     pub fn insert_llm_message_full(
@@ -3478,14 +3518,15 @@ impl Db {
         tool_calls: &str,
         tool_call_id: &str,
         tool_name: &str,
+        kind: &str,
     ) -> Result<LlmMessageRow, rusqlite::Error> {
         let conn = self.conn.lock();
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO llm_messages(
-                id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name, kind
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 id,
                 thread_id,
@@ -3495,7 +3536,8 @@ impl Db {
                 reasoning,
                 tool_calls,
                 tool_call_id,
-                tool_name
+                tool_name,
+                kind
             ],
         )?;
         let now2 = now;
@@ -3513,6 +3555,7 @@ impl Db {
             tool_calls: tool_calls.to_string(),
             tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
+            kind: kind.to_string(),
         })
     }
 
@@ -5472,9 +5515,19 @@ mod folder_index_status_tests {
             r#"[{"id":"c1"}]"#,
             "",
             "",
+            "",
         )
         .unwrap();
-        db.insert_llm_message_full("t1", "tool", "検索結果", "", "", "c1", "search_index")
+        db.insert_llm_message_full(
+            "t1",
+            "tool",
+            "検索結果",
+            "",
+            "",
+            "c1",
+            "search_index",
+            "",
+        )
             .unwrap();
         let messages = db.list_llm_messages("t1").unwrap();
         assert_eq!(messages[1].reasoning, "思考");
@@ -5625,6 +5678,66 @@ mod folder_index_status_tests {
                 "b-answer".to_string()
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_notices_are_marked_and_stay_in_order() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE llm_threads (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL DEFAULT '',
+                  search_enabled INTEGER NOT NULL DEFAULT 1,
+                  path_prefix TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_threads(id, title, search_enabled, path_prefix, created_at, updated_at)
+                  VALUES ('t1', '会話', 1, '', 10, 20);
+                CREATE TABLE llm_messages (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_messages(id, thread_id, role, content, created_at) VALUES
+                  ('u1', 't1', 'user', '調べて', 100),
+                  ('n1', 't1', 'assistant', 'ツール往復が上限の 8 回に達したため、残りの操作はしていません。続きはもう一度指示するか、設定の「ツール往復の上限」を上げてください。', 100),
+                  ('n2', 't1', 'assistant', 'ツール往復が上限の 8 回に達したため、続きの操作はせず、ここまでの資料で答えています。', 100),
+                  ('n3', 't1', 'assistant', 'MTPLX に思考の上限（--agent-thinking-budget）が設定されていません。上限がないと思考が長く続くことがあります。', 100),
+                  ('q1', 't1', 'user', 'ツール往復が上限の 8 回に達したため、これは利用者の発言です。', 100),
+                  ('a1', 't1', 'assistant', 'ここまでの結論です。', 100);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let messages = db.list_llm_messages("t1").unwrap();
+        let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(ids, ["u1", "n1", "n2", "n3", "q1", "a1"]);
+        let kinds: Vec<&str> = messages.iter().map(|message| message.kind.as_str()).collect();
+        assert_eq!(kinds, ["", "notice", "notice", "notice", "", ""]);
+        let echoed = db
+            .insert_llm_message(
+                "t1",
+                "assistant",
+                "ツール往復が上限の 8 回に達したため、これはモデルの本文です。",
+            )
+            .unwrap();
+        assert_eq!(echoed.kind, "");
+        let fresh = db.insert_llm_notice("t1", "新しい案内").unwrap();
+        assert_eq!(fresh.kind, LLM_MESSAGE_NOTICE);
+        let messages = db.list_llm_messages("t1").unwrap();
+        assert_eq!(messages.last().unwrap().id, fresh.id);
+        assert_eq!(messages.last().unwrap().content, "新しい案内");
+        assert_eq!(messages.last().unwrap().kind, "notice");
+        assert_eq!(messages[messages.len() - 2].kind, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -53,6 +53,81 @@ pub fn round_limit_answer(body: Option<&str>, max_rounds: usize) -> RoundLimitAn
         }
     }
 }
+
+/// The no-tools final call failed. Name the cause in Japanese, without secrets from `error`.
+pub fn round_limit_failure(max_rounds: usize, error: &str) -> RoundLimitAnswer {
+    let reason = round_limit_failure_reason(error);
+    RoundLimitAnswer {
+        text: format!(
+            "ツール往復が上限の {max_rounds} 回に達したため、残りの操作はしていません。続きの回答は失敗しました（{reason}）。続きはもう一度指示するか、設定の「ツール往復の上限」を上げてください。"
+        ),
+        notice: None,
+    }
+}
+
+fn round_limit_failure_reason(error: &str) -> String {
+    let l = error.to_lowercase();
+    if error.contains("字に達しても答えが出ない") {
+        return "思考が長く続いたため止めました".into();
+    }
+    if error.contains("思考を閉じられず") {
+        return "思考を閉じられず止めました".into();
+    }
+    if l.contains("コンテキスト長")
+        || l.contains("context length")
+        || l.contains("context window")
+        || l.contains("n_ctx")
+        || l.contains("too many tokens")
+        || l.contains("prompt is too long")
+        || l.contains("maximum context")
+    {
+        return "コンテキストが長すぎます".into();
+    }
+    if l.contains("タイムアウト") || l.contains("timed out") || l.contains("timeout") {
+        return "応答が時間切れになりました".into();
+    }
+    if l.contains("接続できません")
+        || l.contains("届きません")
+        || l.contains("connection refused")
+        || l.contains("connect")
+        || l.contains("dns")
+    {
+        return "サーバに接続できません".into();
+    }
+    if l.contains("401")
+        || l.contains("unauthorized")
+        || l.contains("invalid api key")
+        || l.contains("api キーが拒否")
+    {
+        return "サーバが認証を拒否しました".into();
+    }
+    if let Some(code) = http_status_code(error) {
+        return format!("サーバがエラーを返しました（HTTP {code}）");
+    }
+    "応答を受け取れませんでした".into()
+}
+
+fn http_status_code(error: &str) -> Option<u16> {
+    let bytes = error.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        let digit = bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit();
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+        let after_ok = i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit();
+        if digit && before_ok && after_ok {
+            let code = (bytes[i] - b'0') as u16 * 100
+                + (bytes[i + 1] - b'0') as u16 * 10
+                + (bytes[i + 2] - b'0') as u16;
+            if (400..=599).contains(&code) {
+                return Some(code);
+            }
+        }
+        i += 1;
+    }
+    None
+}
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
 /// Body length per search hit. Deliberately small: a search round returns up to `k`
@@ -2568,7 +2643,63 @@ mod tests {
             let fallback = round_limit_answer(body, 16);
             assert_eq!(fallback.text, tool_round_limit_notice(16));
             assert!(fallback.notice.is_none());
+            assert!(!fallback.text.contains("失敗しました"));
         }
+        let secret = "sk-live-secret";
+        let runaway = round_limit_failure(
+            8,
+            &format!("思考が 24576 字に達しても答えが出ないため止めました。 key={secret}"),
+        );
+        assert!(runaway.text.contains("上限の 8 回"));
+        assert!(runaway.text.contains("思考が長く続いたため止めました"));
+        assert!(runaway.notice.is_none());
+        assert!(!runaway.text.contains(secret));
+        let too_long = round_limit_failure(
+            8,
+            &format!("context length exceeded Bearer {secret}"),
+        );
+        assert!(too_long.text.contains("コンテキストが長すぎます"));
+        assert!(!too_long.text.contains(secret));
+        assert!(!too_long.text.contains("Bearer"));
+        let http = round_limit_failure(8, &format!("500 internal api_key={secret}"));
+        assert!(http.text.contains("HTTP 500"));
+        assert!(!http.text.contains(secret));
+        assert!(!http.text.contains("api_key"));
+        let bridge = round_limit_failure(8, &crate::llm::thinking::thinking_bridge_error());
+        assert!(bridge.text.contains("思考を閉じられず止めました"));
+        assert!(bridge.notice.is_none());
+        let runaway_mapped = round_limit_failure(
+            8,
+            &crate::llm::thinking::runaway_thinking_error(24_576),
+        );
+        assert!(runaway_mapped.text.contains("思考が長く続いたため止めました"));
+        assert!(!runaway_mapped.text.contains("24576"));
+        assert!(!runaway_mapped.text.contains("HTTP"));
+        let too_long_mapped = round_limit_failure(
+            8,
+            "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。",
+        );
+        assert!(too_long_mapped.text.contains("コンテキストが長すぎます"));
+        let timed_out = round_limit_failure(
+            8,
+            "応答が止まりました（タイムアウト）。指示を分けるか、設定の「思考」をオフにしてください。",
+        );
+        assert!(timed_out.text.contains("応答が時間切れになりました"));
+        let tailscale = round_limit_failure(
+            8,
+            "LLM サーバのポートに届きません。例: mtplx serve --host 0.0.0.0 --port 8000 --api-key sk-live-secret",
+        );
+        assert!(tailscale.text.contains("サーバに接続できません"));
+        assert!(!tailscale.text.contains(secret));
+        assert!(!tailscale.text.contains("api-key"));
+        assert!(!tailscale.text.contains("HTTP"));
+        let auth = round_limit_failure(8, "API キーが拒否されました。キー欄を確認してください。");
+        assert!(auth.text.contains("サーバが認証を拒否しました"));
+        assert!(!auth.text.contains("キー欄"));
+        let unknown = round_limit_failure(8, &format!("unexpected blob api_key={secret}"));
+        assert!(unknown.text.contains("応答を受け取れませんでした"));
+        assert!(!unknown.text.contains(secret));
+        assert!(!unknown.text.contains("api_key"));
         assert!(on.contains(TOOL_WRITE_NOTE));
         assert!(off.contains("ノートの id・題名・更新日時"));
     }

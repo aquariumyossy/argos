@@ -48,4 +48,22 @@ describe("context tokens", () => {
   it("labels the meter in tokens", () => {
     expect(contextMeterLabel(12345, 131072)).toBe("12,345 / 131,072 トークン");
   });
+
+  it("leaves app notices out of the estimate", () => {
+    const withNotice = contextUsageTokens({
+      messages: [
+        { content: "質問" },
+        { content: "ツール往復が上限の 8 回に達したため、続きの操作はせず、ここまでの資料で答えています。", kind: "notice" },
+        { content: "答え" },
+      ],
+      sources: [],
+      draft: "",
+    });
+    const without = contextUsageTokens({
+      messages: [{ content: "質問" }, { content: "答え" }],
+      sources: [],
+      draft: "",
+    });
+    expect(withNotice).toBe(without);
+  });
 });

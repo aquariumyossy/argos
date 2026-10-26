@@ -20,12 +20,13 @@ export function messageTokens(message: {
 }
 
 export function contextUsageTokens(parts: {
-  messages: { content?: string; toolCalls?: string }[];
+  messages: { content?: string; toolCalls?: string; kind?: string }[];
   sources: { body?: string; title?: string }[];
   draft: string;
 }): number {
   let total = 0;
   for (const message of parts.messages) {
+    if (message.kind === "notice") continue;
     total += messageTokens(message);
   }
   for (const source of parts.sources) {

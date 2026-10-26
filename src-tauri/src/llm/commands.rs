@@ -165,6 +165,7 @@ fn store_turn(db: &crate::db::Db, thread_id: &str, turn: &ChatTurn) -> Result<()
         &calls,
         turn.tool_call_id.as_deref().unwrap_or(""),
         turn.name.as_deref().unwrap_or(""),
+        "",
     )
     .map(|_| ())
     .map_err(|e| e.to_string())
@@ -784,7 +785,7 @@ pub async fn llm_send(
                 });
             }
             Err(e) if round_limit_final => {
-                let finished = tools::round_limit_answer(None, max_rounds);
+                let finished = tools::round_limit_failure(max_rounds, &e);
                 result_text = finished.text;
                 round_limit_aside = finished.notice;
                 break;
@@ -1026,6 +1027,11 @@ pub async fn llm_send(
     busy.finish();
     kick_pending_ocr(&app, state_arc.clone());
 
+    let result_kind = if round_limit_final && round_limit_aside.is_none() {
+        crate::db::LLM_MESSAGE_NOTICE
+    } else {
+        ""
+    };
     let assistant_message = if result_text.is_empty() {
         None
     } else {
@@ -1040,23 +1046,23 @@ pub async fn llm_send(
                     "",
                     "",
                     "",
+                    result_kind,
                 )
                 .map_err(|e| e.to_string())?,
         )
     };
     if let Some(notice) = round_limit_aside.as_deref() {
-        let _ = state
-            .db
-            .insert_llm_message(&thread.id, "assistant", notice);
+        let _ = state.db.insert_llm_notice(&thread.id, notice);
     }
     let unset_notice = llm::thinking::thinking_budget_unset_notice();
-    let already_told = history.iter().any(|message| message.content == unset_notice)
-        || result_text == unset_notice;
+    let already_told = history.iter().any(|message| {
+        message.kind == crate::db::LLM_MESSAGE_NOTICE && message.content == unset_notice
+    }) || result_text == unset_notice;
     if llm::thinking::known_budget_for(&llm::normalize_base_url(&settings.llm_base_url))
         == llm::thinking::KnownBudget::Unset
         && !already_told
     {
-        let _ = state.db.insert_llm_message(&thread.id, "assistant", &unset_notice);
+        let _ = state.db.insert_llm_notice(&thread.id, &unset_notice);
     }
     if let Some(assistant) = assistant_message.as_ref() {
         let cited = consumed_cited_in_answer(&consumed, &result_text);
