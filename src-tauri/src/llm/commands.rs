@@ -1026,7 +1026,6 @@ pub async fn llm_send(
                         let original = phantom_fallback
                             .take()
                             .expect("empty phantom retry keeps the first answer");
-                        raise_ledger_for_kept_answer(&state.db, &thread.id, &original.content);
                         final_reasoning = original.reasoning;
                         result_text = original.content;
                         kept_source_ids = Some(original.source_ids);
@@ -1057,21 +1056,13 @@ pub async fn llm_send(
     let assistant_message = if result_text.is_empty() {
         None
     } else {
-        Some(
-            state
-                .db
-                .insert_llm_message_full(
-                    &thread.id,
-                    "assistant",
-                    &result_text,
-                    &final_reasoning,
-                    "",
-                    "",
-                    "",
-                    result_kind,
-                )
-                .map_err(|e| e.to_string())?,
-        )
+        Some(save_assistant_answer(
+            &state.db,
+            &thread.id,
+            &result_text,
+            &final_reasoning,
+            result_kind,
+        )?)
     };
     if let Some(notice) = round_limit_aside.as_deref() {
         let _ = state.db.insert_llm_notice(&thread.id, notice);
@@ -2170,7 +2161,8 @@ fn remember_phantom_answer(
     });
 }
 
-/// A kept phantom answer already used `[n]`. Later sources must start above that.
+/// A saved answer already used `[n]`. Later sources must start above that.
+/// Notices are instructions to the user, not citations the model wrote.
 fn raise_ledger_for_kept_answer(db: &crate::db::Db, thread_id: &str, content: &str) {
     let max_n = parse_cited_nos(content)
         .into_iter()
@@ -2180,6 +2172,22 @@ fn raise_ledger_for_kept_answer(db: &crate::db::Db, thread_id: &str, content: &s
     if max_n > 0 {
         let _ = db.raise_llm_cite_counter(thread_id, max_n);
     }
+}
+
+/// The one place a finished assistant answer is stored. Every non-notice answer,
+/// including a phantom retry and a round-limit final answer, advances the ledger here.
+fn save_assistant_answer(
+    db: &crate::db::Db,
+    thread_id: &str,
+    content: &str,
+    reasoning: &str,
+    kind: &str,
+) -> Result<crate::db::LlmMessageRow, String> {
+    if kind != crate::db::LLM_MESSAGE_NOTICE {
+        raise_ledger_for_kept_answer(db, thread_id, content);
+    }
+    db.insert_llm_message_full(thread_id, "assistant", content, reasoning, "", "", "", kind)
+        .map_err(|e| e.to_string())
 }
 
 /// A kept answer may cite only sources that existed when it was written.
@@ -2554,7 +2562,9 @@ mod tests {
         let mut slot = None;
         remember_phantom_answer(&mut slot, answer, "", &sources_then);
         let kept = slot.expect("the first phantom answer is kept");
-        raise_ledger_for_kept_answer(&db, &thread.id, &kept.content);
+        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "").unwrap();
+        assert_eq!(saved.content, kept.content);
+        assert_ne!(saved.kind, crate::db::LLM_MESSAGE_NOTICE);
         let (later, _) = db
             .insert_llm_source(&thread.id, "tool", "path-d", "D", "p2", "D", "q")
             .unwrap();
@@ -2583,7 +2593,8 @@ mod tests {
         let mut slot = None;
         remember_phantom_answer(&mut slot, answer, "", &sources_then);
         let kept = slot.expect("the first phantom answer is kept");
-        raise_ledger_for_kept_answer(&db, &thread.id, &kept.content);
+        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "").unwrap();
+        assert_eq!(saved.content, kept.content);
         assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 5);
         let (memo, _) = db
             .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
@@ -2594,6 +2605,58 @@ mod tests {
             .insert_llm_source(&thread.id, "attach", "later.txt", "later", "p2", "続き", "")
             .unwrap();
         assert_ne!(second.cite_no, 5);
+        assert_eq!(second.cite_no, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-empty phantom retry is the answer that gets saved, so its `[n]` owns the number.
+    /// A later notice that mentions `[n]` does not.
+    #[test]
+    fn phantom_retry_answer_advances_the_counter_and_a_notice_does_not() {
+        let (dir, db) = temp_db("cite-phantom-retry");
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let (first, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-a", "A", "p1", "A", "q")
+            .unwrap();
+        assert_eq!(first.cite_no, 1);
+        let sources_then = db.list_llm_sources(&thread.id).unwrap();
+        let original = "根拠は [5] です。";
+        assert!(answer_has_phantom_cites(original, &sources_then));
+        let mut slot = None;
+        remember_phantom_answer(&mut slot, original, "", &sources_then);
+        assert!(slot.is_some(), "the first phantom answer is remembered");
+        assert!(matches!(
+            answer_after_phantom_retry(false, true),
+            PhantomRetryAnswer::Retry
+        ));
+        let retry = "調べ直しても [5] のままです。巨大な脚注 [9223372036854775807] は進めません。";
+        let saved = save_assistant_answer(&db, &thread.id, retry, "考え", "").unwrap();
+        assert_eq!(saved.role, "assistant");
+        assert_eq!(saved.content, retry);
+        assert_ne!(saved.kind, crate::db::LLM_MESSAGE_NOTICE);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 5);
+        let (memo, _) = db
+            .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_ne!(memo.cite_no, 5, "memo.txt must not reuse the retried phantom [5]");
+        assert_eq!(memo.cite_no, 6);
+        let notice = save_assistant_answer(
+            &db,
+            &thread.id,
+            "案内 [9]",
+            "",
+            crate::db::LLM_MESSAGE_NOTICE,
+        )
+        .unwrap();
+        assert_eq!(notice.kind, crate::db::LLM_MESSAGE_NOTICE);
+        assert_eq!(
+            db.llm_cite_counter(&thread.id).unwrap(),
+            6,
+            "a notice must not advance the ledger"
+        );
+        let (second, _) = db
+            .insert_llm_source(&thread.id, "attach", "later.txt", "later", "p2", "続き", "")
+            .unwrap();
         assert_eq!(second.cite_no, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -5,11 +5,14 @@ pub mod context;
 pub mod fetch_url;
 pub mod files;
 pub mod grain;
+pub mod http_error;
 pub mod pdf_win;
 pub mod searxng;
 pub mod thinking;
 pub mod tools;
 pub mod transcript;
+
+pub use http_error::is_tools_unsupported_error;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -104,262 +107,8 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     parts.join(" | ")
 }
 
-fn is_transport_error(l: &str) -> bool {
-    l.contains("connection refused")
-        || l.contains("connect error")
-        || l.contains("tcp connect error")
-        || l.contains("failed to connect")
-        || l.contains("could not connect")
-        || l.contains("error sending request")
-        || l.contains("dns error")
-        || l.contains("timed out")
-        || l.contains("timeout")
-        || l.contains("network is unreachable")
-        || l.contains("os error 10060")
-        || l.contains("os error 10061")
-        || l.contains("os error 10051")
-        || l.contains("os error 10065")
-        || l.contains("リモート")
-        || l.contains("接続できません")
-}
-
-fn looks_non_loopback_http(raw: &str) -> bool {
-    raw.contains("100.")
-        || raw.contains("192.168.")
-        || raw.contains("10.")
-        || raw.contains("172.16.")
-        || raw.contains("172.17.")
-        || raw.contains("172.18.")
-        || raw.contains("172.19.")
-        || raw.contains("172.2")
-        || raw.contains("172.30.")
-        || raw.contains("172.31.")
-}
-
 fn map_reqwest_error(e: &reqwest::Error) -> String {
-    map_llm_error(&error_chain(e))
-}
-
-fn is_context_length_error(l: &str) -> bool {
-    l.contains("n_ctx")
-        || l.contains("context length")
-        || l.contains("context window")
-        || l.contains("too many tokens")
-        || l.contains("maximum context")
-        || (l.contains("max_tokens") && l.contains("exceed"))
-        || l.contains("prompt is too long")
-}
-
-fn auth_rejected_message() -> String {
-    "API キーが拒否されました。MTPLX を 0.0.0.0 で起動している場合は、同じキーを Argos の API キー欄に入れてください。"
-        .into()
-}
-
-fn model_not_found_message() -> String {
-    "指定したモデルが見つかりません。モデル名を確認してください。".into()
-}
-
-fn eq_ignore_ascii_at(raw: &str, needle: &str) -> bool {
-    raw.len() >= needle.len() && raw.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
-}
-
-/// Drop `api_key` / `Bearer` / `sk-` values. The status code and the words the
-/// tool and vision checks look for stay in place.
-fn redact_secrets(raw: &str) -> String {
-    redact_sk_tokens(&redact_bearer(&redact_labeled_secrets(raw)))
-}
-
-fn redact_labeled_secrets(raw: &str) -> String {
-    let labels = ["api_key", "api-key"];
-    let mut out = String::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        let rest = &raw[i..];
-        let mut ate = false;
-        for label in labels {
-            if eq_ignore_ascii_at(rest, label) {
-                if let Some(value_end) = labeled_secret_end(raw, i + label.len()) {
-                    out.push('…');
-                    i = value_end;
-                    ate = true;
-                    break;
-                }
-            }
-        }
-        if ate {
-            continue;
-        }
-        let ch = rest.chars().next().unwrap_or('\u{fffd}');
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-/// Byte index just past a labeled secret, when `after_label` is followed by `=` or `:`.
-fn labeled_secret_end(raw: &str, mut i: usize) -> Option<usize> {
-    let b = raw.as_bytes();
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'"' {
-        i += 1;
-    }
-    if i >= b.len() || (b[i] != b'=' && b[i] != b':') {
-        return None;
-    }
-    i += 1;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'"' {
-        i += 1;
-    }
-    if i >= b.len() {
-        return None;
-    }
-    while i < b.len() {
-        let c = b[i];
-        if c.is_ascii_whitespace() || c == b'"' || c == b',' || c == b'}' || c == b']' {
-            break;
-        }
-        i += 1;
-    }
-    Some(i)
-}
-
-fn redact_bearer(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        let rest = &raw[i..];
-        if eq_ignore_ascii_at(rest, "bearer") {
-            let b = raw.as_bytes();
-            let mut j = i + "bearer".len();
-            if j < b.len() && b[j] == b' ' {
-                j += 1;
-                let value_start = j;
-                while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b'"' && b[j] != b',' {
-                    j += 1;
-                }
-                if j > value_start {
-                    out.push('…');
-                    i = j;
-                    continue;
-                }
-            }
-        }
-        let ch = rest.chars().next().unwrap_or('\u{fffd}');
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-fn redact_sk_tokens(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let b = raw.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if i + 3 <= b.len() && b[i..i + 3].eq_ignore_ascii_case(b"sk-") {
-            let mut j = i + 3;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-' || b[j] == b'_') {
-                j += 1;
-            }
-            if j > i + 3 {
-                out.push('…');
-                i = j;
-                continue;
-            }
-        }
-        let ch = raw[i..].chars().next().unwrap_or('\u{fffd}');
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-fn excerpt_after_status(raw: &str) -> &str {
-    let s = raw.trim_start();
-    let b = s.as_bytes();
-    if b.len() >= 3 && b[..3].iter().all(|c| c.is_ascii_digit()) {
-        let rest = s[3..].trim_start();
-        if rest.is_empty() {
-            s
-        } else {
-            rest
-        }
-    } else {
-        s
-    }
-}
-
-fn short_excerpt(raw: &str, max_chars: usize) -> String {
-    let redacted = redact_secrets(excerpt_after_status(raw));
-    let trimmed = redacted.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let take = max_chars.saturating_sub(1);
-    let mut out: String = trimmed.chars().take(take).collect();
-    out.push('…');
-    out
-}
-
-/// 400/413/422/429 keep a short body excerpt. 401/403/404 and 5xx do not.
-fn client_error_with_excerpt(code: u16, raw: &str) -> String {
-    let excerpt = short_excerpt(raw, 180);
-    if excerpt.is_empty() {
-        format!("LLM サーバがエラーを返しました（HTTP {code}）。")
-    } else {
-        format!("LLM サーバがエラーを返しました（HTTP {code}）。{excerpt}")
-    }
-}
-
-fn map_llm_error(raw: &str) -> String {
-    let l = raw.to_lowercase();
-    // Classify the real status first. Numbers and phrases inside the body
-    // (`10061 tokens`, `HTTP 404`, `Unauthorized for url`) do not override it.
-    if let Some(code) = tools::http_status_code(raw) {
-        if code == 401 || code == 403 {
-            return auth_rejected_message();
-        }
-        if code == 404 {
-            return model_not_found_message();
-        }
-        if is_context_length_error(&l) {
-            return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。"
-                .into();
-        }
-        if matches!(code, 400 | 413 | 422 | 429) {
-            return client_error_with_excerpt(code, raw);
-        }
-        return format!("LLM サーバがエラーを返しました（HTTP {code}）。");
-    }
-    if is_context_length_error(&l) {
-        return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。"
-            .into();
-    }
-    if is_transport_error(&l) {
-        if looks_non_loopback_http(raw) {
-            return "LLM サーバのポートに届きません。Mac の MTPLX は既定で 127.0.0.1:8000 だけ待ち受けるため、Tailscale の 100.x からは繋がりません。Mac 側で LAN 公開するか、Tailscale Serve で 8000 を出してください（例: mtplx serve --host 0.0.0.0 --port 8000 --api-key 任意のキー）。Argos の API キー欄に同じキーを入れます。".into();
-        }
-        return "LLM サーバに接続できません。起動と URL を確認してください。".into();
-    }
-    if l.contains("unauthorized") || l.contains("invalid api key") {
-        return auth_rejected_message();
-    }
-    if l.contains("model") && (l.contains("not found") || l.contains("does not exist")) {
-        return model_not_found_message();
-    }
-    let trimmed = raw.trim();
-    if trimmed.chars().count() > 400 {
-        format!("{}…", trimmed.chars().take(400).collect::<String>())
-    } else if trimmed.is_empty() {
-        "LLM の呼び出しに失敗しました。".into()
-    } else {
-        trimmed.to_string()
-    }
+    http_error::transport_failure(&error_chain(e))
 }
 
 fn apply_auth(mut req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
@@ -502,17 +251,9 @@ async fn fetch_models_url(
     let status = resp.status();
     let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
     if !status.is_success() {
-        return Err(map_models_list_error(&format!("{status} {text}")));
+        return Err(http_error::models_failure(status.as_u16()));
     }
     parse_models_json(&text)
-}
-
-/// `GET /models` 404 is a missing list endpoint, not a missing chat model.
-fn map_models_list_error(raw: &str) -> String {
-    if tools::http_status_code(raw) == Some(404) {
-        return "モデル一覧を取得できませんでした（HTTP 404）。".into();
-    }
-    map_llm_error(raw)
 }
 
 fn parse_models_json(text: &str) -> Result<Vec<LlmModelInfo>, String> {
@@ -568,7 +309,7 @@ pub async fn test_connection(settings: &Settings) -> Result<(String, Vec<LlmMode
             Ok((message, models))
         }
         Err(e) => {
-            if is_transport_error(&e.to_lowercase()) || settings.llm_model.trim().is_empty() {
+            if http_error::is_connection_message(&e) || settings.llm_model.trim().is_empty() {
                 return Err(e);
             }
             ping_chat(settings).await?;
@@ -605,7 +346,7 @@ async fn ping_chat(settings: &Settings) -> Result<(), String> {
     let status = resp.status();
     let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
     if !status.is_success() {
-        return Err(map_llm_error(&format!("{status} {text}")));
+        return Err(http_error::chat_failure(status.as_u16(), &text));
     }
     Ok(())
 }
@@ -782,56 +523,6 @@ fn pull_embedded_tool_calls(text: &str) -> (String, Vec<ToolCallAcc>) {
     (stripped, calls)
 }
 
-pub fn is_tools_unsupported_error(e: &str) -> bool {
-    let l = e.to_lowercase();
-    let mentions_tools = l.contains("tool")
-        || l.contains("function_call")
-        || l.contains("function calling")
-        || l.contains("function call");
-    let looks_invalid = l.contains("400")
-        || l.contains("404")
-        || l.contains("invalid")
-        || l.contains("unknown")
-        || l.contains("not support")
-        || l.contains("unsupported")
-        || l.contains("unexpected")
-        || l.contains("does not support");
-    mentions_tools && looks_invalid
-}
-
-/// Tools-unsupported is decided on the raw `{status} {text}` before the body is
-/// replaced by a short Japanese message. The string returned still matches
-/// `is_tools_unsupported_error`, with secret values removed.
-fn chat_http_error(status: reqwest::StatusCode, text: &str) -> String {
-    let raw = format!("{status} {text}");
-    if is_tools_unsupported_error(&raw) {
-        return preserved_tools_error(&raw);
-    }
-    map_llm_error(&raw)
-}
-
-fn cap_chars_local(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let take = max_chars.saturating_sub(1);
-    let mut out: String = s.chars().take(take).collect();
-    out.push('…');
-    out
-}
-
-fn preserved_tools_error(raw: &str) -> String {
-    let redacted = redact_secrets(raw);
-    let trimmed = redacted.trim();
-    // Keep the leading status. Stripping it would hide the `400` the fallback matches.
-    let head = cap_chars_local(trimmed, 400);
-    if is_tools_unsupported_error(&head) || !is_tools_unsupported_error(trimmed) {
-        head
-    } else {
-        trimmed.to_string()
-    }
-}
-
 pub async fn stream_chat(
     settings: &Settings,
     turns: &[ChatTurn],
@@ -887,7 +578,7 @@ pub async fn stream_chat(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(chat_http_error(status, &text));
+        return Err(http_error::chat_failure(status.as_u16(), &text));
     }
 
     let content_type = resp
@@ -1033,7 +724,7 @@ fn ingest_payload(
     on_delta: &mut impl FnMut(&str, &str),
 ) -> Result<(), String> {
     let v: Value = serde_json::from_str(data)
-        .map_err(|_| map_llm_error(&format!("ストリームの解釈に失敗しました: {data}")))?;
+        .map_err(|_| "応答の解釈に失敗しました。".to_string())?;
     if let Some(id) = v.get("id").and_then(|value| value.as_str()) {
         if !id.is_empty() {
             parse.request_id = id.to_string();
@@ -1044,12 +735,8 @@ fn ingest_payload(
             parse.finish_reason = reason.to_string();
         }
     }
-    if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or_else(|| err.as_str().unwrap_or("error"));
-        return Err(map_llm_error(msg));
+    if v.get("error").is_some() {
+        return Err("LLM の呼び出しに失敗しました。".into());
     }
     if let Some(arr) = v
         .pointer("/choices/0/delta/tool_calls")
@@ -1307,16 +994,11 @@ pub async fn transcribe_image(
     let status = resp.status();
     let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
     if !status.is_success() {
-        return Err(map_vision_error(&format!("{status} {text}")));
+        return Err(http_error::ocr_failure(status.as_u16(), &text));
     }
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|_| map_llm_error(&format!("応答の解釈に失敗しました: {text}")))?;
-    if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or_else(|| err.as_str().unwrap_or("error"));
-        return Err(map_vision_error(msg));
+    let v: Value = serde_json::from_str(&text).map_err(|_| "応答の解釈に失敗しました。".to_string())?;
+    if v.get("error").is_some() {
+        return Err("モデルが書き起こしを返しませんでした。画像に対応したモデルか確認してください。".into());
     }
     let content = first_text(&[
         v.pointer("/choices/0/message/content"),
@@ -1334,19 +1016,6 @@ pub async fn transcribe_image(
         .take(crate::llm::context::PER_SOURCE_CAP)
         .collect();
     Ok(capped)
-}
-
-fn map_vision_error(msg: &str) -> String {
-    let l = msg.to_lowercase();
-    if l.contains("image")
-        || l.contains("vision")
-        || l.contains("multimodal")
-        || l.contains("does not support")
-        || l.contains("unsupported")
-    {
-        return "このモデルは画像を読めません。vision 対応のモデルを設定してください。".into();
-    }
-    map_llm_error(msg)
 }
 
 #[cfg(test)]
@@ -1381,92 +1050,104 @@ mod tests {
     }
 
     #[test]
-    fn maps_context_errors() {
-        let msg = map_llm_error("prompt is too long: n_ctx=4096");
-        assert!(msg.contains("コンテキスト長"));
-        let conn = map_llm_error("error sending request for url: connection refused");
-        assert!(conn.contains("接続できません"));
-        let lan =
-            map_llm_error("error sending request for url (http://100.65.231.111:8000/v1/models)");
-        assert!(lan.contains("127.0.0.1") || lan.contains("届きません"));
-    }
-
-    #[test]
-    fn auth_failure_follows_the_leading_status_not_a_401_substring() {
-        let tokens = map_llm_error(
-            r#"500 Internal Server Error {"message":"prompt is 14017 tokens"}"#,
+    fn transport_failures_stay_connection_messages() {
+        let conn = http_error::transport_failure("error sending request for url: connection refused");
+        assert!(conn.contains("接続できません"), "{conn}");
+        let lan = http_error::transport_failure(
+            "error sending request for url (http://100.65.231.111:8000/v1/models)",
         );
-        assert!(
-            !tokens.contains("API キーが拒否"),
-            "14017 is not an auth failure: {tokens}"
-        );
-        assert!(tokens.contains("HTTP 500"), "{tokens}");
-        assert!(
-            !tokens.contains("14017"),
-            "a server error must not echo the body: {tokens}"
-        );
-        let request = map_llm_error(
-            r#"500 Internal Server Error {"request_id":"req_a401f9"}"#,
-        );
-        assert!(
-            !request.contains("API キーが拒否"),
-            "req_a401f9 is not an auth failure: {request}"
-        );
-        assert!(request.contains("HTTP 500"), "{request}");
-        assert!(
-            !request.contains("req_a401f9"),
-            "a server error must not echo the body: {request}"
-        );
-        assert!(map_llm_error("401").contains("API キーが拒否"));
-        assert!(map_llm_error("403 Forbidden").contains("API キーが拒否"));
-        assert!(map_llm_error("invalid api key").contains("API キーが拒否"));
-        assert!(map_llm_error("401 Unauthorized").contains("API キーが拒否"));
-    }
-
-    #[test]
-    fn server_error_quoting_10061_tokens_is_not_a_connection_error() {
-        let msg = map_llm_error("500 Internal Server Error prompt is 10061 tokens");
-        assert!(msg.contains("HTTP 500"), "{msg}");
-        assert!(!msg.contains("接続できません"), "{msg}");
-        assert!(!msg.contains("10061"), "{msg}");
-    }
-
-    #[test]
-    fn auth_status_wins_when_the_body_quotes_a_socket_code() {
-        let msg = map_llm_error(r#"401 Unauthorized {"request_id":"req_10061"}"#);
-        assert!(msg.contains("API キーが拒否"), "{msg}");
-        assert!(!msg.contains("接続できません"), "{msg}");
-    }
-
-    #[test]
-    fn prompt_token_count_inside_a_server_error_is_not_auth() {
-        let msg = map_llm_error("500 Internal Server Error prompt_tokens 14049");
-        assert!(msg.contains("HTTP 500"), "{msg}");
-        assert!(!msg.contains("API キーが拒否"), "{msg}");
-        assert!(!msg.contains("14049"), "{msg}");
-    }
-
-    #[test]
-    fn quoted_404_inside_a_server_error_stays_a_server_error() {
-        let msg = map_llm_error("500 Internal Server Error HTTP 404 Not Found");
-        assert!(msg.contains("HTTP 500"), "{msg}");
-        assert!(!msg.contains("モデルが見つかりません"), "{msg}");
-        assert!(!msg.contains("404"), "{msg}");
-    }
-
-    #[test]
-    fn unauthorized_phrase_inside_a_server_error_stays_a_server_error() {
-        let msg = map_llm_error("500 Internal Server Error Unauthorized for url");
-        assert!(msg.contains("HTTP 500"), "{msg}");
-        assert!(!msg.contains("API キーが拒否"), "{msg}");
-    }
-
-    #[test]
-    fn socket_error_without_an_http_status_is_a_connection_error() {
-        let refused = map_llm_error("tcp connect error: os error 10061");
+        assert!(lan.contains("127.0.0.1") || lan.contains("届きません"), "{lan}");
+        let refused = http_error::transport_failure("tcp connect error: os error 10061");
         assert!(refused.contains("接続できません"), "{refused}");
-        let timed_out = map_llm_error("os error 10060");
+        let timed_out = http_error::transport_failure("os error 10060");
         assert!(timed_out.contains("接続できません"), "{timed_out}");
+        let unknown = http_error::transport_failure("invalid api key sk-live-secret");
+        assert!(!unknown.contains("sk-live-secret"), "{unknown}");
+        assert!(!unknown.contains("invalid api key"), "{unknown}");
+    }
+
+    #[test]
+    fn http_status_chooses_a_fixed_message_and_drops_the_body() {
+        let tokens = http_error::chat_failure(500, r#"{"message":"prompt is 14017 tokens"}"#);
+        assert!(tokens.contains("HTTP 500"), "{tokens}");
+        assert!(!tokens.contains("API キーが拒否"), "{tokens}");
+        assert!(!tokens.contains("14017"), "{tokens}");
+        let request = http_error::chat_failure(500, r#"{"request_id":"req_a401f9"}"#);
+        assert!(request.contains("HTTP 500"), "{request}");
+        assert!(!request.contains("req_a401f9"), "{request}");
+        assert!(!request.contains("API キーが拒否"), "{request}");
+        let auth = http_error::chat_failure(401, r#"{"request_id":"req_10061"}"#);
+        assert!(auth.contains("API キーが拒否"), "{auth}");
+        assert!(!auth.contains("req_10061"), "{auth}");
+        assert!(!auth.contains("接続できません"), "{auth}");
+        assert!(http_error::chat_failure(403, "Forbidden").contains("API キーが拒否"));
+        let tokens_10061 = http_error::chat_failure(500, "prompt is 10061 tokens");
+        assert!(tokens_10061.contains("HTTP 500"), "{tokens_10061}");
+        assert!(!tokens_10061.contains("10061"), "{tokens_10061}");
+        assert!(!tokens_10061.contains("接続できません"), "{tokens_10061}");
+        let count = http_error::chat_failure(500, "prompt_tokens 14049");
+        assert!(count.contains("HTTP 500"), "{count}");
+        assert!(!count.contains("14049"), "{count}");
+        let nested = http_error::chat_failure(500, "HTTP 404 Not Found");
+        assert!(nested.contains("HTTP 500"), "{nested}");
+        assert!(!nested.contains("404"), "{nested}");
+        assert!(!nested.contains("モデルが見つかりません"), "{nested}");
+        let phrase = http_error::chat_failure(500, "Unauthorized for url");
+        assert!(phrase.contains("HTTP 500"), "{phrase}");
+        assert!(!phrase.contains("API キーが拒否"), "{phrase}");
+        assert!(!phrase.contains("Unauthorized"), "{phrase}");
+        let missing = http_error::chat_failure(404, "model 'llama3.2-vision:7b' not found");
+        assert!(missing.contains("指定したモデルが見つかりません"), "{missing}");
+        assert!(!missing.contains("llama3"), "{missing}");
+        assert!(!is_tools_unsupported_error(&missing), "{missing}");
+        let tool_name = http_error::chat_failure(404, "llama3-groq-tool-use");
+        assert!(!is_tools_unsupported_error(&tool_name), "{tool_name}");
+        assert!(!tool_name.contains("llama3"), "{tool_name}");
+        let big = http_error::chat_failure(413, "secret-body");
+        assert!(big.contains("HTTP 413"), "{big}");
+        assert!(!big.contains("secret-body"), "{big}");
+        let limited = http_error::chat_failure(429, "secret-body");
+        assert!(limited.contains("HTTP 429"), "{limited}");
+        assert!(!limited.contains("secret-body"), "{limited}");
+        let other = http_error::chat_failure(422, "secret-body");
+        assert!(other.contains("HTTP 422"), "{other}");
+        assert!(!other.contains("secret-body"), "{other}");
+        let tools = http_error::chat_failure(400, "registry.ollama.ai/library/llama3:latest does not support tools");
+        assert_eq!(tools, http_error::TOOLS_UNSUPPORTED_ERROR);
+        let choice = http_error::chat_failure(400, r#""auto" tool choice requires --enable-auto-tool-choice"#);
+        assert!(is_tools_unsupported_error(&choice), "{choice}");
+        let choice_json = http_error::chat_failure(
+            400,
+            r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#,
+        );
+        assert!(is_tools_unsupported_error(&choice_json), "{choice_json}");
+        let parsing = http_error::chat_failure(500, "error parsing tool call secret-user-text");
+        assert!(parsing.contains("HTTP 500"), "{parsing}");
+        assert!(!is_tools_unsupported_error(&parsing), "{parsing}");
+        assert!(!parsing.contains("secret-user-text"), "{parsing}");
+        assert!(!parsing.contains("tool"), "{parsing}");
+        let vision = http_error::ocr_failure(400, "this model does not support image input");
+        assert!(vision.contains("画像を読めません"), "{vision}");
+        assert!(!vision.contains("image input"), "{vision}");
+        let vision_404 = http_error::ocr_failure(404, "llama3.2-vision:7b does not support image input");
+        assert!(vision_404.contains("指定したモデルが見つかりません"), "{vision_404}");
+        assert!(!vision_404.contains("画像を読めません"), "{vision_404}");
+        assert!(!vision_404.contains("llama3"), "{vision_404}");
+        let list = http_error::models_failure(404);
+        assert!(list.contains("HTTP 404"), "{list}");
+        assert!(!list.contains("見つかりません"), "{list}");
+        let image_on_chat = http_error::chat_failure(400, "this model does not support image input");
+        assert!(image_on_chat.contains("HTTP 400"), "{image_on_chat}");
+        assert!(!image_on_chat.contains("画像を読めません"), "{image_on_chat}");
+        let generic_words = http_error::chat_failure(400, "tool image vision unsupported");
+        assert!(!is_tools_unsupported_error(&generic_words), "{generic_words}");
+        assert!(generic_words.contains("HTTP 400"), "{generic_words}");
+        let tools_on_404 = http_error::chat_failure(404, "model does not support tools");
+        assert!(!is_tools_unsupported_error(&tools_on_404), "{tools_on_404}");
+        assert!(tools_on_404.contains("指定したモデルが見つかりません"), "{tools_on_404}");
+        let tools_on_500 = http_error::chat_failure(500, "does not support tools");
+        assert!(!is_tools_unsupported_error(&tools_on_500), "{tools_on_500}");
+        assert!(tools_on_500.contains("HTTP 500"), "{tools_on_500}");
     }
 
     #[test]
@@ -1539,45 +1220,6 @@ mod tests {
         assert!(out.tool_calls[0].arguments.contains("民法"));
     }
 
-    #[test]
-    fn tools_unsupported_detects_400() {
-        assert!(is_tools_unsupported_error(
-            "400 invalid tools: unknown field"
-        ));
-        assert!(!is_tools_unsupported_error("connection refused"));
-    }
-
-    #[test]
-    fn client_errors_keep_a_short_secret_free_excerpt() {
-        for (status, marker) in [
-            ("400 Bad Request", "marker-400"),
-            ("413 Payload Too Large", "marker-413"),
-            ("422 Unprocessable Entity", "marker-422"),
-            ("429 Too Many Requests", "marker-429"),
-        ] {
-            let msg = map_llm_error(&format!(
-                "{status} {{\"error\":\"{marker}\",\"api_key\":\"sk-live-secret\",\"authorization\":\"Bearer sk-live-secret\"}}"
-            ));
-            assert!(msg.contains("HTTP"), "{msg}");
-            assert!(msg.contains(marker), "{msg}");
-            assert!(!msg.contains("sk-live-secret"), "{msg}");
-            assert!(!msg.to_lowercase().contains("api_key"), "{msg}");
-            assert!(!msg.contains("Bearer"), "{msg}");
-        }
-        let server = map_llm_error("500 Internal Server Error marker-500 api_key=sk-live-secret");
-        assert!(server.contains("HTTP 500"), "{server}");
-        assert!(!server.contains("marker-500"), "{server}");
-        assert!(!server.contains("sk-live-secret"), "{server}");
-    }
-
-    #[test]
-    fn models_list_404_is_not_a_missing_chat_model() {
-        let msg = map_models_list_error(r#"404 Not Found {"error":"model not found"}"#);
-        assert!(msg.contains("HTTP 404"), "{msg}");
-        assert!(!msg.contains("見つかりません"), "{msg}");
-        assert!(!msg.to_lowercase().contains("model not found"), "{msg}");
-    }
-
     fn local_llm_settings(port: u16) -> Settings {
         let mut settings = Settings::default();
         settings.llm_base_url = format!("http://127.0.0.1:{port}/v1");
@@ -1640,7 +1282,12 @@ mod tests {
     }
 
     async fn stream_chat_err(port: u16, tools: bool) -> String {
-        let settings = local_llm_settings(port);
+        stream_chat_err_model(port, "test-model", tools).await
+    }
+
+    async fn stream_chat_err_model(port: u16, model: &str, tools: bool) -> String {
+        let mut settings = local_llm_settings(port);
+        settings.llm_model = model.into();
         let turns = [ChatTurn::text("user", "こんにちは")];
         let schema = json!([{ "type": "function", "function": { "name": "search_index" } }]);
         stream_chat(
@@ -1664,7 +1311,8 @@ mod tests {
             is_tools_unsupported_error(&ollama_err),
             "ollama tools error must still reach the tool-free fallback: {ollama_err}"
         );
-        assert!(ollama_err.contains("does not support tools"), "{ollama_err}");
+        assert!(!ollama_err.contains("does not support tools"), "{ollama_err}");
+        assert!(!ollama_err.contains("registry.ollama.ai"), "{ollama_err}");
 
         let vllm = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}}"#;
         let vllm_port = serve_http(400, "Bad Request", vllm, 2);
@@ -1673,7 +1321,8 @@ mod tests {
             is_tools_unsupported_error(&vllm_err),
             "vllm tool-choice error must still reach the tool-free fallback: {vllm_err}"
         );
-        assert!(vllm_err.to_lowercase().contains("tool"), "{vllm_err}");
+        assert!(!vllm_err.contains("enable-auto-tool-choice"), "{vllm_err}");
+        assert!(!vllm_err.contains("tool choice"), "{vllm_err}");
     }
 
     #[tokio::test]
@@ -1683,7 +1332,7 @@ mod tests {
         let port_400 = serve_http(400, "Bad Request", secret_body, 2);
         let err_400 = stream_chat_err(port_400, false).await;
         assert!(err_400.contains("HTTP 400"), "{err_400}");
-        assert!(err_400.contains("marker-safe-detail"), "{err_400}");
+        assert!(!err_400.contains("marker-safe-detail"), "{err_400}");
         assert!(!err_400.contains("sk-live-secret"), "{err_400}");
         assert!(!err_400.to_lowercase().contains("api_key"), "{err_400}");
         assert!(!err_400.contains("Bearer"), "{err_400}");
@@ -1701,7 +1350,7 @@ mod tests {
             let port = serve_http(code, reason, &body, 1);
             let err = stream_chat_err(port, false).await;
             assert!(err.contains(&format!("HTTP {code}")), "{err}");
-            assert!(err.contains(&format!("marker-{code}")), "{err}");
+            assert!(!err.contains(&format!("marker-{code}")), "{err}");
             assert!(!err.contains("sk-live-secret"), "{err}");
             assert!(!err.to_lowercase().contains("api_key"), "{err}");
         }
@@ -1709,17 +1358,32 @@ mod tests {
         let port_500 = serve_http(
             500,
             "Internal Server Error",
-            r#"{"error":"marker-secret-body","api_key":"sk-live-secret"}"#,
+            r#"{"error":"error parsing tool call","user":"秘密の依頼文をそのまま返して"}"#,
             1,
         );
-        let err_500 = stream_chat_err(port_500, false).await;
+        let err_500 = stream_chat_err(port_500, true).await;
         assert!(err_500.contains("HTTP 500"), "{err_500}");
-        assert!(!err_500.contains("marker-secret-body"), "{err_500}");
-        assert!(!err_500.contains("sk-live-secret"), "{err_500}");
+        assert!(!err_500.contains("秘密の依頼文"), "{err_500}");
+        assert!(!err_500.contains("error parsing tool call"), "{err_500}");
+        assert!(!err_500.contains("tool"), "{err_500}");
+        assert!(!is_tools_unsupported_error(&err_500), "{err_500}");
 
-        let port_404 = serve_http(404, "Not Found", r#"{"error":"model not found"}"#, 1);
-        let err_404 = stream_chat_err(port_404, false).await;
-        assert!(err_404.contains("指定したモデルが見つかりません"), "{err_404}");
+        let port_401 = serve_http(401, "Unauthorized", r#"{"request_id":"req_10061"}"#, 1);
+        let err_401 = stream_chat_err(port_401, false).await;
+        assert!(err_401.contains("API キーが拒否"), "{err_401}");
+        assert!(!err_401.contains("req_10061"), "{err_401}");
+        assert!(!err_401.contains("接続"), "{err_401}");
+
+        for model in ["llama3.2-vision:7b", "llama3-groq-tool-use"] {
+            let body = format!(r#"{{"error":"model '{model}' not found, try pulling it first"}}"#);
+            let port = serve_http(404, "Not Found", &body, 1);
+            let err = stream_chat_err_model(port, model, true).await;
+            assert!(err.contains("指定したモデルが見つかりません"), "{model}: {err}");
+            assert!(!is_tools_unsupported_error(&err), "{model}: {err}");
+            assert!(!err.contains("画像を読めません"), "{model}: {err}");
+            assert!(!err.contains(model), "{model}: {err}");
+            assert!(!err.to_lowercase().contains("not found"), "{model}: {err}");
+        }
     }
 
     #[tokio::test]
@@ -1734,10 +1398,27 @@ mod tests {
         )
         .await
         .expect_err("vision models reject image input with HTTP 400");
+        assert!(err.contains("このモデルは画像を読めません"), "{err}");
+        assert!(!err.contains("image input"), "{err}");
+
+        let missing = r#"{"error":"model 'llama3.2-vision:7b' not found"}"#;
+        let missing_port = serve_http(404, "Not Found", missing, 1);
+        let mut settings = local_llm_settings(missing_port);
+        settings.llm_model = "llama3.2-vision:7b".into();
+        let missing_err = transcribe_image(
+            &settings,
+            "image/png",
+            &[0x89, 0x50, 0x4e, 0x47],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("an unpulled vision model is HTTP 404");
         assert!(
-            err.contains("このモデルは画像を読めません"),
-            "{err}"
+            missing_err.contains("指定したモデルが見つかりません"),
+            "{missing_err}"
         );
+        assert!(!missing_err.contains("画像を読めません"), "{missing_err}");
+        assert!(!missing_err.contains("llama3.2-vision"), "{missing_err}");
     }
 
     #[tokio::test]

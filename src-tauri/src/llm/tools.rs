@@ -67,13 +67,16 @@ pub fn round_limit_failure(max_rounds: usize, error: &str) -> RoundLimitAnswer {
 
 fn round_limit_failure_reason(error: &str) -> String {
     let l = error.to_lowercase();
-    // The leading status is the response. A 500 whose body says "Unauthorized" or
-    // "10061" is still a server error; a socket code counts only with no status.
-    if let Some(code) = http_status_code(error) {
-        if code == 401 || code == 403 {
-            return "サーバが認証を拒否しました".into();
-        }
-        return format!("サーバがエラーを返しました（HTTP {code}）");
+    // `error` is already a fixed Japanese message. A status is named only when that
+    // message contains our own `（HTTP n）` clause. Raw server text is not parsed.
+    if let Some(clause) = crate::llm::http_error::owned_status_clause(error) {
+        return clause;
+    }
+    if error.contains("API キーが拒否") {
+        return "サーバが認証を拒否しました".into();
+    }
+    if error.contains("指定したモデルが見つかりません") {
+        return "指定したモデルが見つかりません".into();
     }
     if error.contains("字に達しても答えが出ない") {
         return "思考が長く続いたため止めました".into();
@@ -104,120 +107,9 @@ fn round_limit_failure_reason(error: &str) -> String {
     {
         return "サーバに接続できません".into();
     }
-    if l.contains("unauthorized") || l.contains("invalid api key") || l.contains("api キーが拒否")
-    {
-        return "サーバが認証を拒否しました".into();
-    }
     "応答を受け取れませんでした".into()
 }
 
-/// Status of this response. A leading `500 Reason` wins over a code quoted in the body.
-/// Labels and `HTTP nnn` are used only when the text has no leading status.
-/// A port in a URL (`:8080`, `:11434`, `:1234`, `:500`) is not a status code.
-pub(crate) fn http_status_code(error: &str) -> Option<u16> {
-    let lower = error.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    if let Some(code) = leading_status(bytes) {
-        return Some(code);
-    }
-    if let Some(code) = code_after_label(bytes, b"status_code") {
-        return Some(code);
-    }
-    if let Some(code) = code_after_label(bytes, b"status code") {
-        return Some(code);
-    }
-    if let Some(code) = code_after_label(bytes, b"status") {
-        return Some(code);
-    }
-    code_after_http(bytes)
-}
-
-fn code_after_label(bytes: &[u8], label: &[u8]) -> Option<u16> {
-    let mut i = 0;
-    while i + label.len() <= bytes.len() {
-        if bytes[i..].starts_with(label) && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
-            let after = i + label.len();
-            if after < bytes.len() && bytes[after].is_ascii_alphanumeric() {
-                i += 1;
-                continue;
-            }
-            if let Some(code) = code_after_separator(bytes, after) {
-                return Some(code);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn code_after_http(bytes: &[u8]) -> Option<u16> {
-    let mut i = 0;
-    while i + 4 <= bytes.len() {
-        if bytes[i..].starts_with(b"http") && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
-            let mut j = i + 4;
-            if j < bytes.len() && bytes[j] == b's' {
-                i += 1;
-                continue;
-            }
-            if j < bytes.len() && bytes[j] == b'/' {
-                j += 1;
-                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
-                    j += 1;
-                }
-            }
-            if j < bytes.len() && bytes[j] == b':' {
-                i += 1;
-                continue;
-            }
-            if let Some(code) = code_after_separator(bytes, j) {
-                return Some(code);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn code_after_separator(bytes: &[u8], mut i: usize) -> Option<u16> {
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b':' || bytes[i] == b'=')
-    {
-        i += 1;
-    }
-    status_at(bytes, i)
-}
-
-fn leading_status(bytes: &[u8]) -> Option<u16> {
-    let mut i = 0;
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-        i += 1;
-    }
-    let code = status_at(bytes, i)?;
-    let after = i + 3;
-    if after < bytes.len() && bytes[after] != b' ' && bytes[after] != b'\t' {
-        return None;
-    }
-    Some(code)
-}
-
-fn status_at(bytes: &[u8], i: usize) -> Option<u16> {
-    if i > 0 && bytes[i - 1].is_ascii_digit() {
-        return None;
-    }
-    if i + 2 >= bytes.len() {
-        return None;
-    }
-    if !bytes[i].is_ascii_digit() || !bytes[i + 1].is_ascii_digit() || !bytes[i + 2].is_ascii_digit()
-    {
-        return None;
-    }
-    if i + 3 < bytes.len() && bytes[i + 3].is_ascii_digit() {
-        return None;
-    }
-    let code = (bytes[i] - b'0') as u16 * 100
-        + (bytes[i + 1] - b'0') as u16 * 10
-        + (bytes[i + 2] - b'0') as u16;
-    (400..=599).contains(&code).then_some(code)
-}
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
 /// Body length per search hit. Deliberately small: a search round returns up to `k`
@@ -2754,12 +2646,20 @@ mod tests {
     }
 
     #[test]
-    fn http_status_ignores_url_ports_and_reads_a_real_status() {
+    fn round_limit_names_only_a_status_already_in_our_message() {
         let secret = "sk-live-secret";
-        let http = round_limit_failure(8, &format!("500 internal api_key={secret}"));
-        assert!(http.text.contains("HTTP 500"));
-        assert!(!http.text.contains(secret));
-        assert!(!http.text.contains("api_key"));
+        let raw = round_limit_failure(8, &format!("500 internal api_key={secret}"));
+        assert!(raw.text.contains("応答を受け取れませんでした"), "{}", raw.text);
+        assert!(!raw.text.contains("HTTP"), "{}", raw.text);
+        assert!(!raw.text.contains(secret), "{}", raw.text);
+        assert!(!raw.text.contains("api_key"), "{}", raw.text);
+        let mapped = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, &format!("internal api_key={secret}")),
+        );
+        assert!(mapped.text.contains("HTTP 500"), "{}", mapped.text);
+        assert!(!mapped.text.contains(secret), "{}", mapped.text);
+        assert!(!mapped.text.contains("api_key"), "{}", mapped.text);
         for port in ["8080", "11434", "1234", "500", "404"] {
             let refused =
                 round_limit_failure(8, &format!("connection refused to http://127.0.0.1:{port}"));
@@ -2772,53 +2672,69 @@ mod tests {
             let bare = round_limit_failure(8, &format!("http://127.0.0.1:{port}/v1/chat"));
             assert!(!bare.text.contains("HTTP"), "{port}: {}", bare.text);
             assert!(!bare.text.contains("認証"), "{port}: {}", bare.text);
-            assert_eq!(
-                http_status_code(&format!("http://127.0.0.1:{port}/v1/chat")),
-                None,
-                "{port}"
-            );
         }
         let auth_status = round_limit_failure(8, "401 Unauthorized");
-        assert!(auth_status.text.contains("サーバが認証を拒否しました"));
-        assert!(!auth_status.text.contains("HTTP"));
+        assert!(auth_status.text.contains("応答を受け取れませんでした"), "{}", auth_status.text);
+        assert!(!auth_status.text.contains("認証"), "{}", auth_status.text);
         let http_line = round_limit_failure(8, "HTTP/1.1 404 Not Found");
-        assert!(http_line.text.contains("HTTP 404"));
+        assert!(http_line.text.contains("応答を受け取れませんでした"), "{}", http_line.text);
+        assert!(!http_line.text.contains("HTTP"), "{}", http_line.text);
         let status_field = round_limit_failure(8, "status_code=503");
-        assert!(status_field.text.contains("HTTP 503"));
-        assert_eq!(http_status_code("status_code=503"), Some(503));
+        assert!(status_field.text.contains("応答を受け取れませんでした"), "{}", status_field.text);
+        assert!(!status_field.text.contains("HTTP"), "{}", status_field.text);
+        assert!(!status_field.text.contains("503"), "{}", status_field.text);
     }
 
     #[test]
-    fn leading_http_status_wins_over_a_code_quoted_in_the_body() {
-        let wrapped = r#"500 Internal Server Error {"message":"request failed: HTTP 404 Not Found"}"#;
-        assert_eq!(http_status_code(wrapped), Some(500));
-        let wrapped_reason = round_limit_failure(8, wrapped);
-        assert!(wrapped_reason.text.contains("HTTP 500"));
-        assert!(!wrapped_reason.text.contains("404"));
-        let gateway = r#"502 Bad Gateway {"error":"upstream HTTP 500"}"#;
-        assert_eq!(http_status_code(gateway), Some(502));
-        let gateway_reason = round_limit_failure(8, gateway);
-        assert!(gateway_reason.text.contains("HTTP 502"));
-        assert!(!gateway_reason.text.contains("HTTP 500"));
-        assert_eq!(http_status_code("HTTP/1.1 404 Not Found"), Some(404));
+    fn mapped_http_status_is_the_only_status_round_limit_names() {
+        let wrapped = crate::llm::http_error::chat_failure(
+            500,
+            r#"{"message":"request failed: HTTP 404 Not Found"}"#,
+        );
+        let wrapped_reason = round_limit_failure(8, &wrapped);
+        assert!(wrapped_reason.text.contains("HTTP 500"), "{}", wrapped_reason.text);
+        assert!(!wrapped_reason.text.contains("404"), "{}", wrapped_reason.text);
+        let gateway = crate::llm::http_error::chat_failure(502, r#"{"error":"upstream HTTP 500"}"#);
+        let gateway_reason = round_limit_failure(8, &gateway);
+        assert!(gateway_reason.text.contains("HTTP 502"), "{}", gateway_reason.text);
+        assert!(!gateway_reason.text.contains("500"), "{}", gateway_reason.text);
+        let missing = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(404, "HTTP/1.1 404 Not Found"),
+        );
+        assert!(
+            missing.text.contains("指定したモデルが見つかりません"),
+            "{}",
+            missing.text
+        );
+        assert!(!missing.text.contains("HTTP"), "{}", missing.text);
+        assert!(!missing.text.contains("Not Found"), "{}", missing.text);
     }
 
     #[test]
     fn round_limit_treats_403_the_same_as_401() {
-        for status in ["401 Unauthorized", "403 Forbidden"] {
-            let msg = round_limit_failure(8, status);
+        for code in [401_u16, 403] {
+            let msg = round_limit_failure(
+                8,
+                &crate::llm::http_error::chat_failure(code, "Forbidden req_10061"),
+            );
             assert!(
                 msg.text.contains("サーバが認証を拒否しました"),
-                "{status}: {}",
+                "{code}: {}",
                 msg.text
             );
-            assert!(!msg.text.contains("HTTP"), "{status}: {}", msg.text);
+            assert!(!msg.text.contains("HTTP"), "{code}: {}", msg.text);
+            assert!(!msg.text.contains("req_10061"), "{code}: {}", msg.text);
+            assert!(!msg.text.contains("Forbidden"), "{code}: {}", msg.text);
         }
     }
 
     #[test]
     fn round_limit_server_error_quoting_10061_tokens_is_not_a_connection_error() {
-        let msg = round_limit_failure(8, "500 Internal Server Error prompt is 10061 tokens");
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "prompt is 10061 tokens"),
+        );
         assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
         assert!(!msg.text.contains("接続"), "{}", msg.text);
         assert!(!msg.text.contains("10061"), "{}", msg.text);
@@ -2826,14 +2742,21 @@ mod tests {
 
     #[test]
     fn round_limit_auth_status_wins_when_the_body_quotes_a_socket_code() {
-        let msg = round_limit_failure(8, r#"401 Unauthorized {"request_id":"req_10061"}"#);
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(401, r#"{"request_id":"req_10061"}"#),
+        );
         assert!(msg.text.contains("サーバが認証を拒否しました"), "{}", msg.text);
         assert!(!msg.text.contains("接続"), "{}", msg.text);
+        assert!(!msg.text.contains("req_10061"), "{}", msg.text);
     }
 
     #[test]
     fn round_limit_prompt_token_count_inside_a_server_error_is_not_auth() {
-        let msg = round_limit_failure(8, "500 Internal Server Error prompt_tokens 14049");
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "prompt_tokens 14049"),
+        );
         assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
         assert!(!msg.text.contains("認証"), "{}", msg.text);
         assert!(!msg.text.contains("14049"), "{}", msg.text);
@@ -2841,16 +2764,27 @@ mod tests {
 
     #[test]
     fn round_limit_quoted_404_inside_a_server_error_stays_a_server_error() {
-        let msg = round_limit_failure(8, "500 Internal Server Error HTTP 404 Not Found");
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "HTTP 404 Not Found"),
+        );
         assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
         assert!(!msg.text.contains("404"), "{}", msg.text);
     }
 
     #[test]
     fn round_limit_unauthorized_phrase_inside_a_server_error_stays_a_server_error() {
-        let msg = round_limit_failure(8, "500 Internal Server Error Unauthorized for url");
+        let raw = round_limit_failure(8, "500 Internal Server Error Unauthorized for url");
+        assert!(raw.text.contains("応答を受け取れませんでした"), "{}", raw.text);
+        assert!(!raw.text.contains("認証"), "{}", raw.text);
+        assert!(!raw.text.contains("Unauthorized"), "{}", raw.text);
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "Unauthorized for url"),
+        );
         assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
         assert!(!msg.text.contains("認証"), "{}", msg.text);
+        assert!(!msg.text.contains("Unauthorized"), "{}", msg.text);
     }
 
     #[test]
