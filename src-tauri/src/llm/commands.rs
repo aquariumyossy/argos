@@ -673,6 +673,7 @@ pub async fn llm_send(
     let mut final_reasoning = String::new();
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
+    let mut empty_reply = false;
     let result_text;
 
     loop {
@@ -1006,12 +1007,15 @@ pub async fn llm_send(
                     if answer_has_phantom_cites(&out.content, &all) {
                         phantom_retried = true;
                         current_turns.push(ChatTurn::text("user", PHANTOM_CITE_HINT));
-                        use_tools = true;
+                        // At the cap, turning tools back on makes the next pass the
+                        // round-limit final answer (notice and stream reset).
+                        use_tools = phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds);
                         continue;
                     }
                 }
                 final_reasoning = out.reasoning;
                 result_text = if out.content.trim().is_empty() {
+                    empty_reply = true;
                     silent_end_notice(&out.finish_reason)
                 } else {
                     out.content
@@ -1024,7 +1028,7 @@ pub async fn llm_send(
     busy.finish();
     kick_pending_ocr(&app, state_arc.clone());
 
-    let result_kind = if round_limit_final && round_limit_aside.is_none() {
+    let result_kind = if (round_limit_final && round_limit_aside.is_none()) || empty_reply {
         crate::db::LLM_MESSAGE_NOTICE
     } else {
         ""
@@ -2090,6 +2094,12 @@ pub fn llm_attached_file_path(
     Err("ファイルが見つかりません。".into())
 }
 
+/// A phantom [n] may call tools again only while rounds remain.
+/// At the cap the retry stays tool-free, so it is not the round-limit final answer.
+fn phantom_retry_enables_tools(unlimited_rounds: bool, rounds: usize, max_rounds: usize) -> bool {
+    unlimited_rounds || rounds < max_rounds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2163,5 +2173,19 @@ mod tests {
             &[("hit".into(), 2)],
             false,
         ));
+    }
+
+    #[test]
+    fn phantom_retry_at_the_round_cap_stays_tool_free() {
+        assert!(phantom_retry_enables_tools(false, 7, 8));
+        assert!(
+            !phantom_retry_enables_tools(false, 8, 8),
+            "the cap is already used, so the retry must not turn tools back on"
+        );
+        assert!(!phantom_retry_enables_tools(false, 9, 8));
+        assert!(
+            phantom_retry_enables_tools(true, 8, 0),
+            "unlimited rounds keep tools on"
+        );
     }
 }

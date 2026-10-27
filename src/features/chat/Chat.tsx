@@ -1651,12 +1651,15 @@ export default function Chat() {
               const citeGroups = groupSources(cites, 1);
               const citeInfo = openableCitesFromGroups(citeGroups);
               const calls = toolCallNames(m.toolCalls);
+              const isNotice = m.kind === "notice";
               const roleClass =
                 m.role === "user"
                   ? "chat-msg user"
                   : m.role === "tool"
                     ? "chat-msg tool"
-                    : "chat-msg assistant";
+                    : isNotice
+                      ? "chat-msg assistant notice"
+                      : "chat-msg assistant";
               return (
                 <article key={m.id} className={roleClass}>
                   {m.role === "assistant" && (m.reasoning ?? "").trim() ? (
@@ -1718,7 +1721,7 @@ export default function Chat() {
                       })}
                     </div>
                   ) : null}
-                  {m.role === "assistant" && m.content.trim() ? (
+                  {m.role === "assistant" && !isNotice && m.content.trim() ? (
                     <div className="chat-msg-actions">
                       <NoteDestPicker
                         buttonClassName="chat-tpl"

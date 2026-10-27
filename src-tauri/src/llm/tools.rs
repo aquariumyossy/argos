@@ -94,39 +94,124 @@ fn round_limit_failure_reason(error: &str) -> String {
     {
         return "サーバに接続できません".into();
     }
-    if l.contains("401")
-        || l.contains("unauthorized")
-        || l.contains("invalid api key")
-        || l.contains("api キーが拒否")
+    if l.contains("unauthorized") || l.contains("invalid api key") || l.contains("api キーが拒否")
     {
         return "サーバが認証を拒否しました".into();
     }
     if let Some(code) = http_status_code(error) {
+        if code == 401 {
+            return "サーバが認証を拒否しました".into();
+        }
         return format!("サーバがエラーを返しました（HTTP {code}）");
     }
     "応答を受け取れませんでした".into()
 }
 
+/// Status from an HTTP status line, a status field, or a leading `500 Reason` phrase.
+/// A port in a URL (`:8080`, `:11434`, `:1234`, `:500`) is not a status code.
 fn http_status_code(error: &str) -> Option<u16> {
-    let bytes = error.as_bytes();
+    let lower = error.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    if let Some(code) = code_after_label(bytes, b"status_code") {
+        return Some(code);
+    }
+    if let Some(code) = code_after_label(bytes, b"status code") {
+        return Some(code);
+    }
+    if let Some(code) = code_after_label(bytes, b"status") {
+        return Some(code);
+    }
+    if let Some(code) = code_after_http(bytes) {
+        return Some(code);
+    }
+    leading_status(bytes)
+}
+
+fn code_after_label(bytes: &[u8], label: &[u8]) -> Option<u16> {
     let mut i = 0;
-    while i + 2 < bytes.len() {
-        let digit = bytes[i].is_ascii_digit()
-            && bytes[i + 1].is_ascii_digit()
-            && bytes[i + 2].is_ascii_digit();
-        let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
-        let after_ok = i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit();
-        if digit && before_ok && after_ok {
-            let code = (bytes[i] - b'0') as u16 * 100
-                + (bytes[i + 1] - b'0') as u16 * 10
-                + (bytes[i + 2] - b'0') as u16;
-            if (400..=599).contains(&code) {
+    while i + label.len() <= bytes.len() {
+        if bytes[i..].starts_with(label) && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+            let after = i + label.len();
+            if after < bytes.len() && bytes[after].is_ascii_alphanumeric() {
+                i += 1;
+                continue;
+            }
+            if let Some(code) = code_after_separator(bytes, after) {
                 return Some(code);
             }
         }
         i += 1;
     }
     None
+}
+
+fn code_after_http(bytes: &[u8]) -> Option<u16> {
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i..].starts_with(b"http") && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+            let mut j = i + 4;
+            if j < bytes.len() && bytes[j] == b's' {
+                i += 1;
+                continue;
+            }
+            if j < bytes.len() && bytes[j] == b'/' {
+                j += 1;
+                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b':' {
+                i += 1;
+                continue;
+            }
+            if let Some(code) = code_after_separator(bytes, j) {
+                return Some(code);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn code_after_separator(bytes: &[u8], mut i: usize) -> Option<u16> {
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b':' || bytes[i] == b'=')
+    {
+        i += 1;
+    }
+    status_at(bytes, i)
+}
+
+fn leading_status(bytes: &[u8]) -> Option<u16> {
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let code = status_at(bytes, i)?;
+    let after = i + 3;
+    if after < bytes.len() && bytes[after] != b' ' && bytes[after] != b'\t' {
+        return None;
+    }
+    Some(code)
+}
+
+fn status_at(bytes: &[u8], i: usize) -> Option<u16> {
+    if i > 0 && bytes[i - 1].is_ascii_digit() {
+        return None;
+    }
+    if i + 2 >= bytes.len() {
+        return None;
+    }
+    if !bytes[i].is_ascii_digit() || !bytes[i + 1].is_ascii_digit() || !bytes[i + 2].is_ascii_digit()
+    {
+        return None;
+    }
+    if i + 3 < bytes.len() && bytes[i + 3].is_ascii_digit() {
+        return None;
+    }
+    let code = (bytes[i] - b'0') as u16 * 100
+        + (bytes[i + 1] - b'0') as u16 * 10
+        + (bytes[i + 2] - b'0') as u16;
+    (400..=599).contains(&code).then_some(code)
 }
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
@@ -2700,6 +2785,25 @@ mod tests {
         assert!(unknown.text.contains("応答を受け取れませんでした"));
         assert!(!unknown.text.contains(secret));
         assert!(!unknown.text.contains("api_key"));
+        for port in ["8080", "11434", "1234", "500", "404"] {
+            let refused = round_limit_failure(8, &format!("connection refused to http://127.0.0.1:{port}"));
+            assert!(
+                refused.text.contains("サーバに接続できません"),
+                "{port}: {}",
+                refused.text
+            );
+            assert!(!refused.text.contains("HTTP"), "{port}: {}", refused.text);
+            let bare = round_limit_failure(8, &format!("http://127.0.0.1:{port}/v1/chat"));
+            assert!(!bare.text.contains("HTTP"), "{port}: {}", bare.text);
+            assert!(!bare.text.contains("認証"), "{port}: {}", bare.text);
+        }
+        let auth_status = round_limit_failure(8, "401 Unauthorized");
+        assert!(auth_status.text.contains("サーバが認証を拒否しました"));
+        assert!(!auth_status.text.contains("HTTP"));
+        let http_line = round_limit_failure(8, "HTTP/1.1 404 Not Found");
+        assert!(http_line.text.contains("HTTP 404"));
+        let status_field = round_limit_failure(8, "status_code=503");
+        assert!(status_field.text.contains("HTTP 503"));
         assert!(on.contains(TOOL_WRITE_NOTE));
         assert!(off.contains("ノートの id・題名・更新日時"));
     }
