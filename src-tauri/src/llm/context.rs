@@ -214,6 +214,10 @@ pub const STOP_TOOLS_HINT: &str =
     "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。";
 pub const PHANTOM_CITE_HINT: &str =
     "存在しない出典番号があります。実際にツールで裏を取るか、出典がないと明示して書き直してください。";
+/// Same retry when tools are already off. Asking for a tool call here makes some models
+/// emit `<tool_call>` text, which is stripped and leaves an empty reply.
+pub const PHANTOM_CITE_HINT_NO_TOOLS: &str =
+    "存在しない出典番号があります。ツールは使えません。出典がないと明示して書き直してください。";
 
 /// True when the answer cites `[n]` that is not among this thread's sources.
 pub fn answer_has_phantom_cites(answer: &str, sources: &[LlmSourceRow]) -> bool {

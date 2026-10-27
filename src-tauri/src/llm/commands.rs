@@ -8,8 +8,9 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, estimate_tokens,
-    final_source_turn, fit_tool_text, silent_end_notice, sources_for_consumed, ChatTurn,
-    PHANTOM_CITE_HINT, REASONING_CARRY_CAP, STOP_TOOLS_HINT, TOOL_RESULT_BUDGET_RATIO,
+    final_source_turn, fit_tool_text, parse_cited_nos, silent_end_notice, sources_for_consumed,
+    ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
+    TOOL_RESULT_BUDGET_RATIO,
 };
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
@@ -636,11 +637,17 @@ pub async fn llm_send(
         .map(|c| (c.id.clone(), c.cite_no))
         .collect();
     persist_image_group_cites(&state.db, &sources, &consumed);
-    let mut next_cite = state
-        .db
-        .max_llm_cite_no(&thread.id)
-        .unwrap_or(0)
-        .max(consumed.iter().map(|(_, n)| *n).max().unwrap_or(0));
+    let mut next_cite = cite_number_high_water(
+        state
+            .db
+            .max_llm_cite_no(&thread.id)
+            .unwrap_or(0)
+            .max(consumed.iter().map(|(_, n)| *n).max().unwrap_or(0)),
+        history
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.content.as_str()),
+    );
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let state_arc = state.inner().clone();
@@ -674,6 +681,8 @@ pub async fn llm_send(
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
     let mut empty_reply = false;
+    // First answer kept when a tool-free phantom retry comes back empty.
+    let mut phantom_fallback: Option<(String, String)> = None;
     let result_text;
 
     loop {
@@ -1006,20 +1015,47 @@ pub async fn llm_send(
                     let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
                     if answer_has_phantom_cites(&out.content, &all) {
                         phantom_retried = true;
-                        current_turns.push(ChatTurn::text("user", PHANTOM_CITE_HINT));
                         // At the cap, turning tools back on makes the next pass the
                         // round-limit final answer (notice and stream reset).
-                        use_tools = phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds);
+                        let tools_on =
+                            phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds);
+                        current_turns.push(ChatTurn::text("user", phantom_cite_hint(tools_on)));
+                        use_tools = tools_on;
+                        phantom_fallback = Some((out.content, out.reasoning));
+                        // Drop the rejected answer from the live stream before the retry.
+                        let _ = app.emit(
+                            "llm-chat-delta",
+                            LlmChatDelta {
+                                request_id: request_id.clone(),
+                                thread_id: thread.id.clone(),
+                                text: String::new(),
+                                kind: "reset".into(),
+                            },
+                        );
                         continue;
                     }
                 }
-                final_reasoning = out.reasoning;
-                result_text = if out.content.trim().is_empty() {
-                    empty_reply = true;
-                    silent_end_notice(&out.finish_reason)
-                } else {
-                    out.content
-                };
+                match answer_after_phantom_retry(
+                    out.content.trim().is_empty(),
+                    phantom_fallback.is_some(),
+                ) {
+                    PhantomRetryAnswer::Original => {
+                        let (original, reasoning) = phantom_fallback
+                            .take()
+                            .expect("empty phantom retry keeps the first answer");
+                        final_reasoning = reasoning;
+                        result_text = original;
+                    }
+                    PhantomRetryAnswer::EmptyNotice => {
+                        empty_reply = true;
+                        final_reasoning = out.reasoning;
+                        result_text = silent_end_notice(&out.finish_reason);
+                    }
+                    PhantomRetryAnswer::Retry => {
+                        final_reasoning = out.reasoning;
+                        result_text = out.content;
+                    }
+                }
                 break;
             }
         }
@@ -2100,6 +2136,49 @@ fn phantom_retry_enables_tools(unlimited_rounds: bool, rounds: usize, max_rounds
     unlimited_rounds || rounds < max_rounds
 }
 
+fn phantom_cite_hint(tools_on: bool) -> &'static str {
+    if tools_on {
+        PHANTOM_CITE_HINT
+    } else {
+        PHANTOM_CITE_HINT_NO_TOOLS
+    }
+}
+
+enum PhantomRetryAnswer {
+    Retry,
+    Original,
+    EmptyNotice,
+}
+
+/// An empty phantom-cite retry keeps the first answer. An empty first reply is the notice.
+fn answer_after_phantom_retry(retry_empty: bool, had_original: bool) -> PhantomRetryAnswer {
+    if !retry_empty {
+        PhantomRetryAnswer::Retry
+    } else if had_original {
+        PhantomRetryAnswer::Original
+    } else {
+        PhantomRetryAnswer::EmptyNotice
+    }
+}
+
+/// Highest `[n]` that still names a source, including numbers only left in tool text.
+/// Uncited tool rows are deleted, so `MAX(cite_no)` would reuse those numbers while the
+/// saved tool result still says `[n]`. The next assignment is this value plus one.
+fn cite_number_high_water<'a>(
+    max_remaining: i64,
+    tool_texts: impl IntoIterator<Item = &'a str>,
+) -> i64 {
+    let mut high = max_remaining.max(0);
+    for text in tool_texts {
+        for n in parse_cited_nos(text) {
+            if n > high {
+                high = n;
+            }
+        }
+    }
+    high
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2187,5 +2266,123 @@ mod tests {
             phantom_retry_enables_tools(true, 8, 0),
             "unlimited rounds keep tools on"
         );
+    }
+
+    #[test]
+    fn phantom_retry_at_the_cap_does_not_ask_for_tools_and_keeps_an_empty_retry() {
+        let hint = phantom_cite_hint(false);
+        assert_ne!(hint, PHANTOM_CITE_HINT);
+        assert!(
+            !hint.contains("ツールで"),
+            "a tool-free retry must not tell the model to call a tool: {hint}"
+        );
+        assert!(phantom_cite_hint(true).contains("ツールで"));
+        assert!(matches!(
+            answer_after_phantom_retry(true, true),
+            PhantomRetryAnswer::Original
+        ));
+        assert!(matches!(
+            answer_after_phantom_retry(false, true),
+            PhantomRetryAnswer::Retry
+        ));
+        assert!(matches!(
+            answer_after_phantom_retry(true, false),
+            PhantomRetryAnswer::EmptyNotice
+        ));
+    }
+
+    #[test]
+    fn citation_numbers_are_not_reused_after_uncited_tool_sources_are_deleted() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-cite-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let user = db
+            .insert_llm_message(&thread.id, "user", "Aを調べて")
+            .unwrap();
+        let assistant = db
+            .insert_llm_message(&thread.id, "assistant", "Aです [1]")
+            .unwrap();
+        let titles = ["A", "B", "C", "D"];
+        let mut rows = Vec::new();
+        for (index, title) in titles.iter().enumerate() {
+            let n = (index + 1) as i64;
+            let (mut row, created) = db
+                .insert_llm_source(
+                    &thread.id,
+                    "tool",
+                    &format!("path-{title}"),
+                    title,
+                    &format!("p{n}"),
+                    title,
+                    "query",
+                )
+                .unwrap();
+            assert!(created);
+            db.set_llm_source_cite_no(&row.id, n).unwrap();
+            row.cite_no = n;
+            rows.push(row);
+        }
+        let tool_text = crate::llm::context::format_sources(&rows);
+        assert!(tool_text.contains("[1]"));
+        assert!(tool_text.contains("[2]"));
+        assert!(tool_text.contains("[3]"));
+        assert!(tool_text.contains("[4]"));
+        db.insert_llm_message_full(
+            &thread.id,
+            "tool",
+            &tool_text,
+            "",
+            "",
+            "call-1",
+            "search_index",
+            "",
+        )
+        .unwrap();
+        db.consume_llm_sources(&[(rows[0].id.clone(), 1)], &user.id, &assistant.id)
+            .unwrap();
+        let deleted = db.delete_uncited_tool_sources(&thread.id).unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(db.max_llm_cite_no(&thread.id).unwrap(), 1);
+        let history = db.list_llm_messages(&thread.id).unwrap();
+        let replayed = history
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("tool result is replayed");
+        assert!(
+            replayed.content.contains("[2]"),
+            "deleted B stays in the tool text"
+        );
+        let high = cite_number_high_water(
+            db.max_llm_cite_no(&thread.id).unwrap_or(0),
+            history
+                .iter()
+                .filter(|message| message.role == "tool")
+                .map(|message| message.content.as_str()),
+        );
+        assert_eq!(high, 4, "turn 2 must not start again at the deleted [2]");
+        let assigned_to_e = high + 1;
+        assert_eq!(assigned_to_e, 5);
+        let (e, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-E", "E", "p5", "E", "query")
+            .unwrap();
+        db.set_llm_source_cite_no(&e.id, assigned_to_e).unwrap();
+        let mut nos: Vec<i64> = db
+            .list_llm_sources(&thread.id)
+            .unwrap()
+            .iter()
+            .map(|source| source.cite_no)
+            .collect();
+        nos.sort();
+        assert_eq!(nos, vec![1, 5]);
+        assert!(replayed.content.contains("[2]"));
+        assert_ne!(assigned_to_e, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -161,7 +161,12 @@ fn map_llm_error(raw: &str) -> String {
         }
         return "LLM サーバに接続できません。起動と URL を確認してください。".into();
     }
-    if l.contains("unauthorized") || l.contains("401") || l.contains("invalid api key") {
+    // Auth is the response status (401/403) or an explicit phrase. A digit string
+    // such as "14017 tokens" or "req_a401f9" inside a 500 is not a rejected key.
+    if l.contains("unauthorized")
+        || l.contains("invalid api key")
+        || matches!(tools::http_status_code(raw), Some(401 | 403))
+    {
         return "API キーが拒否されました。MTPLX を 0.0.0.0 で起動している場合は、同じキーを Argos の API キー欄に入れてください。".into();
     }
     if l.contains("model")
@@ -1167,6 +1172,30 @@ mod tests {
         let lan =
             map_llm_error("error sending request for url (http://100.65.231.111:8000/v1/models)");
         assert!(lan.contains("127.0.0.1") || lan.contains("届きません"));
+    }
+
+    #[test]
+    fn auth_failure_follows_the_leading_status_not_a_401_substring() {
+        let tokens = map_llm_error(
+            r#"500 Internal Server Error {"message":"prompt is 14017 tokens"}"#,
+        );
+        assert!(
+            !tokens.contains("API キーが拒否"),
+            "14017 is not an auth failure: {tokens}"
+        );
+        assert!(tokens.contains("14017"), "{tokens}");
+        let request = map_llm_error(
+            r#"500 Internal Server Error {"request_id":"req_a401f9"}"#,
+        );
+        assert!(
+            !request.contains("API キーが拒否"),
+            "req_a401f9 is not an auth failure: {request}"
+        );
+        assert!(request.contains("req_a401f9"), "{request}");
+        assert!(map_llm_error("401").contains("API キーが拒否"));
+        assert!(map_llm_error("403 Forbidden").contains("API キーが拒否"));
+        assert!(map_llm_error("invalid api key").contains("API キーが拒否"));
+        assert!(map_llm_error("401 Unauthorized").contains("API キーが拒否"));
     }
 
     #[test]

@@ -107,11 +107,15 @@ fn round_limit_failure_reason(error: &str) -> String {
     "応答を受け取れませんでした".into()
 }
 
-/// Status from an HTTP status line, a status field, or a leading `500 Reason` phrase.
+/// Status of this response. A leading `500 Reason` wins over a code quoted in the body.
+/// Labels and `HTTP nnn` are used only when the text has no leading status.
 /// A port in a URL (`:8080`, `:11434`, `:1234`, `:500`) is not a status code.
-fn http_status_code(error: &str) -> Option<u16> {
+pub(crate) fn http_status_code(error: &str) -> Option<u16> {
     let lower = error.to_ascii_lowercase();
     let bytes = lower.as_bytes();
+    if let Some(code) = leading_status(bytes) {
+        return Some(code);
+    }
     if let Some(code) = code_after_label(bytes, b"status_code") {
         return Some(code);
     }
@@ -121,10 +125,7 @@ fn http_status_code(error: &str) -> Option<u16> {
     if let Some(code) = code_after_label(bytes, b"status") {
         return Some(code);
     }
-    if let Some(code) = code_after_http(bytes) {
-        return Some(code);
-    }
-    leading_status(bytes)
+    code_after_http(bytes)
 }
 
 fn code_after_label(bytes: &[u8], label: &[u8]) -> Option<u16> {
@@ -2746,10 +2747,6 @@ mod tests {
         assert!(too_long.text.contains("コンテキストが長すぎます"));
         assert!(!too_long.text.contains(secret));
         assert!(!too_long.text.contains("Bearer"));
-        let http = round_limit_failure(8, &format!("500 internal api_key={secret}"));
-        assert!(http.text.contains("HTTP 500"));
-        assert!(!http.text.contains(secret));
-        assert!(!http.text.contains("api_key"));
         let bridge = round_limit_failure(8, &crate::llm::thinking::thinking_bridge_error());
         assert!(bridge.text.contains("思考を閉じられず止めました"));
         assert!(bridge.notice.is_none());
@@ -2785,8 +2782,20 @@ mod tests {
         assert!(unknown.text.contains("応答を受け取れませんでした"));
         assert!(!unknown.text.contains(secret));
         assert!(!unknown.text.contains("api_key"));
+        assert!(on.contains(TOOL_WRITE_NOTE));
+        assert!(off.contains("ノートの id・題名・更新日時"));
+    }
+
+    #[test]
+    fn http_status_ignores_url_ports_and_reads_a_real_status() {
+        let secret = "sk-live-secret";
+        let http = round_limit_failure(8, &format!("500 internal api_key={secret}"));
+        assert!(http.text.contains("HTTP 500"));
+        assert!(!http.text.contains(secret));
+        assert!(!http.text.contains("api_key"));
         for port in ["8080", "11434", "1234", "500", "404"] {
-            let refused = round_limit_failure(8, &format!("connection refused to http://127.0.0.1:{port}"));
+            let refused =
+                round_limit_failure(8, &format!("connection refused to http://127.0.0.1:{port}"));
             assert!(
                 refused.text.contains("サーバに接続できません"),
                 "{port}: {}",
@@ -2796,6 +2805,11 @@ mod tests {
             let bare = round_limit_failure(8, &format!("http://127.0.0.1:{port}/v1/chat"));
             assert!(!bare.text.contains("HTTP"), "{port}: {}", bare.text);
             assert!(!bare.text.contains("認証"), "{port}: {}", bare.text);
+            assert_eq!(
+                http_status_code(&format!("http://127.0.0.1:{port}/v1/chat")),
+                None,
+                "{port}"
+            );
         }
         let auth_status = round_limit_failure(8, "401 Unauthorized");
         assert!(auth_status.text.contains("サーバが認証を拒否しました"));
@@ -2804,8 +2818,22 @@ mod tests {
         assert!(http_line.text.contains("HTTP 404"));
         let status_field = round_limit_failure(8, "status_code=503");
         assert!(status_field.text.contains("HTTP 503"));
-        assert!(on.contains(TOOL_WRITE_NOTE));
-        assert!(off.contains("ノートの id・題名・更新日時"));
+        assert_eq!(http_status_code("status_code=503"), Some(503));
+    }
+
+    #[test]
+    fn leading_http_status_wins_over_a_code_quoted_in_the_body() {
+        let wrapped = r#"500 Internal Server Error {"message":"request failed: HTTP 404 Not Found"}"#;
+        assert_eq!(http_status_code(wrapped), Some(500));
+        let wrapped_reason = round_limit_failure(8, wrapped);
+        assert!(wrapped_reason.text.contains("HTTP 500"));
+        assert!(!wrapped_reason.text.contains("404"));
+        let gateway = r#"502 Bad Gateway {"error":"upstream HTTP 500"}"#;
+        assert_eq!(http_status_code(gateway), Some(502));
+        let gateway_reason = round_limit_failure(8, gateway);
+        assert!(gateway_reason.text.contains("HTTP 502"));
+        assert!(!gateway_reason.text.contains("HTTP 500"));
+        assert_eq!(http_status_code("HTTP/1.1 404 Not Found"), Some(404));
     }
 
     #[test]
