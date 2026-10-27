@@ -70,48 +70,35 @@ function byPage<T extends GroupableSource>(a: T, b: T): number {
   return a.sortOrder - b.sortOrder;
 }
 
-export function groupSources<T extends GroupableSource>(
-  rows: T[],
-  fallbackStart: number,
-): SourceGroup<T>[] {
+export function groupSources<T extends GroupableSource>(rows: T[]): SourceGroup<T>[] {
   const used = new Set<string>();
   const out: SourceGroup<T>[] = [];
-  let fi = 0;
   for (const s of rows) {
     const key = imageGroupKey(s);
     if (key) {
       if (used.has(key)) continue;
       used.add(key);
       const members = rows.filter((r) => imageGroupKey(r) === key).sort(byPage);
-      const fallback = fallbackStart + fi;
-      fi += 1;
-      out.push(buildGroup(key, members, fallback));
+      out.push(buildGroup(key, members));
     } else {
-      const fallback = fallbackStart + fi;
-      fi += 1;
-      out.push(buildGroup(`id:${s.id}`, [s], fallback));
+      out.push(buildGroup(`id:${s.id}`, [s]));
     }
   }
   return out;
 }
 
-function buildGroup<T extends GroupableSource>(
-  key: string,
-  members: T[],
-  fallback: number,
-): SourceGroup<T> {
+function buildGroup<T extends GroupableSource>(key: string, members: T[]): SourceGroup<T> {
   const assigned = members
     .map((m) => m.citeNo)
     .filter((n): n is number => typeof n === "number" && n > 0);
-  const citeNo = assigned.length ? Math.min(...assigned) : fallback;
-  const citeNos = new Set<number>([citeNo, ...assigned]);
+  const citeNo = assigned.length ? Math.min(...assigned) : 0;
   const representative = members[0];
   return {
     key,
     representative,
     members,
     citeNo,
-    citeNos: [...citeNos],
+    citeNos: assigned,
     label: fileLabel(representative),
   };
 }
@@ -123,6 +110,7 @@ export function openableCitesFromGroups<T extends GroupableSource>(
   const byNo = new Map<number, T>();
   for (const g of groups) {
     for (const n of g.citeNos) {
+      if (n <= 0) continue;
       byNo.set(n, g.representative);
       if (g.representative.path.trim()) nos.add(n);
     }

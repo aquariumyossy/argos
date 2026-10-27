@@ -632,6 +632,169 @@ pub struct Db {
     conn: parking_lot::Mutex<rusqlite::Connection>,
 }
 
+/// Highest `[n]` in stored text. Markdown links `[n](url)` are not citations.
+fn max_bracket_cite(text: &str) -> i64 {
+    let b = text.as_bytes();
+    let mut high = 0i64;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'[' {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && j < b.len() && b[j] == b']' && b.get(j + 1) != Some(&b'(') {
+                if let Ok(n) = std::str::from_utf8(&b[start..j]).unwrap_or("").parse::<i64>() {
+                    if n > high {
+                        high = n;
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    high
+}
+
+fn alloc_llm_cite_no_locked(conn: &rusqlite::Connection, thread_id: &str) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "UPDATE llm_threads SET cite_counter = cite_counter + 1 WHERE id=?1 RETURNING cite_counter",
+        [thread_id],
+        |r| r.get(0),
+    )
+}
+
+fn image_group_cite_locked(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    path: &str,
+) -> Result<Option<i64>, rusqlite::Error> {
+    match conn.query_row(
+        "SELECT cite_no FROM llm_thread_sources
+         WHERE thread_id=?1 AND lower(path)=lower(?2) AND kind='image' AND cite_no>0
+         ORDER BY cite_no ASC LIMIT 1",
+        rusqlite::params![thread_id, path],
+        |r| r.get(0),
+    ) {
+        Ok(n) => Ok(Some(n)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Number for a source the moment it is stored. Image pages of one file share a number.
+fn allocate_source_cite(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    path: &str,
+    kind: &str,
+) -> Result<i64, rusqlite::Error> {
+    if kind.eq_ignore_ascii_case("image") {
+        if let Some(n) = image_group_cite_locked(conn, thread_id, path)? {
+            return Ok(n);
+        }
+    }
+    alloc_llm_cite_no_locked(conn, thread_id)
+}
+
+fn ensure_source_cite(
+    conn: &rusqlite::Connection,
+    mut row: LlmSourceRow,
+) -> Result<LlmSourceRow, rusqlite::Error> {
+    if row.cite_no > 0 {
+        return Ok(row);
+    }
+    let n = allocate_source_cite(conn, &row.thread_id, &row.path, &row.kind)?;
+    conn.execute(
+        "UPDATE llm_thread_sources SET cite_no=?1 WHERE id=?2 AND cite_no=0",
+        rusqlite::params![n, row.id],
+    )?;
+    row.cite_no = n;
+    Ok(row)
+}
+
+/// Once, when `cite_counter` is added: start above every number already used,
+/// including `[n]` left in tool results and assistant answers. Then give any
+/// still-unnumbered row a real number so nothing is shown as `sort_order + 1`.
+fn seed_cite_ledgers(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    let thread_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM llm_threads")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for thread_id in thread_ids {
+        let from_rows: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(cite_no), 0) FROM llm_thread_sources WHERE thread_id=?1",
+            [&thread_id],
+            |r| r.get(0),
+        )?;
+        let mut high = from_rows;
+        let mut stmt = conn.prepare(
+            "SELECT content FROM llm_messages
+             WHERE thread_id=?1 AND role IN ('tool', 'assistant')",
+        )?;
+        let texts = stmt.query_map([&thread_id], |r| r.get::<_, String>(0))?;
+        for text in texts {
+            let n = max_bracket_cite(&text?);
+            if n > high {
+                high = n;
+            }
+        }
+        drop(stmt);
+        conn.execute(
+            "UPDATE llm_threads SET cite_counter=?1 WHERE id=?2",
+            rusqlite::params![high, thread_id],
+        )?;
+        conn.execute(
+            "UPDATE llm_thread_sources AS s
+             SET cite_no = (
+               SELECT MIN(o.cite_no) FROM llm_thread_sources o
+               WHERE o.thread_id = s.thread_id AND lower(o.path) = lower(s.path)
+                 AND o.kind = 'image' AND o.cite_no > 0
+             )
+             WHERE s.thread_id=?1 AND s.kind='image' AND s.cite_no=0
+               AND EXISTS (
+                 SELECT 1 FROM llm_thread_sources o
+                 WHERE o.thread_id = s.thread_id AND lower(o.path) = lower(s.path)
+                   AND o.kind = 'image' AND o.cite_no > 0
+               )",
+            [&thread_id],
+        )?;
+        let zeros: Vec<(String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, path, kind FROM llm_thread_sources
+                 WHERE thread_id=?1 AND cite_no=0
+                 ORDER BY sort_order ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map([&thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut shared_image: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for (id, path, kind) in zeros {
+            let n = if kind.eq_ignore_ascii_case("image") {
+                let key = path.to_lowercase();
+                if let Some(n) = shared_image.get(&key) {
+                    *n
+                } else {
+                    let n = alloc_llm_cite_no_locked(conn, &thread_id)?;
+                    shared_image.insert(key, n);
+                    n
+                }
+            } else {
+                alloc_llm_cite_no_locked(conn, &thread_id)?
+            };
+            conn.execute(
+                "UPDATE llm_thread_sources SET cite_no=?1 WHERE id=?2 AND cite_no=0",
+                rusqlite::params![n, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
@@ -764,6 +927,7 @@ impl Db {
               search_enabled INTEGER NOT NULL DEFAULT 1,
               path_prefix TEXT NOT NULL DEFAULT '',
               sort_order INTEGER NOT NULL DEFAULT 0,
+              cite_counter INTEGER NOT NULL DEFAULT 0,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
@@ -994,6 +1158,17 @@ impl Db {
             "ALTER TABLE llm_threads ADD COLUMN note_id TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // One monotonic counter per thread. Seeded once, from numbers already stored,
+        // so later sends do not scan message text to choose the next [n].
+        let cite_counter_added = conn
+            .execute(
+                "ALTER TABLE llm_threads ADD COLUMN cite_counter INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok();
+        if cite_counter_added {
+            seed_cite_ledgers(&conn)?;
+        }
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN llm_review_base TEXT", []);
         let _ = conn.execute(
             "UPDATE llm_note_proposals SET status='dismissed' WHERE status='pending'",
@@ -3627,7 +3802,7 @@ impl Db {
                 && existing.title == title
                 && existing.query == query
             {
-                return Ok((existing, false));
+                return Ok((ensure_source_cite(&conn, existing)?, false));
             }
             let now = chrono::Utc::now().timestamp();
             conn.execute(
@@ -3640,7 +3815,7 @@ impl Db {
             )?;
             let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
             let row = conn.query_row(&sql, [id], map_llm_source)?;
-            return Ok((row, true));
+            return Ok((ensure_source_cite(&conn, row)?, true));
         }
         let next_order: i64 = conn
             .query_row(
@@ -3651,11 +3826,12 @@ impl Db {
             .unwrap_or(0);
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
+        let cite_no = allocate_source_cite(&conn, thread_id, path, "text")?;
         conn.execute(
             "INSERT INTO llm_thread_sources(
                 id, thread_id, sort_order, origin, path, title, paragraph_id, body, query,
                 created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'unit', '', '', '', 0)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'unit', '', '', '', ?11)",
             rusqlite::params![
                 id,
                 thread_id,
@@ -3666,7 +3842,8 @@ impl Db {
                 paragraph_id,
                 body,
                 query,
-                now
+                now,
+                cite_no
             ],
         )?;
         conn.execute(
@@ -3689,7 +3866,7 @@ impl Db {
                 unit_body: String::new(),
                 injected_user_message_id: String::new(),
                 cited_assistant_message_id: String::new(),
-                cite_no: 0,
+                cite_no,
                 kind: "text".into(),
                 stored_relpath: String::new(),
                 ocr_status: String::new(),
@@ -3760,7 +3937,7 @@ impl Db {
                 && existing.ocr_status == ocr_status
                 && existing.stored_relpath == stored_relpath
             {
-                return Ok((existing, false));
+                return Ok((ensure_source_cite(&conn, existing)?, false));
             }
             let now = chrono::Utc::now().timestamp();
             conn.execute(
@@ -3785,7 +3962,7 @@ impl Db {
             )?;
             let sql = format!("SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources WHERE id=?1");
             let row = conn.query_row(&sql, [existing_id], map_llm_source)?;
-            return Ok((row, true));
+            return Ok((ensure_source_cite(&conn, row)?, true));
         }
         let next_order: i64 = conn
             .query_row(
@@ -3800,12 +3977,13 @@ impl Db {
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = chrono::Utc::now().timestamp();
+        let cite_no = allocate_source_cite(&conn, thread_id, path, kind)?;
         conn.execute(
             "INSERT INTO llm_thread_sources(
                 id, thread_id, sort_order, origin, path, title, paragraph_id, body, query,
                 created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id,
                 cite_no, kind, stored_relpath, ocr_status
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '', '', '', 0, ?12, ?13, ?14)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '', '', '', ?15, ?12, ?13, ?14)",
             rusqlite::params![
                 id,
                 thread_id,
@@ -3820,7 +3998,8 @@ impl Db {
                 grain,
                 kind,
                 stored_relpath,
-                ocr_status
+                ocr_status,
+                cite_no
             ],
         )?;
         conn.execute(
@@ -3843,7 +4022,7 @@ impl Db {
                 unit_body: String::new(),
                 injected_user_message_id: String::new(),
                 cited_assistant_message_id: String::new(),
-                cite_no: 0,
+                cite_no,
                 kind: kind.into(),
                 stored_relpath: stored_relpath.to_string(),
                 ocr_status: ocr_status.to_string(),
@@ -3969,6 +4148,21 @@ impl Db {
         )?;
         drop(conn);
         self.get_llm_source(id)
+    }
+
+    /// Next citation number for this thread. The counter only moves forward.
+    pub fn alloc_llm_cite_no(&self, thread_id: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock();
+        alloc_llm_cite_no_locked(&conn, thread_id)
+    }
+
+    pub fn llm_cite_counter(&self, thread_id: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT cite_counter FROM llm_threads WHERE id=?1",
+            [thread_id],
+            |r| r.get(0),
+        )
     }
 
     pub fn max_llm_cite_no(&self, thread_id: &str) -> Result<i64, rusqlite::Error> {
@@ -5078,7 +5272,10 @@ mod llm_source_pending_tests {
                 Some("p2"),
             )
             .unwrap();
+        assert_eq!(p1.cite_no, 1);
+        assert_eq!(p2.cite_no, 1, "pages of one file share the first number");
         db.set_llm_source_cite_no(&p1.id, 3).unwrap();
+        db.set_llm_source_cite_no(&p2.id, 0).unwrap();
         db.apply_image_group_cite(&thread.id, r"C:\scan.pdf", 3)
             .unwrap();
         let g = db.list_llm_image_group(&thread.id, r"C:\scan.pdf").unwrap();
@@ -5131,11 +5328,12 @@ mod llm_source_pending_tests {
                 Some("p2"),
             )
             .unwrap();
-        db.consume_llm_sources(&[(p1.id.clone(), 4)], "u1", "a1")
+        assert_eq!(p2.cite_no, p1.cite_no);
+        db.consume_llm_sources(&[(p1.id.clone(), p1.cite_no)], "u1", "a1")
             .unwrap();
         db.inherit_image_group_meta(&p2.id).unwrap();
         let p2b = db.get_llm_source(&p2.id).unwrap().unwrap();
-        assert_eq!(p2b.cite_no, 4);
+        assert_eq!(p2b.cite_no, p1.cite_no);
         assert_eq!(p2b.injected_user_message_id, "u1");
         assert_eq!(p2b.cited_assistant_message_id, "a1");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5768,6 +5966,121 @@ mod folder_index_status_tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, echoed_id);
         assert_eq!(messages[0].kind, "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cite_counter_is_seeded_once_above_numbers_already_used() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE llm_threads (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL DEFAULT '',
+                  search_enabled INTEGER NOT NULL DEFAULT 1,
+                  path_prefix TEXT NOT NULL DEFAULT '',
+                  sort_order INTEGER NOT NULL DEFAULT 0,
+                  note_id TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_threads(
+                  id, title, search_enabled, path_prefix, sort_order, note_id, created_at, updated_at
+                ) VALUES ('t1', '調査', 1, '', 0, '', 10, 20);
+                CREATE TABLE llm_messages (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL DEFAULT '',
+                  reasoning TEXT NOT NULL DEFAULT '',
+                  tool_calls TEXT NOT NULL DEFAULT '',
+                  tool_call_id TEXT NOT NULL DEFAULT '',
+                  tool_name TEXT NOT NULL DEFAULT '',
+                  kind TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_messages(id, thread_id, role, content, tool_call_id, tool_name, created_at)
+                  VALUES
+                  ('tool1', 't1', 'tool', '【出典】
+[1] A
+
+[4] D
+
+脚注 [180]。リンク [4096](https://example.com) は出典ではない。', 'c1', 'search_index', 30),
+                  ('a1', 't1', 'assistant', 'Aです [1]。別の答え [12]。', '', '', 40);
+                CREATE TABLE llm_thread_sources (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  sort_order INTEGER NOT NULL DEFAULT 0,
+                  origin TEXT NOT NULL DEFAULT 'attach',
+                  path TEXT NOT NULL DEFAULT '',
+                  title TEXT NOT NULL DEFAULT '',
+                  paragraph_id TEXT NOT NULL DEFAULT '',
+                  body TEXT NOT NULL DEFAULT '',
+                  query TEXT NOT NULL DEFAULT '',
+                  grain TEXT NOT NULL DEFAULT 'unit',
+                  unit_body TEXT NOT NULL DEFAULT '',
+                  injected_user_message_id TEXT NOT NULL DEFAULT '',
+                  cited_assistant_message_id TEXT NOT NULL DEFAULT '',
+                  cite_no INTEGER NOT NULL DEFAULT 0,
+                  kind TEXT NOT NULL DEFAULT 'text',
+                  stored_relpath TEXT NOT NULL DEFAULT '',
+                  ocr_status TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_thread_sources(
+                  id, thread_id, sort_order, origin, path, title, paragraph_id, body, cite_no, kind, created_at
+                ) VALUES
+                  ('s1', 't1', 0, 'tool', 'path-a', 'A', 'p1', 'A', 1, 'text', 30),
+                  ('img1', 't1', 1, 'attach', 'C:\scan.pdf', 'scan', 'pdf-page:1', '一枚目', 4, 'image', 31),
+                  ('img2', 't1', 2, 'attach', 'C:\scan.pdf', 'scan', 'pdf-page:2', '二枚目', 0, 'image', 32),
+                  ('s0', 't1', 3, 'attach', 'path-extra', 'extra', 'p0', '未番号', 0, 'text', 33);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.llm_cite_counter("t1").unwrap(), 181);
+        let by_id = |id: &str| {
+            db.list_llm_sources("t1")
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .cite_no
+        };
+        assert_eq!(by_id("s1"), 1);
+        assert_eq!(by_id("img1"), 4);
+        assert_eq!(by_id("img2"), 4, "an image page shares its sibling's number");
+        assert_eq!(by_id("s0"), 181, "an unnumbered row is numbered above the stored text");
+        let tool = db
+            .list_llm_messages("t1")
+            .unwrap()
+            .into_iter()
+            .find(|message| message.role == "tool")
+            .unwrap();
+        assert!(tool.content.contains("[180]"));
+        {
+            let conn = db.conn.lock();
+            conn.execute("DELETE FROM llm_thread_sources WHERE id='s0'", [])
+                .unwrap();
+        }
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.llm_cite_counter("t1").unwrap(),
+            181,
+            "reopening must not scan the thread and pull the counter back"
+        );
+        db.insert_llm_message("t1", "assistant", "新しい脚注 [4096] と [2026]。")
+            .unwrap();
+        let (next, _) = db
+            .insert_llm_source("t1", "attach", "path-new", "new", "p", "本文", "")
+            .unwrap();
+        assert_eq!(next.cite_no, 182);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

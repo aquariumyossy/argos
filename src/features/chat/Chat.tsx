@@ -248,6 +248,10 @@ function chipLabel(s: LlmSourceRow): string {
   return imageGroupKey(s) ? fileLabel(s) : sourceLabel(s);
 }
 
+function citePrefix(n: number): string {
+  return n > 0 ? `[${n}] ` : "";
+}
+
 function IconOpenFile() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
@@ -820,22 +824,14 @@ export default function Chat() {
     return [...ready, ...tools];
   }, [pendingSources, sources]);
 
-  const maxCitedNo = useMemo(
-    () =>
-      sources
-        .filter((s) => (s.injectedUserMessageId ?? "").trim())
-        .reduce((n, s) => Math.max(n, s.citeNo ?? 0), 0),
-    [sources],
-  );
-
   const pendingGroups = useMemo(
-    () => groupSources(pendingSources, maxCitedNo + 1),
-    [pendingSources, maxCitedNo],
+    () => groupSources(pendingSources),
+    [pendingSources],
   );
 
   const liveCiteGroups = useMemo(
-    () => groupSources(liveCites, maxCitedNo + 1),
-    [liveCites, maxCitedNo],
+    () => groupSources(liveCites),
+    [liveCites],
   );
 
   const liveCiteInfo = useMemo(
@@ -1648,7 +1644,7 @@ export default function Chat() {
             messages.map((m) => {
               const cites =
                 m.role === "assistant" ? citedForMessage(sources, m.id) : [];
-              const citeGroups = groupSources(cites, 1);
+              const citeGroups = groupSources(cites);
               const citeInfo = openableCitesFromGroups(citeGroups);
               const calls = toolCallNames(m.toolCalls);
               const isNotice = m.kind === "notice";
@@ -1703,7 +1699,7 @@ export default function Chat() {
                         if (!path) {
                           return (
                             <span key={g.key} className="chat-cite-badge">
-                              [{g.citeNo}] {chipLabel(s)}
+                              {citePrefix(g.citeNo)}{chipLabel(s)}
                             </span>
                           );
                         }
@@ -1715,7 +1711,7 @@ export default function Chat() {
                             title={sourceOpenTitle(s)}
                             onClick={() => void openSource(s)}
                           >
-                            [{g.citeNo}] {chipLabel(s)}
+                            {citePrefix(g.citeNo)}{chipLabel(s)}
                           </button>
                         );
                       })}
@@ -1767,7 +1763,7 @@ export default function Chat() {
                     if (!path) {
                       return (
                         <span key={g.key} className="chat-cite-badge">
-                          [{g.citeNo}] {chipLabel(s)}
+                          {citePrefix(g.citeNo)}{chipLabel(s)}
                         </span>
                       );
                     }
@@ -1779,7 +1775,7 @@ export default function Chat() {
                         title={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
-                        [{g.citeNo}] {chipLabel(s)}
+                        {citePrefix(g.citeNo)}{chipLabel(s)}
                       </button>
                     );
                   })}
@@ -1879,7 +1875,7 @@ export default function Chat() {
                         }
                         onClick={() => void toggleSourceGrain(s)}
                       >
-                        [{n}] {label}
+                        {citePrefix(n)}{label}
                         {badge ? (
                           <span className="chat-source-badge">{badge}</span>
                         ) : null}
@@ -1891,7 +1887,7 @@ export default function Chat() {
                         title={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
-                        [{n}] {label}
+                        {citePrefix(n)}{label}
                         {badge ? (
                           <span className="chat-source-badge">{badge}</span>
                         ) : null}

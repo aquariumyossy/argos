@@ -67,6 +67,14 @@ pub fn round_limit_failure(max_rounds: usize, error: &str) -> RoundLimitAnswer {
 
 fn round_limit_failure_reason(error: &str) -> String {
     let l = error.to_lowercase();
+    // The leading status is the response. A 500 whose body says "Unauthorized" or
+    // "10061" is still a server error; a socket code counts only with no status.
+    if let Some(code) = http_status_code(error) {
+        if code == 401 || code == 403 {
+            return "サーバが認証を拒否しました".into();
+        }
+        return format!("サーバがエラーを返しました（HTTP {code}）");
+    }
     if error.contains("字に達しても答えが出ない") {
         return "思考が長く続いたため止めました".into();
     }
@@ -91,18 +99,14 @@ fn round_limit_failure_reason(error: &str) -> String {
         || l.contains("connection refused")
         || l.contains("connect")
         || l.contains("dns")
+        || l.contains("os error 10060")
+        || l.contains("os error 10061")
     {
         return "サーバに接続できません".into();
     }
     if l.contains("unauthorized") || l.contains("invalid api key") || l.contains("api キーが拒否")
     {
         return "サーバが認証を拒否しました".into();
-    }
-    if let Some(code) = http_status_code(error) {
-        if code == 401 {
-            return "サーバが認証を拒否しました".into();
-        }
-        return format!("サーバがエラーを返しました（HTTP {code}）");
     }
     "応答を受け取れませんでした".into()
 }
@@ -529,7 +533,6 @@ fn persist_hit(
     hit: &SearchHit,
     query: &str,
     body_cap: usize,
-    next_cite: &mut i64,
     new_rows: &mut Vec<LlmSourceRow>,
     already: &mut Vec<String>,
     consumed: &mut Vec<(String, i64)>,
@@ -553,7 +556,7 @@ fn persist_hit(
     } else {
         "text"
     };
-    let (mut row, created) = state
+    let (row, _) = state
         .db
         .insert_llm_source_full(
             thread_id,
@@ -570,14 +573,6 @@ fn persist_hit(
             None,
         )
         .map_err(|e| e.to_string())?;
-    if created || row.cite_no <= 0 {
-        *next_cite += 1;
-        row.cite_no = *next_cite;
-        state
-            .db
-            .set_llm_source_cite_no(&row.id, row.cite_no)
-            .map_err(|e| e.to_string())?;
-    }
     consumed.push((row.id.clone(), row.cite_no));
     new_rows.push(row);
     Ok(())
@@ -589,13 +584,11 @@ fn web_body_looks_full(body: &str) -> bool {
     body.chars().count() > TOOL_BODY_CAP + TRUNCATED_MARK.chars().count()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn persist_web_hit(
     state: &AppState,
     thread_id: &str,
     hit: &crate::llm::searxng::WebHit,
     query: &str,
-    next_cite: &mut i64,
     new_rows: &mut Vec<LlmSourceRow>,
     already: &mut Vec<String>,
     consumed: &mut Vec<(String, i64)>,
@@ -616,7 +609,7 @@ fn persist_web_hit(
             cap_chars(raw, TOOL_BODY_CAP)
         }
     };
-    let (mut row, created) = state
+    let (row, _) = state
         .db
         .insert_llm_source_full(
             thread_id,
@@ -633,14 +626,6 @@ fn persist_web_hit(
             None,
         )
         .map_err(|e| e.to_string())?;
-    if created || row.cite_no <= 0 {
-        *next_cite += 1;
-        row.cite_no = *next_cite;
-        state
-            .db
-            .set_llm_source_cite_no(&row.id, row.cite_no)
-            .map_err(|e| e.to_string())?;
-    }
     consumed.push((row.id.clone(), row.cite_no));
     new_rows.push(row);
     Ok(())
@@ -654,7 +639,6 @@ fn persist_web_page(
     title: &str,
     body: &str,
     origin: &str,
-    next_cite: &mut i64,
     new_rows: &mut Vec<LlmSourceRow>,
     already: &mut Vec<String>,
     consumed: &mut Vec<(String, i64)>,
@@ -679,7 +663,7 @@ fn persist_web_page(
         return Ok(());
     }
     let title = if title.trim().is_empty() { url } else { title };
-    let (mut row, created) = state
+    let (row, _) = state
         .db
         .insert_llm_source_full(
             thread_id,
@@ -696,14 +680,6 @@ fn persist_web_page(
             None,
         )
         .map_err(|e| e.to_string())?;
-    if created || row.cite_no <= 0 {
-        *next_cite += 1;
-        row.cite_no = *next_cite;
-        state
-            .db
-            .set_llm_source_cite_no(&row.id, row.cite_no)
-            .map_err(|e| e.to_string())?;
-    }
     consumed.push((row.id.clone(), row.cite_no));
     new_rows.push(row);
     Ok(())
@@ -1756,7 +1732,6 @@ pub fn execute_tool(
     name: &str,
     arguments: &str,
     thread_scope: Option<&str>,
-    next_cite: &mut i64,
     web_search: bool,
     request_id: &str,
 ) -> ToolExec {
@@ -1766,7 +1741,6 @@ pub fn execute_tool(
         name,
         arguments,
         thread_scope,
-        next_cite,
         web_search,
         request_id,
     ) {
@@ -1785,7 +1759,6 @@ fn execute_tool_inner(
     name: &str,
     arguments: &str,
     thread_scope: Option<&str>,
-    next_cite: &mut i64,
     web_search: bool,
     _request_id: &str,
 ) -> Result<ToolExec, String> {
@@ -1940,7 +1913,6 @@ fn execute_tool_inner(
                     hit,
                     &query,
                     TOOL_BODY_CAP,
-                    next_cite,
                     &mut new_rows,
                     &mut already,
                     &mut consumed,
@@ -1953,7 +1925,6 @@ fn execute_tool_inner(
                     hit,
                     &query,
                     TOOL_BODY_CAP,
-                    next_cite,
                     &mut new_rows,
                     &mut already,
                     &mut consumed,
@@ -1972,7 +1943,6 @@ fn execute_tool_inner(
                                 thread_id,
                                 hit,
                                 &query,
-                                next_cite,
                                 &mut new_rows,
                                 &mut already,
                                 &mut consumed,
@@ -2088,7 +2058,6 @@ fn execute_tool_inner(
                 &hit,
                 "",
                 READ_BODY_CAP,
-                next_cite,
                 &mut new_rows,
                 &mut already,
                 &mut consumed,
@@ -2109,7 +2078,6 @@ fn execute_tool_inner(
                             &n,
                             "",
                             READ_BODY_CAP,
-                            next_cite,
                             &mut new_rows,
                             &mut already,
                             &mut consumed,
@@ -2202,7 +2170,6 @@ fn execute_tool_inner(
                 &page.title,
                 &body,
                 "tool",
-                next_cite,
                 &mut new_rows,
                 &mut already,
                 &mut consumed,
@@ -2834,6 +2801,65 @@ mod tests {
         assert!(gateway_reason.text.contains("HTTP 502"));
         assert!(!gateway_reason.text.contains("HTTP 500"));
         assert_eq!(http_status_code("HTTP/1.1 404 Not Found"), Some(404));
+    }
+
+    #[test]
+    fn round_limit_treats_403_the_same_as_401() {
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let msg = round_limit_failure(8, status);
+            assert!(
+                msg.text.contains("サーバが認証を拒否しました"),
+                "{status}: {}",
+                msg.text
+            );
+            assert!(!msg.text.contains("HTTP"), "{status}: {}", msg.text);
+        }
+    }
+
+    #[test]
+    fn round_limit_server_error_quoting_10061_tokens_is_not_a_connection_error() {
+        let msg = round_limit_failure(8, "500 Internal Server Error prompt is 10061 tokens");
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("接続"), "{}", msg.text);
+        assert!(!msg.text.contains("10061"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_auth_status_wins_when_the_body_quotes_a_socket_code() {
+        let msg = round_limit_failure(8, r#"401 Unauthorized {"request_id":"req_10061"}"#);
+        assert!(msg.text.contains("サーバが認証を拒否しました"), "{}", msg.text);
+        assert!(!msg.text.contains("接続"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_prompt_token_count_inside_a_server_error_is_not_auth() {
+        let msg = round_limit_failure(8, "500 Internal Server Error prompt_tokens 14049");
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("認証"), "{}", msg.text);
+        assert!(!msg.text.contains("14049"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_quoted_404_inside_a_server_error_stays_a_server_error() {
+        let msg = round_limit_failure(8, "500 Internal Server Error HTTP 404 Not Found");
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("404"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_unauthorized_phrase_inside_a_server_error_stays_a_server_error() {
+        let msg = round_limit_failure(8, "500 Internal Server Error Unauthorized for url");
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("認証"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_socket_error_without_an_http_status_is_a_connection_error() {
+        let msg = round_limit_failure(8, "connection failed: os error 10061");
+        assert!(msg.text.contains("サーバに接続できません"), "{}", msg.text);
+        assert!(!msg.text.contains("HTTP"), "{}", msg.text);
+        let timed_out = round_limit_failure(8, "os error 10060");
+        assert!(timed_out.text.contains("サーバに接続できません"), "{}", timed_out.text);
     }
 
     #[test]

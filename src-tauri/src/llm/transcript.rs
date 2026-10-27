@@ -101,7 +101,7 @@ pub fn group_cite_no(members: &[&LlmSourceRow]) -> i64 {
         .filter(|s| s.cite_no > 0)
         .map(|s| s.cite_no)
         .min()
-        .unwrap_or_else(|| members.first().map(|s| s.sort_order + 1).unwrap_or(1))
+        .unwrap_or(0)
 }
 
 fn page_heading(row: &LlmSourceRow) -> Option<String> {
@@ -253,13 +253,9 @@ pub fn omission_note(shown: &[&LlmSourceRow], pool: &[LlmSourceRow]) -> Option<S
     }
 }
 
-/// Map group key -> cite_no to apply on kept rows, allocating new numbers for new groups.
-pub fn assign_group_cites(
-    kept: &mut [LlmSourceRow],
-    all: &[LlmSourceRow],
-    pending_ids: &HashSet<String>,
-    next_cite: &mut i64,
-) {
+/// Copy an image group's stored number onto siblings that do not have one yet.
+/// The thread ledger assigns numbers when a row is stored, so this does not mint.
+pub fn assign_group_cites(kept: &mut [LlmSourceRow], all: &[LlmSourceRow]) {
     let mut group_cite: HashMap<String, i64> = HashMap::new();
     for s in all.iter().chain(kept.iter()) {
         let Some(k) = image_group_key(s) else {
@@ -272,28 +268,15 @@ pub fn assign_group_cites(
                 .or_insert(s.cite_no);
         }
     }
-    let mut minted: HashSet<String> = HashSet::new();
-    for s in kept.iter() {
+    for s in kept.iter_mut() {
+        if s.cite_no > 0 {
+            continue;
+        }
         let Some(k) = image_group_key(s) else {
             continue;
         };
-        if group_cite.contains_key(&k) || minted.contains(&k) {
-            continue;
-        }
-        if pending_ids.contains(&s.id) {
-            *next_cite += 1;
-            group_cite.insert(k.clone(), *next_cite);
-            minted.insert(k);
-        }
-    }
-    for s in kept.iter_mut() {
-        if let Some(k) = image_group_key(s) {
-            if let Some(&n) = group_cite.get(&k) {
-                s.cite_no = n;
-            }
-        } else if pending_ids.contains(&s.id) && s.cite_no <= 0 {
-            *next_cite += 1;
-            s.cite_no = *next_cite;
+        if let Some(&n) = group_cite.get(&k) {
+            s.cite_no = n;
         }
     }
 }

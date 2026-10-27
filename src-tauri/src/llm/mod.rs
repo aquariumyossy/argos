@@ -119,8 +119,6 @@ fn is_transport_error(l: &str) -> bool {
         || l.contains("os error 10061")
         || l.contains("os error 10051")
         || l.contains("os error 10065")
-        || l.contains("10060")
-        || l.contains("10061")
         || l.contains("リモート")
         || l.contains("接続できません")
 }
@@ -142,16 +140,43 @@ fn map_reqwest_error(e: &reqwest::Error) -> String {
     map_llm_error(&error_chain(e))
 }
 
-fn map_llm_error(raw: &str) -> String {
-    let l = raw.to_lowercase();
-    if l.contains("n_ctx")
+fn is_context_length_error(l: &str) -> bool {
+    l.contains("n_ctx")
         || l.contains("context length")
         || l.contains("context window")
         || l.contains("too many tokens")
         || l.contains("maximum context")
         || (l.contains("max_tokens") && l.contains("exceed"))
         || l.contains("prompt is too long")
-    {
+}
+
+fn auth_rejected_message() -> String {
+    "API キーが拒否されました。MTPLX を 0.0.0.0 で起動している場合は、同じキーを Argos の API キー欄に入れてください。"
+        .into()
+}
+
+fn model_not_found_message() -> String {
+    "指定したモデルが見つかりません。モデル名を確認してください。".into()
+}
+
+fn map_llm_error(raw: &str) -> String {
+    let l = raw.to_lowercase();
+    // Classify the real status first. Numbers and phrases inside the body
+    // (`10061 tokens`, `HTTP 404`, `Unauthorized for url`) do not override it.
+    if let Some(code) = tools::http_status_code(raw) {
+        if code == 401 || code == 403 {
+            return auth_rejected_message();
+        }
+        if code == 404 {
+            return model_not_found_message();
+        }
+        if is_context_length_error(&l) {
+            return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。"
+                .into();
+        }
+        return format!("LLM サーバがエラーを返しました（HTTP {code}）。");
+    }
+    if is_context_length_error(&l) {
         return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。"
             .into();
     }
@@ -161,18 +186,11 @@ fn map_llm_error(raw: &str) -> String {
         }
         return "LLM サーバに接続できません。起動と URL を確認してください。".into();
     }
-    // Auth is the response status (401/403) or an explicit phrase. A digit string
-    // such as "14017 tokens" or "req_a401f9" inside a 500 is not a rejected key.
-    if l.contains("unauthorized")
-        || l.contains("invalid api key")
-        || matches!(tools::http_status_code(raw), Some(401 | 403))
-    {
-        return "API キーが拒否されました。MTPLX を 0.0.0.0 で起動している場合は、同じキーを Argos の API キー欄に入れてください。".into();
+    if l.contains("unauthorized") || l.contains("invalid api key") {
+        return auth_rejected_message();
     }
-    if l.contains("model")
-        && (l.contains("not found") || l.contains("does not exist") || l.contains("404"))
-    {
-        return "指定したモデルが見つかりません。モデル名を確認してください。".into();
+    if l.contains("model") && (l.contains("not found") || l.contains("does not exist")) {
+        return model_not_found_message();
     }
     let trimmed = raw.trim();
     if trimmed.chars().count() > 400 {
@@ -1183,7 +1201,11 @@ mod tests {
             !tokens.contains("API キーが拒否"),
             "14017 is not an auth failure: {tokens}"
         );
-        assert!(tokens.contains("14017"), "{tokens}");
+        assert!(tokens.contains("HTTP 500"), "{tokens}");
+        assert!(
+            !tokens.contains("14017"),
+            "a server error must not echo the body: {tokens}"
+        );
         let request = map_llm_error(
             r#"500 Internal Server Error {"request_id":"req_a401f9"}"#,
         );
@@ -1191,11 +1213,61 @@ mod tests {
             !request.contains("API キーが拒否"),
             "req_a401f9 is not an auth failure: {request}"
         );
-        assert!(request.contains("req_a401f9"), "{request}");
+        assert!(request.contains("HTTP 500"), "{request}");
+        assert!(
+            !request.contains("req_a401f9"),
+            "a server error must not echo the body: {request}"
+        );
         assert!(map_llm_error("401").contains("API キーが拒否"));
         assert!(map_llm_error("403 Forbidden").contains("API キーが拒否"));
         assert!(map_llm_error("invalid api key").contains("API キーが拒否"));
         assert!(map_llm_error("401 Unauthorized").contains("API キーが拒否"));
+    }
+
+    #[test]
+    fn server_error_quoting_10061_tokens_is_not_a_connection_error() {
+        let msg = map_llm_error("500 Internal Server Error prompt is 10061 tokens");
+        assert!(msg.contains("HTTP 500"), "{msg}");
+        assert!(!msg.contains("接続できません"), "{msg}");
+        assert!(!msg.contains("10061"), "{msg}");
+    }
+
+    #[test]
+    fn auth_status_wins_when_the_body_quotes_a_socket_code() {
+        let msg = map_llm_error(r#"401 Unauthorized {"request_id":"req_10061"}"#);
+        assert!(msg.contains("API キーが拒否"), "{msg}");
+        assert!(!msg.contains("接続できません"), "{msg}");
+    }
+
+    #[test]
+    fn prompt_token_count_inside_a_server_error_is_not_auth() {
+        let msg = map_llm_error("500 Internal Server Error prompt_tokens 14049");
+        assert!(msg.contains("HTTP 500"), "{msg}");
+        assert!(!msg.contains("API キーが拒否"), "{msg}");
+        assert!(!msg.contains("14049"), "{msg}");
+    }
+
+    #[test]
+    fn quoted_404_inside_a_server_error_stays_a_server_error() {
+        let msg = map_llm_error("500 Internal Server Error HTTP 404 Not Found");
+        assert!(msg.contains("HTTP 500"), "{msg}");
+        assert!(!msg.contains("モデルが見つかりません"), "{msg}");
+        assert!(!msg.contains("404"), "{msg}");
+    }
+
+    #[test]
+    fn unauthorized_phrase_inside_a_server_error_stays_a_server_error() {
+        let msg = map_llm_error("500 Internal Server Error Unauthorized for url");
+        assert!(msg.contains("HTTP 500"), "{msg}");
+        assert!(!msg.contains("API キーが拒否"), "{msg}");
+    }
+
+    #[test]
+    fn socket_error_without_an_http_status_is_a_connection_error() {
+        let refused = map_llm_error("tcp connect error: os error 10061");
+        assert!(refused.contains("接続できません"), "{refused}");
+        let timed_out = map_llm_error("os error 10060");
+        assert!(timed_out.contains("接続できません"), "{timed_out}");
     }
 
     #[test]

@@ -143,6 +143,12 @@ pub struct AssembleStats {
     pub consumed: Vec<ConsumedSource>,
 }
 
+fn push_cite_prefix(out: &mut String, n: i64) {
+    if n > 0 {
+        out.push_str(&format!("[{n}] "));
+    }
+}
+
 fn char_len(s: &str) -> usize {
     s.chars().count()
 }
@@ -158,11 +164,7 @@ pub(crate) fn cap_chars(s: &str, max: usize) -> String {
 }
 
 fn cite_no_of(s: &LlmSourceRow) -> i64 {
-    if s.cite_no > 0 {
-        s.cite_no
-    } else {
-        s.sort_order + 1
-    }
+    s.cite_no
 }
 
 /// `[n]` in the assistant answer (prose, mermaid labels, code fences).
@@ -284,7 +286,8 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         if seed.is_image() && crate::llm::transcript::image_group_key(seed).is_some() {
             let n = crate::llm::transcript::group_cite_no(&unit);
             let title = crate::llm::transcript::file_label(&seed.path, &seed.title);
-            out.push_str(&format!("[{n}] {title}"));
+            push_cite_prefix(&mut out, n);
+            out.push_str(&title);
             if !seed.path.trim().is_empty() && seed.path.trim() != title {
                 out.push_str(" — ");
                 out.push_str(seed.path.trim());
@@ -308,7 +311,8 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         } else {
             seed.title.as_str()
         };
-        out.push_str(&format!("[{n}] {title}"));
+        push_cite_prefix(&mut out, n);
+        out.push_str(title);
         if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
             out.push_str(" — ");
             out.push_str(seed.path.trim());
@@ -482,8 +486,7 @@ pub fn assemble_turns(
     let (mut kept, dropped_sources, src_trunc) =
         select_sources(sources, source_budget, &pending_ids);
 
-    let mut next_cite = sources.iter().map(|s| s.cite_no).max().unwrap_or(0);
-    crate::llm::transcript::assign_group_cites(&mut kept, sources, &pending_ids, &mut next_cite);
+    crate::llm::transcript::assign_group_cites(&mut kept, sources);
 
     let consumed: Vec<ConsumedSource> = kept
         .iter()
@@ -875,7 +878,9 @@ mod tests {
 
     #[test]
     fn pending_attaches_to_latest_user() {
-        let sources = vec![src("b", "attach", 1, "追送本文")];
+        let mut pending = src("b", "attach", 1, "追送本文");
+        pending.cite_no = 1;
+        let sources = vec![pending];
         let history = vec![
             msg("u1", "user", "要約して"),
             msg("a1", "assistant", "要約です"),
@@ -892,10 +897,9 @@ mod tests {
 
     #[test]
     fn followup_pending_continues_cite_no() {
-        let sources = vec![
-            consumed("a", "attach", 0, "最初", "u1", 1),
-            src("b", "attach", 1, "追加"),
-        ];
+        let mut pending = src("b", "attach", 1, "追加");
+        pending.cite_no = 2;
+        let sources = vec![consumed("a", "attach", 0, "最初", "u1", 1), pending];
         let history = vec![
             msg("u1", "user", "要約して"),
             msg("a1", "assistant", "要約です"),
@@ -1194,7 +1198,13 @@ mod tests {
             img_page("p1", 1, "一枚目"),
             img_page("p2", 2, "二枚目"),
             img_page("p3", 3, "三枚目"),
-        ];
+        ]
+        .into_iter()
+        .map(|mut page| {
+            page.cite_no = 1;
+            page
+        })
+        .collect::<Vec<_>>();
         let history = vec![msg("u1", "user", "要約して")];
         let (turns, stats) = assemble_turns("役割", &pages, &history, 80_000);
         assert_eq!(stats.consumed.len(), 3);
