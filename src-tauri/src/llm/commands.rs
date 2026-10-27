@@ -658,7 +658,6 @@ pub async fn llm_send(
     let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
     let mut use_tools = true;
     let mut retried_without_tools = false;
-    let mut extra_final = false;
     let mut phantom_retried = false;
     let mut rounds = 0usize;
     let max_rounds = tools::max_tool_rounds(settings.llm_max_tool_rounds);
@@ -976,7 +975,6 @@ pub async fn llm_send(
                     // The reserve is spent; answer from what the rounds already produced.
                     if tool_used >= tool_budget {
                         use_tools = false;
-                        extra_final = true;
                         if !source_turn_injected {
                             let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
                             source_turn_injected =
@@ -999,7 +997,6 @@ pub async fn llm_send(
                         if inject_final_source_turn(&mut current_turns, &all, &consumed, true) {
                             source_turn_injected = true;
                             use_tools = false;
-                            extra_final = true;
                             continue;
                         }
                     }

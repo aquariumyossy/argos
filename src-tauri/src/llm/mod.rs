@@ -373,7 +373,7 @@ pub async fn test_connection(settings: &Settings) -> Result<(String, Vec<LlmMode
                     names.join(", ")
                 )
             };
-            message.push_str(&thinking_budget_sentence(&refresh_thinking_budget(settings, None).await));
+            message.push_str(&thinking_budget_sentence(refresh_thinking_budget(settings, None).await));
             Ok((message, models))
         }
         Err(e) => {
@@ -1404,6 +1404,8 @@ mod tests {
             content: "答え".into(),
             reasoning: "検討".into(),
             tool_calls: Vec::new(),
+            finish_reason: String::new(),
+            request_id: String::new(),
         };
         let out = parse.into_outcome();
         assert_eq!(out.reasoning, "検討");
@@ -1420,6 +1422,8 @@ mod tests {
             .into(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            finish_reason: String::new(),
+            request_id: String::new(),
         };
         let out = parse.into_outcome();
         assert_eq!(out.tool_calls.len(), 1);
