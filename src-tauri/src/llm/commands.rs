@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, estimate_tokens,
-    final_source_turn, fit_tool_text, silent_end_notice, sources_for_consumed,
+    final_source_turn, fit_tool_text, parse_cited_nos, silent_end_notice, sources_for_consumed,
     ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
     TOOL_RESULT_BUDGET_RATIO,
 };
@@ -1026,6 +1026,7 @@ pub async fn llm_send(
                         let original = phantom_fallback
                             .take()
                             .expect("empty phantom retry keeps the first answer");
+                        raise_ledger_for_kept_answer(&state.db, &thread.id, &original.content);
                         final_reasoning = original.reasoning;
                         result_text = original.content;
                         kept_source_ids = Some(original.source_ids);
@@ -2169,6 +2170,18 @@ fn remember_phantom_answer(
     });
 }
 
+/// A kept phantom answer already used `[n]`. Later sources must start above that.
+fn raise_ledger_for_kept_answer(db: &crate::db::Db, thread_id: &str, content: &str) {
+    let max_n = parse_cited_nos(content)
+        .into_iter()
+        .filter(|n| *n > 0 && *n <= crate::db::LLM_CITE_SCAN_MAX)
+        .max()
+        .unwrap_or(0);
+    if max_n > 0 {
+        let _ = db.raise_llm_cite_counter(thread_id, max_n);
+    }
+}
+
 /// A kept answer may cite only sources that existed when it was written.
 fn citations_for_saved_answer(
     consumed: &[(String, i64)],
@@ -2541,17 +2554,47 @@ mod tests {
         let mut slot = None;
         remember_phantom_answer(&mut slot, answer, "", &sources_then);
         let kept = slot.expect("the first phantom answer is kept");
+        raise_ledger_for_kept_answer(&db, &thread.id, &kept.content);
         let (later, _) = db
             .insert_llm_source(&thread.id, "tool", "path-d", "D", "p2", "D", "q")
             .unwrap();
         assert_ne!(later.cite_no, 3, "the ledger must not hand [3] to a later source");
-        assert_eq!(later.cite_no, 2);
+        assert_eq!(later.cite_no, 4);
         let bound = citations_for_saved_answer(
             &[(first.id.clone(), first.cite_no), (later.id, later.cite_no)],
             &kept.content,
             Some(&kept.source_ids),
         );
         assert_eq!(bound, vec![(first.id, 1)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_phantom_answer_advances_the_counter_past_two_later_sources() {
+        let (dir, db) = temp_db("cite-phantom-two");
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let (first, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-a", "A", "p1", "A", "q")
+            .unwrap();
+        assert_eq!(first.cite_no, 1);
+        let sources_then = db.list_llm_sources(&thread.id).unwrap();
+        let answer = "根拠は [5] です。巨大な脚注 [9223372036854775807] は進めません。";
+        assert!(answer_has_phantom_cites(answer, &sources_then));
+        let mut slot = None;
+        remember_phantom_answer(&mut slot, answer, "", &sources_then);
+        let kept = slot.expect("the first phantom answer is kept");
+        raise_ledger_for_kept_answer(&db, &thread.id, &kept.content);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 5);
+        let (memo, _) = db
+            .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_ne!(memo.cite_no, 5, "memo.txt must not reuse the kept phantom [5]");
+        assert_eq!(memo.cite_no, 6);
+        let (second, _) = db
+            .insert_llm_source(&thread.id, "attach", "later.txt", "later", "p2", "続き", "")
+            .unwrap();
+        assert_ne!(second.cite_no, 5);
+        assert_eq!(second.cite_no, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

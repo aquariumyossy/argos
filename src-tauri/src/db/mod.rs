@@ -632,7 +632,15 @@ pub struct Db {
     conn: parking_lot::Mutex<rusqlite::Connection>,
 }
 
+/// Bracket numbers above this are years-or-ids that must not become the counter.
+/// `[2026]` still counts. `i64::MAX` must not, or `+ 1` overflows into REAL and open fails.
+pub(crate) const LLM_CITE_SCAN_MAX: i64 = 100_000;
+
+/// A counter this large was poisoned by an earlier seed that stored `i64::MAX`.
+const LLM_CITE_COUNTER_ABSURD: i64 = 1_000_000_000_000;
+
 /// Highest `[n]` in stored text. Markdown links `[n](url)` are not citations.
+/// Numbers above `LLM_CITE_SCAN_MAX` are ignored.
 fn max_bracket_cite(text: &str) -> i64 {
     let b = text.as_bytes();
     let mut high = 0i64;
@@ -646,7 +654,7 @@ fn max_bracket_cite(text: &str) -> i64 {
             }
             if j > start && j < b.len() && b[j] == b']' && b.get(j + 1) != Some(&b'(') {
                 if let Ok(n) = std::str::from_utf8(&b[start..j]).unwrap_or("").parse::<i64>() {
-                    if n > high {
+                    if n > high && n <= LLM_CITE_SCAN_MAX {
                         high = n;
                     }
                 }
@@ -660,9 +668,21 @@ fn max_bracket_cite(text: &str) -> i64 {
 }
 
 fn alloc_llm_cite_no_locked(conn: &rusqlite::Connection, thread_id: &str) -> Result<i64, rusqlite::Error> {
+    // One statement, so a cite written by an older build (counter still 0) is not reused.
+    // A poisoned counter above `LLM_CITE_COUNTER_ABSURD` is ignored; a real counter past
+    // the text-scan cap is not.
     conn.query_row(
-        "UPDATE llm_threads SET cite_counter = cite_counter + 1 WHERE id=?1 RETURNING cite_counter",
-        [thread_id],
+        "UPDATE llm_threads
+         SET cite_counter = MAX(
+               CASE WHEN cite_counter > ?2 THEN 0 ELSE cite_counter END,
+               COALESCE((
+                 SELECT MAX(cite_no) FROM llm_thread_sources
+                 WHERE thread_id = ?1 AND cite_no > 0 AND cite_no <= ?3
+               ), 0)
+             ) + 1
+         WHERE id = ?1
+         RETURNING cite_counter",
+        rusqlite::params![thread_id, LLM_CITE_COUNTER_ABSURD, LLM_CITE_SCAN_MAX],
         |r| r.get(0),
     )
 }
@@ -727,8 +747,9 @@ fn seed_cite_ledgers(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error>
     };
     for thread_id in thread_ids {
         let from_rows: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(cite_no), 0) FROM llm_thread_sources WHERE thread_id=?1",
-            [&thread_id],
+            "SELECT COALESCE(MAX(cite_no), 0) FROM llm_thread_sources
+             WHERE thread_id=?1 AND cite_no > 0 AND cite_no <= ?2",
+            rusqlite::params![thread_id, LLM_CITE_SCAN_MAX],
             |r| r.get(0),
         )?;
         let mut high = from_rows;
@@ -1158,8 +1179,10 @@ impl Db {
             "ALTER TABLE llm_threads ADD COLUMN note_id TEXT NOT NULL DEFAULT ''",
             [],
         );
-        // One monotonic counter per thread. Seeded once, from numbers already stored,
-        // so later sends do not scan message text to choose the next [n].
+        // One monotonic counter per thread. The column add and the seed commit together:
+        // a crash or a seed error rolls the column back, so the next open tries again
+        // instead of leaving cite_counter = 0 forever.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
         let cite_counter_added = conn
             .execute(
                 "ALTER TABLE llm_threads ADD COLUMN cite_counter INTEGER NOT NULL DEFAULT 0",
@@ -1167,8 +1190,12 @@ impl Db {
             )
             .is_ok();
         if cite_counter_added {
-            seed_cite_ledgers(&conn)?;
+            if let Err(e) = seed_cite_ledgers(&conn) {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
         }
+        conn.execute_batch("COMMIT;")?;
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN llm_review_base TEXT", []);
         let _ = conn.execute(
             "UPDATE llm_note_proposals SET status='dismissed' WHERE status='pending'",
@@ -4174,6 +4201,25 @@ impl Db {
         )
     }
 
+    /// Move the thread counter up to at least `at_least` (a `[n]` kept in an answer).
+    /// Numbers above the scan cap are ignored so a huge footnote cannot poison the counter.
+    pub fn raise_llm_cite_counter(&self, thread_id: &str, at_least: i64) -> Result<(), rusqlite::Error> {
+        if at_least <= 0 || at_least > LLM_CITE_SCAN_MAX {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_threads
+             SET cite_counter = MAX(
+                   CASE WHEN cite_counter > ?3 THEN 0 ELSE cite_counter END,
+                   ?1
+                 )
+             WHERE id=?2",
+            rusqlite::params![at_least, thread_id, LLM_CITE_COUNTER_ABSURD],
+        )?;
+        Ok(())
+    }
+
     pub fn find_cited_llm_source(
         &self,
         thread_id: &str,
@@ -6081,6 +6127,130 @@ mod folder_index_status_tests {
             .insert_llm_source("t1", "attach", "path-new", "new", "p", "本文", "")
             .unwrap();
         assert_eq!(next.cite_no, 182);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alloc_respects_cite_numbers_written_while_the_counter_stayed_zero() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        let db = Db::open(&path).unwrap();
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE llm_threads SET cite_counter=0 WHERE id=?1",
+                [&thread.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO llm_thread_sources(
+                   id, thread_id, sort_order, origin, path, title, paragraph_id, body, cite_no, kind, created_at
+                 ) VALUES ('old', ?1, 0, 'tool', 'old.txt', 'old', 'p', '本文', 4, 'text', 1)",
+                [&thread.id],
+            )
+            .unwrap();
+        }
+        let (row, _) = db
+            .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_eq!(row.cite_no, 5, "an older build's [4] must not be handed out again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_ignores_huge_bracket_numbers_and_still_counts_years() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE llm_threads (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL DEFAULT '',
+                  search_enabled INTEGER NOT NULL DEFAULT 1,
+                  path_prefix TEXT NOT NULL DEFAULT '',
+                  sort_order INTEGER NOT NULL DEFAULT 0,
+                  note_id TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_threads(
+                  id, title, search_enabled, path_prefix, sort_order, note_id, created_at, updated_at
+                ) VALUES ('t1', '調査', 1, '', 0, '', 10, 20);
+                CREATE TABLE llm_messages (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL DEFAULT '',
+                  reasoning TEXT NOT NULL DEFAULT '',
+                  tool_calls TEXT NOT NULL DEFAULT '',
+                  tool_call_id TEXT NOT NULL DEFAULT '',
+                  tool_name TEXT NOT NULL DEFAULT '',
+                  kind TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_messages(id, thread_id, role, content, created_at)
+                  VALUES (
+                    'a1', 't1', 'assistant',
+                    '年は [2026]。範囲外は [100001] と [9223372036854775807] と [99999999999999999999]。',
+                    40
+                  );
+                CREATE TABLE llm_thread_sources (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  sort_order INTEGER NOT NULL DEFAULT 0,
+                  origin TEXT NOT NULL DEFAULT 'attach',
+                  path TEXT NOT NULL DEFAULT '',
+                  title TEXT NOT NULL DEFAULT '',
+                  paragraph_id TEXT NOT NULL DEFAULT '',
+                  body TEXT NOT NULL DEFAULT '',
+                  query TEXT NOT NULL DEFAULT '',
+                  grain TEXT NOT NULL DEFAULT 'unit',
+                  unit_body TEXT NOT NULL DEFAULT '',
+                  injected_user_message_id TEXT NOT NULL DEFAULT '',
+                  cited_assistant_message_id TEXT NOT NULL DEFAULT '',
+                  cite_no INTEGER NOT NULL DEFAULT 0,
+                  kind TEXT NOT NULL DEFAULT 'text',
+                  stored_relpath TEXT NOT NULL DEFAULT '',
+                  ocr_status TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_thread_sources(
+                  id, thread_id, sort_order, origin, path, title, paragraph_id, body, cite_no, kind, created_at
+                ) VALUES ('huge', 't1', 0, 'tool', 'huge.txt', 'huge', 'p', '巨大', 9223372036854775807, 'text', 30);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.llm_cite_counter("t1").unwrap(), 2026);
+        let (next, _) = db
+            .insert_llm_source("t1", "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_eq!(next.cite_no, 2027);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alloc_does_not_overflow_a_poisoned_counter() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        let db = Db::open(&path).unwrap();
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE llm_threads SET cite_counter=?1 WHERE id=?2",
+                rusqlite::params![i64::MAX, thread.id],
+            )
+            .unwrap();
+        }
+        let (row, _) = db
+            .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_eq!(row.cite_no, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

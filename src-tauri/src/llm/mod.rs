@@ -159,6 +159,163 @@ fn model_not_found_message() -> String {
     "指定したモデルが見つかりません。モデル名を確認してください。".into()
 }
 
+fn eq_ignore_ascii_at(raw: &str, needle: &str) -> bool {
+    raw.len() >= needle.len() && raw.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+}
+
+/// Drop `api_key` / `Bearer` / `sk-` values. The status code and the words the
+/// tool and vision checks look for stay in place.
+fn redact_secrets(raw: &str) -> String {
+    redact_sk_tokens(&redact_bearer(&redact_labeled_secrets(raw)))
+}
+
+fn redact_labeled_secrets(raw: &str) -> String {
+    let labels = ["api_key", "api-key"];
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let rest = &raw[i..];
+        let mut ate = false;
+        for label in labels {
+            if eq_ignore_ascii_at(rest, label) {
+                if let Some(value_end) = labeled_secret_end(raw, i + label.len()) {
+                    out.push('…');
+                    i = value_end;
+                    ate = true;
+                    break;
+                }
+            }
+        }
+        if ate {
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Byte index just past a labeled secret, when `after_label` is followed by `=` or `:`.
+fn labeled_secret_end(raw: &str, mut i: usize) -> Option<usize> {
+    let b = raw.as_bytes();
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'"' {
+        i += 1;
+    }
+    if i >= b.len() || (b[i] != b'=' && b[i] != b':') {
+        return None;
+    }
+    i += 1;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i < b.len() && b[i] == b'"' {
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() || c == b'"' || c == b',' || c == b'}' || c == b']' {
+            break;
+        }
+        i += 1;
+    }
+    Some(i)
+}
+
+fn redact_bearer(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let rest = &raw[i..];
+        if eq_ignore_ascii_at(rest, "bearer") {
+            let b = raw.as_bytes();
+            let mut j = i + "bearer".len();
+            if j < b.len() && b[j] == b' ' {
+                j += 1;
+                let value_start = j;
+                while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b'"' && b[j] != b',' {
+                    j += 1;
+                }
+                if j > value_start {
+                    out.push('…');
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn redact_sk_tokens(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if i + 3 <= b.len() && b[i..i + 3].eq_ignore_ascii_case(b"sk-") {
+            let mut j = i + 3;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-' || b[j] == b'_') {
+                j += 1;
+            }
+            if j > i + 3 {
+                out.push('…');
+                i = j;
+                continue;
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn excerpt_after_status(raw: &str) -> &str {
+    let s = raw.trim_start();
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[..3].iter().all(|c| c.is_ascii_digit()) {
+        let rest = s[3..].trim_start();
+        if rest.is_empty() {
+            s
+        } else {
+            rest
+        }
+    } else {
+        s
+    }
+}
+
+fn short_excerpt(raw: &str, max_chars: usize) -> String {
+    let redacted = redact_secrets(excerpt_after_status(raw));
+    let trimmed = redacted.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let take = max_chars.saturating_sub(1);
+    let mut out: String = trimmed.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
+/// 400/413/422/429 keep a short body excerpt. 401/403/404 and 5xx do not.
+fn client_error_with_excerpt(code: u16, raw: &str) -> String {
+    let excerpt = short_excerpt(raw, 180);
+    if excerpt.is_empty() {
+        format!("LLM サーバがエラーを返しました（HTTP {code}）。")
+    } else {
+        format!("LLM サーバがエラーを返しました（HTTP {code}）。{excerpt}")
+    }
+}
+
 fn map_llm_error(raw: &str) -> String {
     let l = raw.to_lowercase();
     // Classify the real status first. Numbers and phrases inside the body
@@ -173,6 +330,9 @@ fn map_llm_error(raw: &str) -> String {
         if is_context_length_error(&l) {
             return "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。"
                 .into();
+        }
+        if matches!(code, 400 | 413 | 422 | 429) {
+            return client_error_with_excerpt(code, raw);
         }
         return format!("LLM サーバがエラーを返しました（HTTP {code}）。");
     }
@@ -342,9 +502,17 @@ async fn fetch_models_url(
     let status = resp.status();
     let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
     if !status.is_success() {
-        return Err(map_llm_error(&format!("{status} {text}")));
+        return Err(map_models_list_error(&format!("{status} {text}")));
     }
     parse_models_json(&text)
+}
+
+/// `GET /models` 404 is a missing list endpoint, not a missing chat model.
+fn map_models_list_error(raw: &str) -> String {
+    if tools::http_status_code(raw) == Some(404) {
+        return "モデル一覧を取得できませんでした（HTTP 404）。".into();
+    }
+    map_llm_error(raw)
 }
 
 fn parse_models_json(text: &str) -> Result<Vec<LlmModelInfo>, String> {
@@ -631,6 +799,39 @@ pub fn is_tools_unsupported_error(e: &str) -> bool {
     mentions_tools && looks_invalid
 }
 
+/// Tools-unsupported is decided on the raw `{status} {text}` before the body is
+/// replaced by a short Japanese message. The string returned still matches
+/// `is_tools_unsupported_error`, with secret values removed.
+fn chat_http_error(status: reqwest::StatusCode, text: &str) -> String {
+    let raw = format!("{status} {text}");
+    if is_tools_unsupported_error(&raw) {
+        return preserved_tools_error(&raw);
+    }
+    map_llm_error(&raw)
+}
+
+fn cap_chars_local(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let take = max_chars.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
+fn preserved_tools_error(raw: &str) -> String {
+    let redacted = redact_secrets(raw);
+    let trimmed = redacted.trim();
+    // Keep the leading status. Stripping it would hide the `400` the fallback matches.
+    let head = cap_chars_local(trimmed, 400);
+    if is_tools_unsupported_error(&head) || !is_tools_unsupported_error(trimmed) {
+        head
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub async fn stream_chat(
     settings: &Settings,
     turns: &[ChatTurn],
@@ -686,7 +887,7 @@ pub async fn stream_chat(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(map_llm_error(&format!("{status} {text}")));
+        return Err(chat_http_error(status, &text));
     }
 
     let content_type = resp
@@ -1106,9 +1307,7 @@ pub async fn transcribe_image(
     let status = resp.status();
     let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
     if !status.is_success() {
-        return Err(map_vision_error(&map_llm_error(&format!(
-            "{status} {text}"
-        ))));
+        return Err(map_vision_error(&format!("{status} {text}")));
     }
     let v: Value = serde_json::from_str(&text)
         .map_err(|_| map_llm_error(&format!("応答の解釈に失敗しました: {text}")))?;
@@ -1117,7 +1316,7 @@ pub async fn transcribe_image(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or_else(|| err.as_str().unwrap_or("error"));
-        return Err(map_vision_error(&map_llm_error(msg)));
+        return Err(map_vision_error(msg));
     }
     let content = first_text(&[
         v.pointer("/choices/0/message/content"),
@@ -1147,7 +1346,7 @@ fn map_vision_error(msg: &str) -> String {
     {
         return "このモデルは画像を読めません。vision 対応のモデルを設定してください。".into();
     }
-    msg.to_string()
+    map_llm_error(msg)
 }
 
 #[cfg(test)]
@@ -1346,6 +1545,210 @@ mod tests {
             "400 invalid tools: unknown field"
         ));
         assert!(!is_tools_unsupported_error("connection refused"));
+    }
+
+    #[test]
+    fn client_errors_keep_a_short_secret_free_excerpt() {
+        for (status, marker) in [
+            ("400 Bad Request", "marker-400"),
+            ("413 Payload Too Large", "marker-413"),
+            ("422 Unprocessable Entity", "marker-422"),
+            ("429 Too Many Requests", "marker-429"),
+        ] {
+            let msg = map_llm_error(&format!(
+                "{status} {{\"error\":\"{marker}\",\"api_key\":\"sk-live-secret\",\"authorization\":\"Bearer sk-live-secret\"}}"
+            ));
+            assert!(msg.contains("HTTP"), "{msg}");
+            assert!(msg.contains(marker), "{msg}");
+            assert!(!msg.contains("sk-live-secret"), "{msg}");
+            assert!(!msg.to_lowercase().contains("api_key"), "{msg}");
+            assert!(!msg.contains("Bearer"), "{msg}");
+        }
+        let server = map_llm_error("500 Internal Server Error marker-500 api_key=sk-live-secret");
+        assert!(server.contains("HTTP 500"), "{server}");
+        assert!(!server.contains("marker-500"), "{server}");
+        assert!(!server.contains("sk-live-secret"), "{server}");
+    }
+
+    #[test]
+    fn models_list_404_is_not_a_missing_chat_model() {
+        let msg = map_models_list_error(r#"404 Not Found {"error":"model not found"}"#);
+        assert!(msg.contains("HTTP 404"), "{msg}");
+        assert!(!msg.contains("見つかりません"), "{msg}");
+        assert!(!msg.to_lowercase().contains("model not found"), "{msg}");
+    }
+
+    fn local_llm_settings(port: u16) -> Settings {
+        let mut settings = Settings::default();
+        settings.llm_base_url = format!("http://127.0.0.1:{port}/v1");
+        settings.llm_model = "test-model".into();
+        settings.llm_timeout_ms = 5_000;
+        settings
+    }
+
+    fn serve_http(status: u16, reason: &str, body: &str, times: usize) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reason = reason.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            for _ in 0..times {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut sock, &mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        if name.eq_ignore_ascii_case("content-length") {
+                                            value.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() - (header_end + 4) >= len {
+                                    break;
+                                }
+                            }
+                            if buf.len() > 2_000_000 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+                let _ = std::io::Write::flush(&mut sock);
+            }
+        });
+        port
+    }
+
+    async fn stream_chat_err(port: u16, tools: bool) -> String {
+        let settings = local_llm_settings(port);
+        let turns = [ChatTurn::text("user", "こんにちは")];
+        let schema = json!([{ "type": "function", "function": { "name": "search_index" } }]);
+        stream_chat(
+            &settings,
+            &turns,
+            Arc::new(AtomicBool::new(false)),
+            if tools { Some(&schema) } else { None },
+            0,
+            |_, _| {},
+        )
+        .await
+        .expect_err("the local server returns an error status")
+    }
+
+    #[tokio::test]
+    async fn stream_chat_keeps_tools_unsupported_errors_detectable() {
+        let ollama = r#"{"error":{"message":"registry.ollama.ai/library/llama3:latest does not support tools"}}"#;
+        let ollama_port = serve_http(400, "Bad Request", ollama, 2);
+        let ollama_err = stream_chat_err(ollama_port, true).await;
+        assert!(
+            is_tools_unsupported_error(&ollama_err),
+            "ollama tools error must still reach the tool-free fallback: {ollama_err}"
+        );
+        assert!(ollama_err.contains("does not support tools"), "{ollama_err}");
+
+        let vllm = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}}"#;
+        let vllm_port = serve_http(400, "Bad Request", vllm, 2);
+        let vllm_err = stream_chat_err(vllm_port, true).await;
+        assert!(
+            is_tools_unsupported_error(&vllm_err),
+            "vllm tool-choice error must still reach the tool-free fallback: {vllm_err}"
+        );
+        assert!(vllm_err.to_lowercase().contains("tool"), "{vllm_err}");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_maps_client_and_server_errors_from_the_response() {
+        let secret_body = r#"{"error":"marker-safe-detail","api_key":"sk-live-secret","authorization":"Bearer sk-live-secret"}"#;
+        // The first HTTP 400 is the thinking-field retry, so a 400 is served twice.
+        let port_400 = serve_http(400, "Bad Request", secret_body, 2);
+        let err_400 = stream_chat_err(port_400, false).await;
+        assert!(err_400.contains("HTTP 400"), "{err_400}");
+        assert!(err_400.contains("marker-safe-detail"), "{err_400}");
+        assert!(!err_400.contains("sk-live-secret"), "{err_400}");
+        assert!(!err_400.to_lowercase().contains("api_key"), "{err_400}");
+        assert!(!err_400.contains("Bearer"), "{err_400}");
+        assert!(
+            !is_tools_unsupported_error(&err_400),
+            "a generic 400 must not look like a tools fallback: {err_400}"
+        );
+
+        for (code, reason) in [
+            (413u16, "Payload Too Large"),
+            (422, "Unprocessable Entity"),
+            (429, "Too Many Requests"),
+        ] {
+            let body = format!(r#"{{"error":"marker-{code}","api_key":"sk-live-secret"}}"#);
+            let port = serve_http(code, reason, &body, 1);
+            let err = stream_chat_err(port, false).await;
+            assert!(err.contains(&format!("HTTP {code}")), "{err}");
+            assert!(err.contains(&format!("marker-{code}")), "{err}");
+            assert!(!err.contains("sk-live-secret"), "{err}");
+            assert!(!err.to_lowercase().contains("api_key"), "{err}");
+        }
+
+        let port_500 = serve_http(
+            500,
+            "Internal Server Error",
+            r#"{"error":"marker-secret-body","api_key":"sk-live-secret"}"#,
+            1,
+        );
+        let err_500 = stream_chat_err(port_500, false).await;
+        assert!(err_500.contains("HTTP 500"), "{err_500}");
+        assert!(!err_500.contains("marker-secret-body"), "{err_500}");
+        assert!(!err_500.contains("sk-live-secret"), "{err_500}");
+
+        let port_404 = serve_http(404, "Not Found", r#"{"error":"model not found"}"#, 1);
+        let err_404 = stream_chat_err(port_404, false).await;
+        assert!(err_404.contains("指定したモデルが見つかりません"), "{err_404}");
+    }
+
+    #[tokio::test]
+    async fn transcribe_image_reads_vision_unsupported_from_the_raw_status() {
+        let body = r#"{"error":{"message":"this model does not support image input"}}"#;
+        let port = serve_http(400, "Bad Request", body, 1);
+        let err = transcribe_image(
+            &local_llm_settings(port),
+            "image/png",
+            &[0x89, 0x50, 0x4e, 0x47],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("vision models reject image input with HTTP 400");
+        assert!(
+            err.contains("このモデルは画像を読めません"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_404_does_not_say_the_chat_model_is_missing() {
+        let port = serve_http(404, "Not Found", r#"{"error":"model not found"}"#, 1);
+        let err = list_models(&local_llm_settings(port))
+            .await
+            .expect_err("GET /models returned 404");
+        assert!(err.contains("404"), "{err}");
+        assert!(!err.contains("見つかりません"), "{err}");
+        assert!(!err.to_lowercase().contains("model not found"), "{err}");
     }
 
     fn thinking_settings(mode: &str) -> Settings {
