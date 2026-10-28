@@ -219,22 +219,44 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
         .filter(|turn| turn.role != "tool")
         .map(turn_tokens)
         .sum();
-    let mut room = ceiling.saturating_sub(non_tool);
-    for turn in turns.iter_mut().filter(|turn| turn.role == "tool") {
-        if turn_tokens(turn) <= room {
-            room = room.saturating_sub(turn_tokens(turn));
+    let room = ceiling.saturating_sub(non_tool);
+    // A read_note body is the whole note. A shortened prefix looks complete, so a
+    // later headingless write can delete the tail. Keep it whole, or replace it.
+    let read_note_cost: usize = turns
+        .iter()
+        .filter(|turn| is_read_note_turn(turn))
+        .map(turn_tokens)
+        .sum();
+    let mut others = room.saturating_sub(read_note_cost);
+    for turn in turns.iter_mut() {
+        if turn.role != "tool" || is_read_note_turn(turn) {
             continue;
         }
-        // Message overhead, the truncation note, and one token of rounding.
+        if turn_tokens(turn) <= others {
+            others = others.saturating_sub(turn_tokens(turn));
+            continue;
+        }
         let note_tokens = estimate_tokens(TOOL_RESULT_TRUNCATION_NOTE);
-        let body_budget = room.saturating_sub(4 + note_tokens + 1).max(1);
+        let body_budget = others.saturating_sub(4 + note_tokens + 1).max(1);
         turn.content = truncate_to_tokens(&turn.content, body_budget);
-        if turn_tokens(turn) > room {
+        if turn_tokens(turn) > others {
             turn.content = "（文脈の上限に達したため、この結果は省略しました）".into();
         }
-        room = room.saturating_sub(turn_tokens(turn));
+        others = others.saturating_sub(turn_tokens(turn));
+    }
+    if turn_list_tokens(turns) <= ceiling {
+        return;
+    }
+    for turn in turns.iter_mut().filter(|turn| is_read_note_turn(turn)) {
+        turn.content = READ_NOTE_OMITTED.into();
     }
 }
+
+fn is_read_note_turn(turn: &ChatTurn) -> bool {
+    turn.role == "tool" && turn.name.as_deref() == Some(crate::llm::tools::TOOL_READ_NOTE)
+}
+
+const READ_NOTE_OMITTED: &str = "（文脈の上限に達したため、ノート本文は省略しました。全文置換はせず、heading を指定して読み直してください）";
 
 const TOOL_RESULT_TRUNCATION_NOTE: &str = "\n…（長いので省略しました）";
 
@@ -2895,6 +2917,38 @@ mod tests {
         let carried = turns[2].reasoning.as_deref().unwrap_or("");
         assert!(char_len(carried) < 4_000, "{}", char_len(carried));
         assert_eq!(turns[3].content, tool_body);
+    }
+
+    #[test]
+    fn read_note_followup_is_replaced_whole_not_prefix_cut() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let search_body = "索".repeat(8_000);
+        let note_body = format!("見出し\n{}", "記".repeat(30_000));
+        let mut search = ChatTurn::text("tool", search_body.clone());
+        search.name = Some("search_index".into());
+        let mut note = ChatTurn::text("tool", note_body);
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        let mut turns = vec![
+            ChatTurn::text("system", "役割"),
+            ChatTurn::text("user", "読んでから書いて"),
+            search,
+            note,
+        ];
+        assert!(turn_list_tokens(&turns) > ceiling);
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_ne!(turns[2].content, search_body);
+        assert!(
+            char_len(&turns[2].content) < char_len(&search_body),
+            "the other result is trimmed before the note"
+        );
+        assert_eq!(turns[3].content, READ_NOTE_OMITTED);
+        assert!(!turns[3].content.contains("見出し"));
+        assert!(!turns[3].content.contains("…（長いので省略しました）"));
     }
 
     #[test]
