@@ -185,14 +185,12 @@ pub fn fit_tool_text(content: String, budget_tokens: usize, used_tokens: usize) 
     truncate_to_tokens(&content, left.saturating_sub(8).max(1))
 }
 
-/// Before a later tool round, keep the request inside the limit.
-/// Carried reasoning is shortened first, oldest first. Tool results then take what remains.
-pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_tokens: usize) {
-    let reply = reply_headroom_tokens(limit_tokens);
-    let ceiling = limit_tokens
-        .saturating_sub(schema_tokens)
-        .saturating_sub(reply)
-        .max(1);
+/// Before a later tool round, keep the request inside `ceiling`.
+/// `ceiling` already leaves the reply reserve: the normal headroom, or the
+/// smaller one a long question required. Carried reasoning is shortened first,
+/// oldest first. Tool results then take what remains.
+pub fn fit_followup_request(turns: &mut [ChatTurn], ceiling: usize) {
+    let ceiling = ceiling.max(1);
     // Each pass shortens or clears the oldest reasoning, so this ends without a cap.
     while turn_list_tokens(turns) > ceiling {
         let Some(idx) = turns.iter().position(|turn| {
@@ -338,7 +336,13 @@ fn next_read_note_to_omit(turns: &[ChatTurn]) -> Option<usize> {
 }
 
 fn other_result_floor(turn: &ChatTurn) -> usize {
-    turn_tokens(turn).min(turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED)))
+    let cost = turn_tokens(turn);
+    let minimal = turn_tokens(&ChatTurn::text(
+        "tool",
+        &truncate_to_tokens(&turn.content, 1),
+    ));
+    let placeholder = turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED));
+    cost.min(minimal).min(placeholder)
 }
 
 fn next_other_result_to_omit(turns: &[ChatTurn]) -> Option<usize> {
@@ -3026,7 +3030,7 @@ mod tests {
             before + schema + reply > limit,
             "fixture must overshoot: {before} ceiling {ceiling}"
         );
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         let carried = turns[2].reasoning.as_deref().unwrap_or("");
@@ -3053,7 +3057,7 @@ mod tests {
             note,
         ];
         assert!(turn_list_tokens(&turns) > ceiling);
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         assert_eq!(
@@ -3090,7 +3094,7 @@ mod tests {
             notes[2].clone(),
         ];
         assert!(turn_list_tokens(&turns) > ceiling);
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         assert_eq!(turns[2].content, small_a);
@@ -3119,7 +3123,7 @@ mod tests {
         ];
         let note_alone = turn_tokens(&turns[0]) + turn_tokens(&turns[1]) + turn_tokens(&turns[3]);
         assert!(note_alone > ceiling, "the note alone must exceed the room");
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         assert_eq!(turns[2].content, search_body);
@@ -3147,7 +3151,7 @@ mod tests {
             (1..200).contains(&over),
             "fixture should be slightly over the room: before {before} ceiling {ceiling} over {over}"
         );
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         let kept = &turns[2].content;
@@ -3191,7 +3195,7 @@ mod tests {
         assert_eq!(turn_tokens(&system) + turn_tokens(&user), non_tool);
         let mut turns = vec![system, user, search, note, write];
         assert!(turn_list_tokens(&turns) > ceiling);
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         assert_eq!(turns[3].content, note_body);
@@ -3226,7 +3230,7 @@ mod tests {
             (1..200).contains(&over),
             "fixture should be slightly over the room: before {before} ceiling {ceiling} over {over}"
         );
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         let kept = &turns[2].content;
@@ -3268,7 +3272,7 @@ mod tests {
         assert_eq!(turn_tokens(&system) + turn_tokens(&user), non_tool);
         let mut turns = vec![system, user, search_a, search_b, unit, note];
         assert!(turn_list_tokens(&turns) > ceiling);
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         assert_eq!(turns[5].content, note_body);
@@ -3327,7 +3331,7 @@ mod tests {
         let before = turn_list_tokens(&turns);
         assert_eq!(before, ceiling + 14_000);
         assert!(before - 17_500 <= ceiling);
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
         let kept = turns
@@ -3377,14 +3381,14 @@ mod tests {
         );
         let mut turns = vec![system, user, first, second];
         assert_eq!(turn_list_tokens(&turns) - ceiling, 6);
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
-        assert_eq!(turns[3].content, body);
-        assert!(turns[2].content.starts_with('あ'));
-        assert!(turns[2].content.contains("…（長いので省略しました）"));
-        assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
-        assert!(turn_tokens(&turns[2]) < 20);
+        assert_eq!(turns[2].content, body);
+        assert!(turns[3].content.starts_with('あ'));
+        assert!(turns[3].content.contains("…（長いので省略しました）"));
+        assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
+        assert_eq!(turn_tokens(&turns[3]), 14);
     }
 
     #[test]
@@ -3412,16 +3416,123 @@ mod tests {
             room
         );
         let mut turns = vec![system, user, first, second];
-        fit_followup_request(&mut turns, limit, schema);
+        fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
-        assert_eq!(turn_tokens(&turns[2]), 14);
-        assert_eq!(turn_tokens(&turns[3]), 15);
+        assert_eq!(turn_tokens(&turns[2]), 15);
+        assert_eq!(turn_tokens(&turns[3]), 14);
         assert!(turns[2].content.starts_with('読'));
         assert!(turns[3].content.starts_with('読'));
         assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
         assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
         assert!(turns[2].content.contains("…（長いので省略しました）"));
         assert!(turns[3].content.contains("…（長いので省略しました）"));
+    }
+
+    #[test]
+    fn shrunk_reply_reserve_keeps_results_that_fit_the_tool_allowance() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let split = context_budget(limit, schema, 12_700).expect("question fits");
+        assert_eq!(split.messages, 12_700);
+        assert_eq!(split.tool_allowance, 1_127);
+        let inject_budget = split.messages + split.tool_allowance;
+        assert_eq!(inject_budget, 13_827);
+        let note_body = "記".repeat(tokens_to_chars(996));
+        let search_body = "索".repeat(tokens_to_chars(96));
+        let mut note = ChatTurn::text("tool", note_body.clone());
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        let mut search = ChatTurn::text("tool", search_body.clone());
+        search.name = Some("search_index".into());
+        assert_eq!(turn_tokens(&note), 1_000);
+        assert_eq!(turn_tokens(&search), 100);
+        let system = ChatTurn::text("system", "役割");
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(12_700 - turn_tokens(&system) - 4)),
+        );
+        let assistant = ChatTurn::text("assistant", "助".repeat(tokens_to_chars(15)));
+        assert_eq!(turn_tokens(&system) + turn_tokens(&user), 12_700);
+        assert_eq!(turn_tokens(&assistant), 19);
+        let mut turns = vec![system, user, assistant, search, note];
+        assert_eq!(turn_list_tokens(&turns), 13_819);
+        assert!(turn_list_tokens(&turns) > limit - schema - reply_headroom_tokens(limit));
+        fit_followup_request(&mut turns, inject_budget);
+        assert!(turn_list_tokens(&turns) <= inject_budget);
+        assert_eq!(turns[3].content, search_body);
+        assert_eq!(turns[4].content, note_body);
+    }
+
+    #[test]
+    fn shrunk_reply_reserve_keeps_a_large_note_at_260k() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let split = context_budget(limit, schema, 200_000).expect("question fits");
+        assert_eq!(split.messages, 200_000);
+        assert_eq!(split.tool_allowance, 41_353);
+        let inject_budget = split.messages + split.tool_allowance;
+        assert_eq!(inject_budget, 241_353);
+        assert_eq!(
+            limit - schema - split.messages - split.tool_allowance,
+            16_542
+        );
+        let note_body = "記".repeat(tokens_to_chars(34_996));
+        let mut note = ChatTurn::text("tool", note_body.clone());
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        assert_eq!(turn_tokens(&note), 35_000);
+        let system = ChatTurn::text("system", "役割");
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(200_000 - turn_tokens(&system) - 4)),
+        );
+        let assistant = ChatTurn::text("assistant", "助".repeat(tokens_to_chars(15)));
+        assert_eq!(turn_tokens(&system) + turn_tokens(&user), 200_000);
+        assert_eq!(turn_tokens(&assistant), 19);
+        let mut turns = vec![system, user, assistant, note];
+        assert_eq!(turn_list_tokens(&turns), 235_019);
+        assert!(turn_list_tokens(&turns) > limit - schema - reply_headroom_tokens(limit));
+        fit_followup_request(&mut turns, inject_budget);
+        assert!(turn_list_tokens(&turns) <= inject_budget);
+        assert_eq!(turns[3].content, note_body);
+    }
+
+    #[test]
+    fn truncation_floor_keeps_a_note_beside_two_searches() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let room = 30_033;
+        let search_body = "索".repeat(tokens_to_chars(1_000));
+        let note_body = "記".repeat(tokens_to_chars(29_996));
+        let mut first = ChatTurn::text("tool", search_body.clone());
+        first.name = Some("search_index".into());
+        let mut second = ChatTurn::text("tool", search_body);
+        second.name = Some("search_index".into());
+        let mut note = ChatTurn::text("tool", note_body.clone());
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        assert_eq!(turn_tokens(&first), 1_004);
+        assert_eq!(turn_tokens(&note), 30_000);
+        let system = ChatTurn::text("system", "役割");
+        let non_tool = ceiling - room;
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(non_tool - turn_tokens(&system) - 4)),
+        );
+        assert_eq!(turn_tokens(&system) + turn_tokens(&user), non_tool);
+        let mut turns = vec![system, user, first, second, note];
+        assert!(turn_list_tokens(&turns) > ceiling);
+        fit_followup_request(&mut turns, ceiling);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turns[4].content, note_body);
+        assert_eq!(turn_tokens(&turns[2]), 18);
+        assert_eq!(turn_tokens(&turns[3]), 14);
+        assert!(turns[2].content.starts_with('索'));
+        assert!(turns[3].content.starts_with('索'));
+        assert!(turns[2].content.contains("…（長いので省略しました）"));
+        assert!(turns[3].content.contains("…（長いので省略しました）"));
+        assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
+        assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
     }
 }

@@ -815,11 +815,7 @@ pub async fn llm_send(
         }
         let with_tools = use_tools;
         if rounds > 0 {
-            crate::llm::context::fit_followup_request(
-                &mut current_turns,
-                full_limit,
-                schema_tokens,
-            );
+            crate::llm::context::fit_followup_request(&mut current_turns, inject_budget);
         }
         let turns_now = current_turns.clone();
         let mut bridge_retried = false;
