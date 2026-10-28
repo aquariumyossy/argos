@@ -497,6 +497,7 @@ fn turns_chars(turns: &[ChatTurn]) -> usize {
 
 fn select_sources(
     sources: &[LlmSourceRow],
+    pool: &[LlmSourceRow],
     budget: usize,
     pending_ids: &HashSet<String>,
 ) -> (Vec<LlmSourceRow>, usize, bool) {
@@ -514,7 +515,7 @@ fn select_sources(
         })
         .collect();
 
-    let over = |rows: &[LlmSourceRow]| char_len(&format_sources(rows)) > budget;
+    let over = |rows: &[LlmSourceRow]| char_len(&format_sources_with_pool(rows, pool)) > budget;
     let is_protected = |s: &LlmSourceRow| pending_ids.contains(&s.id) && s.origin == "attach";
 
     while over(&rows) {
@@ -551,16 +552,14 @@ fn select_sources(
         let next = char_len(&rows[idx].body) / 2;
         let pending_attach =
             pending_ids.contains(&rows[idx].id) && rows[idx].origin == "attach";
-        if next < 400 {
-            if pending_attach {
-                let keep = char_len(&rows[idx].body).min(80).max(1);
-                rows[idx].body = cap_chars(&rows[idx].body, keep);
-                if over(&rows) {
-                    rows.remove(idx);
-                }
-            } else {
-                rows.remove(idx);
+        if pending_attach {
+            let before = rows[idx].body.clone();
+            fit_pending_prefix(&mut rows, idx, pool, budget);
+            if rows[idx].body == before {
+                break;
             }
+        } else if next < 400 {
+            rows.remove(idx);
         } else {
             rows[idx].body = cap_chars(&rows[idx].body, next);
         }
@@ -575,6 +574,81 @@ fn select_sources(
                 .is_some_and(|o| char_len(o.body.trim()) > char_len(&s.body))
         });
     (rows, dropped, truncated)
+}
+
+/// Longest body prefix that keeps the rendered block inside `budget`.
+/// An empty body leaves the citation header. The row itself stays.
+fn fit_pending_prefix(rows: &mut [LlmSourceRow], idx: usize, pool: &[LlmSourceRow], budget: usize) {
+    let full = rows[idx].body.clone();
+    let mut lo = 0usize;
+    let mut hi = char_len(&full);
+    let mut best = 0usize;
+    loop {
+        let mid = lo + (hi - lo) / 2;
+        rows[idx].body = if mid == 0 {
+            String::new()
+        } else {
+            cap_chars(&full, mid)
+        };
+        let fits = char_len(&format_sources_with_pool(rows, pool)) <= budget;
+        if fits {
+            best = mid;
+            if mid == hi {
+                break;
+            }
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+        if lo > hi {
+            break;
+        }
+    }
+    rows[idx].body = if best == 0 {
+        String::new()
+    } else {
+        cap_chars(&full, best)
+    };
+}
+
+/// Tokens to take from the tool reserve so a pending attachment still has a short excerpt.
+/// Zero when the message budget already holds that excerpt.
+pub fn pending_attachment_borrow(
+    system: &str,
+    question: &str,
+    sources: &[LlmSourceRow],
+    message_budget: usize,
+) -> usize {
+    let mut excerpt: Vec<LlmSourceRow> = sources
+        .iter()
+        .filter(|source| {
+            source.is_pending() && source.origin == "attach" && source.is_injectable()
+        })
+        .cloned()
+        .collect();
+    if excerpt.is_empty() {
+        return 0;
+    }
+    for row in &mut excerpt {
+        row.body = cap_chars(row.body.trim(), 400);
+    }
+    prompt_tokens_with_sources(system, question, &excerpt).saturating_sub(message_budget)
+}
+
+fn prompt_tokens_with_sources(system: &str, question: &str, sources: &[LlmSourceRow]) -> usize {
+    let mut sys = system.trim().to_string();
+    if !sources.is_empty() && !sys.contains("[n]") {
+        sys.push_str(CITATION_GUIDE);
+    }
+    let sys_tokens = if sys.is_empty() {
+        0
+    } else {
+        turn_tokens(&ChatTurn::text("system", sys))
+    };
+    let user = wrap_user(&format_sources_with_pool(sources, sources), question);
+    sys_tokens + turn_tokens(&ChatTurn::text("user", user))
 }
 
 struct BuiltTurn {
@@ -1065,14 +1139,23 @@ fn refit_freed_budget(
 }
 
 /// Replace remaining recent source bodies with stubs so the previous question can stay.
+/// The latest turn's unsent attachment is shortened instead of stubbed.
 fn shrink_recent_sources(built: &mut [BuiltTurn], pool: &[LlmSourceRow], max_tokens: usize) -> bool {
     if tokens_of(built) <= max_tokens {
         return false;
     }
     let recent = recent_user_ids(built);
+    let latest = built
+        .iter()
+        .rev()
+        .find(|row| row.turn.role == "user")
+        .map(|row| row.message_id.clone());
     let mut changed = false;
     for row in built.iter_mut() {
         if row.turn.role != "user" || !recent.contains(&row.message_id) || row.sources.is_empty() {
+            continue;
+        }
+        if latest.as_deref() == Some(row.message_id.as_str()) && has_unsent_attachment(row) {
             continue;
         }
         let next = render_user_content(&row.question, &row.sources, pool, true);
@@ -1080,6 +1163,54 @@ fn shrink_recent_sources(built: &mut [BuiltTurn], pool: &[LlmSourceRow], max_tok
             row.turn.content = next;
             changed = true;
         }
+    }
+    changed || shrink_unsent_attachment(built, pool, max_tokens)
+}
+
+fn has_unsent_attachment(row: &BuiltTurn) -> bool {
+    row.sources
+        .iter()
+        .any(|source| source.is_pending() && source.origin == "attach")
+}
+
+fn shrink_unsent_attachment(
+    built: &mut [BuiltTurn],
+    pool: &[LlmSourceRow],
+    max_tokens: usize,
+) -> bool {
+    let mut changed = false;
+    let mut guard = 0;
+    while tokens_of(built) > max_tokens && guard < 24 {
+        guard += 1;
+        let Some(turn_idx) = built.iter().rposition(|row| row.turn.role == "user") else {
+            break;
+        };
+        if !has_unsent_attachment(&built[turn_idx]) {
+            break;
+        }
+        let Some(src_idx) = built[turn_idx]
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                source.is_pending() && source.origin == "attach" && !source.body.is_empty()
+            })
+            .max_by_key(|(_, source)| char_len(&source.body))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let len = char_len(&built[turn_idx].sources[src_idx].body);
+        let next = len / 2;
+        built[turn_idx].sources[src_idx].body = if next == 0 {
+            String::new()
+        } else {
+            cap_chars(&built[turn_idx].sources[src_idx].body, next)
+        };
+        let question = built[turn_idx].question.clone();
+        let sources = built[turn_idx].sources.clone();
+        built[turn_idx].turn.content = render_user_content(&question, &sources, pool, false);
+        changed = true;
     }
     changed
 }
@@ -1089,18 +1220,21 @@ fn source_char_room(built: &[BuiltTurn], max_tokens: usize) -> usize {
     let base: usize = built
         .iter()
         .map(|row| {
-            // Full bodies are fitted separately. Stubbed turns are already one line.
+            // Source bodies are fitted separately. Count the wrapper that render adds
+            // around them, not the question text alone.
             if row.turn.role == "user"
                 && !row.sources.is_empty()
                 && recent.contains(&row.message_id)
             {
-                turn_tokens(&ChatTurn::text("user", &row.question))
+                let shell = wrap_user("【出典】\n", &row.question);
+                turn_tokens(&ChatTurn::text("user", shell))
             } else {
                 turn_tokens(&row.turn)
             }
         })
         .sum();
-    tokens_to_chars(max_tokens.saturating_sub(base))
+    // A few tokens of slack, so omission notes and rounding cannot stub the attachment.
+    tokens_to_chars(max_tokens.saturating_sub(base).saturating_sub(16))
 }
 
 /// Drop source bodies that still do not fit. Attachments are removed last, matching
@@ -1116,8 +1250,12 @@ fn refit_sources(
     if current.is_empty() {
         return false;
     }
-    let (kept, dropped, shortened) =
-        select_sources(&current, source_char_room(built, max_tokens), pending_ids);
+    let (kept, dropped, shortened) = select_sources(
+        &current,
+        pool,
+        source_char_room(built, max_tokens),
+        pending_ids,
+    );
     if dropped == 0 && !shortened {
         return false;
     }
@@ -2168,6 +2306,92 @@ mod tests {
         assert!(user.content.contains("見て"), "{}", user.content);
         assert!(user.content.contains("【質問】"), "{}", user.content);
         assert!(!user.content.contains(&body), "the attachment is cut to fit");
+        assert!(
+            user.content.contains("[5]") || user.content.contains("添"),
+            "a header or a body prefix stays whenever the question fits: {}",
+            user.content.chars().take(240).collect::<String>()
+        );
+        assert!(!user.content.contains("既読 [5]"), "{}", user.content);
+    }
+
+    #[test]
+    fn near_budget_attachment_is_truncated_not_stubbed() {
+        let body = "あ".repeat(1_471);
+        let mut file = src_file("f", "attach", 0, &body);
+        file.cite_no = 1;
+        file.path = r"C:\docs\a.txt".into();
+        file.title = "a.txt".into();
+        file.paragraph_id.clear();
+        let (turns, stats) = assemble_turns("役割", &[file], &[msg("u1", "user", "見て")], 1_000);
+        assert!(!stats.question_exceeds);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(user.content.contains("見て"), "{}", user.content);
+        assert!(user.content.contains("[1]"), "{}", user.content);
+        assert!(
+            !user.content.contains("既読 [1]"),
+            "a near-budget attachment stays truncated, not a stub: {}",
+            user.content
+        );
+        assert!(stats.consumed.iter().any(|source| source.id == "f"));
+    }
+
+    #[test]
+    fn attachment_near_the_16k_window_is_not_stubbed() {
+        let split = context_budget(16_384, 2_105, 200).expect("short question fits");
+        for n in [12_931usize, 12_934] {
+            let body = "文".repeat(n);
+            let mut file = src_file("f", "attach", 0, &body);
+            file.cite_no = 1;
+            file.path = r"C:\docs\scan.pdf".into();
+            file.title = "scan.pdf".into();
+            file.paragraph_id.clear();
+            let (turns, stats) =
+                assemble_turns("役割", &[file], &[msg("u1", "user", "見て")], split.messages);
+            assert!(!stats.question_exceeds, "{n}");
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            assert!(
+                !user.content.contains("既読 [1]"),
+                "{n} chars became a stub: {}",
+                user.content.chars().take(160).collect::<String>()
+            );
+            assert!(user.content.contains("[1]"), "{n}");
+            assert!(user.content.contains("文"), "{n}");
+        }
+    }
+
+    #[test]
+    fn question_that_fills_the_budget_keeps_an_attachment_prefix() {
+        let system = crate::db::DEFAULT_LLM_SYSTEM_PROMPT;
+        let question = "あ".repeat(12_600);
+        let body = "添".repeat(3_000);
+        let mut file = src_file("big", "attach", 0, &body);
+        file.cite_no = 1;
+        file.path = r"C:\docs\memo.txt".into();
+        file.title = "memo.txt".into();
+        file.paragraph_id.clear();
+        let question_turn = format!("【質問】\n{question}");
+        let required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", question_turn));
+        let split = context_budget(16_384, 2_105, required).expect("the question fits");
+        let borrow =
+            pending_attachment_borrow(system, &question, std::slice::from_ref(&file), split.messages);
+        let budget = split.messages + borrow.min(split.tool_allowance);
+        let (turns, stats) = assemble_turns(
+            system,
+            &[file],
+            &[msg("u1", "user", &question)],
+            budget,
+        );
+        assert!(!stats.question_exceeds);
+        assert!(stats.consumed.iter().any(|source| source.id == "big"));
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(user.content.contains("[1]"), "{}", user.content.chars().take(240).collect::<String>());
+        assert!(!user.content.contains("既読 [1]"), "{}", user.content);
+        assert!(
+            user.content.contains("添") || user.content.contains("memo.txt"),
+            "header or a body prefix stays: {}",
+            user.content.chars().take(240).collect::<String>()
+        );
     }
 
     #[test]

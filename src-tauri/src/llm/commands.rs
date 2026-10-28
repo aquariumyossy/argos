@@ -730,7 +730,17 @@ pub async fn llm_send(
         ));
     };
     // Reserves shrink when this question needs the room. The schema stays counted.
-    let prompt_budget = split.messages;
+    let mut prompt_budget = split.messages;
+    let mut tool_budget = split.tool_allowance;
+    let excerpt = crate::llm::context::pending_attachment_borrow(
+        &system,
+        &content,
+        &sources,
+        prompt_budget,
+    )
+    .min(tool_budget);
+    prompt_budget = prompt_budget.saturating_add(excerpt);
+    tool_budget = tool_budget.saturating_sub(excerpt);
     // Messages plus the tool allowance leave the reply reserve untouched.
     let inject_budget = split.messages.saturating_add(split.tool_allowance).max(1);
     let (assembled, stats) = assemble_turns(&system, &sources, &history, prompt_budget);
@@ -773,8 +783,7 @@ pub async fn llm_send(
     let unlimited_rounds = max_rounds == 0;
     let mut current_turns = assembled;
     let mut source_turn_injected = false;
-    // In-turn tool results spend the allowance left after the question and the schema.
-    let tool_budget = split.tool_allowance;
+    // In-turn tool results spend the allowance left after the attachment excerpt.
     let mut tool_used = 0usize;
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
