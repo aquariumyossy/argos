@@ -389,7 +389,7 @@ function normalizeSettings(s: SettingsData): SettingsData {
   if (typeof s.llmMaxContextTokens !== "number" || !Number.isFinite(s.llmMaxContextTokens)) {
     s.llmMaxContextTokens = 131072;
   } else {
-    s.llmMaxContextTokens = Math.min(1048576, Math.max(4096, Math.round(s.llmMaxContextTokens)));
+    s.llmMaxContextTokens = Math.min(1048576, Math.max(16384, Math.round(s.llmMaxContextTokens)));
   }
   if (typeof s.llmSystemPrompt !== "string" || !s.llmSystemPrompt.trim()) {
     s.llmSystemPrompt =
@@ -3170,7 +3170,7 @@ export default function Settings() {
                 <span className="field-leader" aria-hidden="true" />
                 <input
                   type="number"
-                  min={4096}
+                  min={16384}
                   max={1048576}
                   value={settings.llmMaxContextTokens}
                   onChange={(e) =>
