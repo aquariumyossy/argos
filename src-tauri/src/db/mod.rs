@@ -3699,6 +3699,11 @@ impl Db {
         self.insert_llm_message_full(thread_id, role, content, "", "", "", "", "")
     }
 
+    pub fn delete_llm_message(&self, id: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM llm_messages WHERE id=?1", [id])
+    }
+
     pub fn insert_llm_notice(
         &self,
         thread_id: &str,

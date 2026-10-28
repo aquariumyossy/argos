@@ -9,8 +9,8 @@ use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
     estimate_tokens, final_source_turn, fit_injected_turn, fit_tool_text, is_synthetic_user_turn,
-    parse_cited_nos, silent_end_notice, sources_for_consumed, tool_schema_tokens, turn_tokens,
-    ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
+    parse_cited_nos, silent_end_notice, sources_for_consumed, tool_schema_tokens, ChatTurn,
+    PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
 };
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
@@ -194,10 +194,10 @@ fn inject_final_source_turn(
     message_budget: usize,
 ) -> bool {
     let rows = sources_for_consumed(sources, consumed);
-    // A source already on the question turn, truncated or full, is not copied again.
+    // A cite already in this request, truncated or full, is not copied again.
     let fresh: Vec<LlmSourceRow> = rows
         .into_iter()
-        .filter(|row| !question_turn_has_source(turns, row))
+        .filter(|row| !source_already_in_request(turns, row))
         .collect();
     if let Some(turn) = final_source_turn(&fresh, stop_tools) {
         crate::llm::context::omit_source_bodies_from_tool_turns(turns, &fresh);
@@ -249,17 +249,28 @@ fn send_error(
     }
 }
 
-fn question_turn_has_source(turns: &[ChatTurn], source: &LlmSourceRow) -> bool {
+/// A cite already in this request, including a truncated tool entry, is not sent again.
+fn source_already_in_request(turns: &[ChatTurn], source: &LlmSourceRow) -> bool {
+    if source.cite_no > 0
+        && turns.iter().any(|turn| {
+            crate::llm::context::citation_header_nos(&turn.content).contains(&source.cite_no)
+        })
+    {
+        return true;
+    }
     let id = source.id.trim();
+    if id.is_empty() {
+        return false;
+    }
     turns.iter().any(|turn| {
-        if turn.role != "user" || is_synthetic_user_turn(&turn.content) {
-            return false;
-        }
-        if source.cite_no > 0 && parse_cited_nos(&turn.content).contains(&source.cite_no) {
-            return true;
-        }
-        !id.is_empty() && turn.content.contains(id)
+        turn.role == "user"
+            && !is_synthetic_user_turn(&turn.content)
+            && turn.content.contains(id)
     })
+}
+
+fn discard_refused_user_message(db: &crate::db::Db, message_id: &str) {
+    let _ = db.delete_llm_message(message_id);
 }
 
 #[tauri::command]
@@ -700,6 +711,7 @@ pub async fn llm_send(
     let full_limit = max_tokens;
     let required = required_prompt_tokens(&system, &content, &sources);
     let Some(split) = context_budget(full_limit, schema_tokens, required) else {
+        discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
             thread,
             user_message,
@@ -709,9 +721,11 @@ pub async fn llm_send(
     };
     // Reserves shrink when this question needs the room. The schema stays counted.
     let prompt_budget = split.messages;
-    let message_ceiling = full_limit.saturating_sub(schema_tokens).max(1);
+    // Messages plus the tool allowance leave the reply reserve untouched.
+    let inject_budget = split.messages.saturating_add(split.tool_allowance).max(1);
     let (assembled, stats) = assemble_turns(&system, &sources, &history, prompt_budget);
     if stats.question_exceeds {
+        discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
             thread,
             user_message,
@@ -771,7 +785,7 @@ pub async fn llm_send(
             if !source_turn_injected {
                 let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
                 source_turn_injected =
-                    inject_final_source_turn(&mut current_turns, &all, &consumed, true, message_ceiling);
+                    inject_final_source_turn(&mut current_turns, &all, &consumed, true, inject_budget);
             }
             if !source_turn_injected {
                 current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
@@ -1052,7 +1066,7 @@ pub async fn llm_send(
                                 &all,
                                 &consumed,
                                 true,
-                                message_ceiling,
+                                inject_budget,
                             );
                         }
                         if !source_turn_injected {
@@ -1074,7 +1088,7 @@ pub async fn llm_send(
                             &all,
                             &consumed,
                             true,
-                            message_ceiling,
+                            inject_budget,
                         ) {
                             source_turn_injected = true;
                             use_tools = false;
@@ -2372,11 +2386,13 @@ mod tests {
         assert_eq!(blob.matches("第936条").count(), 1, "{blob}");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[1].role, "user");
-        assert!(turns[1].content.contains("【出典】"));
-        assert!(turns[1].content.contains("[2]"));
-        assert!(turns[1].content.contains("[n]"));
+        assert!(turns[0].content.contains("第936条"), "{}", turns[0].content);
+        assert!(
+            !turns[1].content.contains("第936条"),
+            "a cite already in the tool result is not copied again: {}",
+            turns[1].content
+        );
         assert!(turns[1].content.contains("ツールはこれ以上"));
-        assert!(turns[1].content.contains("第936条"));
         s.id = "other".into();
         let mut empty = Vec::new();
         assert!(!inject_final_source_turn(
@@ -2431,33 +2447,102 @@ mod tests {
             "a truncated copy on the question is still that source: {blob}"
         );
         assert!(turns.iter().any(|turn| turn.content.contains(STOP_TOOLS_HINT)));
-        attached.body = "あ".repeat(40_000);
+        let full = "あ".repeat(40_000);
+        attached.body = full.clone();
+        let stored = fit_tool_text(
+            crate::llm::context::format_sources(std::slice::from_ref(&attached)),
+            2_000,
+            0,
+        );
+        assert!(stored.contains("[3]"));
+        assert!(!stored.contains(&full));
         let tool = ChatTurn {
             role: "tool".into(),
-            content: crate::llm::context::format_sources(std::slice::from_ref(&attached)),
+            content: stored.clone(),
             name: Some("read_unit".into()),
             tool_call_id: Some("c".into()),
             tool_calls: None,
             reasoning: None,
         };
         let mut wide = vec![ChatTurn::text("user", "質問"), tool];
-        assert!(inject_final_source_turn(
-            &mut wide,
-            std::slice::from_ref(&attached),
-            &[("file".into(), 3)],
-            false,
-            2_000,
-        ));
-        let wide_tokens: usize = wide.iter().map(turn_tokens).sum();
-        assert!(wide_tokens <= 2_000, "{wide_tokens}");
-        assert_eq!(wide[0].content, "質問");
-        assert!(!wide.iter().any(|turn| turn.content.contains(&"あ".repeat(40_000))));
-        let injected = wide.last().unwrap();
         assert!(
-            injected.content.contains(crate::llm::context::FINAL_CITE_HINT),
-            "the cite hint stays whole: {}",
+            !inject_final_source_turn(
+                &mut wide,
+                std::slice::from_ref(&attached),
+                &[("file".into(), 3)],
+                false,
+                8_000,
+            ),
+            "a truncated tool entry is already this source"
+        );
+        assert_eq!(wide.len(), 2);
+        assert_eq!(wide[1].content, stored);
+        assert!(!wide.iter().any(|turn| turn.content.contains(&full)));
+    }
+
+    #[test]
+    fn injected_turn_stays_inside_the_reply_reserve() {
+        let split = context_budget(16_384, 2_105, 200).expect("room for a short question");
+        let budget = split.messages + split.tool_allowance;
+        assert_eq!(
+            16_384 - 2_105 - budget,
+            crate::llm::context::reply_headroom_tokens(16_384)
+        );
+        let full = "あ".repeat(40_000);
+        let hit = LlmSourceRow {
+            id: "hit".into(),
+            thread_id: "t".into(),
+            sort_order: 0,
+            origin: "tool".into(),
+            path: r"C:\law\民法.txt".into(),
+            title: "民法.txt".into(),
+            paragraph_id: "p9".into(),
+            body: full.clone(),
+            query: String::new(),
+            created_at: 0,
+            grain: "unit".into(),
+            unit_body: String::new(),
+            injected_user_message_id: String::new(),
+            cited_assistant_message_id: String::new(),
+            cite_no: 9,
+            kind: "text".into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
+        };
+        let mut turns = vec![ChatTurn::text("user", "質問")];
+        assert!(inject_final_source_turn(
+            &mut turns,
+            std::slice::from_ref(&hit),
+            &[("hit".into(), 9)],
+            false,
+            budget,
+        ));
+        let tokens: usize = turns.iter().map(crate::llm::context::turn_tokens).sum();
+        assert!(tokens <= budget, "{tokens} > {budget}");
+        let injected = turns.last().unwrap();
+        assert!(
+            injected
+                .content
+                .contains(crate::llm::context::FINAL_CITE_HINT),
+            "{}",
             injected.content
         );
+        assert!(!injected.content.contains(&full));
+    }
+
+    #[test]
+    fn refused_question_is_removed_from_replayed_history() {
+        let (dir, db) = temp_db("refuse");
+        let thread = db.create_llm_thread("会話", true).unwrap();
+        let row = db
+            .insert_llm_message(&thread.id, "user", &"あ".repeat(40_000))
+            .unwrap();
+        discard_refused_user_message(&db, &row.id);
+        let history = db.list_llm_messages(&thread.id).unwrap();
+        assert!(history.is_empty());
+        let (turns, _) = assemble_turns("役割", &[], &history, 500);
+        assert!(turns.iter().all(|turn| turn.role != "user"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

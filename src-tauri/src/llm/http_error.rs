@@ -9,11 +9,11 @@ pub const VISION_UNSUPPORTED_ERROR: &str =
     "このモデルは画像を読めません。vision 対応のモデルを設定してください。";
 
 /// Returned for a 400 whose body says the prompt does not fit the context window.
-/// The server body is not part of this string. The smaller-budget retry matches it exactly.
+/// The server body is not part of this string.
 pub const CONTEXT_TOO_LONG_ERROR: &str =
     "この会話はモデルのコンテキストに対して長すぎます。新しい会話に切り替えるか、古い内容を減らしてください。";
 
-/// The question itself, with this turn's attachments, does not fit even with no reserve.
+/// The system prompt and the typed question do not fit even with no reserve.
 pub const QUESTION_DOES_NOT_FIT_ERROR: &str =
     "この質問はモデルのコンテキストに入りません。短くしてから送ってください。";
 

@@ -24,6 +24,7 @@ import {
   contextUsageTokens,
   toolSchemaTokenCount,
 } from "./contextEstimate";
+import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
 import { openPreview } from "../preview/openPreview";
@@ -1246,6 +1247,9 @@ export default function Chat() {
         setError("生成を停止しました。");
       } else if (result.error) {
         setError(result.error);
+        if (shouldRestoreDraft(result.error)) {
+          setDraft(text);
+        }
       } else if (result.warning) {
         setNotice(result.warning);
       } else if (result.truncated) {
