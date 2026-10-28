@@ -111,7 +111,7 @@ pub const DEFAULT_LLM_TIMEOUT_MS: u32 = 120_000;
 /// Previous default, stored as characters. Unedited copies move to the token default.
 pub const LEGACY_DEFAULT_LLM_MAX_CONTEXT_CHARS: u32 = 80_000;
 pub const DEFAULT_LLM_MAX_CONTEXT_TOKENS: u32 = 131_072;
-pub const MIN_LLM_CONTEXT_TOKENS: u32 = 4_096;
+pub const MIN_LLM_CONTEXT_TOKENS: u32 = 16_384;
 pub const MAX_LLM_CONTEXT_TOKENS: u32 = 1_048_576;
 pub const DEFAULT_LLM_THINKING: &str = "on";
 pub const DEFAULT_LLM_MAX_TOOL_ROUNDS: u32 = 8;
@@ -5876,7 +5876,7 @@ mod folder_index_status_tests {
         );
         let s = db.load_settings();
         assert_eq!(s.llm_thinking, "on");
-        assert_eq!(s.llm_max_context_tokens, 10_000);
+        assert_eq!(s.llm_max_context_tokens, MIN_LLM_CONTEXT_TOKENS);
         assert_eq!(s.llm_system_prompt, "独自の指示です");
         assert_eq!(s.llm_max_tool_rounds, 16);
 
@@ -5894,6 +5894,11 @@ mod folder_index_status_tests {
         assert_eq!(s.llm_max_context_tokens, 20_000);
         assert_eq!(s.llm_max_tool_rounds, 0);
         assert_eq!(s.llm_system_prompt, DEFAULT_LLM_SYSTEM_PROMPT);
+
+        put_settings(&db, &[("llm_max_context_tokens", "4096")]);
+        let s = db.load_settings();
+        assert_eq!(s.llm_max_context_tokens, MIN_LLM_CONTEXT_TOKENS);
+        assert_eq!(s.llm_max_context_tokens, 16_384);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
