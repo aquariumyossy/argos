@@ -1,0 +1,62 @@
+# Windows compile gate for pull requests and main.
+# package.json has no engines field. The lockfile's strictest range is
+# jsdom's ^22.22.2 || ^24.15.0 || >=26.0.0. vitest requires
+# ^22.12.0 || ^24.0.0 || >=26.0.0 and vite requires ^20.19.0 || >=22.12.0,
+# so 22.22.2 is the lowest release that satisfies every locked engine.
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 22.22.2
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Cargo check
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib --tests --bins
+
+      - name: Tauri build
+        # Unsigned NSIS only. CI=true is also set by Actions; --ci skips prompts.
+        # No updater key, no GitHub Release, no secrets.
+        run: npm run tauri -- build --ci --no-sign --bundles nsis
