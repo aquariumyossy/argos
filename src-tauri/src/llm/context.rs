@@ -221,13 +221,22 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
         .sum();
     let room = ceiling.saturating_sub(non_tool);
     // A read_note body is the whole note. A shortened prefix looks complete, so a
-    // later headingless write can delete the tail. Keep it whole, or replace it.
-    let read_note_cost: usize = turns
+    // later headingless write can delete the tail. Drop whole notes until the rest
+    // can fit, then give the freed room to the other tool results.
+    let mut guard = 0;
+    while read_notes_exceed_room(turns, room) && guard < 64 {
+        guard += 1;
+        let Some(idx) = next_read_note_to_omit(turns) else {
+            break;
+        };
+        turns[idx].content = READ_NOTE_OMITTED.into();
+    }
+    let note_cost: usize = turns
         .iter()
         .filter(|turn| is_read_note_turn(turn))
         .map(turn_tokens)
         .sum();
-    let mut others = room.saturating_sub(read_note_cost);
+    let mut others = room.saturating_sub(note_cost);
     for turn in turns.iter_mut() {
         if turn.role != "tool" || is_read_note_turn(turn) {
             continue;
@@ -240,16 +249,89 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
         let body_budget = others.saturating_sub(4 + note_tokens + 1).max(1);
         turn.content = truncate_to_tokens(&turn.content, body_budget);
         if turn_tokens(turn) > others {
-            turn.content = "（文脈の上限に達したため、この結果は省略しました）".into();
+            turn.content = TOOL_RESULT_OMITTED.into();
         }
         others = others.saturating_sub(turn_tokens(turn));
     }
-    if turn_list_tokens(turns) <= ceiling {
-        return;
+    let mut guard = 0;
+    while turn_list_tokens(turns) > ceiling && guard < 64 {
+        guard += 1;
+        if let Some(idx) = next_read_note_to_omit(turns) {
+            turns[idx].content = READ_NOTE_OMITTED.into();
+            continue;
+        }
+        let Some(idx) = next_other_result_to_omit(turns) else {
+            break;
+        };
+        turns[idx].content = TOOL_RESULT_OMITTED.into();
     }
-    for turn in turns.iter_mut().filter(|turn| is_read_note_turn(turn)) {
-        turn.content = READ_NOTE_OMITTED.into();
+}
+
+fn read_notes_exceed_room(turns: &[ChatTurn], room: usize) -> bool {
+    let notes: usize = turns
+        .iter()
+        .filter(|turn| is_read_note_turn(turn))
+        .map(turn_tokens)
+        .sum();
+    let others: usize = turns
+        .iter()
+        .filter(|turn| turn.role == "tool" && !is_read_note_turn(turn))
+        .map(other_result_floor)
+        .sum();
+    notes.saturating_add(others) > room
+}
+
+/// Largest note that is still longer than the omission text. Equal sizes keep the oldest.
+fn next_read_note_to_omit(turns: &[ChatTurn]) -> Option<usize> {
+    let placeholder = turn_tokens(&ChatTurn::text("tool", READ_NOTE_OMITTED));
+    let mut best: Option<(usize, usize)> = None;
+    for (index, turn) in turns.iter().enumerate() {
+        if !is_read_note_turn(turn) {
+            continue;
+        }
+        let cost = turn_tokens(turn);
+        if cost <= placeholder {
+            continue;
+        }
+        let take = match best {
+            None => true,
+            Some((best_cost, best_index)) => {
+                cost > best_cost || (cost == best_cost && index < best_index)
+            }
+        };
+        if take {
+            best = Some((cost, index));
+        }
     }
+    best.map(|(_, index)| index)
+}
+
+fn other_result_floor(turn: &ChatTurn) -> usize {
+    turn_tokens(turn).min(turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED)))
+}
+
+fn next_other_result_to_omit(turns: &[ChatTurn]) -> Option<usize> {
+    let placeholder = turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED));
+    let mut best: Option<(usize, usize)> = None;
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.role != "tool" || is_read_note_turn(turn) {
+            continue;
+        }
+        let cost = turn_tokens(turn);
+        if cost <= placeholder {
+            continue;
+        }
+        let take = match best {
+            None => true,
+            Some((best_cost, best_index)) => {
+                cost > best_cost || (cost == best_cost && index < best_index)
+            }
+        };
+        if take {
+            best = Some((cost, index));
+        }
+    }
+    best.map(|(_, index)| index)
 }
 
 fn is_read_note_turn(turn: &ChatTurn) -> bool {
@@ -257,6 +339,8 @@ fn is_read_note_turn(turn: &ChatTurn) -> bool {
 }
 
 const READ_NOTE_OMITTED: &str = "（文脈の上限に達したため、ノート本文は省略しました。全文置換はせず、heading を指定して読み直してください）";
+
+const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
 
 const TOOL_RESULT_TRUNCATION_NOTE: &str = "\n…（長いので省略しました）";
 
@@ -2941,14 +3025,75 @@ mod tests {
         fit_followup_request(&mut turns, limit, schema);
         let after = turn_list_tokens(&turns);
         assert!(after + schema + reply <= limit, "{after}");
-        assert_ne!(turns[2].content, search_body);
-        assert!(
-            char_len(&turns[2].content) < char_len(&search_body),
-            "the other result is trimmed before the note"
+        assert_eq!(
+            turns[2].content, search_body,
+            "a search that fits beside the note placeholder keeps its text"
         );
         assert_eq!(turns[3].content, READ_NOTE_OMITTED);
         assert!(!turns[3].content.contains("見出し"));
         assert!(!turns[3].content.contains("…（長いので省略しました）"));
+    }
+
+    #[test]
+    fn only_the_largest_read_note_is_replaced() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let small_a = format!("甲見出し\n{}", "甲".repeat(2_000));
+        let small_b = format!("乙見出し\n{}", "乙".repeat(2_000));
+        let large = format!("丙見出し\n{}", "丙".repeat(20_000));
+        let mut notes = [
+            ChatTurn::text("tool", small_a.clone()),
+            ChatTurn::text("tool", small_b.clone()),
+            ChatTurn::text("tool", large),
+        ];
+        for note in &mut notes {
+            note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        }
+        let mut turns = vec![
+            ChatTurn::text("system", "役割"),
+            ChatTurn::text("user", "三つ読んで"),
+            notes[0].clone(),
+            notes[1].clone(),
+            notes[2].clone(),
+        ];
+        assert!(turn_list_tokens(&turns) > ceiling);
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turns[2].content, small_a);
+        assert_eq!(turns[3].content, small_b);
+        assert_eq!(turns[4].content, READ_NOTE_OMITTED);
+        assert!(!turns[4].content.contains("丙見出し"));
+    }
+
+    #[test]
+    fn oversized_read_note_keeps_the_search_result() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let search_body = "索".repeat(2_004);
+        let note_body = "記".repeat(30_000);
+        let mut search = ChatTurn::text("tool", search_body.clone());
+        search.name = Some("search_index".into());
+        let mut note = ChatTurn::text("tool", note_body);
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        let mut turns = vec![
+            ChatTurn::text("system", "役割"),
+            ChatTurn::text("user", "検索してから読んで"),
+            search,
+            note,
+        ];
+        let note_alone = turn_tokens(&turns[0]) + turn_tokens(&turns[1]) + turn_tokens(&turns[3]);
+        assert!(note_alone > ceiling, "the note alone must exceed the room");
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turns[2].content, search_body);
+        assert_eq!(turns[3].content, READ_NOTE_OMITTED);
+        assert!(!turns[3].content.contains('記'));
     }
 
     #[test]
