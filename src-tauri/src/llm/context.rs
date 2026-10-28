@@ -5,12 +5,104 @@ use std::collections::{HashMap, HashSet};
 use crate::db::{LlmMessageRow, LlmSourceRow};
 
 pub const PER_SOURCE_CAP: usize = 40_000;
-const MIN_KEEP_TURNS: usize = 4;
 
 pub const CITATION_GUIDE: &str = "\n\n出典ブロックがあるときは、その本文だけを根拠にしてください。出典にない事実は推測だと明示し、根拠箇所には [n]（出典番号）を付けてください。";
 pub const IMAGE_TRANSCRIPT_NOTE: &str = "（画像の書き起こし。原本の画素ではない）";
 
 pub const REASONING_CARRY_CAP: usize = 4_000;
+/// Japanese text is about 1.6 characters per token.
+pub const CHARS_PER_TOKEN: f64 = 1.6;
+/// Tool results may take this share of the context window. Older ones shrink first.
+pub const TOOL_RESULT_BUDGET_RATIO: f64 = 0.25;
+
+pub fn estimate_tokens(text: &str) -> usize {
+    let chars = char_len(text);
+    if chars == 0 {
+        return 0;
+    }
+    ((chars as f64) / CHARS_PER_TOKEN).ceil() as usize
+}
+
+pub fn tokens_to_chars(tokens: usize) -> usize {
+    ((tokens as f64) * CHARS_PER_TOKEN).floor() as usize
+}
+
+/// Role and delimiters cost a few tokens per message.
+pub fn turn_tokens(turn: &ChatTurn) -> usize {
+    let mut total = estimate_tokens(&turn.content);
+    if let Some(calls) = &turn.tool_calls {
+        if let Some(arr) = calls.as_array() {
+            for call in arr {
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let args = call
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                total += estimate_tokens(name) + estimate_tokens(args);
+            }
+        } else {
+            total += estimate_tokens(&calls.to_string());
+        }
+    }
+    total + 4
+}
+
+pub fn silent_end_notice(finish_reason: &str) -> String {
+    let reason = finish_reason.trim();
+    let reason = if reason.is_empty() { "不明" } else { reason };
+    format!(
+        "モデルが本文も操作も返さずに終わりました（終了理由: {reason}）。もう一度送るか、指示を分けてください。"
+    )
+}
+
+/// Trim one tool result to the tokens still left in the quarter-window reserve.
+pub fn fit_tool_text(content: String, budget_tokens: usize, used_tokens: usize) -> String {
+    let left = budget_tokens.saturating_sub(used_tokens);
+    if left == 0 {
+        return "（文脈の上限に達したため、この結果は省略しました）".into();
+    }
+    if estimate_tokens(&content) <= left {
+        return content;
+    }
+    truncate_to_tokens(&content, left.saturating_sub(8).max(1))
+}
+
+fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
+    let max_chars = tokens_to_chars(max_tokens);
+    if char_len(text) <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("\n…（長いので省略しました）");
+    out
+}
+
+/// Shrink the oldest tool results once they take more than their share of the window.
+pub fn cap_tool_results(turns: &mut [ChatTurn], limit_tokens: usize) {
+    let budget = ((limit_tokens as f64) * TOOL_RESULT_BUDGET_RATIO).floor() as usize;
+    let indexes: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| turn.role == "tool")
+        .map(|(index, _)| index)
+        .collect();
+    let mut used: usize = indexes.iter().map(|index| turn_tokens(&turns[*index])).sum();
+    if used <= budget {
+        return;
+    }
+    for index in indexes {
+        if used <= budget {
+            break;
+        }
+        let before = turn_tokens(&turns[index]);
+        turns[index].content = truncate_to_tokens(&turns[index].content, 40);
+        let after = turn_tokens(&turns[index]);
+        used = used.saturating_sub(before.saturating_sub(after));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatTurn {
@@ -44,10 +136,17 @@ pub struct ConsumedSource {
 #[derive(Debug, Clone, Default)]
 pub struct AssembleStats {
     pub total_chars: usize,
+    pub total_tokens: usize,
     pub source_chars: usize,
     pub dropped_sources: usize,
     pub truncated: bool,
     pub consumed: Vec<ConsumedSource>,
+}
+
+fn push_cite_prefix(out: &mut String, n: i64) {
+    if n > 0 {
+        out.push_str(&format!("[{n}] "));
+    }
 }
 
 fn char_len(s: &str) -> usize {
@@ -65,11 +164,7 @@ pub(crate) fn cap_chars(s: &str, max: usize) -> String {
 }
 
 fn cite_no_of(s: &LlmSourceRow) -> i64 {
-    if s.cite_no > 0 {
-        s.cite_no
-    } else {
-        s.sort_order + 1
-    }
+    s.cite_no
 }
 
 /// `[n]` in the assistant answer (prose, mermaid labels, code fences).
@@ -121,6 +216,10 @@ pub const STOP_TOOLS_HINT: &str =
     "ツールはこれ以上使わず、これまでに得た出典だけで答えてください。";
 pub const PHANTOM_CITE_HINT: &str =
     "存在しない出典番号があります。実際にツールで裏を取るか、出典がないと明示して書き直してください。";
+/// Same retry when tools are already off. Asking for a tool call here makes some models
+/// emit `<tool_call>` text, which is stripped and leaves an empty reply.
+pub const PHANTOM_CITE_HINT_NO_TOOLS: &str =
+    "存在しない出典番号があります。ツールは使えません。出典がないと明示して書き直してください。";
 
 /// True when the answer cites `[n]` that is not among this thread's sources.
 pub fn answer_has_phantom_cites(answer: &str, sources: &[LlmSourceRow]) -> bool {
@@ -187,7 +286,8 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         if seed.is_image() && crate::llm::transcript::image_group_key(seed).is_some() {
             let n = crate::llm::transcript::group_cite_no(&unit);
             let title = crate::llm::transcript::file_label(&seed.path, &seed.title);
-            out.push_str(&format!("[{n}] {title}"));
+            push_cite_prefix(&mut out, n);
+            out.push_str(&title);
             if !seed.path.trim().is_empty() && seed.path.trim() != title {
                 out.push_str(" — ");
                 out.push_str(seed.path.trim());
@@ -211,7 +311,8 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         } else {
             seed.title.as_str()
         };
-        out.push_str(&format!("[{n}] {title}"));
+        push_cite_prefix(&mut out, n);
+        out.push_str(title);
         if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
             out.push_str(" — ");
             out.push_str(seed.path.trim());
@@ -348,7 +449,7 @@ pub fn assemble_turns(
     system: &str,
     sources: &[LlmSourceRow],
     history: &[LlmMessageRow],
-    max_chars: usize,
+    max_tokens: usize,
 ) -> (Vec<ChatTurn>, AssembleStats) {
     let injectable: Vec<LlmSourceRow> = sources
         .iter()
@@ -356,7 +457,7 @@ pub fn assemble_turns(
         .cloned()
         .collect();
     let sources = &injectable;
-    let max_chars = max_chars.max(4_000);
+    let max_tokens = max_tokens.max(1);
     let pending_ids: HashSet<String> = sources
         .iter()
         .filter(|s| s.is_pending())
@@ -368,26 +469,24 @@ pub fn assemble_turns(
         sys.push_str(CITATION_GUIDE);
     }
 
-    let hist: Vec<&LlmMessageRow> = history
-        .iter()
-        .filter(|m| {
-            (m.role == "user" || m.role == "assistant" || m.role == "system")
-                && !m.content.is_empty()
-        })
-        .collect();
+    let hist: Vec<&LlmMessageRow> = history.iter().filter(|m| message_is_replayed(m)).collect();
 
-    let hist_chars: usize = hist.iter().map(|m| char_len(&m.content)).sum();
-    let sys_chars = char_len(&sys);
-    let source_budget = max_chars
-        .saturating_sub(sys_chars)
-        .saturating_sub(hist_chars)
-        .saturating_sub(32);
+    let hist_tokens: usize = hist.iter().map(|m| message_tokens(m)).sum();
+    let sys_tokens = if sys.is_empty() {
+        0
+    } else {
+        estimate_tokens(&sys) + 4
+    };
+    let source_token_budget = max_tokens
+        .saturating_sub(sys_tokens)
+        .saturating_sub(hist_tokens)
+        .saturating_sub(8);
+    let source_budget = tokens_to_chars(source_token_budget).max(1);
 
     let (mut kept, dropped_sources, src_trunc) =
         select_sources(sources, source_budget, &pending_ids);
 
-    let mut next_cite = sources.iter().map(|s| s.cite_no).max().unwrap_or(0);
-    crate::llm::transcript::assign_group_cites(&mut kept, sources, &pending_ids, &mut next_cite);
+    crate::llm::transcript::assign_group_cites(&mut kept, sources);
 
     let consumed: Vec<ConsumedSource> = kept
         .iter()
@@ -414,7 +513,7 @@ pub fn assemble_turns(
     }
 
     for m in &hist {
-        let mut content = m.content.clone();
+        let mut turn = history_turn(m);
         let mut has_sources = false;
         if m.role == "user" {
             let for_turn: Vec<LlmSourceRow> = kept
@@ -430,21 +529,20 @@ pub fn assemble_turns(
                 .collect();
             if !for_turn.is_empty() {
                 has_sources = true;
-                content = wrap_user(&format_sources_with_pool(&for_turn, sources), &content);
+                turn.content = wrap_user(&format_sources_with_pool(&for_turn, sources), &turn.content);
             }
         }
-        built.push(BuiltTurn {
-            turn: ChatTurn::text(m.role.clone(), content),
-            has_sources,
-        });
+        built.push(BuiltTurn { turn, has_sources });
     }
 
     let mut truncated = src_trunc;
-    trim_history(&mut built, max_chars, &mut truncated);
+    cap_built_tool_results(&mut built, max_tokens);
+    trim_history(&mut built, max_tokens, &mut truncated);
 
     let turns: Vec<ChatTurn> = built.into_iter().map(|b| b.turn).collect();
     let stats = AssembleStats {
         total_chars: turns_chars(&turns),
+        total_tokens: turns.iter().map(turn_tokens).sum(),
         source_chars,
         dropped_sources,
         truncated,
@@ -453,46 +551,103 @@ pub fn assemble_turns(
     (turns, stats)
 }
 
-fn trim_history(built: &mut Vec<BuiltTurn>, max_chars: usize, truncated: &mut bool) {
-    let chars_of = |rows: &[BuiltTurn]| -> usize {
-        rows.iter()
-            .map(|b| char_len(&b.turn.content) + char_len(&b.turn.role) + 8)
-            .sum()
+/// Past turns keep tool calls and tool results, and drop the reasoning channel.
+/// A tool message with an empty body is still a reply the server expects.
+fn message_is_replayed(message: &LlmMessageRow) -> bool {
+    if message.kind == crate::db::LLM_MESSAGE_NOTICE {
+        return false;
+    }
+    match message.role.as_str() {
+        "user" | "system" => !message.content.is_empty(),
+        "assistant" => !message.content.is_empty() || !message.tool_calls.trim().is_empty(),
+        "tool" => !message.content.is_empty() || !message.tool_call_id.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn message_tokens(message: &LlmMessageRow) -> usize {
+    turn_tokens(&history_turn(message))
+}
+
+/// Reasoning is stored for the chat pane. It is not sent again on a later turn.
+fn history_turn(message: &LlmMessageRow) -> ChatTurn {
+    let tool_calls = if message.tool_calls.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str::<serde_json::Value>(&message.tool_calls).ok()
     };
-    while chars_of(built) > max_chars && built.len() > MIN_KEEP_TURNS + 1 {
-        let sys = built.first().is_some_and(|t| t.turn.role == "system");
-        let start = if sys { 1 } else { 0 };
-        let end = built.len().saturating_sub(MIN_KEEP_TURNS);
+    ChatTurn {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        name: if message.tool_name.trim().is_empty() {
+            None
+        } else {
+            Some(message.tool_name.clone())
+        },
+        tool_call_id: if message.tool_call_id.trim().is_empty() {
+            None
+        } else {
+            Some(message.tool_call_id.clone())
+        },
+        tool_calls,
+        reasoning: None,
+    }
+}
+
+fn cap_built_tool_results(built: &mut [BuiltTurn], limit_tokens: usize) {
+    let mut turns: Vec<ChatTurn> = built.iter().map(|row| row.turn.clone()).collect();
+    cap_tool_results(&mut turns, limit_tokens);
+    for (row, turn) in built.iter_mut().zip(turns) {
+        row.turn = turn;
+    }
+}
+
+fn following_tools(built: &[BuiltTurn], assistant_index: usize) -> usize {
+    let mut count = 0;
+    let mut index = assistant_index + 1;
+    while built.get(index).is_some_and(|row| row.turn.role == "tool") {
+        count += 1;
+        index += 1;
+    }
+    count
+}
+
+/// Drop the oldest exchanges until the request fits. An assistant turn leaves
+/// with the tool replies that follow it. The latest user turn stays.
+fn trim_history(built: &mut Vec<BuiltTurn>, max_tokens: usize, truncated: &mut bool) {
+    let tokens_of = |rows: &[BuiltTurn]| -> usize { rows.iter().map(|row| turn_tokens(&row.turn)).sum() };
+    while tokens_of(built) > max_tokens {
+        let start = usize::from(built.first().is_some_and(|row| row.turn.role == "system"));
+        let latest_user = built.iter().rposition(|row| row.turn.role == "user");
+        let end = latest_user.unwrap_or(built.len());
         if start >= end {
             break;
         }
-        let latest_user = built.iter().rposition(|t| t.turn.role == "user");
-        let mut drop_idx = built[start..end]
-            .iter()
-            .enumerate()
-            .find(|(i, t)| {
-                let abs = start + *i;
-                Some(abs) != latest_user && !t.has_sources
-            })
-            .map(|(i, _)| start + i);
-        if drop_idx.is_none() {
-            drop_idx = built[start..end]
-                .iter()
-                .enumerate()
-                .find(|(i, t)| {
-                    let abs = start + *i;
-                    Some(abs) != latest_user && t.turn.role == "user"
-                })
-                .map(|(i, _)| start + i);
-        }
-        let Some(i) = drop_idx else {
+        let drop_idx = (start..end)
+            .find(|index| built[*index].turn.role != "tool" && !built[*index].has_sources)
+            .or_else(|| (start..end).find(|index| built[*index].turn.role != "tool"));
+        let Some(index) = drop_idx else {
             break;
         };
-        let drop_following_assistant = built[i].turn.role == "user"
-            && built.get(i + 1).is_some_and(|t| t.turn.role == "assistant");
-        built.remove(i);
-        if drop_following_assistant && i < built.len() && built[i].turn.role == "assistant" {
-            built.remove(i);
+        let mut tool_count = if built[index].turn.role == "assistant" {
+            following_tools(built, index)
+        } else {
+            0
+        };
+        let drop_following_assistant = built[index].turn.role == "user"
+            && built
+                .get(index + 1)
+                .is_some_and(|row| row.turn.role == "assistant");
+        built.remove(index);
+        if drop_following_assistant && built.get(index).is_some_and(|row| row.turn.role == "assistant")
+        {
+            tool_count = following_tools(built, index);
+            built.remove(index);
+        }
+        for _ in 0..tool_count {
+            if built.get(index).is_some_and(|row| row.turn.role == "tool") {
+                built.remove(index);
+            }
         }
         *truncated = true;
     }
@@ -595,7 +750,111 @@ mod tests {
             role: role.into(),
             content: content.into(),
             created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
         }
+    }
+
+    #[test]
+    fn notices_stay_out_of_later_turns() {
+        let mut short = msg(
+            "n1",
+            "assistant",
+            "ツール往復が上限の 8 回に達したため、続きの操作はせず、ここまでの資料で答えています。",
+        );
+        short.kind = crate::db::LLM_MESSAGE_NOTICE.into();
+        let mut long = msg(
+            "n2",
+            "assistant",
+            "ツール往復が上限の 8 回に達したため、残りの操作はしていません。",
+        );
+        long.kind = crate::db::LLM_MESSAGE_NOTICE.into();
+        let mut unset = msg("n3", "assistant", "上限未設定の案内");
+        unset.kind = crate::db::LLM_MESSAGE_NOTICE.into();
+        let history = vec![
+            msg("u1", "user", "調べて"),
+            msg("a1", "assistant", "途中の答え"),
+            short,
+            long,
+            unset,
+            msg("u2", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[], &history, 80_000);
+        let roles: Vec<&str> = turns.iter().map(|turn| turn.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(turns[2].content, "途中の答え");
+        assert!(turns[3].content.contains("続き"));
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!blob.contains("ツール往復"));
+        assert!(!blob.contains("上限未設定"));
+        let (_, stats) = assemble_turns("役割", &[], &history, 80_000);
+        let without = vec![
+            msg("u1", "user", "調べて"),
+            msg("a1", "assistant", "途中の答え"),
+            msg("u2", "user", "続き"),
+        ];
+        let (_, plain) = assemble_turns("役割", &[], &without, 80_000);
+        assert_eq!(stats.total_tokens, plain.total_tokens);
+    }
+
+    #[test]
+    fn notice_wording_without_the_flag_stays_in_context() {
+        let history = vec![
+            msg("u1", "user", "調べて"),
+            msg(
+                "a1",
+                "assistant",
+                "ツール往復が上限の 8 回に達したため、残りの操作はしていません。",
+            ),
+            msg("u2", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[], &history, 80_000);
+        assert!(turns.iter().any(|turn| turn.content.contains("ツール往復")));
+    }
+
+    #[test]
+    fn later_turns_replay_tool_results_without_reasoning() {
+        let mut assistant = msg("a1", "assistant", "");
+        assistant.reasoning = "これは思考です".into();
+        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"search_index","arguments":"{\"query\":\"民法\"}"}}]"#.into();
+        let mut tool = msg("t1", "tool", "検索結果の本文");
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "search_index".into();
+        let history = vec![msg("u1", "user", "調べて"), assistant, tool, msg("u2", "user", "続き")];
+        let (turns, _) = assemble_turns("役割", &[], &history, 80_000);
+        let replayed = turns.iter().find(|t| t.role == "assistant").unwrap();
+        assert!(replayed.reasoning.is_none());
+        assert!(replayed.tool_calls.is_some());
+        let tool_turn = turns.iter().find(|t| t.role == "tool").unwrap();
+        assert_eq!(tool_turn.content, "検索結果の本文");
+        assert_eq!(tool_turn.tool_call_id.as_deref(), Some("c1"));
+        assert!(turns.iter().any(|t| t.content.contains("続き")));
+    }
+
+    #[test]
+    fn old_tool_results_shrink_to_their_share() {
+        let mut tool = msg("t1", "tool", &"あ".repeat(20_000));
+        tool.tool_call_id = "c1".into();
+        let history = vec![msg("u1", "user", "調べて"), tool, msg("u2", "user", "続き")];
+        let (turns, _) = assemble_turns("役割", &[], &history, 1_000);
+        let tool_turn = turns.iter().find(|t| t.role == "tool").unwrap();
+        assert!(tool_turn.content.contains("省略"));
+        assert!(tool_turn.content.chars().count() < 2_000);
+        assert!(turns.iter().any(|t| t.content == "続き"));
+    }
+
+    #[test]
+    fn silent_end_notice_includes_the_finish_reason() {
+        let notice = silent_end_notice("length");
+        assert!(notice.contains("length"));
+        assert!(silent_end_notice("  ").contains("不明"));
     }
 
     #[test]
@@ -619,7 +878,9 @@ mod tests {
 
     #[test]
     fn pending_attaches_to_latest_user() {
-        let sources = vec![src("b", "attach", 1, "追送本文")];
+        let mut pending = src("b", "attach", 1, "追送本文");
+        pending.cite_no = 1;
+        let sources = vec![pending];
         let history = vec![
             msg("u1", "user", "要約して"),
             msg("a1", "assistant", "要約です"),
@@ -636,10 +897,9 @@ mod tests {
 
     #[test]
     fn followup_pending_continues_cite_no() {
-        let sources = vec![
-            consumed("a", "attach", 0, "最初", "u1", 1),
-            src("b", "attach", 1, "追加"),
-        ];
+        let mut pending = src("b", "attach", 1, "追加");
+        pending.cite_no = 2;
+        let sources = vec![consumed("a", "attach", 0, "最初", "u1", 1), pending];
         let history = vec![
             msg("u1", "user", "要約して"),
             msg("a1", "assistant", "要約です"),
@@ -663,7 +923,7 @@ mod tests {
             src("new", "search", 2, "新しいヒット"),
         ];
         let history = vec![msg("u1", "user", "Q")];
-        let (turns, stats) = assemble_turns("", &sources, &history, 4_000);
+        let (turns, stats) = assemble_turns("", &sources, &history, 2_000);
         let blob = turns
             .iter()
             .find(|t| t.role == "user")
@@ -682,7 +942,7 @@ mod tests {
             src("old", "search", 1, &long),
         ];
         let history = vec![msg("u1", "user", "Q")];
-        let (turns, stats) = assemble_turns("", &sources, &history, 4_000);
+        let (turns, stats) = assemble_turns("", &sources, &history, 2_000);
         let blob = turns
             .iter()
             .find(|t| t.role == "user")
@@ -938,7 +1198,13 @@ mod tests {
             img_page("p1", 1, "一枚目"),
             img_page("p2", 2, "二枚目"),
             img_page("p3", 3, "三枚目"),
-        ];
+        ]
+        .into_iter()
+        .map(|mut page| {
+            page.cite_no = 1;
+            page
+        })
+        .collect::<Vec<_>>();
         let history = vec![msg("u1", "user", "要約して")];
         let (turns, stats) = assemble_turns("役割", &pages, &history, 80_000);
         assert_eq!(stats.consumed.len(), 3);

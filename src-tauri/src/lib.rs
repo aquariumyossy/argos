@@ -475,6 +475,7 @@ pub fn run() {
             llm::commands::llm_send,
             llm::commands::llm_cancel,
             llm::commands::llm_test_connection,
+            llm::commands::llm_thinking_budget,
             llm::commands::llm_list_models,
         ])
         .run(tauri::generate_context!())

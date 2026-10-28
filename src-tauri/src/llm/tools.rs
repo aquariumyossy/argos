@@ -17,8 +17,99 @@ pub const TOOL_LIST_NOTES: &str = "list_notes";
 pub const TOOL_READ_NOTE: &str = "read_note";
 pub const TOOL_CREATE_NOTE: &str = "create_note";
 pub const TOOL_WRITE_NOTE: &str = "write_note";
-pub const MAX_TOOL_ROUNDS: usize = 4;
-pub const MAX_TOOL_ROUNDS_WEB: usize = 4;
+pub const MAX_TOOL_ROUNDS: usize = 8;
+
+/// Shown alone when the no-tools final call fails or comes back empty.
+pub fn tool_round_limit_notice(max_rounds: usize) -> String {
+    format!(
+        "ツール往復が上限の {max_rounds} 回に達したため、残りの操作はしていません。続きはもう一度指示するか、設定の「ツール往復の上限」を上げてください。"
+    )
+}
+
+/// Shown with the answer after that final call succeeds.
+pub fn tool_round_limit_short_notice(max_rounds: usize) -> String {
+    format!(
+        "ツール往復が上限の {max_rounds} 回に達したため、続きの操作はせず、ここまでの資料で答えています。"
+    )
+}
+
+pub struct RoundLimitAnswer {
+    pub text: String,
+    /// Set only when `text` is the model's answer, not the fallback notice.
+    pub notice: Option<String>,
+}
+
+/// Keep a real answer and a short notice. An empty or missing body is the long notice alone.
+pub fn round_limit_answer(body: Option<&str>, max_rounds: usize) -> RoundLimitAnswer {
+    if let Some(text) = body.filter(|text| !text.trim().is_empty()) {
+        RoundLimitAnswer {
+            text: text.to_string(),
+            notice: Some(tool_round_limit_short_notice(max_rounds)),
+        }
+    } else {
+        RoundLimitAnswer {
+            text: tool_round_limit_notice(max_rounds),
+            notice: None,
+        }
+    }
+}
+
+/// The no-tools final call failed. Name the cause in Japanese, without secrets from `error`.
+pub fn round_limit_failure(max_rounds: usize, error: &str) -> RoundLimitAnswer {
+    let reason = round_limit_failure_reason(error);
+    RoundLimitAnswer {
+        text: format!(
+            "ツール往復が上限の {max_rounds} 回に達したため、残りの操作はしていません。続きの回答は失敗しました（{reason}）。続きはもう一度指示するか、設定の「ツール往復の上限」を上げてください。"
+        ),
+        notice: None,
+    }
+}
+
+fn round_limit_failure_reason(error: &str) -> String {
+    let l = error.to_lowercase();
+    // `error` is already a fixed Japanese message. A status is named only when that
+    // message contains our own `（HTTP n）` clause. Raw server text is not parsed.
+    if let Some(clause) = crate::llm::http_error::owned_status_clause(error) {
+        return clause;
+    }
+    if error.contains("API キーが拒否") {
+        return "サーバが認証を拒否しました".into();
+    }
+    if error.contains("指定したモデルが見つかりません") {
+        return "指定したモデルが見つかりません".into();
+    }
+    if error.contains("字に達しても答えが出ない") {
+        return "思考が長く続いたため止めました".into();
+    }
+    if error.contains("思考を閉じられず") {
+        return "思考を閉じられず止めました".into();
+    }
+    if l.contains("コンテキスト長")
+        || l.contains("context length")
+        || l.contains("context window")
+        || l.contains("n_ctx")
+        || l.contains("too many tokens")
+        || l.contains("prompt is too long")
+        || l.contains("maximum context")
+    {
+        return "コンテキストが長すぎます".into();
+    }
+    if l.contains("タイムアウト") || l.contains("timed out") || l.contains("timeout") {
+        return "応答が時間切れになりました".into();
+    }
+    if l.contains("接続できません")
+        || l.contains("届きません")
+        || l.contains("connection refused")
+        || l.contains("connect")
+        || l.contains("dns")
+        || l.contains("os error 10060")
+        || l.contains("os error 10061")
+    {
+        return "サーバに接続できません".into();
+    }
+    "応答を受け取れませんでした".into()
+}
+
 pub const MAX_READ_URL_PER_ROUND: usize = 2;
 pub const LLM_SEARCH_K_MAX: usize = 16;
 /// Body length per search hit. Deliberately small: a search round returns up to `k`
@@ -224,12 +315,8 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
     Value::Array(tools)
 }
 
-pub fn max_tool_rounds(web_search: bool) -> usize {
-    if web_search {
-        MAX_TOOL_ROUNDS_WEB
-    } else {
-        MAX_TOOL_ROUNDS
-    }
+pub fn max_tool_rounds(rounds: u32) -> usize {
+    crate::db::normalize_tool_rounds(rounds) as usize
 }
 
 /// Marker the tool description points at, so the model knows `read_unit` can fetch the
@@ -338,7 +425,6 @@ fn persist_hit(
     hit: &SearchHit,
     query: &str,
     body_cap: usize,
-    next_cite: &mut i64,
     new_rows: &mut Vec<LlmSourceRow>,
     already: &mut Vec<String>,
     consumed: &mut Vec<(String, i64)>,
@@ -362,7 +448,7 @@ fn persist_hit(
     } else {
         "text"
     };
-    let (mut row, created) = state
+    let (row, _) = state
         .db
         .insert_llm_source_full(
             thread_id,
@@ -379,14 +465,6 @@ fn persist_hit(
             None,
         )
         .map_err(|e| e.to_string())?;
-    if created || row.cite_no <= 0 {
-        *next_cite += 1;
-        row.cite_no = *next_cite;
-        state
-            .db
-            .set_llm_source_cite_no(&row.id, row.cite_no)
-            .map_err(|e| e.to_string())?;
-    }
     consumed.push((row.id.clone(), row.cite_no));
     new_rows.push(row);
     Ok(())
@@ -398,13 +476,11 @@ fn web_body_looks_full(body: &str) -> bool {
     body.chars().count() > TOOL_BODY_CAP + TRUNCATED_MARK.chars().count()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn persist_web_hit(
     state: &AppState,
     thread_id: &str,
     hit: &crate::llm::searxng::WebHit,
     query: &str,
-    next_cite: &mut i64,
     new_rows: &mut Vec<LlmSourceRow>,
     already: &mut Vec<String>,
     consumed: &mut Vec<(String, i64)>,
@@ -425,7 +501,7 @@ fn persist_web_hit(
             cap_chars(raw, TOOL_BODY_CAP)
         }
     };
-    let (mut row, created) = state
+    let (row, _) = state
         .db
         .insert_llm_source_full(
             thread_id,
@@ -442,14 +518,6 @@ fn persist_web_hit(
             None,
         )
         .map_err(|e| e.to_string())?;
-    if created || row.cite_no <= 0 {
-        *next_cite += 1;
-        row.cite_no = *next_cite;
-        state
-            .db
-            .set_llm_source_cite_no(&row.id, row.cite_no)
-            .map_err(|e| e.to_string())?;
-    }
     consumed.push((row.id.clone(), row.cite_no));
     new_rows.push(row);
     Ok(())
@@ -463,7 +531,6 @@ fn persist_web_page(
     title: &str,
     body: &str,
     origin: &str,
-    next_cite: &mut i64,
     new_rows: &mut Vec<LlmSourceRow>,
     already: &mut Vec<String>,
     consumed: &mut Vec<(String, i64)>,
@@ -488,7 +555,7 @@ fn persist_web_page(
         return Ok(());
     }
     let title = if title.trim().is_empty() { url } else { title };
-    let (mut row, created) = state
+    let (row, _) = state
         .db
         .insert_llm_source_full(
             thread_id,
@@ -505,14 +572,6 @@ fn persist_web_page(
             None,
         )
         .map_err(|e| e.to_string())?;
-    if created || row.cite_no <= 0 {
-        *next_cite += 1;
-        row.cite_no = *next_cite;
-        state
-            .db
-            .set_llm_source_cite_no(&row.id, row.cite_no)
-            .map_err(|e| e.to_string())?;
-    }
     consumed.push((row.id.clone(), row.cite_no));
     new_rows.push(row);
     Ok(())
@@ -1565,7 +1624,6 @@ pub fn execute_tool(
     name: &str,
     arguments: &str,
     thread_scope: Option<&str>,
-    next_cite: &mut i64,
     web_search: bool,
     request_id: &str,
 ) -> ToolExec {
@@ -1575,7 +1633,6 @@ pub fn execute_tool(
         name,
         arguments,
         thread_scope,
-        next_cite,
         web_search,
         request_id,
     ) {
@@ -1594,7 +1651,6 @@ fn execute_tool_inner(
     name: &str,
     arguments: &str,
     thread_scope: Option<&str>,
-    next_cite: &mut i64,
     web_search: bool,
     _request_id: &str,
 ) -> Result<ToolExec, String> {
@@ -1749,7 +1805,6 @@ fn execute_tool_inner(
                     hit,
                     &query,
                     TOOL_BODY_CAP,
-                    next_cite,
                     &mut new_rows,
                     &mut already,
                     &mut consumed,
@@ -1762,7 +1817,6 @@ fn execute_tool_inner(
                     hit,
                     &query,
                     TOOL_BODY_CAP,
-                    next_cite,
                     &mut new_rows,
                     &mut already,
                     &mut consumed,
@@ -1781,7 +1835,6 @@ fn execute_tool_inner(
                                 thread_id,
                                 hit,
                                 &query,
-                                next_cite,
                                 &mut new_rows,
                                 &mut already,
                                 &mut consumed,
@@ -1897,7 +1950,6 @@ fn execute_tool_inner(
                 &hit,
                 "",
                 READ_BODY_CAP,
-                next_cite,
                 &mut new_rows,
                 &mut already,
                 &mut consumed,
@@ -1918,7 +1970,6 @@ fn execute_tool_inner(
                             &n,
                             "",
                             READ_BODY_CAP,
-                            next_cite,
                             &mut new_rows,
                             &mut already,
                             &mut consumed,
@@ -2011,7 +2062,6 @@ fn execute_tool_inner(
                 &page.title,
                 &body,
                 "tool",
-                next_cite,
                 &mut new_rows,
                 &mut already,
                 &mut consumed,
@@ -2522,10 +2572,228 @@ mod tests {
         assert!(on.contains("公開ウェブも同時に検索"));
         assert!(on.contains(TOOL_READ_URL));
         assert!(on.contains("read_url"));
-        assert_eq!(max_tool_rounds(false), MAX_TOOL_ROUNDS);
-        assert_eq!(max_tool_rounds(true), MAX_TOOL_ROUNDS_WEB);
+        assert_eq!(max_tool_rounds(8), MAX_TOOL_ROUNDS);
+        assert_eq!(max_tool_rounds(0), 0);
+        assert_eq!(max_tool_rounds(3), MAX_TOOL_ROUNDS);
+        assert!(tool_round_limit_notice(8).contains("上限の 8 回"));
+        assert!(tool_round_limit_notice(8).contains("ツール往復の上限"));
+        let answered = round_limit_answer(Some("ここまでの結論です。"), 8);
+        assert_eq!(answered.text, "ここまでの結論です。");
+        let short = answered.notice.expect("short notice");
+        assert!(short.contains("上限の 8 回"));
+        assert!(short.contains("ここまでの資料"));
+        assert_ne!(short, tool_round_limit_notice(8));
+        assert!(short.chars().count() < tool_round_limit_notice(8).chars().count());
+        for body in [None, Some(""), Some("  \n")] {
+            let fallback = round_limit_answer(body, 16);
+            assert_eq!(fallback.text, tool_round_limit_notice(16));
+            assert!(fallback.notice.is_none());
+            assert!(!fallback.text.contains("失敗しました"));
+        }
+        let secret = "sk-live-secret";
+        let runaway = round_limit_failure(
+            8,
+            &format!("思考が 24576 字に達しても答えが出ないため止めました。 key={secret}"),
+        );
+        assert!(runaway.text.contains("上限の 8 回"));
+        assert!(runaway.text.contains("思考が長く続いたため止めました"));
+        assert!(runaway.notice.is_none());
+        assert!(!runaway.text.contains(secret));
+        let too_long = round_limit_failure(
+            8,
+            &format!("context length exceeded Bearer {secret}"),
+        );
+        assert!(too_long.text.contains("コンテキストが長すぎます"));
+        assert!(!too_long.text.contains(secret));
+        assert!(!too_long.text.contains("Bearer"));
+        let bridge = round_limit_failure(8, &crate::llm::thinking::thinking_bridge_error());
+        assert!(bridge.text.contains("思考を閉じられず止めました"));
+        assert!(bridge.notice.is_none());
+        let runaway_mapped = round_limit_failure(
+            8,
+            &crate::llm::thinking::runaway_thinking_error(24_576),
+        );
+        assert!(runaway_mapped.text.contains("思考が長く続いたため止めました"));
+        assert!(!runaway_mapped.text.contains("24576"));
+        assert!(!runaway_mapped.text.contains("HTTP"));
+        let too_long_mapped = round_limit_failure(
+            8,
+            "コンテキスト長が足りません。Ollama の num_ctx などを 64k 以上にしてください。",
+        );
+        assert!(too_long_mapped.text.contains("コンテキストが長すぎます"));
+        let timed_out = round_limit_failure(
+            8,
+            "応答が止まりました（タイムアウト）。指示を分けるか、設定の「思考」をオフにしてください。",
+        );
+        assert!(timed_out.text.contains("応答が時間切れになりました"));
+        let tailscale = round_limit_failure(
+            8,
+            "LLM サーバのポートに届きません。例: mtplx serve --host 0.0.0.0 --port 8000 --api-key sk-live-secret",
+        );
+        assert!(tailscale.text.contains("サーバに接続できません"));
+        assert!(!tailscale.text.contains(secret));
+        assert!(!tailscale.text.contains("api-key"));
+        assert!(!tailscale.text.contains("HTTP"));
+        let auth = round_limit_failure(8, "API キーが拒否されました。キー欄を確認してください。");
+        assert!(auth.text.contains("サーバが認証を拒否しました"));
+        assert!(!auth.text.contains("キー欄"));
+        let unknown = round_limit_failure(8, &format!("unexpected blob api_key={secret}"));
+        assert!(unknown.text.contains("応答を受け取れませんでした"));
+        assert!(!unknown.text.contains(secret));
+        assert!(!unknown.text.contains("api_key"));
         assert!(on.contains(TOOL_WRITE_NOTE));
         assert!(off.contains("ノートの id・題名・更新日時"));
+    }
+
+    #[test]
+    fn round_limit_names_only_a_status_already_in_our_message() {
+        let secret = "sk-live-secret";
+        let raw = round_limit_failure(8, &format!("500 internal api_key={secret}"));
+        assert!(raw.text.contains("応答を受け取れませんでした"), "{}", raw.text);
+        assert!(!raw.text.contains("HTTP"), "{}", raw.text);
+        assert!(!raw.text.contains(secret), "{}", raw.text);
+        assert!(!raw.text.contains("api_key"), "{}", raw.text);
+        let mapped = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, &format!("internal api_key={secret}")),
+        );
+        assert!(mapped.text.contains("HTTP 500"), "{}", mapped.text);
+        assert!(!mapped.text.contains(secret), "{}", mapped.text);
+        assert!(!mapped.text.contains("api_key"), "{}", mapped.text);
+        for port in ["8080", "11434", "1234", "500", "404"] {
+            let refused =
+                round_limit_failure(8, &format!("connection refused to http://127.0.0.1:{port}"));
+            assert!(
+                refused.text.contains("サーバに接続できません"),
+                "{port}: {}",
+                refused.text
+            );
+            assert!(!refused.text.contains("HTTP"), "{port}: {}", refused.text);
+            let bare = round_limit_failure(8, &format!("http://127.0.0.1:{port}/v1/chat"));
+            assert!(!bare.text.contains("HTTP"), "{port}: {}", bare.text);
+            assert!(!bare.text.contains("認証"), "{port}: {}", bare.text);
+        }
+        let auth_status = round_limit_failure(8, "401 Unauthorized");
+        assert!(auth_status.text.contains("応答を受け取れませんでした"), "{}", auth_status.text);
+        assert!(!auth_status.text.contains("認証"), "{}", auth_status.text);
+        let http_line = round_limit_failure(8, "HTTP/1.1 404 Not Found");
+        assert!(http_line.text.contains("応答を受け取れませんでした"), "{}", http_line.text);
+        assert!(!http_line.text.contains("HTTP"), "{}", http_line.text);
+        let status_field = round_limit_failure(8, "status_code=503");
+        assert!(status_field.text.contains("応答を受け取れませんでした"), "{}", status_field.text);
+        assert!(!status_field.text.contains("HTTP"), "{}", status_field.text);
+        assert!(!status_field.text.contains("503"), "{}", status_field.text);
+    }
+
+    #[test]
+    fn mapped_http_status_is_the_only_status_round_limit_names() {
+        let wrapped = crate::llm::http_error::chat_failure(
+            500,
+            r#"{"message":"request failed: HTTP 404 Not Found"}"#,
+        );
+        let wrapped_reason = round_limit_failure(8, &wrapped);
+        assert!(wrapped_reason.text.contains("HTTP 500"), "{}", wrapped_reason.text);
+        assert!(!wrapped_reason.text.contains("404"), "{}", wrapped_reason.text);
+        let gateway = crate::llm::http_error::chat_failure(502, r#"{"error":"upstream HTTP 500"}"#);
+        let gateway_reason = round_limit_failure(8, &gateway);
+        assert!(gateway_reason.text.contains("HTTP 502"), "{}", gateway_reason.text);
+        assert!(!gateway_reason.text.contains("500"), "{}", gateway_reason.text);
+        let missing = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(404, "HTTP/1.1 404 Not Found"),
+        );
+        assert!(
+            missing.text.contains("指定したモデルが見つかりません"),
+            "{}",
+            missing.text
+        );
+        assert!(!missing.text.contains("HTTP"), "{}", missing.text);
+        assert!(!missing.text.contains("Not Found"), "{}", missing.text);
+    }
+
+    #[test]
+    fn round_limit_treats_403_the_same_as_401() {
+        for code in [401_u16, 403] {
+            let msg = round_limit_failure(
+                8,
+                &crate::llm::http_error::chat_failure(code, "Forbidden req_10061"),
+            );
+            assert!(
+                msg.text.contains("サーバが認証を拒否しました"),
+                "{code}: {}",
+                msg.text
+            );
+            assert!(!msg.text.contains("HTTP"), "{code}: {}", msg.text);
+            assert!(!msg.text.contains("req_10061"), "{code}: {}", msg.text);
+            assert!(!msg.text.contains("Forbidden"), "{code}: {}", msg.text);
+        }
+    }
+
+    #[test]
+    fn round_limit_server_error_quoting_10061_tokens_is_not_a_connection_error() {
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "prompt is 10061 tokens"),
+        );
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("接続"), "{}", msg.text);
+        assert!(!msg.text.contains("10061"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_auth_status_wins_when_the_body_quotes_a_socket_code() {
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(401, r#"{"request_id":"req_10061"}"#),
+        );
+        assert!(msg.text.contains("サーバが認証を拒否しました"), "{}", msg.text);
+        assert!(!msg.text.contains("接続"), "{}", msg.text);
+        assert!(!msg.text.contains("req_10061"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_prompt_token_count_inside_a_server_error_is_not_auth() {
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "prompt_tokens 14049"),
+        );
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("認証"), "{}", msg.text);
+        assert!(!msg.text.contains("14049"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_quoted_404_inside_a_server_error_stays_a_server_error() {
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "HTTP 404 Not Found"),
+        );
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("404"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_unauthorized_phrase_inside_a_server_error_stays_a_server_error() {
+        let raw = round_limit_failure(8, "500 Internal Server Error Unauthorized for url");
+        assert!(raw.text.contains("応答を受け取れませんでした"), "{}", raw.text);
+        assert!(!raw.text.contains("認証"), "{}", raw.text);
+        assert!(!raw.text.contains("Unauthorized"), "{}", raw.text);
+        let msg = round_limit_failure(
+            8,
+            &crate::llm::http_error::chat_failure(500, "Unauthorized for url"),
+        );
+        assert!(msg.text.contains("HTTP 500"), "{}", msg.text);
+        assert!(!msg.text.contains("認証"), "{}", msg.text);
+        assert!(!msg.text.contains("Unauthorized"), "{}", msg.text);
+    }
+
+    #[test]
+    fn round_limit_socket_error_without_an_http_status_is_a_connection_error() {
+        let msg = round_limit_failure(8, "connection failed: os error 10061");
+        assert!(msg.text.contains("サーバに接続できません"), "{}", msg.text);
+        assert!(!msg.text.contains("HTTP"), "{}", msg.text);
+        let timed_out = round_limit_failure(8, "os error 10060");
+        assert!(timed_out.text.contains("サーバに接続できません"), "{}", timed_out.text);
     }
 
     #[test]

@@ -15,7 +15,14 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
+import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
+import {
+  CHARS_PER_TOKEN,
+  contextIsNearLimit,
+  contextMeterLabel,
+  contextUsageTokens,
+} from "./contextEstimate";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
 import { openPreview } from "../preview/openPreview";
@@ -50,6 +57,12 @@ type LlmMessageRow = {
   role: string;
   content: string;
   createdAt: number;
+  reasoning?: string;
+  toolCalls?: string;
+  toolCallId?: string;
+  toolName?: string;
+  /** "notice" is shown in the chat and left out of the token estimate. */
+  kind?: string;
 };
 
 type LlmSourceRow = {
@@ -98,8 +111,13 @@ type LlmAttachFilesResult = {
 
 type SettingsData = {
   fontSize: number;
-  llmMaxContextChars?: number;
+  llmMaxContextTokens?: number;
   searxngUrl?: string;
+};
+
+type ThinkingBudgetStatus = {
+  state: string;
+  tokens?: number | null;
 };
 
 type LlmSendResult = {
@@ -109,7 +127,9 @@ type LlmSendResult = {
   cancelled: boolean;
   error: string | null;
   truncated?: boolean;
-  contextChars?: number;
+  contextTokens?: number;
+  thinkingBudgetState?: string;
+  thinkingBudgetTokens?: number | null;
   warning?: string | null;
   noteWrites?: { noteId: string; title: string; hasReview: boolean }[];
 };
@@ -228,6 +248,10 @@ function chipLabel(s: LlmSourceRow): string {
   return imageGroupKey(s) ? fileLabel(s) : sourceLabel(s);
 }
 
+function citePrefix(n: number): string {
+  return n > 0 ? `[${n}] ` : "";
+}
+
 function IconOpenFile() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
@@ -336,8 +360,32 @@ function IconTrash() {
   );
 }
 
-function countChars(s: string): number {
-  return [...s].length;
+function toolCallNames(raw: string | undefined): string[] {
+  const text = (raw ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => {
+        if (!item || typeof item !== "object") return "";
+        const row = item as { name?: unknown; function?: { name?: unknown } };
+        if (typeof row.function?.name === "string") return row.function.name;
+        if (typeof row.name === "string") return row.name;
+        return "";
+      })
+      .filter((name) => name.trim().length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function thinkingBudgetLabel(status: ThinkingBudgetStatus): string {
+  if (status.state === "set" && typeof status.tokens === "number" && status.tokens > 0) {
+    return `思考の上限 ${status.tokens.toLocaleString()} トークン`;
+  }
+  if (status.state === "unset") return "思考の上限は未設定";
+  return "思考の上限は未確認";
 }
 
 function matchesListQuery(text: string, query: string): boolean {
@@ -460,7 +508,10 @@ export default function Chat() {
     chunk: string;
   } | null>(null);
   const [fontSize, setFontSize] = useState(14);
-  const [maxContextChars, setMaxContextChars] = useState(80_000);
+  const [maxContextTokens, setMaxContextTokens] = useState(131_072);
+  const [thinkingBudget, setThinkingBudget] = useState<ThinkingBudgetStatus>({
+    state: "unknown",
+  });
   const [searxngUrl, setSearxngUrl] = useState("");
   const [webSearch, setWebSearch] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -584,12 +635,20 @@ export default function Chat() {
     if (typeof s.fontSize === "number" && s.fontSize > 0) {
       setFontSize(s.fontSize);
     }
-    if (typeof s.llmMaxContextChars === "number" && s.llmMaxContextChars > 0) {
-      setMaxContextChars(s.llmMaxContextChars);
+    if (typeof s.llmMaxContextTokens === "number" && s.llmMaxContextTokens > 0) {
+      setMaxContextTokens(s.llmMaxContextTokens);
     }
     const url = typeof s.searxngUrl === "string" ? s.searxngUrl.trim() : "";
     setSearxngUrl(url);
     if (!url) setWebSearch(false);
+  }, []);
+
+  const refreshThinkingBudget = useCallback(() => {
+    void invoke<ThinkingBudgetStatus>("llm_thinking_budget")
+      .then(setThinkingBudget)
+      .catch(() => {
+        /* keep the last reading */
+      });
   }, []);
 
   const bootstrap = useCallback(async () => {
@@ -603,6 +662,7 @@ export default function Chat() {
       } catch {
         /* keep default */
       }
+      refreshThinkingBudget();
       await loadThreads();
       setError("");
     } catch (e) {
@@ -610,7 +670,7 @@ export default function Chat() {
     } finally {
       bootstrappingRef.current = false;
     }
-  }, [applySettings, loadThreads]);
+  }, [applySettings, loadThreads, refreshThinkingBudget]);
 
   useEffect(() => {
     void bootstrap();
@@ -642,6 +702,7 @@ export default function Chat() {
         .catch(() => {
           /* keep current */
         });
+      refreshThinkingBudget();
     }).then((fn) => {
       if (cancelled) fn();
       else unlistenSettings = fn;
@@ -652,7 +713,7 @@ export default function Chat() {
       unlistenReady?.();
       unlistenSettings?.();
     };
-  }, [applySettings, bootstrap]);
+  }, [applySettings, bootstrap, refreshThinkingBudget]);
 
   useEffect(() => {
     let unlistenDelta: (() => void) | undefined;
@@ -663,7 +724,11 @@ export default function Chat() {
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
       if (event.payload.threadId !== activeIdRef.current) return;
       const kind = event.payload.kind ?? "content";
-      if (kind === "reasoning") {
+      if (kind === "reset") {
+        setStream("");
+        setThinking("");
+        setToolHint("");
+      } else if (kind === "reasoning") {
         setThinking((prev) => prev + event.payload.text);
       } else if (kind === "tool") {
         setToolHint(event.payload.text || "インデックスを検索しています…");
@@ -734,14 +799,19 @@ export default function Chat() {
     scrollLog();
   }, [messages, stream, thinking, toolHint, busy, scrollLog]);
 
-  const estimatedChars = useMemo(() => {
-    const src = sources.reduce(
-      (n, s) => n + countChars(s.body) + countChars(s.title) + 24,
-      0,
-    );
-    const hist = messages.reduce((n, m) => n + countChars(m.content), 0);
-    return src + hist + countChars(draft);
-  }, [sources, messages, draft]);
+  const estimatedTokens = useMemo(
+    () =>
+      contextUsageTokens({
+        messages: messages.map((m) => ({
+          content: m.content,
+          toolCalls: m.toolCalls,
+          kind: m.kind,
+        })),
+        sources: sources.map((s) => ({ body: s.body, title: s.title })),
+        draft,
+      }),
+    [sources, messages, draft],
+  );
 
   const pendingSources = useMemo(
     () => sources.filter(isPendingSource),
@@ -754,22 +824,14 @@ export default function Chat() {
     return [...ready, ...tools];
   }, [pendingSources, sources]);
 
-  const maxCitedNo = useMemo(
-    () =>
-      sources
-        .filter((s) => (s.injectedUserMessageId ?? "").trim())
-        .reduce((n, s) => Math.max(n, s.citeNo ?? 0), 0),
-    [sources],
-  );
-
   const pendingGroups = useMemo(
-    () => groupSources(pendingSources, maxCitedNo + 1),
-    [pendingSources, maxCitedNo],
+    () => groupSources(pendingSources),
+    [pendingSources],
   );
 
   const liveCiteGroups = useMemo(
-    () => groupSources(liveCites, maxCitedNo + 1),
-    [liveCites, maxCitedNo],
+    () => groupSources(liveCites),
+    [liveCites],
   );
 
   const liveCiteInfo = useMemo(
@@ -777,7 +839,7 @@ export default function Chat() {
     [liveCiteGroups],
   );
 
-  const overBudget = estimatedChars > maxContextChars;
+  const nearBudget = contextIsNearLimit(estimatedTokens, maxContextTokens);
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
@@ -967,9 +1029,10 @@ export default function Chat() {
       const preview = await invoke<LlmFilePreview>("llm_preview_source_file", {
         id: s.id,
       });
-      if (preview.chars > maxContextChars) {
+      const fileTokens = Math.ceil(preview.chars / CHARS_PER_TOKEN);
+      if (fileTokens > maxContextTokens) {
         const ok = window.confirm(
-          `このファイルは約 ${preview.chars.toLocaleString()} 文字です。送信の上限は ${maxContextChars.toLocaleString()} 文字です。全文にしますか？`,
+          `このファイルは約 ${fileTokens.toLocaleString()} トークンです。送信の上限は ${maxContextTokens.toLocaleString()} トークンです。全文にしますか？`,
         );
         if (!ok) return;
       }
@@ -1152,6 +1215,12 @@ export default function Chat() {
       setStream("");
       setThinking("");
       setToolHint("");
+      if (result.thinkingBudgetState) {
+        setThinkingBudget({
+          state: result.thinkingBudgetState,
+          tokens: result.thinkingBudgetTokens ?? null,
+        });
+      }
       if (result.cancelled) {
         setError("生成を停止しました。");
       } else if (result.error) {
@@ -1159,7 +1228,7 @@ export default function Chat() {
       } else if (result.warning) {
         setNotice(result.warning);
       } else if (result.truncated) {
-        setNotice("文字数上限のため、古い出典から切り詰めて送りました。");
+        setNotice("トークン上限のため、古いやり取りや出典から切り詰めて送りました。");
       }
     } catch (e) {
       setStream("");
@@ -1575,25 +1644,50 @@ export default function Chat() {
             messages.map((m) => {
               const cites =
                 m.role === "assistant" ? citedForMessage(sources, m.id) : [];
-              const citeGroups = groupSources(cites, 1);
+              const citeGroups = groupSources(cites);
               const citeInfo = openableCitesFromGroups(citeGroups);
+              const calls = toolCallNames(m.toolCalls);
+              const isNotice = m.kind === "notice";
+              const roleClass =
+                m.role === "user"
+                  ? "chat-msg user"
+                  : m.role === "tool"
+                    ? "chat-msg tool"
+                    : isNotice
+                      ? "chat-msg assistant notice"
+                      : "chat-msg assistant";
               return (
-                <article
-                  key={m.id}
-                  className={m.role === "user" ? "chat-msg user" : "chat-msg assistant"}
-                >
-                  {m.role === "assistant" ? (
-                    <AssistantBody
-                      text={m.content}
-                      citeNos={citeInfo.nos}
-                      onCite={(n) => {
-                        const s = citeInfo.byNo.get(n);
-                        if (s) void openSource(s);
-                      }}
-                      onChoice={applyTemplate}
-                      choicesDisabled={blocked}
-                      onLayout={scrollLog}
-                    />
+                <article key={m.id} className={roleClass}>
+                  {m.role === "assistant" && (m.reasoning ?? "").trim() ? (
+                    <details className="chat-thinking">
+                      <summary>思考</summary>
+                      <div className="chat-thinking-body">{m.reasoning}</div>
+                    </details>
+                  ) : null}
+                  {m.role === "tool" ? (
+                    <details className="chat-thinking">
+                      <summary>{(m.toolName ?? "").trim() || "操作"} の結果</summary>
+                      <div className="chat-thinking-body">{m.content}</div>
+                    </details>
+                  ) : m.role === "assistant" ? (
+                    <>
+                      {calls.length > 0 ? (
+                        <p className="chat-tool-hint">{calls.join("、")}</p>
+                      ) : null}
+                      {m.content.trim() ? (
+                        <AssistantBody
+                          text={m.content}
+                          citeNos={citeInfo.nos}
+                          onCite={(n) => {
+                            const s = citeInfo.byNo.get(n);
+                            if (s) void openSource(s);
+                          }}
+                          onChoice={applyTemplate}
+                          choicesDisabled={blocked}
+                          onLayout={scrollLog}
+                        />
+                      ) : null}
+                    </>
                   ) : (
                     <div className="chat-msg-body">{m.content}</div>
                   )}
@@ -1605,7 +1699,7 @@ export default function Chat() {
                         if (!path) {
                           return (
                             <span key={g.key} className="chat-cite-badge">
-                              [{g.citeNo}] {chipLabel(s)}
+                              {citePrefix(g.citeNo)}{chipLabel(s)}
                             </span>
                           );
                         }
@@ -1617,13 +1711,13 @@ export default function Chat() {
                             title={sourceOpenTitle(s)}
                             onClick={() => void openSource(s)}
                           >
-                            [{g.citeNo}] {chipLabel(s)}
+                            {citePrefix(g.citeNo)}{chipLabel(s)}
                           </button>
                         );
                       })}
                     </div>
                   ) : null}
-                  {m.role === "assistant" ? (
+                  {m.role === "assistant" && !isNotice && m.content.trim() ? (
                     <div className="chat-msg-actions">
                       <NoteDestPicker
                         buttonClassName="chat-tpl"
@@ -1669,7 +1763,7 @@ export default function Chat() {
                     if (!path) {
                       return (
                         <span key={g.key} className="chat-cite-badge">
-                          [{g.citeNo}] {chipLabel(s)}
+                          {citePrefix(g.citeNo)}{chipLabel(s)}
                         </span>
                       );
                     }
@@ -1681,7 +1775,7 @@ export default function Chat() {
                         title={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
-                        [{g.citeNo}] {chipLabel(s)}
+                        {citePrefix(g.citeNo)}{chipLabel(s)}
                       </button>
                     );
                   })}
@@ -1781,7 +1875,7 @@ export default function Chat() {
                         }
                         onClick={() => void toggleSourceGrain(s)}
                       >
-                        [{n}] {label}
+                        {citePrefix(n)}{label}
                         {badge ? (
                           <span className="chat-source-badge">{badge}</span>
                         ) : null}
@@ -1793,7 +1887,7 @@ export default function Chat() {
                         title={sourceOpenTitle(s)}
                         onClick={() => void openSource(s)}
                       >
-                        [{n}] {label}
+                        {citePrefix(n)}{label}
                         {badge ? (
                           <span className="chat-source-badge">{badge}</span>
                         ) : null}
@@ -1880,6 +1974,7 @@ export default function Chat() {
             >
               {webSearch ? "ウェブ検索オン" : "ウェブ検索オフ"}
             </button>
+            <PromptLibrary text={draft} disabled={busy} onRecall={applyTemplate} />
             <button
               type="button"
               className="chat-tpl"
@@ -1912,13 +2007,21 @@ export default function Chat() {
             >
               時系列
             </button>
-            <span
-              className={overBudget ? "chat-char-meter warn" : "chat-char-meter"}
-              title="読込済みの出典本文も履歴の一部として数えます"
-            >
-              約 {estimatedChars.toLocaleString()} / {maxContextChars.toLocaleString()}{" "}
-              文字
-              {overBudget ? " · 古い出典から切り詰めます" : ""}
+            <span className="chat-context-meter">
+              <span
+                className={nearBudget ? "chat-char-meter warn" : "chat-char-meter"}
+                title="この会話を送るときの目安です。上限を超えると古いやり取りから落ちます。"
+              >
+                {contextMeterLabel(estimatedTokens, maxContextTokens)}
+              </span>
+              {nearBudget ? (
+                <span className="chat-char-meter warn">
+                  上限に近いので、新しい会話に切り替えてください。
+                </span>
+              ) : null}
+              <span className="chat-thinking-budget" title={thinkingBudgetLabel(thinkingBudget)}>
+                {thinkingBudgetLabel(thinkingBudget)}
+              </span>
             </span>
           </div>
           <div className="chat-composer-row">

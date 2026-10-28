@@ -7,9 +7,10 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
-    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer,
-    final_source_turn, sources_for_consumed, ChatTurn, PHANTOM_CITE_HINT, REASONING_CARRY_CAP,
-    STOP_TOOLS_HINT,
+    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, estimate_tokens,
+    final_source_turn, fit_tool_text, parse_cited_nos, silent_end_notice, sources_for_consumed,
+    ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
+    TOOL_RESULT_BUDGET_RATIO,
 };
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
@@ -48,7 +49,9 @@ pub struct LlmSendResult {
     pub cancelled: bool,
     pub error: Option<String>,
     pub truncated: bool,
-    pub context_chars: usize,
+    pub context_tokens: usize,
+    pub thinking_budget_state: String,
+    pub thinking_budget_tokens: Option<u32>,
     pub warning: Option<String>,
     #[serde(default)]
     pub note_writes: Vec<NoteWriteNotice>,
@@ -117,51 +120,69 @@ async fn execute_tool_off_runtime(
     name: String,
     arguments: String,
     thread_scope: Option<String>,
-    next_cite: i64,
     web_search: bool,
     request_id: String,
-) -> (ToolExec, i64) {
+) -> ToolExec {
     match tokio::task::spawn_blocking(move || {
-        let mut n = next_cite;
-        let exec = tools::execute_tool(
+        tools::execute_tool(
             &state,
             &thread_id,
             &name,
             &arguments,
             thread_scope.as_deref(),
-            &mut n,
             web_search,
             &request_id,
-        );
-        (exec, n)
+        )
     })
     .await
     {
-        Ok(pair) => pair,
-        Err(e) => (
-            ToolExec {
-                content: format!("ツール実行に失敗しました: {e}"),
-                consumed: Vec::new(),
-                wrote_note_id: None,
-            },
-            next_cite,
-        ),
+        Ok(exec) => exec,
+        Err(e) => ToolExec {
+            content: format!("ツール実行に失敗しました: {e}"),
+            consumed: Vec::new(),
+            wrote_note_id: None,
+        },
     }
 }
 
-/// Trim one tool result to what is left of the reserve, keeping the head (the highest
-/// scoring hits) and telling the model the rest was cut.
-fn fit_tool_content(content: String, budget: usize, used: usize) -> String {
-    let left = budget.saturating_sub(used);
-    if left == 0 {
-        return "（文脈の上限に達したため、この結果は省略しました）".into();
+fn emit_chat_reset(app: &AppHandle, request_id: &str, thread_id: &str) {
+    let _ = app.emit(
+        "llm-chat-delta",
+        LlmChatDelta {
+            request_id: request_id.to_string(),
+            thread_id: thread_id.to_string(),
+            text: String::new(),
+            kind: "reset".into(),
+        },
+    );
+}
+
+fn store_turn(db: &crate::db::Db, thread_id: &str, turn: &ChatTurn) -> Result<(), String> {
+    let calls = turn
+        .tool_calls
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    db.insert_llm_message_full(
+        thread_id,
+        &turn.role,
+        &turn.content,
+        turn.reasoning.as_deref().unwrap_or(""),
+        &calls,
+        turn.tool_call_id.as_deref().unwrap_or(""),
+        turn.name.as_deref().unwrap_or(""),
+        "",
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn budget_fields(base: &str) -> (String, Option<u32>) {
+    match llm::thinking::known_budget_for(&llm::normalize_base_url(base)) {
+        llm::thinking::KnownBudget::Tokens(n) => ("set".into(), Some(n)),
+        llm::thinking::KnownBudget::Unset => ("unset".into(), None),
+        llm::thinking::KnownBudget::Unknown => ("unknown".into(), None),
     }
-    if content.chars().count() <= left {
-        return content;
-    }
-    let mut out: String = content.chars().take(left).collect();
-    out.push_str("\n（以下、文脈の上限により省略）");
-    out
 }
 
 /// Put this-turn hits on a user turn so the model sees a real 出典 block (not only `role: tool`).
@@ -462,6 +483,29 @@ pub async fn llm_test_connection(state: State<'_, Arc<AppState>>) -> Result<LlmT
     })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgetStatus {
+    /// "set" | "unset" | "unknown"
+    pub state: String,
+    pub tokens: Option<u32>,
+}
+
+/// Read MTPLX `GET /metrics` and return the remembered thinking budget.
+/// Does not count or cut the budget; that stays on the server.
+#[tauri::command]
+pub async fn llm_thinking_budget(
+    state: State<'_, Arc<AppState>>,
+) -> Result<ThinkingBudgetStatus, String> {
+    let settings = state.settings.read().clone();
+    let _ = llm::refresh_thinking_budget(&settings, None).await;
+    let (state_name, tokens) = budget_fields(&settings.llm_base_url);
+    Ok(ThinkingBudgetStatus {
+        state: state_name,
+        tokens,
+    })
+}
+
 #[tauri::command]
 pub async fn llm_list_models(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmModelInfo>, String> {
     let settings = state.settings.read().clone();
@@ -552,7 +596,7 @@ pub async fn llm_send(
         .list_llm_sources(&thread.id)
         .map_err(|e| e.to_string())?;
     let settings = state.settings.read().clone();
-    let max_chars = settings.llm_max_context_chars as usize;
+    let max_tokens = settings.llm_max_context_tokens as usize;
     let thread_scope = Some(thread.path_prefix.trim().to_string()).filter(|s| !s.is_empty());
     let mut system = llm::system_for_request(&settings);
     llm::append_diagram_hint(&mut system, &content);
@@ -588,21 +632,16 @@ pub async fn llm_send(
     if let Some(line) = paste.system_line() {
         system.push_str(&line);
     }
-    let (assembled, stats) = assemble_turns(&system, &sources, &history, max_chars);
-    let turns_for_plain = llm::apply_thinking_to_turns(assembled.clone(), &settings);
+    let (assembled, stats) = assemble_turns(&system, &sources, &history, max_tokens);
+    let turns_for_plain = assembled.clone();
     let truncated = stats.truncated;
-    let context_chars = stats.total_chars;
+    let context_tokens = stats.total_tokens;
     let mut consumed: Vec<(String, i64)> = stats
         .consumed
         .iter()
         .map(|c| (c.id.clone(), c.cite_no))
         .collect();
     persist_image_group_cites(&state.db, &sources, &consumed);
-    let mut next_cite = state
-        .db
-        .max_llm_cite_no(&thread.id)
-        .unwrap_or(0)
-        .max(consumed.iter().map(|(_, n)| *n).max().unwrap_or(0));
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let state_arc = state.inner().clone();
@@ -620,28 +659,52 @@ pub async fn llm_send(
     let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
     let mut use_tools = true;
     let mut retried_without_tools = false;
-    let mut extra_final = false;
     let mut phantom_retried = false;
     let mut rounds = 0usize;
-    let max_rounds = tools::max_tool_rounds(web_search);
+    let max_rounds = tools::max_tool_rounds(settings.llm_max_tool_rounds);
+    let unlimited_rounds = max_rounds == 0;
     let mut current_turns = assembled;
     let mut source_turn_injected = false;
     // Tool output is appended after the context was already sized, so it needs its own
     // allowance. A quarter of the window leaves room for the history and the answer.
-    let tool_budget = (max_chars / 4).max(2_000);
+    let tool_budget = ((max_tokens as f64) * TOOL_RESULT_BUDGET_RATIO).floor() as usize;
     let mut tool_used = 0usize;
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
+    let mut final_reasoning = String::new();
+    let mut round_limit_final = false;
+    let mut round_limit_aside: Option<String> = None;
+    let mut empty_reply = false;
+    // First answer kept when a phantom retry (hint or source-block) comes back empty.
+    let mut phantom_fallback: Option<PhantomOriginal> = None;
+    let mut kept_source_ids: Option<std::collections::HashSet<String>> = None;
     let result_text;
 
     loop {
+        if use_tools && !unlimited_rounds && rounds >= max_rounds {
+            // One answer from what this turn already collected. No further tool calls.
+            use_tools = false;
+            round_limit_final = true;
+            if !source_turn_injected {
+                let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                source_turn_injected =
+                    inject_final_source_turn(&mut current_turns, &all, &consumed, true);
+            }
+            if !source_turn_injected {
+                current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
+                source_turn_injected = true;
+            }
+            emit_chat_reset(&app, &request_id, &thread.id);
+            continue;
+        }
         let with_tools = use_tools;
-        let turns_now = llm::apply_thinking_to_turns(current_turns.clone(), &settings);
-        let outcome = {
+        let turns_now = current_turns.clone();
+        let mut bridge_retried = false;
+        let outcome = loop {
             let app2 = app.clone();
             let req = request_id.clone();
             let tid = thread.id.clone();
-            llm::stream_chat(
+            let streamed = llm::stream_chat(
                 &settings,
                 &turns_now,
                 cancel.clone(),
@@ -650,6 +713,7 @@ pub async fn llm_send(
                 } else {
                     None
                 },
+                llm::runaway_chars_for(&settings.llm_base_url),
                 move |kind, delta| {
                     let _ = app2.emit(
                         "llm-chat-delta",
@@ -662,7 +726,25 @@ pub async fn llm_send(
                     );
                 },
             )
-            .await
+            .await;
+            match streamed {
+                Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR && !bridge_retried => {
+                    bridge_retried = true;
+                    emit_chat_reset(&app, &request_id, &thread.id);
+                    continue;
+                }
+                Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR => {
+                    break Err(llm::thinking::thinking_bridge_error());
+                }
+                Err(e) if e.starts_with(llm::thinking::THINKING_RUNAWAY_PREFIX) => {
+                    let chars = e
+                        .strip_prefix(llm::thinking::THINKING_RUNAWAY_PREFIX)
+                        .unwrap_or("");
+                    let n: usize = chars.parse().unwrap_or(0);
+                    break Err(llm::thinking::runaway_thinking_error(n));
+                }
+                other => break other,
+            }
         };
 
         match outcome {
@@ -683,10 +765,18 @@ pub async fn llm_send(
                     cancelled: true,
                     error: None,
                     truncated,
-                    context_chars,
+                    context_tokens,
+                    thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                    thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
                     note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
+            }
+            Err(e) if round_limit_final => {
+                let finished = tools::round_limit_failure(max_rounds, &e);
+                result_text = finished.text;
+                round_limit_aside = finished.notice;
+                break;
             }
             Err(e)
                 if use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&e) =>
@@ -730,13 +820,30 @@ pub async fn llm_send(
                     cancelled: false,
                     error: Some(e),
                     truncated,
-                    context_chars,
+                    context_tokens,
+                    thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                    thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
                     note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
             }
             Ok(out) => {
-                if use_tools && !out.tool_calls.is_empty() && rounds < max_rounds {
+                if round_limit_final {
+                    let finished = tools::round_limit_answer(Some(&out.content), max_rounds);
+                    if finished.notice.is_some() {
+                        final_reasoning = out.reasoning;
+                    }
+                    result_text = finished.text;
+                    round_limit_aside = finished.notice;
+                    break;
+                }
+                if with_tools
+                    && llm::thinking::thinking_enabled(&settings)
+                    && !out.request_id.is_empty()
+                {
+                    let _ = llm::refresh_thinking_budget(&settings, Some(&out.request_id)).await;
+                }
+                if use_tools && !out.tool_calls.is_empty() {
                     rounds += 1;
                     let tool_calls_json = serde_json::json!(out
                         .tool_calls
@@ -757,14 +864,16 @@ pub async fn llm_send(
                             Some(cap_chars(r, REASONING_CARRY_CAP))
                         }
                     };
-                    current_turns.push(ChatTurn {
+                    let assistant_turn = ChatTurn {
                         role: "assistant".into(),
                         content: out.content,
                         name: None,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls_json),
                         reasoning,
-                    });
+                    };
+                    store_turn(&state.db, &thread.id, &assistant_turn)?;
+                    current_turns.push(assistant_turn);
                     let mut read_url_in_round = 0usize;
                     for tc in out.tool_calls {
                         let hint = if web_search && tc.name == tools::TOOL_SEARCH {
@@ -784,21 +893,23 @@ pub async fn llm_send(
                         if tc.name == tools::TOOL_READ_URL
                             && read_url_in_round >= tools::MAX_READ_URL_PER_ROUND
                         {
-                            let content = fit_tool_content(
+                            let content = fit_tool_text(
                                 "一度に読める URL は 2 件までです。必要なものから順に read_url してください。"
                                     .into(),
                                 tool_budget,
                                 tool_used,
                             );
-                            tool_used += content.chars().count();
-                            current_turns.push(ChatTurn {
+                            tool_used += estimate_tokens(&content);
+                            let tool_turn = ChatTurn {
                                 role: "tool".into(),
                                 content,
                                 name: Some(tc.name),
                                 tool_call_id: Some(tc.id),
                                 tool_calls: None,
                                 reasoning: None,
-                            });
+                            };
+                            store_turn(&state.db, &thread.id, &tool_turn)?;
+                            current_turns.push(tool_turn);
                             continue;
                         }
                         if tc.name == tools::TOOL_READ_URL {
@@ -807,18 +918,16 @@ pub async fn llm_send(
                         if tc.name == tools::TOOL_READ_NOTE {
                             read_note_called = true;
                         }
-                        let (exec, new_cite) = execute_tool_off_runtime(
+                        let exec = execute_tool_off_runtime(
                             state_arc.clone(),
                             thread.id.clone(),
                             tc.name.clone(),
                             tc.arguments.clone(),
                             thread_scope.clone(),
-                            next_cite,
                             web_search,
                             request_id.clone(),
                         )
                         .await;
-                        next_cite = new_cite;
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
                         if let Some(nid) = exec.wrote_note_id.clone() {
@@ -836,22 +945,23 @@ pub async fn llm_send(
                         let content = if tc.name == tools::TOOL_READ_NOTE {
                             content
                         } else {
-                            fit_tool_content(content, tool_budget, tool_used)
+                            fit_tool_text(content, tool_budget, tool_used)
                         };
-                        tool_used += content.chars().count();
-                        current_turns.push(ChatTurn {
+                        tool_used += estimate_tokens(&content);
+                        let tool_turn = ChatTurn {
                             role: "tool".into(),
                             content,
                             name: Some(tc.name),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
                             reasoning: None,
-                        });
+                        };
+                        store_turn(&state.db, &thread.id, &tool_turn)?;
+                        current_turns.push(tool_turn);
                     }
                     // The reserve is spent; answer from what the rounds already produced.
                     if tool_used >= tool_budget {
                         use_tools = false;
-                        extra_final = true;
                         if !source_turn_injected {
                             let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
                             source_turn_injected =
@@ -861,24 +971,6 @@ pub async fn llm_send(
                             current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
                             source_turn_injected = true;
                         }
-                    }
-                    continue;
-                }
-                if use_tools
-                    && !out.tool_calls.is_empty()
-                    && rounds >= max_rounds
-                    && !extra_final
-                {
-                    extra_final = true;
-                    use_tools = false;
-                    if !source_turn_injected {
-                        let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
-                        source_turn_injected =
-                            inject_final_source_turn(&mut current_turns, &all, &consumed, true);
-                    }
-                    if !source_turn_injected {
-                        current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
-                        source_turn_injected = true;
                     }
                     continue;
                 }
@@ -892,7 +984,16 @@ pub async fn llm_send(
                         if inject_final_source_turn(&mut current_turns, &all, &consumed, true) {
                             source_turn_injected = true;
                             use_tools = false;
-                            extra_final = true;
+                            // This continue is itself a retry. Keep a phantom answer so an
+                            // empty follow-up does not throw it away, and so a source fetched
+                            // on the retry cannot bind to a number in that answer.
+                            remember_phantom_answer(
+                                &mut phantom_fallback,
+                                &out.content,
+                                &out.reasoning,
+                                &all,
+                            );
+                            emit_chat_reset(&app, &request_id, &thread.id);
                             continue;
                         }
                     }
@@ -901,12 +1002,44 @@ pub async fn llm_send(
                     let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
                     if answer_has_phantom_cites(&out.content, &all) {
                         phantom_retried = true;
-                        current_turns.push(ChatTurn::text("user", PHANTOM_CITE_HINT));
-                        use_tools = true;
+                        // At the cap, turning tools back on makes the next pass the
+                        // round-limit final answer (notice and stream reset).
+                        let tools_on =
+                            phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds);
+                        current_turns.push(ChatTurn::text("user", phantom_cite_hint(tools_on)));
+                        use_tools = tools_on;
+                        remember_phantom_answer(
+                            &mut phantom_fallback,
+                            &out.content,
+                            &out.reasoning,
+                            &all,
+                        );
+                        emit_chat_reset(&app, &request_id, &thread.id);
                         continue;
                     }
                 }
-                result_text = out.content;
+                match answer_after_phantom_retry(
+                    out.content.trim().is_empty(),
+                    phantom_fallback.is_some(),
+                ) {
+                    PhantomRetryAnswer::Original => {
+                        let original = phantom_fallback
+                            .take()
+                            .expect("empty phantom retry keeps the first answer");
+                        final_reasoning = original.reasoning;
+                        result_text = original.content;
+                        kept_source_ids = Some(original.source_ids);
+                    }
+                    PhantomRetryAnswer::EmptyNotice => {
+                        empty_reply = true;
+                        final_reasoning = out.reasoning;
+                        result_text = silent_end_notice(&out.finish_reason);
+                    }
+                    PhantomRetryAnswer::Retry => {
+                        final_reasoning = out.reasoning;
+                        result_text = out.content;
+                    }
+                }
                 break;
             }
         }
@@ -915,18 +1048,37 @@ pub async fn llm_send(
     busy.finish();
     kick_pending_ocr(&app, state_arc.clone());
 
+    let result_kind = if (round_limit_final && round_limit_aside.is_none()) || empty_reply {
+        crate::db::LLM_MESSAGE_NOTICE
+    } else {
+        ""
+    };
     let assistant_message = if result_text.is_empty() {
         None
     } else {
-        Some(
-            state
-                .db
-                .insert_llm_message(&thread.id, "assistant", &result_text)
-                .map_err(|e| e.to_string())?,
-        )
+        Some(save_assistant_answer(
+            &state.db,
+            &thread.id,
+            &result_text,
+            &final_reasoning,
+            result_kind,
+        )?)
     };
+    if let Some(notice) = round_limit_aside.as_deref() {
+        let _ = state.db.insert_llm_notice(&thread.id, notice);
+    }
+    let unset_notice = llm::thinking::thinking_budget_unset_notice();
+    let already_told = history.iter().any(|message| {
+        message.kind == crate::db::LLM_MESSAGE_NOTICE && message.content == unset_notice
+    }) || result_text == unset_notice;
+    if llm::thinking::known_budget_for(&llm::normalize_base_url(&settings.llm_base_url))
+        == llm::thinking::KnownBudget::Unset
+        && !already_told
+    {
+        let _ = state.db.insert_llm_notice(&thread.id, &unset_notice);
+    }
     if let Some(assistant) = assistant_message.as_ref() {
-        let cited = consumed_cited_in_answer(&consumed, &result_text);
+        let cited = citations_for_saved_answer(&consumed, &result_text, kept_source_ids.as_ref());
         if !cited.is_empty() {
             state
                 .db
@@ -946,16 +1098,11 @@ pub async fn llm_send(
         user_message,
         assistant_message,
         cancelled: false,
-        error: if result_text.trim().is_empty() {
-            Some(
-                "モデルが本文を返しませんでした。思考を「オフ」にするか、検索窓から出典を送ってください。"
-                    .into(),
-            )
-        } else {
-            None
-        },
+        error: None,
         truncated,
-        context_chars,
+        context_tokens,
+        thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+        thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
         warning,
         note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
     })
@@ -1959,6 +2106,103 @@ pub fn llm_attached_file_path(
     Err("ファイルが見つかりません。".into())
 }
 
+/// A phantom [n] may call tools again only while rounds remain.
+/// At the cap the retry stays tool-free, so it is not the round-limit final answer.
+fn phantom_retry_enables_tools(unlimited_rounds: bool, rounds: usize, max_rounds: usize) -> bool {
+    unlimited_rounds || rounds < max_rounds
+}
+
+fn phantom_cite_hint(tools_on: bool) -> &'static str {
+    if tools_on {
+        PHANTOM_CITE_HINT
+    } else {
+        PHANTOM_CITE_HINT_NO_TOOLS
+    }
+}
+
+enum PhantomRetryAnswer {
+    Retry,
+    Original,
+    EmptyNotice,
+}
+
+/// An empty phantom-cite retry keeps the first answer. An empty first reply is the notice.
+fn answer_after_phantom_retry(retry_empty: bool, had_original: bool) -> PhantomRetryAnswer {
+    if !retry_empty {
+        PhantomRetryAnswer::Retry
+    } else if had_original {
+        PhantomRetryAnswer::Original
+    } else {
+        PhantomRetryAnswer::EmptyNotice
+    }
+}
+
+struct PhantomOriginal {
+    content: String,
+    reasoning: String,
+    source_ids: std::collections::HashSet<String>,
+}
+
+/// Remember the first phantom answer and the source ids that existed then.
+/// A later retry must not replace it, and must not bind a newly fetched row to it.
+fn remember_phantom_answer(
+    slot: &mut Option<PhantomOriginal>,
+    content: &str,
+    reasoning: &str,
+    sources: &[LlmSourceRow],
+) {
+    if slot.is_some() || !answer_has_phantom_cites(content, sources) {
+        return;
+    }
+    slot.replace(PhantomOriginal {
+        content: content.to_string(),
+        reasoning: reasoning.to_string(),
+        source_ids: sources.iter().map(|source| source.id.clone()).collect(),
+    });
+}
+
+/// A saved answer already used `[n]`. Later sources must start above that.
+/// Notices are instructions to the user, not citations the model wrote.
+fn raise_ledger_for_kept_answer(db: &crate::db::Db, thread_id: &str, content: &str) {
+    let max_n = parse_cited_nos(content)
+        .into_iter()
+        .filter(|n| *n > 0 && *n <= crate::db::LLM_CITE_SCAN_MAX)
+        .max()
+        .unwrap_or(0);
+    if max_n > 0 {
+        let _ = db.raise_llm_cite_counter(thread_id, max_n);
+    }
+}
+
+/// The one place a finished assistant answer is stored. Every non-notice answer,
+/// including a phantom retry and a round-limit final answer, advances the ledger here.
+fn save_assistant_answer(
+    db: &crate::db::Db,
+    thread_id: &str,
+    content: &str,
+    reasoning: &str,
+    kind: &str,
+) -> Result<crate::db::LlmMessageRow, String> {
+    if kind != crate::db::LLM_MESSAGE_NOTICE {
+        raise_ledger_for_kept_answer(db, thread_id, content);
+    }
+    db.insert_llm_message_full(thread_id, "assistant", content, reasoning, "", "", "", kind)
+        .map_err(|e| e.to_string())
+}
+
+/// A kept answer may cite only sources that existed when it was written.
+fn citations_for_saved_answer(
+    consumed: &[(String, i64)],
+    answer: &str,
+    existed: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, i64)> {
+    let mut cited = consumed_cited_in_answer(consumed, answer);
+    if let Some(ids) = existed {
+        cited.retain(|(id, _)| ids.contains(id));
+    }
+    cited
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1969,19 +2213,19 @@ mod tests {
     fn tool_results_are_trimmed_to_the_reserve() {
         let body = "あ".repeat(100);
         assert_eq!(
-            fit_tool_content(body.clone(), 500, 0),
+            fit_tool_text(body.clone(), 500, 0),
             body,
             "content within the reserve passes through untouched"
         );
 
-        let trimmed = fit_tool_content(body.clone(), 60, 0);
+        let trimmed = fit_tool_text(body.clone(), 20, 0);
         assert!(trimmed.chars().count() < body.chars().count());
         assert!(
             trimmed.contains("省略"),
             "the model must be told the result was cut: {trimmed}"
         );
 
-        let exhausted = fit_tool_content(body, 60, 60);
+        let exhausted = fit_tool_text(body, 20, 20);
         assert!(
             exhausted.contains("省略"),
             "a spent reserve yields a notice, not silence: {exhausted}"
@@ -2032,5 +2276,388 @@ mod tests {
             &[("hit".into(), 2)],
             false,
         ));
+    }
+
+    #[test]
+    fn phantom_retry_at_the_round_cap_stays_tool_free() {
+        assert!(phantom_retry_enables_tools(false, 7, 8));
+        assert!(
+            !phantom_retry_enables_tools(false, 8, 8),
+            "the cap is already used, so the retry must not turn tools back on"
+        );
+        assert!(!phantom_retry_enables_tools(false, 9, 8));
+        assert!(
+            phantom_retry_enables_tools(true, 8, 0),
+            "unlimited rounds keep tools on"
+        );
+    }
+
+    #[test]
+    fn phantom_retry_at_the_cap_does_not_ask_for_tools_and_keeps_an_empty_retry() {
+        let hint = phantom_cite_hint(false);
+        assert_ne!(hint, PHANTOM_CITE_HINT);
+        assert!(
+            !hint.contains("ツールで"),
+            "a tool-free retry must not tell the model to call a tool: {hint}"
+        );
+        assert!(phantom_cite_hint(true).contains("ツールで"));
+        assert!(matches!(
+            answer_after_phantom_retry(true, true),
+            PhantomRetryAnswer::Original
+        ));
+        assert!(matches!(
+            answer_after_phantom_retry(false, true),
+            PhantomRetryAnswer::Retry
+        ));
+        assert!(matches!(
+            answer_after_phantom_retry(true, false),
+            PhantomRetryAnswer::EmptyNotice
+        ));
+    }
+
+    fn temp_db(label: &str) -> (std::path::PathBuf, crate::db::Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db)
+    }
+
+    /// Turn 1 searches [1]–[4], the answer cites only [1], and the rest are deleted.
+    fn thread_after_partial_citation(db: &crate::db::Db) -> crate::db::LlmThreadRow {
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let user = db
+            .insert_llm_message(&thread.id, "user", "Aを調べて")
+            .unwrap();
+        let assistant = db
+            .insert_llm_message(&thread.id, "assistant", "Aです [1]")
+            .unwrap();
+        let titles = ["A", "B", "C", "D"];
+        let mut rows = Vec::new();
+        for (index, title) in titles.iter().enumerate() {
+            let n = (index + 1) as i64;
+            let (row, created) = db
+                .insert_llm_source(
+                    &thread.id,
+                    "tool",
+                    &format!("path-{title}"),
+                    title,
+                    &format!("p{n}"),
+                    title,
+                    "query",
+                )
+                .unwrap();
+            assert!(created);
+            assert_eq!(row.cite_no, n);
+            rows.push(row);
+        }
+        let tool_text = crate::llm::context::format_sources(&rows);
+        assert!(tool_text.contains("[1]"));
+        assert!(tool_text.contains("[4]"));
+        db.insert_llm_message_full(
+            &thread.id,
+            "tool",
+            &tool_text,
+            "",
+            "",
+            "call-1",
+            "search_index",
+            "",
+        )
+        .unwrap();
+        db.consume_llm_sources(&[(rows[0].id.clone(), 1)], &user.id, &assistant.id)
+            .unwrap();
+        assert_eq!(db.delete_uncited_tool_sources(&thread.id).unwrap(), 3);
+        db.insert_llm_message(&thread.id, "user", "これも見て").unwrap();
+        thread
+    }
+
+    fn user_block_for(db: &crate::db::Db, thread_id: &str) -> String {
+        let sources = db.list_llm_sources(thread_id).unwrap();
+        let history = db.list_llm_messages(thread_id).unwrap();
+        let (turns, _) = assemble_turns("役割", &sources, &history, 80_000);
+        turns
+            .iter()
+            .rev()
+            .find(|turn| turn.role == "user")
+            .map(|turn| turn.content.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn attach_after_deleted_uncited_hits_gets_the_next_ledger_number() {
+        let (dir, db) = temp_db("cite-attach");
+        let thread = thread_after_partial_citation(&db);
+        let (file, _) = db
+            .insert_llm_source(
+                &thread.id,
+                "attach",
+                r"C:\memo.txt",
+                "memo.txt",
+                "file",
+                "添付本文",
+                "",
+            )
+            .unwrap();
+        assert_eq!(file.cite_no, 5, "the deleted [2] must not be reused");
+        let block = user_block_for(&db, &thread.id);
+        assert!(block.contains("[5]"), "{block}");
+        assert!(block.contains("添付本文"), "{block}");
+        assert!(!block.contains("[2]"), "{block}");
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert!(!answer_has_phantom_cites("添付です [5]", &sources));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pasted_url_shown_as_six_is_accepted_and_a_stale_three_is_rejected() {
+        let (dir, db) = temp_db("cite-url");
+        let thread = thread_after_partial_citation(&db);
+        let (file, _) = db
+            .insert_llm_source(
+                &thread.id,
+                "attach",
+                r"C:\memo.txt",
+                "memo.txt",
+                "file",
+                "添付本文",
+                "",
+            )
+            .unwrap();
+        assert_eq!(file.cite_no, 5);
+        let (page, created) = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                "https://example.com/case",
+                "裁判例",
+                "",
+                "ページ本文",
+                "",
+                "unit",
+                "web",
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(page.cite_no, 6);
+        let block = user_block_for(&db, &thread.id);
+        assert!(block.contains("[6]"), "{block}");
+        assert!(block.contains("https://example.com/case"), "{block}");
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert!(
+            !answer_has_phantom_cites("ページです [6]", &sources),
+            "the number the prompt shows must be a real source"
+        );
+        assert!(
+            answer_has_phantom_cites("古い [3]", &sources),
+            "a deleted search hit must stay rejected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_search_after_a_pasted_url_continues_the_ledger() {
+        let (dir, db) = temp_db("cite-search");
+        let thread = thread_after_partial_citation(&db);
+        db.insert_llm_source(
+            &thread.id,
+            "attach",
+            r"C:\memo.txt",
+            "memo.txt",
+            "file",
+            "添付本文",
+            "",
+        )
+        .unwrap();
+        db.insert_llm_source_full(
+            &thread.id,
+            "attach",
+            "https://example.com/case",
+            "裁判例",
+            "",
+            "ページ本文",
+            "",
+            "unit",
+            "web",
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+        let (hit, _) = db
+            .insert_llm_source(
+                &thread.id,
+                "tool",
+                "path-E",
+                "E",
+                "p7",
+                "次の検索",
+                "query",
+            )
+            .unwrap();
+        assert_eq!(hit.cite_no, 7);
+        let block = user_block_for(&db, &thread.id);
+        assert!(block.contains("[7]"), "{block}");
+        assert!(block.contains("次の検索"), "{block}");
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert!(!answer_has_phantom_cites("続き [7]", &sources));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn footnotes_in_stored_answers_do_not_move_the_citation_counter() {
+        let (dir, db) = temp_db("cite-footnote");
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        db.insert_llm_message(
+            &thread.id,
+            "assistant",
+            "脚注 [180] と [4096] と [2026]。リンクは [1](https://example.com) です。",
+        )
+        .unwrap();
+        db.insert_llm_message(&thread.id, "user", "添付").unwrap();
+        let (row, _) = db
+            .insert_llm_source(&thread.id, "attach", "path-a", "A", "p", "本文", "")
+            .unwrap();
+        assert_eq!(row.cite_no, 1);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 1);
+        let block = user_block_for(&db, &thread.id);
+        assert!(block.contains("[1]"), "{block}");
+        assert!(!block.contains("[180]"), "{block}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_answer_binds_only_sources_that_existed_when_it_was_written() {
+        let existed = std::collections::HashSet::from(["a".to_string()]);
+        let bound = citations_for_saved_answer(
+            &[
+                ("a".into(), 1),
+                ("d".into(), 3),
+            ],
+            "Aです [1]。幻の出典 [3]。",
+            Some(&existed),
+        );
+        assert_eq!(bound, vec![("a".to_string(), 1)]);
+    }
+
+    #[test]
+    fn phantom_number_in_a_kept_answer_is_not_reused_by_a_later_source() {
+        let (dir, db) = temp_db("cite-phantom");
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let (first, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-a", "A", "p1", "A", "q")
+            .unwrap();
+        assert_eq!(first.cite_no, 1);
+        let sources_then = db.list_llm_sources(&thread.id).unwrap();
+        let answer = "Aです [1]。裏が取れない [3]。";
+        assert!(answer_has_phantom_cites(answer, &sources_then));
+        let mut slot = None;
+        remember_phantom_answer(&mut slot, answer, "", &sources_then);
+        let kept = slot.expect("the first phantom answer is kept");
+        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "").unwrap();
+        assert_eq!(saved.content, kept.content);
+        assert_ne!(saved.kind, crate::db::LLM_MESSAGE_NOTICE);
+        let (later, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-d", "D", "p2", "D", "q")
+            .unwrap();
+        assert_ne!(later.cite_no, 3, "the ledger must not hand [3] to a later source");
+        assert_eq!(later.cite_no, 4);
+        let bound = citations_for_saved_answer(
+            &[(first.id.clone(), first.cite_no), (later.id, later.cite_no)],
+            &kept.content,
+            Some(&kept.source_ids),
+        );
+        assert_eq!(bound, vec![(first.id, 1)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_phantom_answer_advances_the_counter_past_two_later_sources() {
+        let (dir, db) = temp_db("cite-phantom-two");
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let (first, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-a", "A", "p1", "A", "q")
+            .unwrap();
+        assert_eq!(first.cite_no, 1);
+        let sources_then = db.list_llm_sources(&thread.id).unwrap();
+        let answer = "根拠は [5] です。巨大な脚注 [9223372036854775807] は進めません。";
+        assert!(answer_has_phantom_cites(answer, &sources_then));
+        let mut slot = None;
+        remember_phantom_answer(&mut slot, answer, "", &sources_then);
+        let kept = slot.expect("the first phantom answer is kept");
+        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "").unwrap();
+        assert_eq!(saved.content, kept.content);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 5);
+        let (memo, _) = db
+            .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_ne!(memo.cite_no, 5, "memo.txt must not reuse the kept phantom [5]");
+        assert_eq!(memo.cite_no, 6);
+        let (second, _) = db
+            .insert_llm_source(&thread.id, "attach", "later.txt", "later", "p2", "続き", "")
+            .unwrap();
+        assert_ne!(second.cite_no, 5);
+        assert_eq!(second.cite_no, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-empty phantom retry is the answer that gets saved, so its `[n]` owns the number.
+    /// A later notice that mentions `[n]` does not.
+    #[test]
+    fn phantom_retry_answer_advances_the_counter_and_a_notice_does_not() {
+        let (dir, db) = temp_db("cite-phantom-retry");
+        let thread = db.create_llm_thread("調査", true).unwrap();
+        let (first, _) = db
+            .insert_llm_source(&thread.id, "tool", "path-a", "A", "p1", "A", "q")
+            .unwrap();
+        assert_eq!(first.cite_no, 1);
+        let sources_then = db.list_llm_sources(&thread.id).unwrap();
+        let original = "根拠は [5] です。";
+        assert!(answer_has_phantom_cites(original, &sources_then));
+        let mut slot = None;
+        remember_phantom_answer(&mut slot, original, "", &sources_then);
+        assert!(slot.is_some(), "the first phantom answer is remembered");
+        assert!(matches!(
+            answer_after_phantom_retry(false, true),
+            PhantomRetryAnswer::Retry
+        ));
+        let retry = "調べ直しても [5] のままです。巨大な脚注 [9223372036854775807] は進めません。";
+        let saved = save_assistant_answer(&db, &thread.id, retry, "考え", "").unwrap();
+        assert_eq!(saved.role, "assistant");
+        assert_eq!(saved.content, retry);
+        assert_ne!(saved.kind, crate::db::LLM_MESSAGE_NOTICE);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 5);
+        let (memo, _) = db
+            .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
+            .unwrap();
+        assert_ne!(memo.cite_no, 5, "memo.txt must not reuse the retried phantom [5]");
+        assert_eq!(memo.cite_no, 6);
+        let notice = save_assistant_answer(
+            &db,
+            &thread.id,
+            "案内 [9]",
+            "",
+            crate::db::LLM_MESSAGE_NOTICE,
+        )
+        .unwrap();
+        assert_eq!(notice.kind, crate::db::LLM_MESSAGE_NOTICE);
+        assert_eq!(
+            db.llm_cite_counter(&thread.id).unwrap(),
+            6,
+            "a notice must not advance the ledger"
+        );
+        let (second, _) = db
+            .insert_llm_source(&thread.id, "attach", "later.txt", "later", "p2", "続き", "")
+            .unwrap();
+        assert_eq!(second.cite_no, 7);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
