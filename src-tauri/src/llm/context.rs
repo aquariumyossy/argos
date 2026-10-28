@@ -231,30 +231,23 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
         };
         turns[idx].content = READ_NOTE_OMITTED.into();
     }
-    let note_cost: usize = turns
+    let mut originals: Vec<(usize, String)> = turns
         .iter()
-        .filter(|turn| is_read_note_turn(turn))
-        .map(turn_tokens)
-        .sum();
-    let mut others = room.saturating_sub(note_cost);
-    for turn in turns.iter_mut() {
-        if turn.role != "tool" || is_read_note_turn(turn) {
-            continue;
-        }
-        if turn_tokens(turn) <= others {
-            others = others.saturating_sub(turn_tokens(turn));
-            continue;
-        }
-        let note_tokens = estimate_tokens(TOOL_RESULT_TRUNCATION_NOTE);
-        let body_budget = others.saturating_sub(4 + note_tokens + 1).max(1);
-        turn.content = truncate_to_tokens(&turn.content, body_budget);
-        if turn_tokens(turn) > others {
-            turn.content = TOOL_RESULT_OMITTED.into();
-        }
-        others = others.saturating_sub(turn_tokens(turn));
-    }
+        .enumerate()
+        .filter(|(_, turn)| turn.role == "tool" && !is_read_note_turn(turn))
+        .map(|(index, turn)| (index, turn.content.clone()))
+        .collect();
     let mut guard = 0;
-    while turn_list_tokens(turns) > ceiling && guard < 64 {
+    loop {
+        let note_cost: usize = turns
+            .iter()
+            .filter(|turn| is_read_note_turn(turn))
+            .map(turn_tokens)
+            .sum();
+        fit_other_tool_results(turns, room.saturating_sub(note_cost), &originals);
+        if turn_list_tokens(turns) <= ceiling || guard >= 64 {
+            break;
+        }
         guard += 1;
         if let Some(idx) = next_read_note_to_omit(turns) {
             turns[idx].content = READ_NOTE_OMITTED.into();
@@ -264,6 +257,42 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
             break;
         };
         turns[idx].content = TOOL_RESULT_OMITTED.into();
+        if let Some(slot) = originals.iter_mut().find(|(index, _)| *index == idx) {
+            slot.1 = TOOL_RESULT_OMITTED.into();
+        }
+    }
+}
+
+/// Fit non-note tool results into `budget`, leaving each later result its floor.
+fn fit_other_tool_results(turns: &mut [ChatTurn], budget: usize, originals: &[(usize, String)]) {
+    for (index, content) in originals {
+        turns[*index].content = content.clone();
+    }
+    let indexes: Vec<usize> = originals.iter().map(|(index, _)| *index).collect();
+    let mut others = budget;
+    for (pos, &idx) in indexes.iter().enumerate() {
+        let later_floor: usize = indexes[pos + 1..]
+            .iter()
+            .map(|&later| other_result_floor(&turns[later]))
+            .sum();
+        let avail = others.saturating_sub(later_floor);
+        let cost = turn_tokens(&turns[idx]);
+        if cost <= avail {
+            others = others.saturating_sub(cost);
+            continue;
+        }
+        let placeholder = turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED));
+        if cost <= placeholder {
+            others = others.saturating_sub(cost);
+            continue;
+        }
+        let note_tokens = estimate_tokens(TOOL_RESULT_TRUNCATION_NOTE);
+        let body_budget = avail.saturating_sub(4 + note_tokens + 1).max(1);
+        turns[idx].content = truncate_to_tokens(&turns[idx].content, body_budget);
+        if turn_tokens(&turns[idx]) > avail {
+            turns[idx].content = TOOL_RESULT_OMITTED.into();
+        }
+        others = others.saturating_sub(turn_tokens(&turns[idx]));
     }
 }
 
@@ -3129,5 +3158,125 @@ mod tests {
             !kept.starts_with("（文脈の上限に達したため"),
             "{kept}"
         );
+    }
+
+    #[test]
+    fn fitting_note_and_following_small_result_stay_intact() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let search_body = "索".repeat(tokens_to_chars(20_000));
+        let note_body = "記".repeat(tokens_to_chars(30_000));
+        let saved = "保存しました";
+        let mut search = ChatTurn::text("tool", search_body.clone());
+        search.name = Some("search_index".into());
+        let mut note = ChatTurn::text("tool", note_body.clone());
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        let mut write = ChatTurn::text("tool", saved);
+        write.name = Some(crate::llm::tools::TOOL_WRITE_NOTE.into());
+        let search_cost = turn_tokens(&search);
+        let note_cost = turn_tokens(&note);
+        let system = ChatTurn::text("system", "役割");
+        // The search fills the non-note budget exactly, so a later confirmation
+        // has no leftover unless its floor was reserved up front.
+        let room = note_cost + search_cost;
+        let non_tool = ceiling - room;
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(non_tool - turn_tokens(&system) - 4)),
+        );
+        assert_eq!(turn_tokens(&system) + turn_tokens(&user), non_tool);
+        let mut turns = vec![system, user, search, note, write];
+        assert!(turn_list_tokens(&turns) > ceiling);
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turns[3].content, note_body);
+        assert_eq!(turns[4].content, saved);
+        assert!(
+            turns[2].content.starts_with(&"索".repeat(1_000)),
+            "{}",
+            turns[2].content.chars().take(40).collect::<String>()
+        );
+        assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
+    }
+
+    #[test]
+    fn slightly_over_result_keeps_prefix_beside_an_empty_search() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let tool_body = "読".repeat(tokens_to_chars(25_001));
+        let tool_cost = turn_tokens(&ChatTurn::text("tool", &tool_body));
+        let system = ChatTurn::text("system", "役割");
+        let user_tokens = ceiling + 77 - tool_cost - turn_tokens(&system);
+        let user = ChatTurn::text("user", "問".repeat(tokens_to_chars(user_tokens)));
+        let mut tool = ChatTurn::text("tool", tool_body);
+        tool.name = Some("read_unit".into());
+        let mut empty = ChatTurn::text("tool", "");
+        empty.name = Some("search_index".into());
+        let mut turns = vec![system, user, tool, empty];
+        let before = turn_list_tokens(&turns);
+        let over = before as isize - ceiling as isize;
+        assert!(
+            (1..200).contains(&over),
+            "fixture should be slightly over the room: before {before} ceiling {ceiling} over {over}"
+        );
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        let kept = &turns[2].content;
+        assert!(
+            kept.starts_with(&"読".repeat(1_000)),
+            "a slightly long result keeps its prefix: {}",
+            kept.chars().take(40).collect::<String>()
+        );
+        assert!(!kept.starts_with("（文脈の上限に達したため"), "{kept}");
+        assert_eq!(turns[3].content, "");
+    }
+
+    #[test]
+    fn two_large_searches_keep_the_fitting_note() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let room = 60_000;
+        let search_a_body = "索".repeat(tokens_to_chars(39_000));
+        let search_b_body = "検".repeat(tokens_to_chars(26_000));
+        let note_body = "記".repeat(tokens_to_chars(7_503));
+        let unit_body = "件";
+        let mut search_a = ChatTurn::text("tool", search_a_body.clone());
+        search_a.name = Some("search_index".into());
+        let mut search_b = ChatTurn::text("tool", search_b_body.clone());
+        search_b.name = Some("search_index".into());
+        let mut unit = ChatTurn::text("tool", unit_body);
+        unit.name = Some("read_unit".into());
+        let mut note = ChatTurn::text("tool", note_body.clone());
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        assert_eq!(turn_tokens(&note), 7_507);
+        let system = ChatTurn::text("system", "役割");
+        let non_tool = ceiling - room;
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(non_tool - turn_tokens(&system) - 4)),
+        );
+        assert_eq!(turn_tokens(&system) + turn_tokens(&user), non_tool);
+        let mut turns = vec![system, user, search_a, search_b, unit, note];
+        assert!(turn_list_tokens(&turns) > ceiling);
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turns[5].content, note_body);
+        assert_eq!(turns[2].content, search_a_body);
+        assert_eq!(turns[4].content, unit_body);
+        assert!(
+            turns[3].content.starts_with(&"検".repeat(1_000)),
+            "{}",
+            turns[3].content.chars().take(40).collect::<String>()
+        );
+        assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
     }
 }
