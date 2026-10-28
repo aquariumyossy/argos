@@ -159,6 +159,9 @@ pub fn turn_tokens(turn: &ChatTurn) -> usize {
             total += estimate_tokens(&calls.to_string());
         }
     }
+    if let Some(reasoning) = turn.reasoning.as_deref() {
+        total += estimate_tokens(reasoning);
+    }
     total + 4
 }
 
@@ -180,6 +183,55 @@ pub fn fit_tool_text(content: String, budget_tokens: usize, used_tokens: usize) 
         return content;
     }
     truncate_to_tokens(&content, left.saturating_sub(8).max(1))
+}
+
+/// Before a later tool round, keep the request inside the limit.
+/// Carried reasoning is shortened first, oldest first. Tool results then take what remains.
+pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_tokens: usize) {
+    let reply = reply_headroom_tokens(limit_tokens);
+    let ceiling = limit_tokens
+        .saturating_sub(schema_tokens)
+        .saturating_sub(reply)
+        .max(1);
+    let mut guard = 0;
+    while turn_list_tokens(turns) > ceiling && guard < 32 {
+        guard += 1;
+        let Some(idx) = turns.iter().position(|turn| {
+            turn.role == "assistant"
+                && turn
+                    .reasoning
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty())
+        }) else {
+            break;
+        };
+        let text = turns[idx].reasoning.take().unwrap_or_default();
+        let next = char_len(&text) / 2;
+        if next >= 40 {
+            turns[idx].reasoning = Some(cap_chars(&text, next));
+        }
+    }
+    if turn_list_tokens(turns) <= ceiling {
+        return;
+    }
+    let non_tool: usize = turns
+        .iter()
+        .filter(|turn| turn.role != "tool")
+        .map(turn_tokens)
+        .sum();
+    let mut room = ceiling.saturating_sub(non_tool);
+    for turn in turns.iter_mut().filter(|turn| turn.role == "tool") {
+        if turn_tokens(turn) <= room {
+            room = room.saturating_sub(turn_tokens(turn));
+            continue;
+        }
+        let body_budget = room.saturating_sub(4).max(1);
+        turn.content = truncate_to_tokens(&turn.content, body_budget);
+        if turn_tokens(turn) > room {
+            turn.content = "（文脈の上限に達したため、この結果は省略しました）".into();
+        }
+        room = room.saturating_sub(turn_tokens(turn));
+    }
 }
 
 fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
@@ -565,6 +617,7 @@ fn select_sources(
         }
     }
 
+    drop_empty_image_pages(&mut rows);
     let dropped = original.saturating_sub(rows.len());
     let truncated = dropped > 0
         || rows.iter().any(|s| {
@@ -1207,12 +1260,39 @@ fn shrink_unsent_attachment(
         } else {
             cap_chars(&built[turn_idx].sources[src_idx].body, next)
         };
+        drop_empty_image_pages(&mut built[turn_idx].sources);
         let question = built[turn_idx].question.clone();
         let sources = built[turn_idx].sources.clone();
         built[turn_idx].turn.content = render_user_content(&question, &sources, pool, false);
         changed = true;
     }
     changed
+}
+
+/// An emptied scan page is not part of the send when another page of the same
+/// file still has text. The group header stays on the page that remains.
+fn drop_empty_image_pages(rows: &mut Vec<LlmSourceRow>) {
+    let mut filled = HashSet::new();
+    for row in rows.iter() {
+        if row.body.trim().is_empty() {
+            continue;
+        }
+        if let Some(key) = crate::llm::transcript::image_group_key(row) {
+            filled.insert(key);
+        }
+    }
+    if filled.is_empty() {
+        return;
+    }
+    rows.retain(|row| {
+        if !row.body.trim().is_empty() {
+            return true;
+        }
+        match crate::llm::transcript::image_group_key(row) {
+            Some(key) => !filled.contains(&key),
+            None => true,
+        }
+    });
 }
 
 fn source_char_room(built: &[BuiltTurn], max_tokens: usize) -> usize {
@@ -1420,7 +1500,7 @@ fn must_fit_tokens(built: &[BuiltTurn]) -> usize {
     let Some(latest) = built.iter().rev().find(|row| row.turn.role == "user") else {
         return system;
     };
-    let text = if latest.turn.content.contains("【質問】") || !latest.sources.is_empty() {
+    let text = if !latest.sources.is_empty() {
         format!("【質問】\n{}", latest.question)
     } else {
         latest.question.clone()
@@ -2709,5 +2789,107 @@ mod tests {
         assert!(user.content.contains("添"), "{}", user.content);
         assert!(!user.content.contains(&body), "the attachment is truncated");
         assert!(stats.total_tokens > 1_000, "{}", stats.total_tokens);
+    }
+
+    #[test]
+    fn scanned_pdf_omits_empty_pages_without_counting_them() {
+        let split = context_budget(16_384, 2_105, 80).expect("short question fits");
+        let mut pages = Vec::new();
+        for n in 1..=10 {
+            let mut page = img_page(&format!("p{n}"), n, &"頁".repeat(1_500));
+            page.cite_no = 1;
+            pages.push(page);
+        }
+        let (turns, stats) = assemble_turns(
+            "役割",
+            &pages,
+            &[msg("u1", "user", "要約して")],
+            split.messages,
+        );
+        assert!(!stats.question_exceeds);
+        assert!(
+            stats.consumed.len() < pages.len(),
+            "unsent pages stay pending, consumed={}",
+            stats.consumed.len()
+        );
+        assert!(!stats.consumed.is_empty());
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(user.content.contains("頁"), "{}", user.content);
+        assert!(user.content.contains("契約.pdf"), "{}", user.content);
+        let kept: Vec<u32> = stats
+            .consumed
+            .iter()
+            .filter_map(|source| source.id.strip_prefix('p')?.parse().ok())
+            .collect();
+        let last = *kept.iter().max().unwrap();
+        assert!(
+            user.content
+                .contains(&format!("（{}ページ以降は文字数のため省略）", last + 1)),
+            "kept {kept:?}: {}",
+            user.content
+        );
+        for page in 1..=10 {
+            let heading = format!("## {page}ページ目");
+            if kept.contains(&page) {
+                assert!(user.content.contains(&heading), "{heading} missing");
+            } else {
+                assert!(!user.content.contains(&heading), "{heading} was emptied but kept");
+            }
+        }
+    }
+
+    #[test]
+    fn question_text_that_says_question_is_not_refused_when_it_fits() {
+        let question = format!("前文【質問】{}", "あ".repeat(1_500));
+        let budget = turn_tokens(&ChatTurn::text("system", "役割"))
+            + turn_tokens(&ChatTurn::text("user", &question));
+        let wrapped = format!("【質問】\n{question}");
+        assert!(
+            turn_tokens(&ChatTurn::text("system", "役割"))
+                + turn_tokens(&ChatTurn::text("user", wrapped))
+                > budget
+        );
+        let (turns, stats) = assemble_turns("役割", &[], &[msg("u1", "user", &question)], budget);
+        assert!(!stats.question_exceeds);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert_eq!(user.content, question);
+    }
+
+    #[test]
+    fn followup_shortens_carried_reasoning_before_the_tool_result() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let tool_body = "読".repeat(6_000);
+        let reasoning = "考".repeat(4_000);
+        let user = "問".repeat(tokens_to_chars(7_000));
+        let mut assistant = ChatTurn::text("assistant", "検索します");
+        assistant.reasoning = Some(reasoning);
+        assistant.tool_calls = Some(serde_json::json!([{
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "read_unit", "arguments": "{}" }
+        }]));
+        let mut tool = ChatTurn::text("tool", tool_body.clone());
+        tool.tool_call_id = Some("c1".into());
+        tool.name = Some("read_unit".into());
+        let mut turns = vec![
+            ChatTurn::text("system", "役割"),
+            ChatTurn::text("user", user),
+            assistant,
+            tool,
+        ];
+        let before = turn_list_tokens(&turns);
+        assert!(
+            before + schema + reply > limit,
+            "fixture must overshoot: {before} ceiling {ceiling}"
+        );
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        let carried = turns[2].reasoning.as_deref().unwrap_or("");
+        assert!(char_len(carried) < 4_000, "{}", char_len(carried));
+        assert_eq!(turns[3].content, tool_body);
     }
 }
