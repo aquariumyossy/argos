@@ -12,7 +12,7 @@ pub mod thinking;
 pub mod tools;
 pub mod transcript;
 
-pub use http_error::is_tools_unsupported_error;
+pub use http_error::{is_context_too_long_error, is_tools_unsupported_error};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1142,6 +1142,30 @@ mod tests {
         let generic_words = http_error::chat_failure(400, "tool image vision unsupported");
         assert!(!is_tools_unsupported_error(&generic_words), "{generic_words}");
         assert!(generic_words.contains("HTTP 400"), "{generic_words}");
+        let too_long = http_error::chat_failure(
+            400,
+            r#"{"error":{"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size"}}"#,
+        );
+        assert_eq!(too_long, http_error::CONTEXT_TOO_LONG_ERROR);
+        assert!(!too_long.contains("exceed"), "{too_long}");
+        assert!(!too_long.contains("context size"), "{too_long}");
+        assert!(is_context_too_long_error(&too_long));
+        for phrase in [
+            "maximum context length is 32768",
+            "context_length_exceeded",
+            "prompt is too long",
+            "n_ctx exceeded",
+            "too many tokens",
+        ] {
+            let mapped = http_error::chat_failure(400, phrase);
+            assert_eq!(mapped, http_error::CONTEXT_TOO_LONG_ERROR, "{phrase}");
+            assert!(!mapped.contains(phrase), "{phrase} -> {mapped}");
+        }
+        let context_on_500 = http_error::chat_failure(500, "context length exceeded secret-body");
+        assert!(context_on_500.contains("HTTP 500"), "{context_on_500}");
+        assert!(!is_context_too_long_error(&context_on_500), "{context_on_500}");
+        assert!(!context_on_500.contains("secret-body"), "{context_on_500}");
+        assert!(!context_on_500.contains("context length"), "{context_on_500}");
         let tools_on_404 = http_error::chat_failure(404, "model does not support tools");
         assert!(!is_tools_unsupported_error(&tools_on_404), "{tools_on_404}");
         assert!(tools_on_404.contains("指定したモデルが見つかりません"), "{tools_on_404}");

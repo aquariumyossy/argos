@@ -84,7 +84,9 @@ fn round_limit_failure_reason(error: &str) -> String {
     if error.contains("思考を閉じられず") {
         return "思考を閉じられず止めました".into();
     }
-    if l.contains("コンテキスト長")
+    if error == crate::llm::http_error::CONTEXT_TOO_LONG_ERROR
+        || l.contains("コンテキスト長")
+        || l.contains("コンテキストに対して長すぎ")
         || l.contains("context length")
         || l.contains("context window")
         || l.contains("n_ctx")
@@ -222,18 +224,24 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
             "type": "function",
             "function": {
                 "name": TOOL_READ,
-                "description": "段落IDの本文を索引から読む。出典に (paragraph_id: ...) と示された段落や、\
-末尾が […] で切れている出典の続きを読むときに使う。",
+                "description": "段落の本文を読む。既読 [n] の原文は cite_no に n を渡すと、この会話に保存された本文を読む。\
+出典に (paragraph_id: ...) と示された段落や、末尾が […] で切れている出典の続きは paragraph_id で索引から読む。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "paragraph_id": { "type": "string" },
+                        "cite_no": {
+                            "type": "integer",
+                            "description": "出典番号 [n]。既読スタブの原文をこの会話の保存分から読み直す。"
+                        },
+                        "paragraph_id": {
+                            "type": "string",
+                            "description": "段落ID。出典番号が無いとき、索引からその段落を読む。"
+                        },
                         "with_neighbors": {
                             "type": "boolean",
                             "description": "前後の段落も併せて読む（既定 false）"
                         }
-                    },
-                    "required": ["paragraph_id"]
+                    }
                 }
             }
         }),
@@ -1618,6 +1626,40 @@ fn tool_list_calendar(state: &AppState, args: &Value) -> ToolExec {
     ToolExec::text(head)
 }
 
+fn arg_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(n) = value.as_i64() {
+        return Some(n);
+    }
+    if let Some(n) = value.as_u64() {
+        return i64::try_from(n).ok();
+    }
+    value.as_str().and_then(|text| text.trim().parse::<i64>().ok())
+}
+
+/// Re-read a source already stored on this thread. Does not allocate a citation number.
+pub fn read_saved_cite(db: &crate::db::Db, thread_id: &str, cite_no: i64) -> ToolExec {
+    if cite_no <= 0 {
+        return ToolExec::text("出典番号が不正です。");
+    }
+    let rows = match db.list_llm_sources_by_cite(thread_id, cite_no) {
+        Ok(rows) => rows,
+        Err(e) => return ToolExec::text(format!("出典を読めません: {e}")),
+    };
+    if rows.is_empty() {
+        return ToolExec::text(format!("出典 [{cite_no}] はこの会話にありません。"));
+    }
+    let consumed = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.cite_no))
+        .collect();
+    ToolExec {
+        content: format_sources(&rows),
+        consumed,
+        wrote_note_id: None,
+    }
+}
+
 pub fn execute_tool(
     state: &AppState,
     thread_id: &str,
@@ -1920,6 +1962,9 @@ fn execute_tool_inner(
             })
         }
         TOOL_READ => {
+            if let Some(cite_no) = arg_i64(args.get("cite_no")).filter(|n| *n > 0) {
+                return Ok(read_saved_cite(&state.db, thread_id, cite_no));
+            }
             let paragraph_id = args
                 .get("paragraph_id")
                 .and_then(|v| v.as_str())
@@ -2554,6 +2599,75 @@ mod tests {
         );
         assert!(!should_run_web_sidecar(true, false, "  "));
         assert!(!should_run_web_sidecar(false, false, "解雇"));
+    }
+
+    #[test]
+    fn read_unit_schema_accepts_a_citation_number() {
+        let schema = tools_schema(false, false, false).to_string();
+        assert!(schema.contains("cite_no"), "{schema}");
+        assert!(schema.contains("既読"), "{schema}");
+    }
+
+    #[test]
+    fn read_saved_cite_returns_the_stored_body_and_does_not_move_the_counter() {
+        let dir = std::env::temp_dir().join(format!("argos-cite-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        let thread = db.create_llm_thread("t", true).unwrap();
+        let (row, _) = db
+            .insert_llm_source(
+                &thread.id,
+                "attach",
+                r"C:\law\民法.txt",
+                "民法.txt",
+                r"C:\law\民法.txt#4",
+                "第一条の原文",
+                "",
+            )
+            .unwrap();
+        let before = db.llm_cite_counter(&thread.id).unwrap();
+        assert!(row.cite_no > 0);
+        let exec = read_saved_cite(&db, &thread.id, row.cite_no);
+        assert!(exec.content.contains("第一条の原文"), "{}", exec.content);
+        assert!(
+            exec.content.contains(&format!("[{}]", row.cite_no)),
+            "{}",
+            exec.content
+        );
+        assert_eq!(exec.consumed, vec![(row.id.clone(), row.cite_no)]);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), before);
+        let again = read_saved_cite(&db, &thread.id, row.cite_no);
+        assert_eq!(again.content, exec.content);
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), before);
+        let missing = read_saved_cite(&db, &thread.id, row.cite_no + 50);
+        assert!(missing.content.contains("ありません"), "{}", missing.content);
+        assert!(missing.consumed.is_empty());
+        assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn arg_i64_reads_numbers_and_numeric_strings() {
+        assert_eq!(arg_i64(Some(&json!(12))), Some(12));
+        assert_eq!(arg_i64(Some(&json!("12"))), Some(12));
+        assert_eq!(arg_i64(Some(&json!("no"))), None);
+        assert_eq!(arg_i64(None), None);
+    }
+
+    #[test]
+    fn tool_schema_token_counts_match_the_chat_meter() {
+        use crate::llm::context::tool_schema_tokens;
+        let actual = [
+            tool_schema_tokens(&tools_schema(false, false, false)),
+            tool_schema_tokens(&tools_schema(true, false, false)),
+            tool_schema_tokens(&tools_schema(false, true, false)),
+            tool_schema_tokens(&tools_schema(true, true, false)),
+            tool_schema_tokens(&tools_schema(false, false, true)),
+            tool_schema_tokens(&tools_schema(true, false, true)),
+        ];
+        // src/features/chat/contextEstimate.ts TOOL_SCHEMA_TOKENS, same order.
+        let expected = [2105, 2357, 2150, 2402, 2112, 2365];
+        assert_eq!(actual, expected, "update TOOL_SCHEMA_TOKENS to {actual:?}");
     }
 
     #[test]

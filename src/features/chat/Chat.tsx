@@ -22,6 +22,7 @@ import {
   contextIsNearLimit,
   contextMeterLabel,
   contextUsageTokens,
+  toolSchemaTokenCount,
 } from "./contextEstimate";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
@@ -113,6 +114,7 @@ type SettingsData = {
   fontSize: number;
   llmMaxContextTokens?: number;
   searxngUrl?: string;
+  searchMode?: string;
 };
 
 type ThinkingBudgetStatus = {
@@ -513,6 +515,7 @@ export default function Chat() {
     state: "unknown",
   });
   const [searxngUrl, setSearxngUrl] = useState("");
+  const [searchMode, setSearchMode] = useState("local");
   const [webSearch, setWebSearch] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -641,6 +644,9 @@ export default function Chat() {
     const url = typeof s.searxngUrl === "string" ? s.searxngUrl.trim() : "";
     setSearxngUrl(url);
     if (!url) setWebSearch(false);
+    if (typeof s.searchMode === "string" && s.searchMode.trim()) {
+      setSearchMode(s.searchMode);
+    }
   }, []);
 
   const refreshThinkingBudget = useCallback(() => {
@@ -799,6 +805,19 @@ export default function Chat() {
     scrollLog();
   }, [messages, stream, thinking, toolHint, busy, scrollLog]);
 
+  const schemaTokens = useMemo(() => {
+    const remoteOnly = (active?.pathPrefix ?? "")
+      .split(/\r?\n/)
+      .some((line) => line.trim() === "source:remote");
+    const remoteIndex =
+      (searchMode === "hybrid" || searchMode === "remote") && !remoteOnly;
+    return toolSchemaTokenCount({
+      webSearch: webSearch && !!searxngUrl,
+      remoteIndex,
+      remoteOnly,
+    });
+  }, [active?.pathPrefix, searchMode, searxngUrl, webSearch]);
+
   const estimatedTokens = useMemo(
     () =>
       contextUsageTokens({
@@ -809,8 +828,10 @@ export default function Chat() {
         })),
         sources: sources.map((s) => ({ body: s.body, title: s.title })),
         draft,
+        schemaTokens,
+        limit: maxContextTokens,
       }),
-    [sources, messages, draft],
+    [sources, messages, draft, schemaTokens, maxContextTokens],
   );
 
   const pendingSources = useMemo(

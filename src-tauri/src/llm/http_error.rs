@@ -8,20 +8,43 @@ pub const TOOLS_UNSUPPORTED_ERROR: &str = "このモデルはツール呼び出�
 pub const VISION_UNSUPPORTED_ERROR: &str =
     "このモデルは画像を読めません。vision 対応のモデルを設定してください。";
 
-const TOOLS_PHRASES: &[&str] = &[
-    "does not support tools",
-    "\"auto\" tool choice requires",
-];
+/// Returned for a 400 whose body says the prompt does not fit the context window.
+/// The server body is not part of this string. The smaller-budget retry matches it exactly.
+pub const CONTEXT_TOO_LONG_ERROR: &str =
+    "この会話はモデルのコンテキストに対して長すぎます。新しい会話に切り替えるか、古い内容を減らしてください。";
+
+const TOOLS_PHRASES: &[&str] = &["does not support tools", "\"auto\" tool choice requires"];
 const VISION_PHRASE: &str = "does not support image input";
+/// Fixed phrases. A 400 is a context-length failure only when the body contains one of these.
+const CONTEXT_PHRASES: &[&str] = &[
+    "context length",
+    "context_length_exceeded",
+    "maximum context",
+    "context window",
+    "exceed_context_size",
+    "exceeds the available context",
+    "n_ctx",
+    "prompt is too long",
+    "too many tokens",
+];
 
 pub fn is_tools_unsupported_error(error: &str) -> bool {
     error == TOOLS_UNSUPPORTED_ERROR
 }
 
-/// Chat and OCR. 400 plus a tools phrase becomes [`TOOLS_UNSUPPORTED_ERROR`]; every other status is a fixed message.
+pub fn is_context_too_long_error(error: &str) -> bool {
+    error == CONTEXT_TOO_LONG_ERROR
+}
+
+/// Chat and OCR. 400 plus a tools phrase becomes [`TOOLS_UNSUPPORTED_ERROR`].
+/// 400 plus a context-length phrase becomes [`CONTEXT_TOO_LONG_ERROR`].
+/// Every other status is a fixed message. The response body is never copied into it.
 pub fn chat_failure(status: u16, body: &str) -> String {
     if status == 400 && body_has(body, TOOLS_PHRASES) {
         return TOOLS_UNSUPPORTED_ERROR.to_string();
+    }
+    if status == 400 && body_has(body, CONTEXT_PHRASES) {
+        return CONTEXT_TOO_LONG_ERROR.to_string();
     }
     status_message(status)
 }

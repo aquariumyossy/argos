@@ -7,10 +7,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
-    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, estimate_tokens,
-    final_source_turn, fit_tool_text, parse_cited_nos, silent_end_notice, sources_for_consumed,
-    ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
-    TOOL_RESULT_BUDGET_RATIO,
+    answer_has_phantom_cites, assemble_turns, assembly_budget, cap_chars, consumed_cited_in_answer,
+    estimate_tokens, final_source_turn, fit_tool_text, parse_cited_nos, shrink_turns,
+    silent_end_notice, sources_for_consumed, tool_result_allowance_tokens, tool_schema_tokens,
+    turn_tokens, ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
+    STOP_TOOLS_HINT,
 };
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
@@ -194,6 +195,8 @@ fn inject_final_source_turn(
 ) -> bool {
     let rows = sources_for_consumed(sources, consumed);
     if let Some(turn) = final_source_turn(&rows, stop_tools) {
+        // The tool result already carried these bodies. Keep them on this user turn only.
+        crate::llm::context::omit_source_bodies_from_tool_turns(turns, &rows);
         turns.push(turn);
         return true;
     }
@@ -632,10 +635,17 @@ pub async fn llm_send(
     if let Some(line) = paste.system_line() {
         system.push_str(&line);
     }
-    let (assembled, stats) = assemble_turns(&system, &sources, &history, max_tokens);
-    let turns_for_plain = assembled.clone();
-    let truncated = stats.truncated;
-    let context_tokens = stats.total_tokens;
+    let remote_only_scope = tools::is_remote_only_thread(&thread.path_prefix);
+    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
+    let schema_tokens = tool_schema_tokens(&tools_schema);
+    let full_limit = max_tokens;
+    // History is sized under the configured limit, leaving room for the schema,
+    // the reply, and tool results that this turn may still append.
+    let mut prompt_budget = assembly_budget(full_limit, schema_tokens);
+    let (assembled, stats) = assemble_turns(&system, &sources, &history, prompt_budget);
+    let mut turns_for_plain = assembled.clone();
+    let mut truncated = stats.truncated;
+    let mut context_tokens = stats.total_tokens;
     let mut consumed: Vec<(String, i64)> = stats
         .consumed
         .iter()
@@ -655,19 +665,18 @@ pub async fn llm_send(
     }
     let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
 
-    let remote_only_scope = tools::is_remote_only_thread(&thread.path_prefix);
-    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
     let mut use_tools = true;
     let mut retried_without_tools = false;
     let mut phantom_retried = false;
+    let mut overflow_retried = false;
     let mut rounds = 0usize;
     let max_rounds = tools::max_tool_rounds(settings.llm_max_tool_rounds);
     let unlimited_rounds = max_rounds == 0;
     let mut current_turns = assembled;
     let mut source_turn_injected = false;
-    // Tool output is appended after the context was already sized, so it needs its own
-    // allowance. A quarter of the window leaves room for the history and the answer.
-    let tool_budget = ((max_tokens as f64) * TOOL_RESULT_BUDGET_RATIO).floor() as usize;
+    // Tool output is appended after the context was already sized, so it spends the
+    // allowance reserved by `assembly_budget`. A quarter of the window is that allowance.
+    let tool_budget = tool_result_allowance_tokens(full_limit);
     let mut tool_used = 0usize;
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
@@ -777,6 +786,24 @@ pub async fn llm_send(
                 result_text = finished.text;
                 round_limit_aside = finished.notice;
                 break;
+            }
+            Err(e) if !overflow_retried && llm::is_context_too_long_error(&e) => {
+                overflow_retried = true;
+                emit_chat_reset(&app, &request_id, &thread.id);
+                if rounds == 0 && !source_turn_injected {
+                    prompt_budget = (prompt_budget / 2).max(1);
+                    let (rebuilt, stats2) =
+                        assemble_turns(&system, &sources, &history, prompt_budget);
+                    current_turns = rebuilt;
+                    turns_for_plain = current_turns.clone();
+                    truncated = truncated || stats2.truncated;
+                    context_tokens = stats2.total_tokens;
+                } else {
+                    let used: usize = current_turns.iter().map(turn_tokens).sum();
+                    let tighter = (used / 2).max(1);
+                    shrink_turns(&mut current_turns, tighter);
+                }
+                continue;
             }
             Err(e)
                 if use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&e) =>
@@ -2255,19 +2282,33 @@ mod tests {
             stored_relpath: String::new(),
             ocr_status: String::new(),
         };
-        let mut turns = Vec::new();
+        let mut turns = vec![ChatTurn {
+            role: "tool".into(),
+            content: crate::llm::context::format_sources(std::slice::from_ref(&s)),
+            name: Some("search_index".into()),
+            tool_call_id: Some("c1".into()),
+            tool_calls: None,
+            reasoning: None,
+        }];
         assert!(inject_final_source_turn(
             &mut turns,
             std::slice::from_ref(&s),
             &[("hit".into(), 2)],
             true,
         ));
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].role, "user");
-        assert!(turns[0].content.contains("【出典】"));
-        assert!(turns[0].content.contains("[2]"));
-        assert!(turns[0].content.contains("[n]"));
-        assert!(turns[0].content.contains("ツールはこれ以上"));
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(blob.matches("第936条").count(), 1, "{blob}");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].role, "user");
+        assert!(turns[1].content.contains("【出典】"));
+        assert!(turns[1].content.contains("[2]"));
+        assert!(turns[1].content.contains("[n]"));
+        assert!(turns[1].content.contains("ツールはこれ以上"));
+        assert!(turns[1].content.contains("第936条"));
         s.id = "other".into();
         let mut empty = Vec::new();
         assert!(!inject_final_source_turn(

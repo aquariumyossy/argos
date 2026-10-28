@@ -4220,6 +4220,26 @@ impl Db {
         Ok(())
     }
 
+    /// Sources that share a citation number (an image group uses one number for every page).
+    pub fn list_llm_sources_by_cite(
+        &self,
+        thread_id: &str,
+        cite_no: i64,
+    ) -> Result<Vec<LlmSourceRow>, rusqlite::Error> {
+        if cite_no <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND cite_no=?2
+             ORDER BY sort_order ASC, created_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![thread_id, cite_no], map_llm_source)?;
+        Ok(rows.flatten().collect())
+    }
+
     pub fn find_cited_llm_source(
         &self,
         thread_id: &str,
