@@ -260,6 +260,48 @@ pub struct AssembleStats {
     pub consumed: Vec<ConsumedSource>,
 }
 
+/// The single line `format_sources` writes above a source body.
+fn citation_header_line(seed: &LlmSourceRow, cite: i64, grouped_image: bool) -> String {
+    let mut line = String::new();
+    push_cite_prefix(&mut line, cite);
+    if grouped_image {
+        let title = crate::llm::transcript::file_label(&seed.path, &seed.title);
+        line.push_str(&title);
+        if !seed.path.trim().is_empty() && seed.path.trim() != title {
+            line.push_str(" — ");
+            line.push_str(seed.path.trim());
+        }
+        return line;
+    }
+    let title = if seed.title.trim().is_empty() {
+        seed.path.as_str()
+    } else {
+        seed.title.as_str()
+    };
+    line.push_str(title);
+    if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
+        line.push_str(" — ");
+        line.push_str(seed.path.trim());
+    }
+    if seed.is_web() {
+        line.push_str("（ウェブ）");
+    } else if seed.is_remote() {
+        line.push_str("（リモート）");
+    }
+    let pid = seed.paragraph_id.trim();
+    if !pid.is_empty() && !crate::llm::grain::is_file_grain(&seed.grain) {
+        line.push_str(&format!(" (paragraph_id: {pid})"));
+    }
+    line
+}
+
+pub(crate) fn source_header_lines(source: &LlmSourceRow) -> [String; 2] {
+    [
+        citation_header_line(source, source.cite_no, false),
+        citation_header_line(source, source.cite_no, true),
+    ]
+}
+
 fn push_cite_prefix(out: &mut String, n: i64) {
     if n > 0 {
         out.push_str(&format!("[{n}] "));
@@ -370,12 +412,22 @@ pub fn sources_for_consumed(all: &[LlmSourceRow], consumed: &[(String, i64)]) ->
 
 /// User turn that makes this-turn hits look like an attached 出典 block.
 pub fn final_source_turn(sources: &[LlmSourceRow], stop_tools: bool) -> Option<ChatTurn> {
+    compose_final_turn(sources, stop_tools, false)
+}
+
+/// `cite_hint` adds [`FINAL_CITE_HINT`] even when `sources` is empty, so a request
+/// that already holds its source bodies still tells the model to cite them.
+pub fn compose_final_turn(
+    sources: &[LlmSourceRow],
+    stop_tools: bool,
+    cite_hint: bool,
+) -> Option<ChatTurn> {
     let block = format_sources(sources);
-    if block.is_empty() && !stop_tools {
+    if block.is_empty() && !stop_tools && !cite_hint {
         return None;
     }
     let mut content = block;
-    if !content.is_empty() {
+    if !content.is_empty() || cite_hint {
         content.push_str(FINAL_CITE_HINT);
         content.push('\n');
     }
@@ -402,13 +454,7 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         let seed = unit[0];
         if seed.is_image() && crate::llm::transcript::image_group_key(seed).is_some() {
             let n = crate::llm::transcript::group_cite_no(&unit);
-            let title = crate::llm::transcript::file_label(&seed.path, &seed.title);
-            push_cite_prefix(&mut out, n);
-            out.push_str(&title);
-            if !seed.path.trim().is_empty() && seed.path.trim() != title {
-                out.push_str(" — ");
-                out.push_str(seed.path.trim());
-            }
+            out.push_str(&citation_header_line(seed, n, true));
             out.push('\n');
             out.push_str(IMAGE_TRANSCRIPT_NOTE);
             out.push('\n');
@@ -423,26 +469,7 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         }
 
         let n = cite_no_of(seed);
-        let title = if seed.title.trim().is_empty() {
-            seed.path.as_str()
-        } else {
-            seed.title.as_str()
-        };
-        push_cite_prefix(&mut out, n);
-        out.push_str(title);
-        if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
-            out.push_str(" — ");
-            out.push_str(seed.path.trim());
-        }
-        if seed.is_web() {
-            out.push_str("（ウェブ）");
-        } else if seed.is_remote() {
-            out.push_str("（リモート）");
-        }
-        let pid = seed.paragraph_id.trim();
-        if !pid.is_empty() && !crate::llm::grain::is_file_grain(&seed.grain) {
-            out.push_str(&format!(" (paragraph_id: {pid})"));
-        }
+        out.push_str(&citation_header_line(seed, n, false));
         out.push('\n');
         if seed.is_image() {
             out.push_str(IMAGE_TRANSCRIPT_NOTE);
@@ -522,8 +549,18 @@ fn select_sources(
             .map(|(i, _)| i)
             .unwrap_or(0);
         let next = char_len(&rows[idx].body) / 2;
+        let pending_attach =
+            pending_ids.contains(&rows[idx].id) && rows[idx].origin == "attach";
         if next < 400 {
-            rows.remove(idx);
+            if pending_attach {
+                let keep = char_len(&rows[idx].body).min(80).max(1);
+                rows[idx].body = cap_chars(&rows[idx].body, keep);
+                if over(&rows) {
+                    rows.remove(idx);
+                }
+            } else {
+                rows.remove(idx);
+            }
         } else {
             rows[idx].body = cap_chars(&rows[idx].body, next);
         }
@@ -542,7 +579,10 @@ fn select_sources(
 
 struct BuiltTurn {
     turn: ChatTurn,
+    /// Sources rendered on this turn right now. Refit may drop or shorten them.
     sources: Vec<LlmSourceRow>,
+    /// Sources attached before fitting, so a later trim can put them back.
+    original_sources: Vec<LlmSourceRow>,
     /// User text without the 出典 block, so a later stub can be rendered again.
     question: String,
     message_id: String,
@@ -606,6 +646,7 @@ pub fn assemble_turns(
         built.push(BuiltTurn {
             turn: ChatTurn::text("system", sys),
             sources: Vec::new(),
+            original_sources: Vec::new(),
             question: String::new(),
             message_id: String::new(),
         });
@@ -637,6 +678,7 @@ pub fn assemble_turns(
         }
         built.push(BuiltTurn {
             turn,
+            original_sources: attached.clone(),
             sources: attached,
             question,
             message_id: m.id.clone(),
@@ -670,6 +712,11 @@ pub fn assemble_turns(
         trim_keeping(&mut built, max_tokens, 1, &mut truncated);
     }
     if tokens_of(&built) > max_tokens && force_under_budget(&mut built, max_tokens) {
+        truncated = true;
+    }
+    // The first refit can drop a pending attachment while an older exchange is
+    // still protected. Put the original sources back into the room that trim freed.
+    if refit_freed_budget(&mut built, pool, max_tokens, &pending_ids) {
         truncated = true;
     }
     // Only the system prompt and the typed question (plus the 【質問】 wrapper) can
@@ -784,52 +831,73 @@ pub fn omit_source_bodies_from_tool_turns(turns: &mut [ChatTurn], sources: &[Llm
         return;
     }
     for turn in turns.iter_mut() {
-        if turn.role == "tool" {
-            turn.content = drop_cited_bodies(&turn.content, &drop);
+        if turn.role != "tool" || !tool_result_lists_sources(turn.name.as_deref()) {
+            continue;
+        }
+        turn.content = drop_cited_bodies(&turn.content, &drop, sources);
+    }
+}
+
+fn tool_result_lists_sources(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            crate::llm::tools::TOOL_SEARCH
+                | crate::llm::tools::TOOL_READ
+                | crate::llm::tools::TOOL_READ_URL
+        )
+    )
+}
+
+/// Header line → cite, for rows this ledger can actually format.
+fn exact_header_cites(ledger: &[LlmSourceRow]) -> HashMap<String, i64> {
+    let mut map = HashMap::new();
+    for unit in crate::llm::transcript::walk_format_units(ledger) {
+        let seed = unit[0];
+        let grouped = seed.is_image() && crate::llm::transcript::image_group_key(seed).is_some();
+        let cite = if grouped {
+            crate::llm::transcript::group_cite_no(&unit)
+        } else {
+            cite_no_of(seed)
+        };
+        if cite > 0 {
+            map.entry(citation_header_line(seed, cite, grouped))
+                .or_insert(cite);
         }
     }
-}
-
-/// Cite numbers that head a `[n] title` line. Body text is not scanned.
-pub fn citation_header_nos(content: &str) -> HashSet<i64> {
-    citation_header_spans(content)
-        .into_iter()
-        .map(|(cite, _, _)| cite)
-        .collect()
-}
-
-fn citation_header_no(line: &str) -> Option<i64> {
-    let rest = line.strip_prefix('[')?;
-    let end = rest.find(|c: char| !c.is_ascii_digit())?;
-    if end == 0 {
-        return None;
+    for row in ledger {
+        let cite = cite_no_of(row);
+        if cite > 0 {
+            map.entry(citation_header_line(row, cite, false))
+                .or_insert(cite);
+        }
     }
-    let (digits, after) = rest.split_at(end);
-    let after = after.strip_prefix(']')?;
-    if !(after.is_empty() || after.starts_with(' ') || after.starts_with('\t')) {
-        return None;
-    }
-    digits.parse::<i64>().ok().filter(|n| *n > 0)
+    map
 }
 
-/// `(cite, header line start, header line end)` in byte offsets.
-fn citation_header_spans(content: &str) -> Vec<(i64, usize, usize)> {
+/// `(cite, header line start, header line end)` for headers this tool call emitted.
+/// A body line that merely starts with `[k] ` is not an entry.
+fn emitted_header_spans(content: &str, ledger: &[LlmSourceRow]) -> Vec<(i64, usize, usize)> {
+    let headers = exact_header_cites(ledger);
+    if headers.is_empty() {
+        return Vec::new();
+    }
     let mut spans = Vec::new();
     let mut offset = 0;
     for line in content.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
         let text = line.trim_end_matches(['\n', '\r']);
-        if let Some(cite) = citation_header_no(text) {
-            spans.push((cite, start, offset));
+        if let Some(cite) = headers.get(text) {
+            spans.push((*cite, start, offset));
         }
     }
     spans
 }
 
-/// Remove the body of each entry whose cite is in `drop`. The header line stays.
-fn drop_cited_bodies(content: &str, drop: &HashSet<i64>) -> String {
-    let spans = citation_header_spans(content);
+/// Remove the body of each real entry whose cite is in `drop`. The header line stays.
+fn drop_cited_bodies(content: &str, drop: &HashSet<i64>, ledger: &[LlmSourceRow]) -> String {
+    let spans = emitted_header_spans(content, ledger);
     if spans.is_empty() || !spans.iter().any(|(cite, _, _)| drop.contains(cite)) {
         return content.to_string();
     }
@@ -882,7 +950,10 @@ fn dedupe_tool_bodies(built: &mut [BuiltTurn], rendered: &[LlmSourceRow]) {
         if row.turn.role != "tool" {
             continue;
         }
-        row.turn.content = drop_cited_bodies(&row.turn.content, &drop);
+        if !tool_result_lists_sources(row.turn.name.as_deref()) {
+            continue;
+        }
+        row.turn.content = drop_cited_bodies(&row.turn.content, &drop, rendered);
     }
 }
 
@@ -917,16 +988,19 @@ fn apply_age_stubs(built: &mut [BuiltTurn], pool: &[LlmSourceRow]) {
         if row.turn.role == "user" && !row.sources.is_empty() && !recent.contains(&row.message_id) {
             row.turn.content = render_user_content(&row.question, &row.sources, pool, true);
         } else if row.turn.role == "tool" && index < recent_from {
-            row.turn.content = stub_old_tool(&row.turn.content, pool);
+            row.turn.content = stub_old_tool(&row.turn.content, pool, row.turn.name.as_deref());
         }
     }
 }
 
-/// Replace an old search/read result with one stub line per cite that is still in
-/// the ledger. Cites removed from the ledger are left out. Other tool text becomes
-/// the fixed stub.
-fn stub_old_tool(content: &str, sources: &[LlmSourceRow]) -> String {
-    let spans = citation_header_spans(content);
+/// Replace an old search/read result with one stub line per cite that result
+/// actually emitted and that is still in the ledger. Notes and other tools are
+/// not split. Cites removed from the ledger are left out.
+fn stub_old_tool(content: &str, sources: &[LlmSourceRow], tool_name: Option<&str>) -> String {
+    if !tool_result_lists_sources(tool_name) {
+        return OLD_TOOL_STUB.to_string();
+    }
+    let spans = emitted_header_spans(content, sources);
     if spans.is_empty() {
         return OLD_TOOL_STUB.to_string();
     }
@@ -950,6 +1024,44 @@ fn stub_old_tool(content: &str, sources: &[LlmSourceRow]) -> String {
         return String::new();
     }
     lines.join("\n")
+}
+
+/// After trim has freed room, render the original sources again and fit them.
+/// Current-turn attachments are tried first inside [`select_sources`].
+fn refit_freed_budget(
+    built: &mut [BuiltTurn],
+    pool: &[LlmSourceRow],
+    max_tokens: usize,
+    pending_ids: &HashSet<String>,
+) -> bool {
+    let recent = recent_user_ids(built);
+    let mut changed = false;
+    for row in built.iter_mut() {
+        if row.turn.role != "user" || !recent.contains(&row.message_id) || row.original_sources.is_empty()
+        {
+            continue;
+        }
+        let same = row.sources.len() == row.original_sources.len()
+            && row
+                .sources
+                .iter()
+                .zip(row.original_sources.iter())
+                .all(|(shown, original)| shown.id == original.id && shown.body == original.body);
+        if same {
+            continue;
+        }
+        row.sources = row.original_sources.clone();
+        row.turn.content = render_user_content(&row.question, &row.sources, pool, false);
+        changed = true;
+    }
+    if !changed {
+        return false;
+    }
+    let fitted = refit_sources(built, pool, max_tokens, pending_ids);
+    if tokens_of(built) > max_tokens {
+        shrink_recent_sources(built, pool, max_tokens);
+    }
+    changed || fitted
 }
 
 /// Replace remaining recent source bodies with stubs so the previous question can stay.
@@ -2250,5 +2362,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn body_lines_that_look_like_cites_are_not_headers() {
+        let tail = "後文ユニークは残してはいけない";
+        let mut kept = src("a", "tool", 1, &format!("前文\n[4] 注記\n{tail}"));
+        kept.cite_no = 1;
+        kept.path = r"C:\law\甲.txt".into();
+        kept.title = "甲.txt".into();
+        kept.paragraph_id = r"C:\law\甲.txt#1".into();
+        kept.injected_user_message_id = "u2".into();
+        let mut other = src("d", "tool", 4, "別の出典です");
+        other.cite_no = 4;
+        other.path = r"C:\law\丁.txt".into();
+        other.title = "丁.txt".into();
+        other.paragraph_id = r"C:\law\丁.txt#1".into();
+        other.injected_user_message_id = "u1".into();
+        let tool_body = format_sources(std::slice::from_ref(&kept));
+        assert!(tool_body.contains("[4] 注記"), "{tool_body}");
+        let mut tool = msg("t2", "tool", &tool_body);
+        tool.tool_call_id = "c2".into();
+        tool.tool_name = "search_index".into();
+        let history = vec![
+            msg("u1", "user", "最初"),
+            msg("a1", "assistant", "答え"),
+            msg("u2", "user", "読んで"),
+            tool,
+            msg("u3", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[kept, other.clone()], &history, 80_000);
+        let tool_turn = turns.iter().find(|turn| turn.role == "tool").unwrap();
+        assert!(
+            !tool_turn.content.contains(tail),
+            "the fake header must not keep the rest of the entry: {}",
+            tool_turn.content
+        );
+        assert!(!tool_turn.content.contains("既読 [4]"), "{}", tool_turn.content);
+        let old = {
+            let mut aged = msg("t0", "tool", &tool_body);
+            aged.tool_call_id = "c0".into();
+            aged.tool_name = "search_index".into();
+            let history = vec![
+                msg("u1", "user", "最初"),
+                aged,
+                msg("a1", "assistant", "答え"),
+                msg("u2", "user", "途中"),
+                msg("a2", "assistant", "続き"),
+                msg("u3", "user", "最新"),
+            ];
+            let (turns, _) = assemble_turns("役割", &[other.clone()], &history, 80_000);
+            turns.into_iter().find(|turn| turn.role == "tool").unwrap()
+        };
+        assert!(!old.content.contains("既読 [4]"), "{}", old.content);
+        assert!(!old.content.contains(tail), "{}", old.content);
+    }
+
+    #[test]
+    fn read_note_is_not_split_on_citation_lines() {
+        let mut hit = src("a", "tool", 1, "検索本文");
+        hit.cite_no = 1;
+        hit.path = r"C:\law\甲.txt".into();
+        hit.title = "甲.txt".into();
+        hit.paragraph_id = r"C:\law\甲.txt#1".into();
+        hit.injected_user_message_id = "u2".into();
+        let header = format_sources(std::slice::from_ref(&hit));
+        let header_line = header
+            .lines()
+            .find(|line| line.starts_with("[1] "))
+            .unwrap()
+            .to_string();
+        let note = format!("ノート\n{header_line}\nノート本文が残る");
+        let mut tool = msg("t2", "tool", &note);
+        tool.tool_call_id = "c2".into();
+        tool.tool_name = "read_note".into();
+        let history = vec![
+            msg("u1", "user", "最初"),
+            msg("a1", "assistant", "答え"),
+            msg("u2", "user", "読んで"),
+            tool,
+            msg("u3", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[hit.clone()], &history, 80_000);
+        let tool_turn = turns.iter().find(|turn| turn.role == "tool").unwrap();
+        assert!(
+            tool_turn.content.contains("ノート本文が残る"),
+            "{}",
+            tool_turn.content
+        );
+    }
+
+    #[test]
+    fn pending_attachment_comes_back_after_the_previous_exchange_is_dropped() {
+        let split = context_budget(16_384, 2_105, 200).expect("question fits");
+        let question = "問".repeat(2_000);
+        let mut tool = msg("t1", "tool", &"読".repeat(5_990));
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "read_unit".into();
+        let answer = "答".repeat(6_000);
+        let body = "添".repeat(20_000);
+        let mut file = src_file("big", "attach", 0, &body);
+        file.cite_no = 3;
+        file.path = r"C:\docs\添付.txt".into();
+        file.title = "添付.txt".into();
+        file.paragraph_id.clear();
+        let history = vec![
+            msg("u1", "user", &question),
+            tool,
+            msg("a1", "assistant", &answer),
+            msg("u2", "user", "短い質問"),
+        ];
+        let (turns, stats) = assemble_turns("役割", &[file], &history, split.messages);
+        assert!(!stats.question_exceeds);
+        assert!(
+            stats.consumed.iter().any(|source| source.id == "big"),
+            "consumed={:?}",
+            stats.consumed
+        );
+        assert!(stats.truncated);
+        let user = turns.iter().rev().find(|turn| turn.role == "user").unwrap();
+        assert!(user.content.contains("短い質問"), "{}", user.content);
+        assert!(user.content.contains("添"), "{}", user.content);
+        assert!(!user.content.contains(&body), "the attachment is truncated");
+        assert!(stats.total_tokens > 1_000, "{}", stats.total_tokens);
     }
 }

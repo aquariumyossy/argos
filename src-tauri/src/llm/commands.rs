@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
-    estimate_tokens, final_source_turn, fit_injected_turn, fit_tool_text, is_synthetic_user_turn,
+    estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn,
     parse_cited_nos, silent_end_notice, sources_for_consumed, tool_schema_tokens, ChatTurn,
     PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
 };
@@ -194,12 +194,18 @@ fn inject_final_source_turn(
     message_budget: usize,
 ) -> bool {
     let rows = sources_for_consumed(sources, consumed);
-    // A cite already in this request, truncated or full, is not copied again.
+    // Tool hits stay where the tool result put them, including ones fit_tool_text
+    // cut out entirely. Only a non-tool source that is not already present is added.
+    let cite_hint = rows.iter().any(|row| row.cite_no > 0 || row.is_injectable());
     let fresh: Vec<LlmSourceRow> = rows
         .into_iter()
-        .filter(|row| !source_already_in_request(turns, row))
+        .filter(|row| !row.is_tool_origin() && !source_already_in_request(turns, row))
         .collect();
-    if let Some(turn) = final_source_turn(&fresh, stop_tools) {
+    if fresh.is_empty() && !cite_hint && !stop_tools {
+        return false;
+    }
+    if let Some(turn) = crate::llm::context::compose_final_turn(&fresh, stop_tools, cite_hint)
+    {
         crate::llm::context::omit_source_bodies_from_tool_turns(turns, &fresh);
         turns.push(turn);
         fit_injected_turn(turns, message_budget);
@@ -249,14 +255,18 @@ fn send_error(
     }
 }
 
-/// A cite already in this request, including a truncated tool entry, is not sent again.
+/// A non-tool source already rendered in this request is not sent again.
 fn source_already_in_request(turns: &[ChatTurn], source: &LlmSourceRow) -> bool {
-    if source.cite_no > 0
-        && turns.iter().any(|turn| {
-            crate::llm::context::citation_header_nos(&turn.content).contains(&source.cite_no)
-        })
-    {
-        return true;
+    if source.cite_no > 0 {
+        let headers = crate::llm::context::source_header_lines(source);
+        if turns.iter().any(|turn| {
+            turn.content.lines().any(|line| {
+                let line = line.trim_end_matches('\r');
+                headers.iter().any(|header| line == header)
+            })
+        }) {
+            return true;
+        }
     }
     let id = source.id.trim();
     if id.is_empty() {
@@ -2392,6 +2402,17 @@ mod tests {
             "a cite already in the tool result is not copied again: {}",
             turns[1].content
         );
+        assert!(
+            !turns[1].content.contains("【出典】"),
+            "the tool body is not copied onto the hint turn: {}",
+            turns[1].content
+        );
+        assert!(
+            turns[1].content.contains("[n]"),
+            "the cite instruction stays when the body is already in the tool result: {}",
+            turns[1].content
+        );
+        assert!(turns[1].content.contains(crate::llm::context::FINAL_CITE_HINT));
         assert!(turns[1].content.contains("ツールはこれ以上"));
         s.id = "other".into();
         let mut empty = Vec::new();
@@ -2427,7 +2448,8 @@ mod tests {
             stored_relpath: String::new(),
             ocr_status: String::new(),
         };
-        let truncated = format!("【出典】\n[3] memo.txt\n{}\n\n【質問】\n見て", &body[..12]);
+        let header = crate::llm::context::source_header_lines(&attached)[0].clone();
+        let truncated = format!("【出典】\n{header}\n{}\n\n【質問】\n見て", &body[..12]);
         let mut turns = vec![ChatTurn::text("user", truncated)];
         assert!(inject_final_source_turn(
             &mut turns,
@@ -2466,18 +2488,90 @@ mod tests {
         };
         let mut wide = vec![ChatTurn::text("user", "質問"), tool];
         assert!(
-            !inject_final_source_turn(
+            inject_final_source_turn(
                 &mut wide,
                 std::slice::from_ref(&attached),
                 &[("file".into(), 3)],
                 false,
                 8_000,
             ),
-            "a truncated tool entry is already this source"
+            "the cite instruction is still added"
         );
-        assert_eq!(wide.len(), 2);
         assert_eq!(wide[1].content, stored);
+        assert!(wide.last().unwrap().content.contains(crate::llm::context::FINAL_CITE_HINT));
         assert!(!wide.iter().any(|turn| turn.content.contains(&full)));
+    }
+
+    #[test]
+    fn injection_does_not_restore_tool_hits_cut_out_of_the_result() {
+        let mut rows = Vec::new();
+        for n in 1..=8 {
+            let body = format!("HIT{n}-{}", "あ".repeat(1_200));
+            rows.push(LlmSourceRow {
+                id: format!("h{n}"),
+                thread_id: "t".into(),
+                sort_order: n,
+                origin: "tool".into(),
+                path: format!(r"C:\law\{n}.txt"),
+                title: format!("{n}.txt"),
+                paragraph_id: format!("p{n}"),
+                body,
+                query: String::new(),
+                created_at: 0,
+                grain: "unit".into(),
+                unit_body: String::new(),
+                injected_user_message_id: String::new(),
+                cited_assistant_message_id: String::new(),
+                cite_no: n,
+                kind: "text".into(),
+                stored_relpath: String::new(),
+                ocr_status: String::new(),
+            });
+        }
+        let stored = fit_tool_text(crate::llm::context::format_sources(&rows), 3_000, 0);
+        assert!(stored.contains("[1]"), "{stored}");
+        let cut: Vec<_> = rows
+            .iter()
+            .filter(|row| !stored.contains(&row.body))
+            .map(|row| row.cite_no)
+            .collect();
+        assert!(
+            cut.len() >= 2,
+            "the fixture must cut later hits, stored tokens {}",
+            estimate_tokens(&stored)
+        );
+        let consumed: Vec<_> = rows
+            .iter()
+            .map(|row| (row.id.clone(), row.cite_no))
+            .collect();
+        let mut turns = vec![ChatTurn {
+            role: "tool".into(),
+            content: stored,
+            name: Some("search_index".into()),
+            tool_call_id: Some("c".into()),
+            tool_calls: None,
+            reasoning: None,
+        }];
+        assert!(inject_final_source_turn(
+            &mut turns,
+            &rows,
+            &consumed,
+            true,
+            16_384,
+        ));
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for row in rows.iter().filter(|row| cut.contains(&row.cite_no)) {
+            assert!(
+                !blob.contains(&row.body),
+                "hit {} was cut from the tool result and must not come back",
+                row.cite_no
+            );
+        }
+        assert!(blob.contains(crate::llm::context::FINAL_CITE_HINT));
     }
 
     #[test]
@@ -2493,7 +2587,7 @@ mod tests {
             id: "hit".into(),
             thread_id: "t".into(),
             sort_order: 0,
-            origin: "tool".into(),
+            origin: "attach".into(),
             path: r"C:\law\民法.txt".into(),
             title: "民法.txt".into(),
             paragraph_id: "p9".into(),

@@ -1651,6 +1651,7 @@ pub fn read_saved_cite(db: &crate::db::Db, thread_id: &str, cite_no: i64) -> Too
     }
     let consumed = rows
         .iter()
+        .filter(|row| row.is_pending())
         .map(|row| (row.id.clone(), row.cite_no))
         .collect();
     ToolExec {
@@ -2643,6 +2644,32 @@ mod tests {
         assert!(missing.content.contains("ありません"), "{}", missing.content);
         assert!(missing.consumed.is_empty());
         assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), before);
+        let user = db.insert_llm_message(&thread.id, "user", "最初").unwrap();
+        let assistant = db
+            .insert_llm_message(&thread.id, "assistant", "答え [1]")
+            .unwrap();
+        db.consume_llm_sources(&[(row.id.clone(), row.cite_no)], &user.id, &assistant.id)
+            .unwrap();
+        let reread = read_saved_cite(&db, &thread.id, row.cite_no);
+        assert!(reread.consumed.is_empty(), "{:?}", reread.consumed);
+        let later = db.insert_llm_message(&thread.id, "user", "もう一度").unwrap();
+        let later_answer = db
+            .insert_llm_message(&thread.id, "assistant", "再掲")
+            .unwrap();
+        db.consume_llm_sources(
+            &[(row.id.clone(), row.cite_no)],
+            &later.id,
+            &later_answer.id,
+        )
+        .unwrap();
+        let owned = db
+            .list_llm_sources(&thread.id)
+            .unwrap()
+            .into_iter()
+            .find(|source| source.id == row.id)
+            .unwrap();
+        assert_eq!(owned.injected_user_message_id, user.id);
+        assert_eq!(owned.cited_assistant_message_id, assistant.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4304,7 +4304,7 @@ impl Db {
             conn.execute(
                 "UPDATE llm_thread_sources
                  SET injected_user_message_id=?1, cited_assistant_message_id=?2, cite_no=?3
-                 WHERE id=?4",
+                 WHERE id=?4 AND injected_user_message_id=''",
                 rusqlite::params![user_message_id, assistant_message_id, cite_no, id],
             )?;
         }
