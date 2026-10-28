@@ -225,7 +225,9 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
             room = room.saturating_sub(turn_tokens(turn));
             continue;
         }
-        let body_budget = room.saturating_sub(4).max(1);
+        // Message overhead, the truncation note, and one token of rounding.
+        let note_tokens = estimate_tokens(TOOL_RESULT_TRUNCATION_NOTE);
+        let body_budget = room.saturating_sub(4 + note_tokens + 1).max(1);
         turn.content = truncate_to_tokens(&turn.content, body_budget);
         if turn_tokens(turn) > room {
             turn.content = "（文脈の上限に達したため、この結果は省略しました）".into();
@@ -234,13 +236,15 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
     }
 }
 
+const TOOL_RESULT_TRUNCATION_NOTE: &str = "\n…（長いので省略しました）";
+
 fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     let max_chars = tokens_to_chars(max_tokens);
     if char_len(text) <= max_chars {
         return text.to_string();
     }
     let mut out: String = text.chars().take(max_chars).collect();
-    out.push_str("\n…（長いので省略しました）");
+    out.push_str(TOOL_RESULT_TRUNCATION_NOTE);
     out
 }
 
@@ -2891,5 +2895,40 @@ mod tests {
         let carried = turns[2].reasoning.as_deref().unwrap_or("");
         assert!(char_len(carried) < 4_000, "{}", char_len(carried));
         assert_eq!(turns[3].content, tool_body);
+    }
+
+    #[test]
+    fn slightly_over_tool_result_keeps_a_body_prefix() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let tool_body = "読".repeat(tokens_to_chars(25_001));
+        let tool_cost = turn_tokens(&ChatTurn::text("tool", &tool_body));
+        let system = ChatTurn::text("system", "役割");
+        let user_tokens = ceiling + 77 - tool_cost - turn_tokens(&system);
+        let user = ChatTurn::text("user", "問".repeat(tokens_to_chars(user_tokens)));
+        let mut tool = ChatTurn::text("tool", tool_body);
+        tool.name = Some("read_unit".into());
+        let mut turns = vec![system, user, tool];
+        let before = turn_list_tokens(&turns);
+        let over = before as isize - ceiling as isize;
+        assert!(
+            (1..200).contains(&over),
+            "fixture should be slightly over the room: before {before} ceiling {ceiling} over {over}"
+        );
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        let kept = &turns[2].content;
+        assert!(
+            kept.starts_with(&"読".repeat(1_000)),
+            "a slightly long result keeps its prefix: {}",
+            kept.chars().take(40).collect::<String>()
+        );
+        assert!(
+            !kept.starts_with("（文脈の上限に達したため"),
+            "{kept}"
+        );
     }
 }
