@@ -193,9 +193,8 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], limit_tokens: usize, schema_
         .saturating_sub(schema_tokens)
         .saturating_sub(reply)
         .max(1);
-    let mut guard = 0;
-    while turn_list_tokens(turns) > ceiling && guard < 32 {
-        guard += 1;
+    // Each pass shortens or clears the oldest reasoning, so this ends without a cap.
+    while turn_list_tokens(turns) > ceiling {
         let Some(idx) = turns.iter().position(|turn| {
             turn.role == "assistant"
                 && turn
@@ -281,16 +280,19 @@ fn fit_other_tool_results(turns: &mut [ChatTurn], budget: usize, originals: &[(u
             others = others.saturating_sub(cost);
             continue;
         }
-        let placeholder = turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED));
-        if cost <= placeholder {
-            others = others.saturating_sub(cost);
-            continue;
-        }
         let note_tokens = estimate_tokens(TOOL_RESULT_TRUNCATION_NOTE);
         let body_budget = avail.saturating_sub(4 + note_tokens + 1).max(1);
-        turns[idx].content = truncate_to_tokens(&turns[idx].content, body_budget);
-        if turn_tokens(&turns[idx]) > avail {
+        let truncated = truncate_to_tokens(&turns[idx].content, body_budget);
+        let truncated_cost = turn_tokens(&ChatTurn::text("tool", &truncated));
+        let placeholder = turn_tokens(&ChatTurn::text("tool", TOOL_RESULT_OMITTED));
+        // A prefix that fits beats the original. The omission text replaces that
+        // prefix only when it is shorter and still inside the remaining room.
+        if truncated_cost <= avail && truncated_cost < cost {
+            turns[idx].content = truncated;
+        } else if placeholder < truncated_cost && placeholder <= avail {
             turns[idx].content = TOOL_RESULT_OMITTED.into();
+        } else if truncated_cost < cost {
+            turns[idx].content = truncated;
         }
         others = others.saturating_sub(turn_tokens(&turns[idx]));
     }
@@ -3278,5 +3280,148 @@ mod tests {
             turns[3].content.chars().take(40).collect::<String>()
         );
         assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
+    }
+
+    #[test]
+    fn carried_reasoning_is_cleared_before_a_fitting_read_note() {
+        let limit = 260_000;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        assert_eq!(ceiling, 231_895);
+        let note_body = "記".repeat(tokens_to_chars(29_996));
+        let mut note = ChatTurn::text("tool", note_body.clone());
+        note.name = Some(crate::llm::tools::TOOL_READ_NOTE.into());
+        assert_eq!(turn_tokens(&note), 30_000);
+        let mut turns = vec![ChatTurn::text("system", "役割")];
+        for i in 0..7 {
+            let mut assistant = ChatTurn::text("assistant", "検索");
+            assistant.reasoning = Some("考".repeat(REASONING_CARRY_CAP));
+            turns.push(assistant);
+            if i < 6 {
+                let mut small = ChatTurn::text("tool", "了");
+                small.name = Some("search_index".into());
+                turns.push(small);
+            }
+        }
+        turns.push(note);
+        let reasoning_at: Vec<usize> = turns
+            .iter()
+            .map(|turn| {
+                turn.reasoning
+                    .as_deref()
+                    .map(estimate_tokens)
+                    .unwrap_or(0)
+            })
+            .filter(|tokens| *tokens > 0)
+            .collect();
+        assert_eq!(reasoning_at, vec![2_500; 7]);
+        let fixed = turn_list_tokens(&turns);
+        let user_tokens = ceiling + 14_000 - fixed;
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(user_tokens - 4)),
+        );
+        assert_eq!(turn_tokens(&user), user_tokens);
+        turns.insert(1, user);
+        let before = turn_list_tokens(&turns);
+        assert_eq!(before, ceiling + 14_000);
+        assert!(before - 17_500 <= ceiling);
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        let kept = turns
+            .iter()
+            .find(|turn| turn.name.as_deref() == Some(crate::llm::tools::TOOL_READ_NOTE))
+            .unwrap();
+        assert_eq!(kept.content, note_body);
+        let reasoning_left: usize = turns
+            .iter()
+            .map(|turn| {
+                turn.reasoning
+                    .as_deref()
+                    .map(estimate_tokens)
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            reasoning_left < 5_157,
+            "reasoning still holding the note out: {reasoning_left}"
+        );
+    }
+
+    #[test]
+    fn result_shorter_than_the_placeholder_is_still_prefix_cut() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        assert_eq!(ceiling, 12_641);
+        let body = "あ".repeat(25);
+        let mut first = ChatTurn::text("tool", body.clone());
+        first.name = Some("search_index".into());
+        let mut second = ChatTurn::text("tool", body.clone());
+        second.name = Some("search_index".into());
+        assert_eq!(turn_tokens(&first), 20);
+        let system = ChatTurn::text("system", "役割");
+        let room = 34;
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(
+                ceiling - room - turn_tokens(&system) - 4,
+            )),
+        );
+        assert_eq!(
+            ceiling - turn_tokens(&system) - turn_tokens(&user),
+            room
+        );
+        let mut turns = vec![system, user, first, second];
+        assert_eq!(turn_list_tokens(&turns) - ceiling, 6);
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turns[3].content, body);
+        assert!(turns[2].content.starts_with('あ'));
+        assert!(turns[2].content.contains("…（長いので省略しました）"));
+        assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
+        assert!(turn_tokens(&turns[2]) < 20);
+    }
+
+    #[test]
+    fn shorter_prefix_is_kept_when_the_placeholder_does_not_fit() {
+        let limit = 16_384;
+        let schema = 2_105;
+        let reply = reply_headroom_tokens(limit);
+        let ceiling = limit - schema - reply;
+        let body = "読".repeat(200);
+        let mut first = ChatTurn::text("tool", body.clone());
+        first.name = Some("read_unit".into());
+        let mut second = ChatTurn::text("tool", body);
+        second.name = Some("read_unit".into());
+        assert_eq!(turn_tokens(&first), 129);
+        let system = ChatTurn::text("system", "役割");
+        let room = 30;
+        let user = ChatTurn::text(
+            "user",
+            "問".repeat(tokens_to_chars(
+                ceiling - room - turn_tokens(&system) - 4,
+            )),
+        );
+        assert_eq!(
+            ceiling - turn_tokens(&system) - turn_tokens(&user),
+            room
+        );
+        let mut turns = vec![system, user, first, second];
+        fit_followup_request(&mut turns, limit, schema);
+        let after = turn_list_tokens(&turns);
+        assert!(after + schema + reply <= limit, "{after}");
+        assert_eq!(turn_tokens(&turns[2]), 14);
+        assert_eq!(turn_tokens(&turns[3]), 15);
+        assert!(turns[2].content.starts_with('読'));
+        assert!(turns[3].content.starts_with('読'));
+        assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
+        assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
+        assert!(turns[2].content.contains("…（長いので省略しました）"));
+        assert!(turns[3].content.contains("…（長いので省略しました）"));
     }
 }
