@@ -58,6 +58,39 @@ pub fn assembly_budget(limit_tokens: usize, schema_tokens: usize) -> usize {
         .max(1)
 }
 
+/// How many tokens the messages may use, and how many of those are the in-turn tool allowance.
+/// Reply and tool reserves shrink when the system prompt and this question need the room.
+/// `None` when the question and the schema cannot fit even with both reserves at zero.
+pub struct ContextBudget {
+    pub messages: usize,
+    pub tool_allowance: usize,
+}
+
+pub fn context_budget(
+    limit_tokens: usize,
+    schema_tokens: usize,
+    required_tokens: usize,
+) -> Option<ContextBudget> {
+    if required_tokens.saturating_add(schema_tokens) > limit_tokens {
+        return None;
+    }
+    let spare = limit_tokens - schema_tokens - required_tokens;
+    let want_reply = reply_headroom_tokens(limit_tokens);
+    let want_tools = tool_result_allowance_tokens(limit_tokens);
+    let want = want_reply.saturating_add(want_tools);
+    let reserve = want.min(spare);
+    let tool_allowance = if want == 0 {
+        0
+    } else {
+        reserve.saturating_mul(want_tools) / want
+    };
+    let reply = reserve.saturating_sub(tool_allowance);
+    Some(ContextBudget {
+        messages: limit_tokens - schema_tokens - reply - tool_allowance,
+        tool_allowance,
+    })
+}
+
 /// Fixed line that replaces an older source body. Citation number, file name, and
 /// location stay; the text does not depend on the body.
 pub fn source_stub_line(row: &LlmSourceRow) -> String {
@@ -231,6 +264,8 @@ pub struct AssembleStats {
     pub source_chars: usize,
     pub dropped_sources: usize,
     pub truncated: bool,
+    /// The latest question was left intact because cutting it was the only way to fit.
+    pub question_exceeds: bool,
     pub consumed: Vec<ConsumedSource>,
 }
 
@@ -631,17 +666,17 @@ pub fn assemble_turns(
         });
     }
 
-    let rendered = sources_on_turns(&built);
-    dedupe_tool_bodies(&mut built, &rendered);
+    // Stub first so trim measures the text that will actually be sent. Dedupe only
+    // bodies that remain in full on a recent user turn; a recent tool read keeps the
+    // body when the older owner was stubbed.
+    apply_age_stubs(&mut built, pool);
+    let full = full_sources_on_recent_turns(&built);
+    dedupe_tool_bodies(&mut built, &full);
 
     let mut truncated = false;
-    // Drop old exchanges while source bodies are still present, so chatter goes
-    // before those bodies. Then stub anything outside the recent window.
     trim_history(&mut built, max_tokens, &mut truncated);
-    apply_age_stubs(&mut built, pool);
     if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids) {
         truncated = true;
-        apply_age_stubs(&mut built, pool);
     }
     if tokens_of(&built) > max_tokens {
         trim_history(&mut built, max_tokens, &mut truncated);
@@ -649,6 +684,7 @@ pub fn assemble_turns(
     if tokens_of(&built) > max_tokens && force_under_budget(&mut built, max_tokens) {
         truncated = true;
     }
+    let question_exceeds = tokens_of(&built) > max_tokens;
 
     let shown_ids: HashSet<String> = built
         .iter()
@@ -683,6 +719,7 @@ pub fn assemble_turns(
         source_chars,
         dropped_sources,
         truncated: truncated || dropped_sources > 0 || shortened,
+        question_exceeds,
         consumed,
     };
     (turns, stats)
@@ -705,15 +742,30 @@ fn render_user_content(
     wrap_user(&block, question)
 }
 
-fn sources_on_turns(built: &[BuiltTurn]) -> Vec<LlmSourceRow> {
-    built
-        .iter()
-        .flat_map(|row| row.sources.iter().cloned())
-        .collect()
-}
-
 fn tokens_of(built: &[BuiltTurn]) -> usize {
     built.iter().map(|row| turn_tokens(&row.turn)).sum()
+}
+
+/// Cap a trailing synthetic 出典 turn so the message list stays within `budget`.
+/// Earlier turns, including the real question, are left as they are.
+pub fn fit_injected_turn(turns: &mut [ChatTurn], budget: usize) {
+    if turns.is_empty() || budget == 0 {
+        return;
+    }
+    let last = turns.len() - 1;
+    if !is_synthetic_user_turn(&turns[last].content) {
+        return;
+    }
+    let mut guard = 0;
+    while chat_tokens(turns) > budget && guard < 24 {
+        guard += 1;
+        let len = char_len(&turns[last].content);
+        let next = (len / 2).max(40);
+        if next >= len {
+            break;
+        }
+        turns[last].content = cap_chars(&turns[last].content, next);
+    }
 }
 
 /// Drop source bodies from tool turns when those bodies are also placed on a user turn.
@@ -728,7 +780,15 @@ pub fn omit_source_bodies_from_tool_turns(turns: &mut [ChatTurn], sources: &[Llm
     }
 }
 
-/// A source rendered on a user turn must not also appear in full inside a tool result.
+fn full_sources_on_recent_turns(built: &[BuiltTurn]) -> Vec<LlmSourceRow> {
+    let recent = recent_user_ids(built);
+    built.iter()
+        .filter(|row| row.turn.role == "user" && recent.contains(&row.message_id))
+        .flat_map(|row| row.sources.iter().cloned())
+        .collect()
+}
+
+/// A source rendered in full on a recent user turn must not also appear in a tool result.
 fn dedupe_tool_bodies(built: &mut [BuiltTurn], rendered: &[LlmSourceRow]) {
     if rendered.is_empty() {
         return;
@@ -866,10 +926,15 @@ fn stub_old_tool(content: &str, sources: &[LlmSourceRow]) -> String {
 }
 
 fn source_char_room(built: &[BuiltTurn], max_tokens: usize) -> usize {
+    let recent = recent_user_ids(built);
     let base: usize = built
         .iter()
         .map(|row| {
-            if row.turn.role == "user" && !row.sources.is_empty() {
+            // Full bodies are fitted separately. Stubbed turns are already one line.
+            if row.turn.role == "user"
+                && !row.sources.is_empty()
+                && recent.contains(&row.message_id)
+            {
                 turn_tokens(&ChatTurn::text("user", &row.question))
             } else {
                 turn_tokens(&row.turn)
@@ -887,7 +952,8 @@ fn refit_sources(
     max_tokens: usize,
     pending_ids: &HashSet<String>,
 ) -> bool {
-    let current: Vec<LlmSourceRow> = sources_on_turns(built);
+    let recent = recent_user_ids(built);
+    let current = full_sources_on_recent_turns(built);
     if current.is_empty() {
         return false;
     }
@@ -898,9 +964,8 @@ fn refit_sources(
     }
     let kept_by_id: HashMap<String, LlmSourceRow> =
         kept.into_iter().map(|row| (row.id.clone(), row)).collect();
-    let recent = recent_user_ids(built);
     for row in built.iter_mut() {
-        if row.sources.is_empty() {
+        if row.turn.role != "user" || !recent.contains(&row.message_id) || row.sources.is_empty() {
             continue;
         }
         row.sources = row
@@ -908,10 +973,7 @@ fn refit_sources(
             .iter()
             .filter_map(|source| kept_by_id.get(&source.id).cloned())
             .collect();
-        if row.turn.role == "user" {
-            let stub = !recent.contains(&row.message_id);
-            row.turn.content = render_user_content(&row.question, &row.sources, pool, stub);
-        }
+        row.turn.content = render_user_content(&row.question, &row.sources, pool, false);
     }
     true
 }
@@ -928,20 +990,10 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
             .filter(|(index, row)| {
                 row.turn.role != "system"
                     && Some(*index) != latest
-                    && char_len(&row.turn.content) > 80
+                    && char_len(&row.turn.content) > 40
             })
             .max_by_key(|(_, row)| char_len(&row.turn.content))
-            .map(|(index, _)| index)
-            .or_else(|| {
-                built
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, row)| {
-                        row.turn.role != "system" && char_len(&row.turn.content) > 40
-                    })
-                    .max_by_key(|(_, row)| char_len(&row.turn.content))
-                    .map(|(index, _)| index)
-            });
+            .map(|(index, _)| index);
         let Some(idx) = idx else {
             break;
         };
@@ -956,13 +1008,28 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
     changed
 }
 
-/// Shrink an already assembled request. Used when the server rejects the first send.
+/// A user turn added after the real question: a 出典 block, the stop-tools line, or a cite hint.
+pub fn is_synthetic_user_turn(content: &str) -> bool {
+    let text = content.trim();
+    text == STOP_TOOLS_HINT
+        || text == PHANTOM_CITE_HINT
+        || text == PHANTOM_CITE_HINT_NO_TOOLS
+        || (text.contains("【出典】") && !text.contains("【質問】"))
+}
+
+pub fn real_question_index(turns: &[ChatTurn]) -> Option<usize> {
+    turns.iter().rposition(|turn| {
+        turn.role == "user" && !is_synthetic_user_turn(&turn.content)
+    })
+}
+
+/// Shrink an already assembled request. True only when the result is within `budget`
+/// and the real question text is unchanged. Tool-call arguments are included.
 pub fn shrink_turns(turns: &mut Vec<ChatTurn>, budget: usize) -> bool {
-    let before: usize = turns.iter().map(turn_tokens).sum();
     let budget = budget.max(1);
+    let question_text = real_question_index(turns).map(|index| turns[index].content.clone());
     loop {
-        let used: usize = turns.iter().map(turn_tokens).sum();
-        if used <= budget {
+        if chat_tokens(turns) <= budget {
             break;
         }
         let mut dropped = 0;
@@ -977,43 +1044,119 @@ pub fn shrink_turns(turns: &mut Vec<ChatTurn>, budget: usize) -> bool {
         }
     }
     let mut guard = 0;
-    while turns.iter().map(turn_tokens).sum::<usize>() > budget && guard < 24 {
+    while chat_tokens(turns) > budget && guard < 32 {
         guard += 1;
-        let latest = turns.iter().rposition(|turn| turn.role == "user");
-        let idx = turns
-            .iter()
-            .enumerate()
-            .filter(|(index, turn)| {
-                turn.role != "system" && Some(*index) != latest && char_len(&turn.content) > 40
-            })
-            .max_by_key(|(_, turn)| char_len(&turn.content))
-            .map(|(index, _)| index);
-        let Some(idx) = idx else {
-            break;
-        };
-        let len = char_len(&turns[idx].content);
-        let next = (len / 2).max(20);
-        if next >= len {
+        if !shrink_one_non_question(turns) {
             break;
         }
-        turns[idx].content = cap_chars(&turns[idx].content, next);
     }
-    turns.iter().map(turn_tokens).sum::<usize>() < before
+    let question_ok = question_text
+        .as_ref()
+        .is_none_or(|text| turns.iter().any(|turn| turn.role == "user" && turn.content == *text));
+    question_ok && chat_tokens(turns) <= budget
+}
+
+fn chat_tokens(turns: &[ChatTurn]) -> usize {
+    turns.iter().map(turn_tokens).sum()
 }
 
 fn drop_oldest_chat_exchange(turns: &mut Vec<ChatTurn>) -> bool {
     let start = usize::from(turns.first().is_some_and(|turn| turn.role == "system"));
-    let latest = turns.iter().rposition(|turn| turn.role == "user");
-    let end = latest.unwrap_or(turns.len());
-    if start >= end {
+    let Some(question) = real_question_index(turns) else {
+        return false;
+    };
+    if start >= question {
         return false;
     }
     let mut remove_until = start + 1;
-    while remove_until < end && turns[remove_until].role != "user" {
+    while remove_until < question && turns[remove_until].role != "user" {
         remove_until += 1;
+    }
+    if remove_until > question {
+        remove_until = question;
+    }
+    if start >= remove_until {
+        return false;
     }
     turns.drain(start..remove_until);
     true
+}
+
+fn shrink_one_non_question(turns: &mut [ChatTurn]) -> bool {
+    let question = real_question_index(turns);
+    let mut best_len = 40usize;
+    let mut best: Option<(usize, bool)> = None;
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.role == "system" || Some(index) == question {
+            continue;
+        }
+        let content_len = char_len(&turn.content);
+        if content_len > best_len {
+            best_len = content_len;
+            best = Some((index, false));
+        }
+        let arg_len = tool_argument_chars(turn);
+        if arg_len > best_len {
+            best_len = arg_len;
+            best = Some((index, true));
+        }
+    }
+    let Some((index, args)) = best else {
+        return false;
+    };
+    let next = (best_len / 2).max(20);
+    if next >= best_len {
+        return false;
+    }
+    if args {
+        cap_tool_arguments(&mut turns[index], next);
+    } else {
+        turns[index].content = cap_chars(&turns[index].content, next);
+    }
+    true
+}
+
+fn tool_argument_chars(turn: &ChatTurn) -> usize {
+    let Some(calls) = turn.tool_calls.as_ref() else {
+        return 0;
+    };
+    let Some(arr) = calls.as_array() else {
+        return char_len(&calls.to_string());
+    };
+    arr.iter()
+        .map(|call| {
+            call.pointer("/function/arguments")
+                .and_then(|value| value.as_str())
+                .map(char_len)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn cap_tool_arguments(turn: &mut ChatTurn, max_chars: usize) {
+    let Some(calls) = turn.tool_calls.as_mut() else {
+        return;
+    };
+    if let Some(arr) = calls.as_array_mut() {
+        for call in arr {
+            let Some(args) = call
+                .pointer("/function/arguments")
+                .and_then(|value| value.as_str())
+                .map(|text| text.to_string())
+            else {
+                continue;
+            };
+            if char_len(&args) <= max_chars {
+                continue;
+            }
+            if let Some(slot) = call.pointer_mut("/function/arguments") {
+                *slot = serde_json::Value::String(cap_chars(&args, max_chars));
+            }
+        }
+    } else if char_len(&calls.to_string()) > max_chars {
+        let capped = cap_chars(&calls.to_string(), max_chars);
+        *calls = serde_json::Value::String(capped);
+    }
 }
 
 /// Past turns keep tool calls and tool results, and drop the reasoning channel.
@@ -1074,16 +1217,37 @@ fn trim_history(built: &mut Vec<BuiltTurn>, max_tokens: usize, truncated: &mut b
     }
 }
 
+fn oldest_protected_user(built: &[BuiltTurn]) -> Option<usize> {
+    let users: Vec<usize> = built
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.turn.role == "user")
+        .map(|(index, _)| index)
+        .collect();
+    if users.is_empty() {
+        return None;
+    }
+    let start = users.len().saturating_sub(RECENT_USER_TURNS);
+    Some(users[start])
+}
+
 fn drop_oldest_exchange(built: &mut Vec<BuiltTurn>) -> bool {
     let start = usize::from(built.first().is_some_and(|row| row.turn.role == "system"));
-    let latest = built.iter().rposition(|row| row.turn.role == "user");
-    let end = latest.unwrap_or(built.len());
-    if start >= end {
+    let Some(protected) = oldest_protected_user(built) else {
+        return false;
+    };
+    if start >= protected {
         return false;
     }
     let mut remove_until = start + 1;
-    while remove_until < end && built[remove_until].turn.role != "user" {
+    while remove_until < protected && built[remove_until].turn.role != "user" {
         remove_until += 1;
+    }
+    if remove_until > protected {
+        remove_until = protected;
+    }
+    if start >= remove_until {
+        return false;
     }
     built.drain(start..remove_until);
     true
@@ -1280,15 +1444,14 @@ mod tests {
     }
 
     #[test]
-    fn old_tool_results_leave_with_their_exchange_before_the_latest_question() {
+    fn recent_window_keeps_both_user_turns_when_a_tool_result_is_large() {
         let mut tool = msg("t1", "tool", &"あ".repeat(20_000));
         tool.tool_call_id = "c1".into();
         let history = vec![msg("u1", "user", "調べて"), tool, msg("u2", "user", "続き")];
-        let (turns, stats) = assemble_turns("役割", &[], &history, 1_000);
-        assert!(stats.truncated);
-        assert!(turns.iter().all(|t| t.role != "tool"));
+        let (turns, _) = assemble_turns("役割", &[], &history, 1_000);
+        assert!(turns.iter().any(|t| t.content == "調べて"));
         assert!(turns.iter().any(|t| t.content == "続き"));
-        assert!(!turns.iter().any(|t| t.content.contains(&"あ".repeat(100))));
+        assert!(!turns.iter().any(|t| t.content.contains(&"あ".repeat(20_000))));
     }
 
     #[test]
@@ -1709,9 +1872,14 @@ mod tests {
             users.iter().any(|text| text.contains(&body)),
             "the latest attachment stays while old turns go: {users:?}"
         );
+        assert!(users.len() >= 2, "the last two user turns stay: {users:?}");
+        let filler = users
+            .iter()
+            .filter(|text| text.contains(&"あ".repeat(80)))
+            .count();
         assert!(
-            users.iter().all(|text| !text.contains(&"あ".repeat(80))),
-            "the oldest chatter is the part that leaves: {users:?}"
+            filler <= 1,
+            "only a protected recent turn may still carry the filler: {users:?}"
         );
     }
 
@@ -1861,5 +2029,206 @@ mod tests {
         assert_eq!(turns[0].role, "system");
         assert!(turns.iter().any(|turn| turn.content == "最新の質問"));
         assert!(turns.iter().all(|turn| turn.content != "質問1"));
+    }
+
+    #[test]
+    fn large_old_file_is_stubbed_before_trim_so_fitting_turns_stay() {
+        let body = "あ".repeat(40_000);
+        let mut file = src_file("big", "attach", 0, &body);
+        file.cite_no = 12;
+        file.injected_user_message_id = "u1".into();
+        file.path = r"C:\docs\big.txt".into();
+        file.title = "big.txt".into();
+        file.paragraph_id.clear();
+        let mut history = vec![msg("u1", "user", "最初"), msg("a1", "assistant", "答え")];
+        for n in 2..8 {
+            history.push(msg(&format!("u{n}"), "user", &format!("質問{n}")));
+            history.push(msg(&format!("a{n}"), "assistant", "答"));
+        }
+        history.push(msg("u8", "user", "質問8"));
+        let (turns, stats) = assemble_turns("役割", &[file], &history, 32_000);
+        let users: Vec<&str> = turns
+            .iter()
+            .filter(|turn| turn.role == "user")
+            .map(|turn| turn.content.as_str())
+            .collect();
+        assert!(
+            users.iter().any(|text| text.contains("質問2")),
+            "stubbed file must not push out turns that fit: {users:?}"
+        );
+        assert!(users.iter().any(|text| text.contains("質問7")));
+        assert!(users.iter().any(|text| *text == "質問8" || text.contains("質問8")));
+        assert!(users.iter().any(|text| text.contains("既読 [12]")));
+        assert!(!users.iter().any(|text| text.contains(&body)));
+        assert!(stats.total_tokens < 32_000, "{}", stats.total_tokens);
+        assert!(!stats.question_exceeds);
+    }
+
+    #[test]
+    fn tiny_budget_keeps_the_recent_window_and_the_stub() {
+        let mut hit = consumed("a", "tool", 0, &"本文".repeat(500), "u1", 12);
+        hit.path = r"C:\law\民法.txt".into();
+        hit.title = "民法.txt".into();
+        hit.paragraph_id = r"C:\law\民法.txt#1".into();
+        let mut history = Vec::new();
+        for n in 1..8 {
+            history.push(msg(&format!("u{n}"), "user", &format!("質問{n}")));
+            history.push(msg(&format!("a{n}"), "assistant", "答"));
+        }
+        history.push(msg("u8", "user", "質問8"));
+        let (turns, _) = assemble_turns("役割", &[hit], &history, 195);
+        let users: Vec<&str> = turns
+            .iter()
+            .filter(|turn| turn.role == "user")
+            .map(|turn| turn.content.as_str())
+            .collect();
+        assert!(
+            users.len() >= 2,
+            "the last two user turns stay: {users:?}"
+        );
+        assert!(users.iter().any(|text| text.contains("質問8")));
+        assert!(users.iter().any(|text| text.contains("質問7")));
+        let blob = users.join("\n");
+        assert!(blob.contains("既読 [12]"), "{blob}");
+    }
+
+    #[test]
+    fn recent_read_keeps_the_body_when_the_older_owner_is_stubbed() {
+        let body = "再読した段落の本文です。消えてはいけません。";
+        let mut hit = consumed("a", "tool", 0, body, "u1", 4);
+        hit.path = r"C:\law\民法.txt".into();
+        hit.title = "民法.txt".into();
+        hit.paragraph_id = r"C:\law\民法.txt#9".into();
+        let tool_body = format_sources(&[hit.clone()]);
+        let mut assistant = msg("a2", "assistant", "");
+        assistant.tool_calls = r#"[{"id":"c2","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        let mut tool = msg("t2", "tool", &tool_body);
+        tool.tool_call_id = "c2".into();
+        tool.tool_name = "read_unit".into();
+        let history = vec![
+            msg("u1", "user", "最初"),
+            msg("a1", "assistant", "答え"),
+            msg("u2", "user", "読み直して"),
+            assistant,
+            tool,
+            msg("u3", "user", "最新"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[hit], &history, 80_000);
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(blob.matches(body).count(), 1, "{blob}");
+        let tool_turn = turns.iter().find(|turn| turn.role == "tool").unwrap();
+        assert!(tool_turn.content.contains(body), "{}", tool_turn.content);
+        let first = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(!first.content.contains(body), "{}", first.content);
+        assert!(first.content.contains("既読 [4]"), "{}", first.content);
+    }
+
+    #[test]
+    fn shrink_keeps_the_real_question_behind_an_injected_source_turn() {
+        let question = "本当の質問です";
+        let mut turns = vec![
+            ChatTurn::text("system", "役割"),
+            ChatTurn::text("user", "あ".repeat(4_000)),
+            ChatTurn::text("assistant", "古い答え"),
+            ChatTurn::text("user", question),
+            ChatTurn::text("assistant", "調べました"),
+            ChatTurn::text("tool", "結果"),
+            ChatTurn::text("user", "【出典】\n[1] 民法.txt\n\n古い本文\n\n"),
+        ];
+        turns[5].tool_call_id = Some("c1".into());
+        assert!(shrink_turns(&mut turns, 80));
+        assert!(turns.iter().any(|turn| turn.content == question));
+        assert!(chat_tokens(&turns) <= 80, "{}", chat_tokens(&turns));
+        assert!(turns.iter().all(|turn| !turn.content.contains(&"あ".repeat(4_000))));
+    }
+
+    #[test]
+    fn shrink_cuts_tool_call_arguments_and_uncapped_tool_results() {
+        let mut assistant = ChatTurn::text("assistant", "");
+        assistant.tool_calls = Some(serde_json::json!([{
+            "id": "c",
+            "type": "function",
+            "function": { "name": "write_note", "arguments": "あ".repeat(20_000) }
+        }]));
+        let mut note = ChatTurn::text("tool", "あ".repeat(4_000));
+        note.tool_call_id = Some("c".into());
+        note.name = Some("read_note".into());
+        let mut turns = vec![
+            ChatTurn::text("system", "役"),
+            ChatTurn::text("user", "質問"),
+            assistant,
+            note,
+        ];
+        let before = chat_tokens(&turns);
+        assert!(before > 4_096, "{before}");
+        assert!(shrink_turns(&mut turns, 300), "{}", chat_tokens(&turns));
+        assert!(chat_tokens(&turns) <= 300, "{}", chat_tokens(&turns));
+        assert!(turns.iter().any(|turn| turn.content == "質問"));
+        let args = turns[2]
+            .tool_calls
+            .as_ref()
+            .and_then(|value| value.pointer("/0/function/arguments"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        assert!(char_len(args) < 20_000, "{args}");
+        assert!(!turns.iter().any(|turn| turn.content.contains(&"あ".repeat(4_000))));
+    }
+
+    #[test]
+    fn shrink_that_cannot_fit_the_question_reports_failure() {
+        let question = "あ".repeat(2_000);
+        let mut turns = vec![
+            ChatTurn::text("system", "役割"),
+            ChatTurn::text("user", question.clone()),
+        ];
+        assert!(!shrink_turns(&mut turns, 30));
+        assert_eq!(turns[1].content, question);
+    }
+
+    #[test]
+    fn reserves_shrink_so_a_fitting_question_is_not_halved() {
+        let limit = 4_096;
+        let schema = 2_105;
+        let system = "あ".repeat(1_000);
+        let question = "短い質問です";
+        let required = estimate_tokens(&system) + 4 + estimate_tokens(question) + 4;
+        let split = context_budget(limit, schema, required).expect("question fits");
+        assert!(split.messages >= required);
+        assert!(split.messages + schema <= limit);
+        let (turns, stats) =
+            assemble_turns(&system, &[], &[msg("u1", "user", question)], split.messages);
+        assert!(!stats.question_exceeds);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert_eq!(user.content, question);
+    }
+
+    #[test]
+    fn question_that_cannot_fit_is_not_silently_halved() {
+        let question = "あ".repeat(20_000);
+        let (turns, stats) = assemble_turns("役割", &[], &[msg("u1", "user", &question)], 500);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(stats.question_exceeds);
+        assert_eq!(user.content, question);
+    }
+
+    #[test]
+    fn paste_that_fits_beside_the_schema_keeps_its_full_text() {
+        let limit = 131_072;
+        let schema = 2_105;
+        let question = "あ".repeat(200_000);
+        let system = "役割";
+        let required = estimate_tokens(system) + 4 + estimate_tokens(&question) + 4;
+        assert!(required + schema <= limit);
+        let split = context_budget(limit, schema, required).expect("fits");
+        let (turns, stats) =
+            assemble_turns(system, &[], &[msg("u1", "user", &question)], split.messages);
+        assert!(!stats.question_exceeds);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert_eq!(user.content, question);
+        assert!(split.tool_allowance < tool_result_allowance_tokens(limit));
     }
 }

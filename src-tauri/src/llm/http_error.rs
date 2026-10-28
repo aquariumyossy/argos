@@ -13,6 +13,10 @@ pub const VISION_UNSUPPORTED_ERROR: &str =
 pub const CONTEXT_TOO_LONG_ERROR: &str =
     "この会話はモデルのコンテキストに対して長すぎます。新しい会話に切り替えるか、古い内容を減らしてください。";
 
+/// The question itself, with this turn's attachments, does not fit even with no reserve.
+pub const QUESTION_DOES_NOT_FIT_ERROR: &str =
+    "この質問はモデルのコンテキストに入りません。短くしてから送ってください。";
+
 const TOOLS_PHRASES: &[&str] = &["does not support tools", "\"auto\" tool choice requires"];
 const VISION_PHRASE: &str = "does not support image input";
 /// Fixed phrases. A 400 is a context-length failure only when the body contains one of these.

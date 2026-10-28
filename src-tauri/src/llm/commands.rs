@@ -7,9 +7,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
-    answer_has_phantom_cites, assemble_turns, assembly_budget, cap_chars, consumed_cited_in_answer,
-    estimate_tokens, final_source_turn, fit_tool_text, parse_cited_nos, shrink_turns,
-    silent_end_notice, sources_for_consumed, tool_result_allowance_tokens, tool_schema_tokens,
+    answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
+    estimate_tokens, final_source_turn, fit_injected_turn, fit_tool_text, is_synthetic_user_turn,
+    parse_cited_nos, shrink_turns, silent_end_notice, sources_for_consumed, tool_schema_tokens,
     turn_tokens, ChatTurn, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
     STOP_TOOLS_HINT,
 };
@@ -192,15 +192,75 @@ fn inject_final_source_turn(
     sources: &[LlmSourceRow],
     consumed: &[(String, i64)],
     stop_tools: bool,
+    message_budget: usize,
 ) -> bool {
     let rows = sources_for_consumed(sources, consumed);
-    if let Some(turn) = final_source_turn(&rows, stop_tools) {
-        // The tool result already carried these bodies. Keep them on this user turn only.
-        crate::llm::context::omit_source_bodies_from_tool_turns(turns, &rows);
+    // Attachments already sitting on the user question are not copied again.
+    let fresh: Vec<LlmSourceRow> = rows
+        .into_iter()
+        .filter(|row| !user_turn_has_body(turns, row))
+        .collect();
+    if let Some(turn) = final_source_turn(&fresh, stop_tools) {
+        crate::llm::context::omit_source_bodies_from_tool_turns(turns, &fresh);
         turns.push(turn);
+        fit_injected_turn(turns, message_budget);
         return true;
     }
     false
+}
+
+fn required_prompt_tokens(system: &str, question: &str, sources: &[LlmSourceRow]) -> usize {
+    let pending: Vec<LlmSourceRow> = sources
+        .iter()
+        .filter(|source| source.is_injectable() && source.is_pending())
+        .cloned()
+        .collect();
+    let mut sys = system.trim().to_string();
+    if !pending.is_empty() && !sys.contains("[n]") {
+        sys.push_str(crate::llm::context::CITATION_GUIDE);
+    }
+    let sys_tokens = if sys.is_empty() {
+        0
+    } else {
+        estimate_tokens(&sys) + 4
+    };
+    let mut question_tokens = estimate_tokens(question) + 4;
+    if !pending.is_empty() {
+        question_tokens += estimate_tokens(&crate::llm::context::format_sources(&pending));
+    }
+    sys_tokens + question_tokens
+}
+
+fn send_error(
+    thread: LlmThreadRow,
+    user_message: LlmMessageRow,
+    base: &str,
+    message: &str,
+) -> LlmSendResult {
+    let (state, tokens) = budget_fields(base);
+    LlmSendResult {
+        thread,
+        user_message,
+        assistant_message: None,
+        cancelled: false,
+        error: Some(message.to_string()),
+        truncated: false,
+        context_tokens: 0,
+        thinking_budget_state: state,
+        thinking_budget_tokens: tokens,
+        warning: None,
+        note_writes: Vec::new(),
+    }
+}
+
+fn user_turn_has_body(turns: &[ChatTurn], source: &LlmSourceRow) -> bool {
+    let body = source.body.trim();
+    if body.is_empty() {
+        return false;
+    }
+    turns
+        .iter()
+        .any(|turn| turn.role == "user" && !is_synthetic_user_turn(&turn.content) && turn.content.contains(body))
 }
 
 #[tauri::command]
@@ -639,10 +699,27 @@ pub async fn llm_send(
     let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
     let schema_tokens = tool_schema_tokens(&tools_schema);
     let full_limit = max_tokens;
-    // History is sized under the configured limit, leaving room for the schema,
-    // the reply, and tool results that this turn may still append.
-    let mut prompt_budget = assembly_budget(full_limit, schema_tokens);
+    let required = required_prompt_tokens(&system, &content, &sources);
+    let Some(split) = context_budget(full_limit, schema_tokens, required) else {
+        return Ok(send_error(
+            thread,
+            user_message,
+            &settings.llm_base_url,
+            crate::llm::http_error::QUESTION_DOES_NOT_FIT_ERROR,
+        ));
+    };
+    // Reserves shrink when this question needs the room. The schema stays counted.
+    let mut prompt_budget = split.messages;
+    let message_ceiling = full_limit.saturating_sub(schema_tokens).max(1);
     let (assembled, stats) = assemble_turns(&system, &sources, &history, prompt_budget);
+    if stats.question_exceeds {
+        return Ok(send_error(
+            thread,
+            user_message,
+            &settings.llm_base_url,
+            crate::llm::http_error::QUESTION_DOES_NOT_FIT_ERROR,
+        ));
+    }
     let mut turns_for_plain = assembled.clone();
     let mut truncated = stats.truncated;
     let mut context_tokens = stats.total_tokens;
@@ -674,9 +751,8 @@ pub async fn llm_send(
     let unlimited_rounds = max_rounds == 0;
     let mut current_turns = assembled;
     let mut source_turn_injected = false;
-    // Tool output is appended after the context was already sized, so it spends the
-    // allowance reserved by `assembly_budget`. A quarter of the window is that allowance.
-    let tool_budget = tool_result_allowance_tokens(full_limit);
+    // In-turn tool results spend the allowance left after the question and the schema.
+    let tool_budget = split.tool_allowance;
     let mut tool_used = 0usize;
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
@@ -697,7 +773,7 @@ pub async fn llm_send(
             if !source_turn_injected {
                 let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
                 source_turn_injected =
-                    inject_final_source_turn(&mut current_turns, &all, &consumed, true);
+                    inject_final_source_turn(&mut current_turns, &all, &consumed, true, message_ceiling);
             }
             if !source_turn_injected {
                 current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
@@ -789,21 +865,74 @@ pub async fn llm_send(
             }
             Err(e) if !overflow_retried && llm::is_context_too_long_error(&e) => {
                 overflow_retried = true;
-                emit_chat_reset(&app, &request_id, &thread.id);
-                if rounds == 0 && !source_turn_injected {
-                    prompt_budget = (prompt_budget / 2).max(1);
+                let fitted = if rounds == 0 && !source_turn_injected {
+                    prompt_budget = (prompt_budget / 2).clamp(1, message_ceiling);
                     let (rebuilt, stats2) =
                         assemble_turns(&system, &sources, &history, prompt_budget);
-                    current_turns = rebuilt;
-                    turns_for_plain = current_turns.clone();
-                    truncated = truncated || stats2.truncated;
-                    context_tokens = stats2.total_tokens;
+                    if stats2.question_exceeds && prompt_budget < message_ceiling {
+                        prompt_budget = message_ceiling;
+                        let (rebuilt, stats2) =
+                            assemble_turns(&system, &sources, &history, prompt_budget);
+                        if stats2.question_exceeds {
+                            false
+                        } else {
+                            current_turns = rebuilt;
+                            turns_for_plain = current_turns.clone();
+                            truncated = truncated || stats2.truncated;
+                            context_tokens = stats2.total_tokens;
+                            true
+                        }
+                    } else if stats2.question_exceeds {
+                        false
+                    } else {
+                        current_turns = rebuilt;
+                        turns_for_plain = current_turns.clone();
+                        truncated = truncated || stats2.truncated;
+                        context_tokens = stats2.total_tokens;
+                        true
+                    }
                 } else {
                     let used: usize = current_turns.iter().map(turn_tokens).sum();
-                    let tighter = (used / 2).max(1);
-                    shrink_turns(&mut current_turns, tighter);
+                    let aggressive = (used / 2).max(1).min(message_ceiling);
+                    shrink_turns(&mut current_turns, aggressive)
+                        || shrink_turns(&mut current_turns, message_ceiling)
+                };
+                if fitted
+                    && current_turns.iter().map(turn_tokens).sum::<usize>() <= message_ceiling
+                {
+                    emit_chat_reset(&app, &request_id, &thread.id);
+                    continue;
                 }
-                continue;
+                busy.finish();
+                kick_pending_ocr(&app, state_arc.clone());
+                let _ = state.db.delete_uncited_tool_sources(&thread.id);
+                emit_sources_updated(&app, &thread.id);
+                let _ = app.emit(
+                    "llm-chat-error",
+                    LlmChatError {
+                        request_id,
+                        thread_id: thread.id.clone(),
+                        message: e.clone(),
+                    },
+                );
+                let thread = state
+                    .db
+                    .get_llm_thread(&thread.id)
+                    .map_err(|err| err.to_string())?
+                    .unwrap_or(thread);
+                return Ok(LlmSendResult {
+                    thread,
+                    user_message,
+                    assistant_message: None,
+                    cancelled: false,
+                    error: Some(e),
+                    truncated,
+                    context_tokens,
+                    thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                    thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
+                    warning,
+                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+                });
             }
             Err(e)
                 if use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&e) =>
@@ -991,8 +1120,13 @@ pub async fn llm_send(
                         use_tools = false;
                         if !source_turn_injected {
                             let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
-                            source_turn_injected =
-                                inject_final_source_turn(&mut current_turns, &all, &consumed, true);
+                            source_turn_injected = inject_final_source_turn(
+                                &mut current_turns,
+                                &all,
+                                &consumed,
+                                true,
+                                message_ceiling,
+                            );
                         }
                         if !source_turn_injected {
                             current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
@@ -1008,7 +1142,13 @@ pub async fn llm_send(
                     let already_cited = consumed_cited_in_answer(&consumed, &out.content);
                     if already_cited.is_empty() {
                         let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
-                        if inject_final_source_turn(&mut current_turns, &all, &consumed, true) {
+                        if inject_final_source_turn(
+                            &mut current_turns,
+                            &all,
+                            &consumed,
+                            true,
+                            message_ceiling,
+                        ) {
                             source_turn_injected = true;
                             use_tools = false;
                             // This continue is itself a retry. Keep a phantom answer so an
@@ -2295,6 +2435,7 @@ mod tests {
             std::slice::from_ref(&s),
             &[("hit".into(), 2)],
             true,
+            usize::MAX,
         ));
         let blob = turns
             .iter()
@@ -2316,7 +2457,73 @@ mod tests {
             std::slice::from_ref(&s),
             &[("hit".into(), 2)],
             false,
+            usize::MAX,
         ));
+    }
+
+    #[test]
+    fn injected_turn_does_not_repeat_an_attachment_already_on_the_question() {
+        let body = "添付の本文です。二度送らない。".repeat(40);
+        let mut attached = LlmSourceRow {
+            id: "file".into(),
+            thread_id: "t".into(),
+            sort_order: 0,
+            origin: "attach".into(),
+            path: r"C:\docs\memo.txt".into(),
+            title: "memo.txt".into(),
+            paragraph_id: String::new(),
+            body: body.clone(),
+            query: String::new(),
+            created_at: 0,
+            grain: "file".into(),
+            unit_body: String::new(),
+            injected_user_message_id: String::new(),
+            cited_assistant_message_id: String::new(),
+            cite_no: 3,
+            kind: "text".into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
+        };
+        let mut turns = vec![ChatTurn::text(
+            "user",
+            crate::llm::context::format_sources(std::slice::from_ref(&attached)) + "【質問】\n見て",
+        )];
+        assert!(inject_final_source_turn(
+            &mut turns,
+            std::slice::from_ref(&attached),
+            &[("file".into(), 3)],
+            true,
+            32_768,
+        ));
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(blob.matches(body.as_str()).count(), 1, "{blob}");
+        let tokens: usize = turns.iter().map(turn_tokens).sum();
+        assert!(tokens < 32_768, "{tokens}");
+        attached.body = "あ".repeat(40_000);
+        let tool = ChatTurn {
+            role: "tool".into(),
+            content: crate::llm::context::format_sources(std::slice::from_ref(&attached)),
+            name: Some("read_unit".into()),
+            tool_call_id: Some("c".into()),
+            tool_calls: None,
+            reasoning: None,
+        };
+        let mut wide = vec![ChatTurn::text("user", "質問"), tool];
+        assert!(inject_final_source_turn(
+            &mut wide,
+            std::slice::from_ref(&attached),
+            &[("file".into(), 3)],
+            false,
+            2_000,
+        ));
+        let wide_tokens: usize = wide.iter().map(turn_tokens).sum();
+        assert!(wide_tokens <= 2_000, "{wide_tokens}");
+        assert_eq!(wide[0].content, "質問");
+        assert!(!wide.iter().any(|turn| turn.content.contains(&"あ".repeat(40_000))));
     }
 
     #[test]
