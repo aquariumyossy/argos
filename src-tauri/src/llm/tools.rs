@@ -2145,7 +2145,9 @@ fn refit_article_sections(preamble: &str, sections: &[RereadSection], max_chars:
             let mut best = String::new();
             for k in 0..=body.len() {
                 let end = if k == 0 { start.saturating_sub(1) } else { start + k - 1 };
-                let note = if k == 0 || end >= start + total.saturating_sub(1) {
+                let note = if k == 0 {
+                    format!("［再読］{label}。続きは start={start}")
+                } else if end >= start + total.saturating_sub(1) {
                     format!("［再読］{label}。{start}文字目から{end}文字目。全{total}文字")
                 } else {
                     format!(
@@ -2164,6 +2166,8 @@ fn refit_article_sections(preamble: &str, sections: &[RereadSection], max_chars:
             if !best.is_empty() {
                 return best;
             }
+            let note = format!("［再読］{label}。続きは start={start}");
+            return fit_notice(out, &note, max_chars);
         }
         break;
     }
@@ -2174,13 +2178,25 @@ fn refit_article_sections(preamble: &str, sections: &[RereadSection], max_chars:
     }
 }
 
+fn fit_notice(preamble: String, note: &str, max_chars: usize) -> String {
+    let note_len = note.chars().count();
+    if preamble.chars().count() + note_len <= max_chars {
+        return format!("{preamble}{note}");
+    }
+    if note_len >= max_chars {
+        return note.chars().take(max_chars).collect();
+    }
+    let head: String = preamble.chars().take(max_chars - note_len).collect();
+    format!("{head}{note}")
+}
+
 fn parse_article_header(header: &str) -> Option<(usize, usize, usize, String)> {
     let rest = header.trim_start_matches("［再読］");
     let (label, rest) = rest.split_once('。')?;
     let label = label.trim_end_matches("の先頭").to_string();
     let (start_s, rest) = rest.split_once("文字目から")?;
     let (end_s, rest) = rest.split_once("文字目。全")?;
-    let total_s = rest.split('字').next()?;
+    let total_s = rest.split("文字").next()?;
     Some((
         start_s.trim().parse().ok()?,
         end_s.trim().parse().ok()?,
@@ -3606,6 +3622,126 @@ mod tests {
         let wrong: String = joined.chars().skip(start - 1).take(3).collect();
         assert_ne!(wrong, "乙ペ", "the no-heading join must not be the index");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refit_of_a_full_article_header_keeps_a_reread_line_at_a_tight_budget() {
+        let body = "あ".repeat(2_550);
+        let preamble = "【出典】\n[1] 契約.txt — C:\\docs\\契約.txt\n";
+        let text = format!("{preamble}［再読］第1条。1文字目から2550文字目。全2550文字\n{body}\n");
+        let budget = preamble.chars().count() + 36;
+        let out = refit_reread_text(&text, budget).expect("refit");
+        assert!(
+            out.contains("［再読］") || out.contains("続きは start="),
+            "{out}"
+        );
+        assert!(!out.contains("1文字目から0文字目"), "{out}");
+        assert!(!out.contains(&"あ".repeat(2_550)), "{out}");
+        let partial = format!(
+            "{preamble}［再読］第1条の先頭。1文字目から10文字目。全2550文字。続きは start=11\n{}\n",
+            "あ".repeat(10)
+        );
+        let again = refit_reread_text(&partial, budget).expect("refit partial header");
+        assert!(
+            again.contains("［再読］") || again.contains("続きは start="),
+            "{again}"
+        );
+        assert!(!again.contains("1文字目から0文字目"), "{again}");
+    }
+
+    #[test]
+    fn shortened_ocr_page_notice_start_reaches_the_later_page() {
+        let (dir, db, thread) = temp_db("ocr-cut");
+        let path = r"C:\docs\scan.pdf";
+        let page1 = "甲".repeat(2_400);
+        let marker = "乙PAGE_MARKER";
+        db.insert_llm_source_full(
+            &thread.id,
+            "attach",
+            path,
+            "scan.pdf",
+            "pdf-page:1",
+            &page1,
+            "",
+            "file",
+            "image",
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+        let second = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                path,
+                "scan.pdf",
+                "pdf-page:2",
+                marker,
+                "",
+                "file",
+                "image",
+                "",
+                "",
+                None,
+            )
+            .unwrap()
+            .0;
+        let rows = db.list_llm_sources_by_cite(&thread.id, second.cite_no).unwrap();
+        assert!(rows.len() >= 2, "{rows:?}");
+        let history = vec![crate::db::LlmMessageRow {
+            id: "u1".into(),
+            thread_id: thread.id.clone(),
+            role: "user".into(),
+            content: "読んで".into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+        }];
+        let mut saw = false;
+        for budget in [500usize, 700, 900, 1_100, 1_400] {
+            let (turns, _) = crate::llm::context::assemble_turns(
+                "役割",
+                &rows,
+                &history,
+                budget,
+            );
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            if user.content.contains(&page1) {
+                continue;
+            }
+            let Some(start) = notice_start(&user.content) else {
+                continue;
+            };
+            saw = true;
+            let exec = read_saved_selection(
+                &db,
+                &thread.id,
+                second.cite_no,
+                &json!({"start": start, "end": start + 4_000}),
+            );
+            assert!(
+                exec.content.contains(marker),
+                "budget {budget} start={start} missed the marker: {}",
+                exec.content.chars().take(240).collect::<String>()
+            );
+        }
+        assert!(saw, "no budget shortened page 1 while hiding the page 2 marker");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn notice_start(text: &str) -> Option<i64> {
+        let line = text.lines().find(|line| line.contains("続きは start="))?;
+        let digits: String = line
+            .split("続きは start=")
+            .nth(1)?
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
     }
 
     #[test]

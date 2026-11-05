@@ -536,24 +536,36 @@ pub(crate) fn cap_chars(s: &str, max: usize) -> String {
 /// Notice after a head-only attachment. `shown` is how many characters of `full`
 /// were kept. `page_slice` is one OCR page, whose local offset is not the
 /// multi-page transcript index.
-pub(crate) fn attachment_cut_note(shown: usize, total: usize, page_slice: bool) -> String {
-    if page_slice {
+/// Where a shortened page body sits in the full `## nページ目` transcript.
+struct PageIndex {
+    /// Characters before this page's body in the stored transcript.
+    prefix: usize,
+    /// Length of the stored transcript.
+    total: usize,
+}
+
+pub(crate) fn attachment_cut_note(shown: usize, total: usize, next_start: usize, page: bool) -> String {
+    if page {
         format!(
-            "…（このページは先頭{shown}文字のみ。全{total}文字。文字位置は ## nページ目 を含む書き起こし。続きは read_unit の cite_no）"
+            "…（このページは先頭{shown}文字のみ。書き起こし全{total}文字。続きは start={next_start}、または条番号）"
         )
     } else {
-        format!(
-            "…（先頭{shown}文字のみ。全{total}文字。続きは start={}、または条番号）",
-            shown.saturating_add(1)
-        )
+        format!("…（先頭{shown}文字のみ。全{total}文字。続きは start={next_start}、または条番号）")
     }
 }
 
-/// Head of `full` that fits in `max_chars`. A cut excerpt ends with [`attachment_cut_note`].
-/// The stored body is not modified.
-pub(crate) fn attachment_excerpt(full: &str, max_chars: usize, page_slice: bool) -> String {
+fn cut_note_for(full: &str, shown: usize, page: Option<&PageIndex>) -> String {
+    match page {
+        Some(page) => attachment_cut_note(shown, page.total, page.prefix + shown + 1, true),
+        None => attachment_cut_note(shown, char_len(full), shown + 1, false),
+    }
+}
+
+/// Head of `full` that fits in `max_chars`. A cut excerpt ends with the re-read note.
+/// The stored body is not modified. `page` gives stored-transcript coordinates.
+pub(crate) fn attachment_excerpt(full: &str, max_chars: usize, page: Option<&PageIndex>) -> String {
     if max_chars == 0 {
-        return String::new();
+        return cut_note_for(full, 0, page);
     }
     let total = char_len(full);
     if total <= max_chars {
@@ -561,7 +573,7 @@ pub(crate) fn attachment_excerpt(full: &str, max_chars: usize, page_slice: bool)
     }
     let mut shown = max_chars.saturating_sub(1);
     while shown > 0 {
-        let note = attachment_cut_note(shown, total, page_slice);
+        let note = cut_note_for(full, shown, page);
         if char_len(&note) + shown <= max_chars {
             let mut out: String = full.chars().take(shown).collect();
             out.push_str(&note);
@@ -569,11 +581,28 @@ pub(crate) fn attachment_excerpt(full: &str, max_chars: usize, page_slice: bool)
         }
         shown -= 1;
     }
-    cap_chars(full, max_chars)
+    cut_note_for(full, 0, page)
 }
 
-fn page_slice_body(row: &LlmSourceRow) -> bool {
-    crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id).is_some()
+fn page_index(pool: &[LlmSourceRow], id: &str) -> Option<PageIndex> {
+    let row = pool.iter().find(|source| source.id == id)?;
+    let page = crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id)?;
+    let mut siblings: Vec<&LlmSourceRow> = pool
+        .iter()
+        .filter(|source| {
+            source.path == row.path
+                && crate::llm::transcript::parse_pdf_page_no(&source.paragraph_id).is_some()
+        })
+        .collect();
+    siblings.sort_by_key(|source| crate::llm::transcript::parse_pdf_page_no(&source.paragraph_id));
+    let transcript = crate::llm::transcript::transcript_body(&siblings, true);
+    let needle = format!("## {page}ページ目\n\n");
+    let byte = transcript.find(&needle)?;
+    let prefix = transcript[..byte].chars().count() + needle.chars().count();
+    Some(PageIndex {
+        prefix,
+        total: transcript.chars().count(),
+    })
 }
 
 fn cite_no_of(s: &LlmSourceRow) -> i64 {
@@ -821,8 +850,8 @@ fn select_sources(
                 .find(|source| source.id == id)
                 .map(|source| source.body.trim().to_string())
                 .unwrap_or_else(|| rows[idx].body.clone());
-            let page = page_slice_body(&rows[idx]);
-            rows[idx].body = attachment_excerpt(&full, next, page);
+            let page = page_index(pool, &id);
+            rows[idx].body = attachment_excerpt(&full, next, page.as_ref());
         } else {
             rows[idx].body = cap_chars(&rows[idx].body, next);
         }
@@ -844,15 +873,16 @@ fn select_sources(
 /// An empty body leaves the citation header. The row itself stays.
 fn fit_pending_prefix(rows: &mut [LlmSourceRow], idx: usize, pool: &[LlmSourceRow], budget: usize) {
     let full = rows[idx].body.clone();
+    let page = page_index(pool, &rows[idx].id);
     let mut lo = 0usize;
     let mut hi = char_len(&full);
     let mut best = 0usize;
     loop {
         let mid = lo + (hi - lo) / 2;
         rows[idx].body = if mid == 0 {
-            String::new()
+            empty_attachment_body(&full, page.as_ref())
         } else {
-            attachment_excerpt(&full, mid, page_slice_body(&rows[idx]))
+            attachment_excerpt(&full, mid, page.as_ref())
         };
         let fits = char_len(&format_sources_with_pool(rows, pool)) <= budget;
         if fits {
@@ -871,10 +901,20 @@ fn fit_pending_prefix(rows: &mut [LlmSourceRow], idx: usize, pool: &[LlmSourceRo
         }
     }
     rows[idx].body = if best == 0 {
+        empty_attachment_body(&full, page.as_ref())
+    } else {
+        attachment_excerpt(&full, best, page.as_ref())
+    };
+}
+
+/// A text attachment cut to nothing still says how to read on. An empty scan
+/// page stays empty so the group can omit it.
+fn empty_attachment_body(full: &str, page: Option<&PageIndex>) -> String {
+    if full.trim().is_empty() || page.is_some() {
         String::new()
     } else {
-        attachment_excerpt(&full, best, page_slice_body(&rows[idx]))
-    };
+        cut_note_for(full, 0, None)
+    }
 }
 
 /// Tokens to take from the tool reserve so a pending attachment still has a short excerpt.
@@ -1369,7 +1409,13 @@ fn reread_body_sample(content: &str) -> String {
         }
         return buf.chars().filter(|c| !c.is_whitespace()).take(24).collect();
     };
-    body.chars().filter(|c| !c.is_whitespace()).take(24).collect()
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let n = compact.chars().count();
+    if n <= 24 {
+        compact
+    } else {
+        compact.chars().skip(n - 24).collect()
+    }
 }
 
 fn dedupe_tool_bodies(built: &mut [BuiltTurn], rendered: &[LlmSourceRow]) {
@@ -1568,10 +1614,11 @@ fn shrink_unsent_attachment(
             .unwrap_or_else(|| built[turn_idx].sources[src_idx].body.clone());
         let len = char_len(&built[turn_idx].sources[src_idx].body);
         let next = len / 2;
+        let page = page_index(pool, &source_id);
         built[turn_idx].sources[src_idx].body = if next == 0 {
-            String::new()
+            empty_attachment_body(&full, page.as_ref())
         } else {
-            attachment_excerpt(&full, next, page_slice_body(&built[turn_idx].sources[src_idx]))
+            attachment_excerpt(&full, next, page.as_ref())
         };
         drop_empty_image_pages(&mut built[turn_idx].sources);
         let question = built[turn_idx].question.clone();
@@ -2774,6 +2821,118 @@ mod tests {
             "the stub or the cut still says how to re-read: {blob}"
         );
         assert!(!blob.contains(&"甲".repeat(8_000)));
+    }
+
+    #[test]
+    fn followup_keeps_article_one_tail_when_its_opening_is_still_in_the_excerpt() {
+        let opening = "VISIBLE_OPENING_TEXT_123456";
+        let tail = "UNIQUE_TAIL_PAST_THE_CUT_99";
+        let eighth = "ARTICLE_EIGHT_PAST_THE_CUT";
+        assert!(opening.chars().count() >= 24);
+        assert!(tail.chars().count() >= 24);
+        let mut body = format!("第1条（目的）\n{opening}\n");
+        body.push_str(&"甲".repeat(6_000));
+        body.push_str(&format!("\n{tail}\n\n第8条（後）\n{eighth}\n"));
+        let mut file = src_file("big", "attach", 0, &body);
+        file.cite_no = 1;
+        file.path = r"C:\docs\契約.txt".into();
+        file.title = "契約.txt".into();
+        file.paragraph_id.clear();
+        file.injected_user_message_id = "u1".into();
+        let tool_for = |marker: &str, label: &str| {
+            let mut assistant = msg("a1", "assistant", "確認します [1]");
+            assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+            let mut tool = msg(
+                "t1",
+                "tool",
+                &format!(
+                    "【出典】\n[1] 契約.txt — C:\\docs\\契約.txt\n［再読］{label}。1文字目から80文字目。全80文字\n{opening}\n{marker}\n"
+                ),
+            );
+            tool.tool_call_id = "c1".into();
+            tool.tool_name = "read_unit".into();
+            (assistant, tool)
+        };
+        let mut saw = false;
+        for budget in [900usize, 1_000, 1_100, 1_200, 1_400] {
+            let (assistant, tool) = tool_for(eighth, "第8条");
+            let history = vec![
+                msg("u1", "user", "契約を見て"),
+                assistant,
+                tool,
+                msg("u2", "user", "続きは"),
+            ];
+            let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
+            let user = turns.iter().find(|turn| turn.content.contains("契約を見て")).unwrap();
+            let blob = turns
+                .iter()
+                .map(|turn| turn.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !user.content.contains(opening) || user.content.contains(tail) || user.content.contains(eighth)
+            {
+                continue;
+            }
+            if !blob.contains(eighth) {
+                continue;
+            }
+            saw = true;
+            let (assistant, tool) = tool_for(tail, "第1条");
+            let history = vec![
+                msg("u1", "user", "契約を見て"),
+                assistant,
+                tool,
+                msg("u2", "user", "続きは"),
+            ];
+            let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
+            let blob = turns
+                .iter()
+                .map(|turn| turn.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                blob.contains(tail),
+                "budget {budget} kept 第8条 but dropped the tail of 第1条: {blob}"
+            );
+        }
+        assert!(saw, "no budget both showed the opening and restored 第8条");
+    }
+
+    #[test]
+    fn second_attachment_cut_to_empty_still_says_how_to_continue() {
+        let mut first = src_file("a", "attach", 0, &"甲".repeat(3_000));
+        first.cite_no = 1;
+        first.path = r"C:\docs\a.txt".into();
+        first.title = "a.txt".into();
+        first.paragraph_id.clear();
+        let marker = "乙の固有マーカー";
+        let mut second_body = "乙".repeat(3_000);
+        second_body.push_str(marker);
+        let mut second = src_file("b", "attach", 1, &second_body);
+        second.cite_no = 2;
+        second.path = r"C:\docs\b.txt".into();
+        second.title = "b.txt".into();
+        second.paragraph_id.clear();
+        let mut saw = false;
+        for budget in [280usize, 320, 360, 420, 480, 560] {
+            let (turns, _) = assemble_turns(
+                "役割",
+                &[first.clone(), second.clone()],
+                &[msg("u1", "user", "見て")],
+                budget,
+            );
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            if !user.content.contains("[2]") || user.content.contains(marker) {
+                continue;
+            }
+            saw = true;
+            assert!(
+                user.content.contains("続きは start=") || user.content.contains("文字のみ"),
+                "budget {budget} emptied [2] without a re-read notice: {}",
+                user.content
+            );
+        }
+        assert!(saw, "no budget left the second attachment without its marker");
     }
 
     #[test]

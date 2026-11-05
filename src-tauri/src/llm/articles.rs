@@ -65,7 +65,7 @@ pub fn article_spans(text: &str) -> Vec<ArticleSpan> {
         let logical = strip_hashes(trimmed.trim_end());
         if let Some(part) = boundary_part(&logical) {
             boundaries.push(at);
-            region = Some(part.to_string());
+            region = Some(part);
         } else if let Some(no) = article_no_at_line_start(trimmed) {
             let mut start = at;
             if let Some((prev_at, prev_text)) = &prev {
@@ -236,22 +236,35 @@ fn strip_hashes(line: &str) -> String {
     s.to_string()
 }
 
-fn boundary_part(line: &str) -> Option<&'static str> {
+fn boundary_part(line: &str) -> Option<String> {
     let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact == "附則" || compact == "附則。" {
-        return Some("附則");
+    if compact.starts_with("附則") {
+        return Some("附則".into());
     }
-    if compact == "別紙"
-        || compact == "（別紙）"
-        || compact == "(別紙)"
-        || (compact.starts_with("別紙") && compact.chars().count() <= 4)
-    {
-        return Some("別紙");
+    if compact == "別紙" || compact == "（別紙）" || compact == "(別紙)" {
+        return Some("別紙".into());
+    }
+    if let Some(rest) = compact.strip_prefix("別紙") {
+        let id: String = rest.chars().take_while(|c| is_exhibit_char(*c)).collect();
+        let after: String = rest.chars().skip(id.chars().count()).collect();
+        if !id.is_empty()
+            && (after.is_empty() || (after.starts_with('（') && after.ends_with('）')))
+        {
+            return Some(format!("別紙{id}"));
+        }
+    }
+    if compact.starts_with("（別紙") && compact.ends_with('）') && compact.chars().count() <= 12 {
+        let inner = compact.trim_start_matches('（').trim_end_matches('）');
+        return Some(inner.to_string());
     }
     if compact == "以上" || compact == "以上。" || compact == "（以上）" {
-        return Some("以上");
+        return Some("以上".into());
     }
     None
+}
+
+fn is_exhibit_char(c: char) -> bool {
+    c.is_ascii_digit() || ('０'..='９').contains(&c)
 }
 
 fn is_standalone_caption(line: &str) -> bool {
@@ -391,6 +404,9 @@ fn starts_with_cross_ref(after: &str) -> bool {
     let after = after.trim_start();
     if after.is_empty() {
         return false;
+    }
+    if after.starts_with('、') || after.starts_with('，') || after.starts_with(',') {
+        return true;
     }
     if item_provision_ref(after) {
         return true;
@@ -809,5 +825,83 @@ mod tests {
         assert!(fifth.text.contains("に定める場合を除く"), "{}", fifth.text);
         assert!(spans.iter().all(|span| span.no.main != 6), "{spans:?}");
         assert!(article_spans("第6条（解除）に定める場合を除く。\n").is_empty());
+    }
+
+    #[test]
+    fn survival_clause_listing_titles_is_not_a_new_article() {
+        let text = "\
+第4条（終了）
+本契約が終了したときも、次の条は残る。
+第5条（秘密保持）、第8条（損害賠償）及び本条の規定は、本契約終了後も有効に存続する。
+";
+        let spans = article_spans(text);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].no.main, 4);
+        assert!(spans[0].text.contains("存続する"));
+        assert!(spans.iter().all(|span| span.display_label() != "第5条"));
+        let labels = available_labels(&spans);
+        assert!(!labels.contains(&"第5条".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn dated_supplement_is_a_boundary_with_or_without_a_following_article() {
+        let with_article = "\
+第2条（終了）
+終了の本文。
+附則（令和2年4月1日施行）
+第1条（施行）
+施行の本文。
+";
+        let spans = article_spans(with_article);
+        assert!(
+            !spans.iter().any(|span| span.no.main == 2 && span.text.contains("施行の本文")),
+            "{spans:?}"
+        );
+        assert!(!spans[0].text.contains("附則"), "{}", spans[0].text);
+        let supplement = spans.iter().find(|span| span.no.main == 1).expect("附則の第1条");
+        assert_eq!(supplement.display_label(), "第1条（附則）");
+        assert!(supplement.text.contains("施行の本文"));
+
+        let bare = "\
+第2条（終了）
+終了の本文。
+附則（令和2年4月1日施行）
+この附則は公布の日から施行する。
+";
+        let spans = article_spans(bare);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!(!spans[0].text.contains("公布"), "{}", spans[0].text);
+        assert!(!spans[0].text.contains("附則"), "{}", spans[0].text);
+    }
+
+    #[test]
+    fn numbered_exhibits_keep_separate_labels() {
+        let text = "\
+第1条（本則）
+本則の本文。
+
+別紙1
+第1条（仕様）
+仕様の本文。
+
+別紙2
+第1条（図面）
+図面の本文。
+";
+        let spans = article_spans(text);
+        let labels = available_labels(&spans);
+        assert!(labels.contains(&"第1条".to_string()), "{labels:?}");
+        assert!(labels.contains(&"第1条（別紙1）".to_string()), "{labels:?}");
+        assert!(labels.contains(&"第1条（別紙2）".to_string()), "{labels:?}");
+        assert_eq!(
+            labels.iter().filter(|label| *label == "第1条（別紙）").count(),
+            0,
+            "{labels:?}"
+        );
+        let spec = spans.iter().find(|span| span.text.contains("仕様の本文")).unwrap();
+        let drawing = spans.iter().find(|span| span.text.contains("図面の本文")).unwrap();
+        assert_ne!(spec.display_label(), drawing.display_label());
+        assert!(spec.text.contains("仕様の本文") && !spec.text.contains("図面の本文"));
+        assert!(drawing.text.contains("図面の本文") && !drawing.text.contains("仕様の本文"));
     }
 }
