@@ -595,10 +595,16 @@ fn page_index(pool: &[LlmSourceRow], id: &str) -> Option<PageIndex> {
         })
         .collect();
     siblings.sort_by_key(|source| crate::llm::transcript::parse_pdf_page_no(&source.paragraph_id));
-    let transcript = crate::llm::transcript::transcript_body(&siblings, true);
-    let needle = format!("## {page}ページ目\n\n");
-    let byte = transcript.find(&needle)?;
-    let prefix = transcript[..byte].chars().count() + needle.chars().count();
+    // One page is shown and re-read without `## nページ目`. Two or more keep it.
+    let multi = siblings.len() > 1;
+    let transcript = crate::llm::transcript::transcript_body(&siblings, multi);
+    let prefix = if multi {
+        let needle = format!("## {page}ページ目\n\n");
+        let byte = transcript.find(&needle)?;
+        transcript[..byte].chars().count() + needle.chars().count()
+    } else {
+        0
+    };
     Some(PageIndex {
         prefix,
         total: transcript.chars().count(),
@@ -1335,14 +1341,8 @@ fn full_sources_on_recent_turns(built: &[BuiltTurn]) -> Vec<LlmSourceRow> {
 /// excerpt no longer contains that text. A later trim keeps the claim honest.
 fn restore_recent_rereads(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
     let recent_from = first_recent_index(built);
-    let user_blob: String = built
-        .iter()
-        .filter(|row| row.turn.role == "user")
-        .map(|row| row.turn.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut restored = false;
-    for (index, row) in built.iter_mut().enumerate() {
+    let mut restore_at: Vec<(usize, String)> = Vec::new();
+    for (index, row) in built.iter().enumerate() {
         if index < recent_from || row.turn.role != "tool" {
             continue;
         }
@@ -1356,10 +1356,17 @@ fn restore_recent_rereads(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
         if sample.chars().count() < 8 {
             continue;
         }
-        if user_blob.contains(&sample) || row.turn.content.contains(&sample) {
+        // Only this cite's rendered attachment counts. The new question, and
+        // another source that happens to quote the same ending, do not.
+        let excerpt = excerpt_for_cite(built, &backup);
+        if excerpt.contains(&sample) || row.turn.content.contains(&sample) {
             continue;
         }
-        row.turn.content = backup;
+        restore_at.push((index, backup));
+    }
+    let mut restored = false;
+    for (index, backup) in restore_at {
+        built[index].turn.content = backup;
         restored = true;
     }
     if !restored {
@@ -1386,6 +1393,63 @@ fn restore_recent_rereads(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
         }
     }
     true
+}
+
+fn excerpt_for_cite(built: &[BuiltTurn], backup: &str) -> String {
+    let Some(cite) = first_cite_no(backup) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for row in built.iter().filter(|row| row.turn.role == "user") {
+        let prompt = prompt_without_question(row);
+        let ledger = if row.original_sources.is_empty() {
+            &row.sources
+        } else {
+            &row.original_sources
+        };
+        let spans = emitted_header_spans(prompt, ledger);
+        for (index, (found, _line_start, line_end)) in spans.iter().enumerate() {
+            if *found != cite {
+                continue;
+            }
+            let entry_end = spans
+                .get(index + 1)
+                .map(|(_, next, _)| *next)
+                .unwrap_or(prompt.len());
+            if *line_end <= entry_end && entry_end <= prompt.len() {
+                out.push_str(&prompt[*line_end..entry_end]);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn prompt_without_question(row: &BuiltTurn) -> &str {
+    let content = row.turn.content.as_str();
+    if row.question.is_empty() {
+        return content;
+    }
+    let suffix = format!("【質問】\n{}", row.question);
+    content.strip_suffix(&suffix).unwrap_or(content)
+}
+
+fn first_cite_no(content: &str) -> Option<i64> {
+    for line in content.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some((num, _)) = rest.split_once(']') else {
+            continue;
+        };
+        if let Ok(n) = num.parse::<i64>() {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn reread_body_sample(content: &str) -> String {
@@ -2896,6 +2960,124 @@ mod tests {
             );
         }
         assert!(saw, "no budget both showed the opening and restored 第8条");
+    }
+
+    #[test]
+    fn quoting_the_ending_does_not_drop_that_cites_reread() {
+        let ending = "ただし、乙の故意又は重大な過失による場合はこの限りでない。";
+        let article = format!("{}{ending}", "償".repeat(560));
+        let body = format!("第1条（目的）\n{}\n\n第8条（賠償）\n{article}\n", "前".repeat(4_000));
+        let mut file = src_file("big", "attach", 0, &body);
+        file.cite_no = 1;
+        file.path = r"C:\docs\契約.txt".into();
+        file.title = "契約.txt".into();
+        file.paragraph_id.clear();
+        file.injected_user_message_id = "u1".into();
+        let tool_body = format!(
+            "【出典】\n[1] 契約.txt — C:\\docs\\契約.txt\n［再読］第8条。1文字目から{}文字目。全{}文字\n{article}\n",
+            article.chars().count(),
+            article.chars().count()
+        );
+        let mut assistant = msg("a1", "assistant", "第8条です [1]");
+        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        let mut tool = msg("t1", "tool", &tool_body);
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "read_unit".into();
+        let quoted = format!("「{ending}」とはどういう意味ですか");
+        let sample: String = {
+            let compact: String = article.chars().filter(|c| !c.is_whitespace()).collect();
+            let n = compact.chars().count();
+            compact.chars().skip(n.saturating_sub(24)).collect()
+        };
+        let mut saw = false;
+        for budget in (1_500usize..3_600).step_by(200) {
+            let history = vec![
+                msg("u1", "user", "契約を見て"),
+                assistant.clone(),
+                tool.clone(),
+                msg("u2", "user", &quoted),
+            ];
+            let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
+            let Some(user) = turns.iter().find(|turn| turn.content.contains("契約を見て")) else {
+                continue;
+            };
+            let source_part = user.content.split("【質問】").next().unwrap_or("");
+            if source_part.contains(&sample) {
+                continue;
+            }
+            saw = true;
+            let tool_turn = turns.iter().find(|turn| turn.role == "tool");
+            assert!(
+                tool_turn.is_some_and(|turn| {
+                    turn.content.contains("［再読］")
+                        && (turn.content.contains(&sample) || turn.content.contains("続きは"))
+                }),
+                "budget {budget} dropped the re-read because the question quoted its ending: {}",
+                tool_turn.map(|turn| turn.content.as_str()).unwrap_or("")
+            );
+        }
+        assert!(saw, "every budget still showed the ending inside the attachment");
+
+        let mut other = src_file("other", "attach", 1, &format!("別の契約です。{ending}"));
+        other.cite_no = 1;
+        other.path = r"C:\docs\other.txt".into();
+        other.title = "other.txt".into();
+        other.paragraph_id.clear();
+        other.injected_user_message_id = "u1".into();
+        let mut mine = src_file("mine", "attach", 2, "この添付にはただし書がない。");
+        mine.cite_no = 2;
+        mine.path = r"C:\docs\mine.txt".into();
+        mine.title = "mine.txt".into();
+        mine.paragraph_id.clear();
+        mine.injected_user_message_id = "u1".into();
+        let mine_tool = format!(
+            "【出典】\n[2] mine.txt — C:\\docs\\mine.txt\n［再読］第8条。1文字目から{}文字目。全{}文字\n{article}\n",
+            article.chars().count(),
+            article.chars().count()
+        );
+        let mut assistant = msg("a1", "assistant", "比べます [2]");
+        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        let mut tool = msg("t1", "tool", &mine_tool);
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "read_unit".into();
+        let mut saw_other = false;
+        for budget in (1_200usize..3_400).step_by(400) {
+            let history = vec![
+                msg("u1", "user", "二つを見て"),
+                assistant.clone(),
+                tool.clone(),
+                msg("u2", "user", "違いは何ですか"),
+            ];
+            let (turns, _) = assemble_turns("役割", &[other.clone(), mine.clone()], &history, budget);
+            let Some(user) = turns.iter().find(|turn| turn.content.contains("二つを見て")) else {
+                continue;
+            };
+            if !user.content.contains("[1]") || !user.content.contains(&sample) {
+                continue;
+            }
+            let mine_part = user
+                .content
+                .split("【質問】")
+                .next()
+                .unwrap_or("")
+                .split("[2]")
+                .nth(1)
+                .unwrap_or("");
+            if mine_part.contains(&sample) {
+                continue;
+            }
+            saw_other = true;
+            let tool_turn = turns.iter().find(|turn| turn.role == "tool");
+            assert!(
+                tool_turn.is_some_and(|turn| {
+                    turn.content.contains("［再読］")
+                        && (turn.content.contains(&sample) || turn.content.contains("続きは"))
+                }),
+                "budget {budget} let the other cite's excerpt drop this re-read: {}",
+                tool_turn.map(|turn| turn.content.as_str()).unwrap_or("")
+            );
+        }
+        assert!(saw_other, "no budget showed the other cite's copy of the ending");
     }
 
     #[test]

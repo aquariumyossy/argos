@@ -2142,52 +2142,98 @@ fn refit_article_sections(preamble: &str, sections: &[RereadSection], max_chars:
         }
         if let Some((start, _end, total, label)) = parse_article_header(&section.header) {
             let body: Vec<char> = section.body.chars().collect();
-            let mut best = String::new();
+            let mut best: Option<String> = None;
             for k in 0..=body.len() {
-                let end = if k == 0 { start.saturating_sub(1) } else { start + k - 1 };
-                let note = if k == 0 {
-                    format!("［再読］{label}。続きは start={start}")
-                } else if end >= start + total.saturating_sub(1) {
-                    format!("［再読］{label}。{start}文字目から{end}文字目。全{total}文字")
-                } else {
-                    format!(
-                        "［再読］{label}の先頭。{start}文字目から{end}文字目。全{total}文字。続きは start={}",
-                        end.saturating_add(1)
-                    )
-                };
-                let text_body: String = body.iter().take(k).collect();
-                let rendered = format!("{out}{note}\n{text_body}\n");
+                let piece = render_article_piece(&label, start, &body, k, total);
+                let rendered = format!("{out}{piece}");
                 if rendered.chars().count() <= max_chars {
-                    best = rendered;
+                    best = Some(rendered);
                 } else {
                     break;
                 }
             }
-            if !best.is_empty() {
+            if let Some(best) = best {
                 return best;
             }
-            let note = format!("［再読］{label}。続きは start={start}");
-            return fit_notice(out, &note, max_chars);
+            let note = format!("［再読］{label}。続きは start={start}\n");
+            return append_notice_without_lying(out, &note, max_chars);
         }
         break;
     }
     if out.chars().count() > max_chars {
-        out.chars().take(max_chars).collect()
+        append_notice_without_lying(out, "", max_chars)
     } else {
         out
     }
 }
 
-fn fit_notice(preamble: String, note: &str, max_chars: usize) -> String {
-    let note_len = note.chars().count();
-    if preamble.chars().count() + note_len <= max_chars {
-        return format!("{preamble}{note}");
+/// The next article's notice did not fit. Shrink the last accepted article and
+/// rewrite its header, instead of cutting its body while it still claims the full range.
+fn append_notice_without_lying(accepted: String, next_note: &str, max_chars: usize) -> String {
+    let note = if next_note.is_empty() {
+        String::new()
+    } else if accepted.ends_with('\n') {
+        next_note.to_string()
+    } else {
+        format!("\n{next_note}")
+    };
+    let room = max_chars.saturating_sub(note.chars().count());
+    if let Some(shrunk) = shrink_last_article(&accepted, room) {
+        let joined = format!("{shrunk}{note}");
+        if joined.chars().count() <= max_chars {
+            return joined;
+        }
     }
-    if note_len >= max_chars {
-        return note.chars().take(max_chars).collect();
+    if accepted.chars().count() <= max_chars {
+        return accepted;
     }
-    let head: String = preamble.chars().take(max_chars - note_len).collect();
-    format!("{head}{note}")
+    shrink_last_article(&accepted, max_chars)
+        .unwrap_or_else(|| accepted.chars().take(max_chars).collect())
+}
+
+fn shrink_last_article(text: &str, room: usize) -> Option<String> {
+    if room == 0 {
+        return Some(String::new());
+    }
+    let marker_at = text.rfind("［再読］")?;
+    if marker_at > 0 && !text[..marker_at].ends_with('\n') {
+        return None;
+    }
+    let prefix = &text[..marker_at];
+    let section = &text[marker_at..];
+    let (header, body) = section.split_once('\n')?;
+    let (start, _end, total, label) = parse_article_header(header)?;
+    let chars: Vec<char> = body.trim_end().chars().collect();
+    let prefix_len = prefix.chars().count();
+    if prefix_len > room {
+        return None;
+    }
+    let mut best: Option<String> = None;
+    for k in 0..=chars.len() {
+        let piece = render_article_piece(&label, start, &chars, k, total);
+        if prefix_len + piece.chars().count() <= room {
+            best = Some(format!("{prefix}{piece}"));
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+fn render_article_piece(label: &str, start: usize, body: &[char], k: usize, total: usize) -> String {
+    if k == 0 {
+        return format!("［再読］{label}。続きは start={start}\n");
+    }
+    let end = start + k - 1;
+    let text: String = body.iter().take(k).collect();
+    if k >= total {
+        format!("［再読］{label}。{start}文字目から{end}文字目。全{total}文字\n{text}\n")
+    } else {
+        format!(
+            "［再読］{label}の先頭。{start}文字目から{end}文字目。全{total}文字。続きは start={}\n{text}\n",
+            end + 1
+        )
+    }
 }
 
 fn parse_article_header(header: &str) -> Option<(usize, usize, usize, String)> {
@@ -3737,6 +3783,191 @@ mod tests {
         let line = text.lines().find(|line| line.contains("続きは start="))?;
         let digits: String = line
             .split("続きは start=")
+            .nth(1)?
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
+    }
+
+    #[test]
+    fn multi_article_refit_rewrites_a_trimmed_header_and_keeps_the_next_notice_on_its_own_line() {
+        for labels in [
+            vec!["第2条", "第3条", "第5条"],
+            vec!["第6条", "第7条"],
+            vec!["第1条", "第1条（別紙1）"],
+        ] {
+            let mut blocks = String::from("【出典】\n[1] 契約.txt — C:\\docs\\契約.txt\n");
+            let mut start = 1usize;
+            for label in &labels {
+                let body = format!("{}END{label}", "あ".repeat(72));
+                let n = body.chars().count();
+                let end = start + n - 1;
+                blocks.push_str(&format!(
+                    "［再読］{label}。{start}文字目から{end}文字目。全{n}文字\n{body}\n"
+                ));
+                start = end + 1;
+            }
+            // The first article ends at its trailing newline. Cut 8 characters into the next notice.
+            let first_article_end = blocks.match_indices("［再読］").nth(1).map(|(i, _)| i);
+            let cut_at = match first_article_end {
+                Some(next) => blocks[..next].chars().count(),
+                None => blocks.chars().count(),
+            };
+            for extra in [8usize, 0] {
+                let budget = cut_at + extra;
+                let out = refit_reread_text(&blocks, budget).expect("refit");
+                assert!(
+                    out.contains("続きは start="),
+                    "{labels:?} +{extra} dropped the overflow without a continuation: {out}"
+                );
+                assert_reread_claims_are_honest(&out, &format!("{labels:?} +{extra}"));
+            }
+            if labels.len() >= 3 {
+                let third = blocks.match_indices("［再読］").nth(2).map(|(i, _)| i).unwrap();
+                let budget = blocks[..third].chars().count() + 8;
+                let out = refit_reread_text(&blocks, budget).expect("refit third");
+                assert_reread_claims_are_honest(&out, &format!("{labels:?} third"));
+            }
+        }
+    }
+
+    fn assert_reread_claims_are_honest(text: &str, what: &str) {
+        let mut rest = text;
+        while let Some(pos) = rest.find("［再読］") {
+            if pos > 0 {
+                assert!(
+                    rest[..pos].ends_with('\n'),
+                    "{what} glued a notice onto the body: {text}"
+                );
+            }
+            rest = &rest[pos + "［再読］".len()..];
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if !lines[i].starts_with("［再読］") {
+                i += 1;
+                continue;
+            }
+            let header = lines[i];
+            let mut body = String::new();
+            let mut j = i + 1;
+            while j < lines.len() && !lines[j].starts_with("［再読］") {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(lines[j]);
+                j += 1;
+            }
+            if let Some((start, end)) = claimed_range(header) {
+                let delivered = body.chars().count();
+                assert_eq!(
+                    delivered, end - start + 1,
+                    "{what} header claims {start}..={end} but body is {delivered}: {header}"
+                );
+                if !header.contains("続きは") {
+                    assert!(
+                        header.contains(&format!("全{delivered}文字")),
+                        "{what} full claim does not match the body: {header}"
+                    );
+                }
+            } else {
+                assert!(
+                    header.contains("続きは start="),
+                    "{what} empty section has neither a range nor 続きは: {header}"
+                );
+            }
+            i = j;
+        }
+    }
+
+    fn claimed_range(header: &str) -> Option<(usize, usize)> {
+        let (start_s, rest) = header.split_once("文字目から")?;
+        let start: usize = start_s
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        let end: usize = rest.split("文字目").next()?.parse().ok()?;
+        Some((start, end))
+    }
+
+    #[test]
+    fn one_page_scan_start_does_not_skip_the_heading_that_is_not_shown() {
+        let (dir, db, thread) = temp_db("one-page");
+        let page = format!("{}MARK{}", "甲".repeat(400), "甲".repeat(2_000));
+        let row = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                r"C:\docs\one.pdf",
+                "one.pdf",
+                "pdf-page:1",
+                &page,
+                "",
+                "file",
+                "image",
+                "",
+                "",
+                None,
+            )
+            .unwrap()
+            .0;
+        let history = vec![crate::db::LlmMessageRow {
+            id: "u1".into(),
+            thread_id: thread.id.clone(),
+            role: "user".into(),
+            content: "読んで".into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+        }];
+        let mut saw = false;
+        for budget in [400usize, 600, 800, 1_000, 1_400] {
+            let (turns, _) =
+                crate::llm::context::assemble_turns("役割", &[row.clone()], &history, budget);
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            if user.content.contains("MARK") || !user.content.contains("このページは先頭") {
+                continue;
+            }
+            let start = notice_start(&user.content).expect("start");
+            let shown = shown_page_chars(&user.content).expect("shown");
+            assert_eq!(
+                start as usize, shown + 1,
+                "budget {budget} advertised start={start} shown={shown}: {}",
+                user.content.chars().rev().take(80).collect::<String>()
+            );
+            assert!(
+                user.content.contains(&format!("書き起こし全{}文字", page.chars().count())),
+                "{}",
+                user.content
+            );
+            saw = true;
+            let exec = read_saved_selection(
+                &db,
+                &thread.id,
+                row.cite_no,
+                &json!({"start": start, "end": start + 20}),
+            );
+            let expect: String = page.chars().skip(shown).take(8).collect();
+            assert!(
+                exec.content.contains(&expect),
+                "start={start} expected {expect}: {}",
+                exec.content.chars().take(180).collect::<String>()
+            );
+        }
+        assert!(saw, "no budget shortened the single page");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn shown_page_chars(text: &str) -> Option<usize> {
+        let line = text.lines().find(|line| line.contains("このページは先頭"))?;
+        let digits: String = line
+            .split("このページは先頭")
             .nth(1)?
             .chars()
             .take_while(|c| c.is_ascii_digit())

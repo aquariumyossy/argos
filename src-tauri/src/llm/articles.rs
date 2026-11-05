@@ -238,7 +238,7 @@ fn strip_hashes(line: &str) -> String {
 
 fn boundary_part(line: &str) -> Option<String> {
     let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact.starts_with("附則") {
+    if is_supplement_heading(&compact) {
         return Some("附則".into());
     }
     if compact == "別紙" || compact == "（別紙）" || compact == "(別紙)" {
@@ -265,6 +265,20 @@ fn boundary_part(line: &str) -> Option<String> {
 
 fn is_exhibit_char(c: char) -> bool {
     c.is_ascii_digit() || ('０'..='９').contains(&c)
+}
+
+/// A supplement heading, not a sentence that merely mentions 附則.
+/// `附則`, `附則。`, `附　則`, and `附則（令和2年4月1日施行）` are headings.
+/// `附則に…` and `附則第2条の規定に…` stay in the current article.
+fn is_supplement_heading(compact: &str) -> bool {
+    let Some(rest) = compact.strip_prefix("附則") else {
+        return false;
+    };
+    let rest = rest.trim_end_matches('。');
+    if rest.is_empty() {
+        return true;
+    }
+    is_standalone_caption(rest)
 }
 
 fn is_standalone_caption(line: &str) -> bool {
@@ -903,5 +917,44 @@ mod tests {
         assert_ne!(spec.display_label(), drawing.display_label());
         assert!(spec.text.contains("仕様の本文") && !spec.text.contains("図面の本文"));
         assert!(drawing.text.contains("図面の本文") && !drawing.text.contains("仕様の本文"));
+    }
+
+    #[test]
+    fn a_sentence_that_starts_with_supplement_stays_in_the_article() {
+        let text = "\
+第8条（損害賠償）
+甲は損害を賠償する。
+附則に別段の定めがある場合を除く。
+乙は遅延損害金を支払う。
+第9条（解除）
+解除できる。
+";
+        let spans = article_spans(text);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_eq!(spans[0].display_label(), "第8条");
+        assert!(spans[0].text.contains("附則に別段の定めがある場合を除く。"), "{}", spans[0].text);
+        assert!(spans[0].text.contains("乙は遅延損害金を支払う。"), "{}", spans[0].text);
+        assert_eq!(spans[1].display_label(), "第9条", "{spans:?}");
+        assert!(!spans[1].display_label().contains("附則"));
+        let cross = "\
+第8条（損害賠償）
+甲は損害を賠償する。
+附則第2条の規定にかかわらず、乙は支払う。
+第9条（解除）
+解除できる。
+";
+        let spans = article_spans(cross);
+        assert!(spans[0].text.contains("附則第2条の規定にかかわらず"), "{spans:?}");
+        assert_eq!(spans.last().unwrap().display_label(), "第9条");
+        for heading in ["附則", "附則。", "附　則", "## 附則"] {
+            let sample = format!("第2条（終了）\n終了。\n{heading}\n第1条（施行）\n施行の本文。\n");
+            let spans = article_spans(&sample);
+            assert_eq!(
+                spans.iter().find(|span| span.no.main == 1).map(|span| span.display_label()),
+                Some("第1条（附則）".into()),
+                "{heading}: {spans:?}"
+            );
+            assert!(!spans[0].text.contains("施行の本文"), "{heading}");
+        }
     }
 }
