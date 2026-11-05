@@ -225,13 +225,28 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
             "function": {
                 "name": TOOL_READ,
                 "description": "段落の本文を読む。既読 [n] の原文は cite_no に n を渡すと、この会話に保存された本文を読む。\
+添付された契約書などの文書について答えるときは、根拠にする条を articles で指定し、答える前に読み直す。\
+条の見出しが無い文書は start と end で文字範囲を指定する。articles も範囲も省略すると保存された全文を返す。\
 出典に (paragraph_id: ...) と示された段落や、末尾が […] で切れている出典の続きは paragraph_id で索引から読む。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "cite_no": {
                             "type": "integer",
-                            "description": "出典番号 [n]。既読スタブの原文をこの会話の保存分から読み直す。"
+                            "description": "出典番号 [n]。既読スタブや添付の原文を、この会話の保存分から読み直す。"
+                        },
+                        "articles": {
+                            "type": "array",
+                            "description": "読み直す条番号。例: [6, 7]。第6条の2 は \"6の2\"。文書にある条だけを原文のまま、文書の順で返す。無い番号では、ある条番号の一覧を返す。",
+                            "items": { "description": "条番号。6 または \"6の2\"。" }
+                        },
+                        "start": {
+                            "type": "integer",
+                            "description": "文字範囲の開始（1文字目から、含む）。条の見出しが無い文書で使う。保存された本文の文字数で数える。"
+                        },
+                        "end": {
+                            "type": "integer",
+                            "description": "文字範囲の終了（含む）。省略すると末尾まで。"
                         },
                         "paragraph_id": {
                             "type": "string",
@@ -1639,9 +1654,26 @@ fn arg_i64(value: Option<&serde_json::Value>) -> Option<i64> {
 
 /// Re-read a source already stored on this thread. Does not allocate a citation number.
 pub fn read_saved_cite(db: &crate::db::Db, thread_id: &str, cite_no: i64) -> ToolExec {
+    read_saved_selection(db, thread_id, cite_no, &json!({}))
+}
+
+/// `cite_no` plus optional `articles` or `start`/`end`. Omitting both returns the saved text.
+///
+/// Article and range slices are returned whole. The caller applies the tool-result
+/// budget (`fit_tool_text`) the same way as a full re-read.
+fn read_saved_selection(
+    db: &crate::db::Db,
+    thread_id: &str,
+    cite_no: i64,
+    args: &Value,
+) -> ToolExec {
     if cite_no <= 0 {
         return ToolExec::text("出典番号が不正です。");
     }
+    let articles = match parse_article_args(args.get("articles")) {
+        Ok(articles) => articles,
+        Err(message) => return ToolExec::text(message),
+    };
     let rows = match db.list_llm_sources_by_cite(thread_id, cite_no) {
         Ok(rows) => rows,
         Err(e) => return ToolExec::text(format!("出典を読めません: {e}")),
@@ -1654,10 +1686,232 @@ pub fn read_saved_cite(db: &crate::db::Db, thread_id: &str, cite_no: i64) -> Too
         .filter(|row| row.is_pending())
         .map(|row| (row.id.clone(), row.cite_no))
         .collect();
+    if !articles.is_empty() {
+        return read_saved_articles(cite_no, &rows, &articles, consumed);
+    }
+    if args.get("start").is_some() || args.get("end").is_some() {
+        return read_saved_range(cite_no, &rows, args, consumed);
+    }
     ToolExec {
         content: format_sources(&rows),
         consumed,
         wrote_note_id: None,
+    }
+}
+
+fn parse_article_args(value: Option<&Value>) -> Result<Vec<crate::llm::articles::ArticleNo>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let items: Vec<&Value> = match value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let token = article_item_token(item)?;
+        if token.trim().is_empty() {
+            continue;
+        }
+        let Some(no) = crate::llm::articles::parse_article_token(&token) else {
+            return Err(format!(
+                "条番号として読めません: {token}。6 や \"6の2\" のように指定してください。"
+            ));
+        };
+        if !out.contains(&no) {
+            out.push(no);
+        }
+    }
+    Ok(out)
+}
+
+fn article_item_token(value: &Value) -> Result<String, String> {
+    if let Some(n) = value.as_i64() {
+        if n <= 0 {
+            return Err(format!(
+                "条番号として読めません: {n}。1 以上の条を指定してください。"
+            ));
+        }
+        return Ok(n.to_string());
+    }
+    if let Some(n) = value.as_u64() {
+        if n == 0 || n > u32::MAX as u64 {
+            return Err(format!(
+                "条番号として読めません: {n}。1 以上の条を指定してください。"
+            ));
+        }
+        return Ok(n.to_string());
+    }
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_string());
+    }
+    Err("条番号は整数か文字列で指定してください。".into())
+}
+
+fn saved_plain_text(rows: &[LlmSourceRow]) -> String {
+    rows.iter()
+        .map(|row| row.body.trim())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn format_saved_body(row: &LlmSourceRow, body: &str) -> String {
+    let mut shown = row.clone();
+    shown.body = body.to_string();
+    format_sources(std::slice::from_ref(&shown))
+}
+
+fn finish_read(content: impl Into<String>, consumed: Vec<(String, i64)>) -> ToolExec {
+    ToolExec {
+        content: content.into(),
+        consumed,
+        wrote_note_id: None,
+    }
+}
+
+fn read_saved_articles(
+    cite_no: i64,
+    rows: &[LlmSourceRow],
+    articles: &[crate::llm::articles::ArticleNo],
+    consumed: Vec<(String, i64)>,
+) -> ToolExec {
+    let text = saved_plain_text(rows);
+    if text.is_empty() {
+        return finish_read(format!("出典 [{cite_no}] の本文は空です。"), consumed);
+    }
+    let spans = crate::llm::articles::article_spans(&text);
+    if spans.is_empty() {
+        return finish_read(
+            format!(
+                "出典 [{cite_no}] に条の見出し（第n条）がありません。start と end で文字範囲を指定してください（1文字目から、end は含みます。全{}文字）。",
+                text.chars().count()
+            ),
+            consumed,
+        );
+    }
+    let present: HashSet<_> = spans.iter().map(|span| span.no).collect();
+    let missing: Vec<_> = articles
+        .iter()
+        .copied()
+        .filter(|no| !present.contains(no))
+        .collect();
+    let found: Vec<_> = spans
+        .iter()
+        .filter(|span| articles.contains(&span.no))
+        .collect();
+    let available = crate::llm::articles::available_labels(&spans).join("、");
+    if found.is_empty() {
+        let missing_labels = missing
+            .iter()
+            .map(|no| no.label())
+            .collect::<Vec<_>>()
+            .join("、");
+        return finish_read(
+            format!("出典 [{cite_no}] に{missing_labels}はありません。ある条番号: {available}。"),
+            consumed,
+        );
+    }
+    let mut content = String::new();
+    if !missing.is_empty() {
+        let missing_labels = missing
+            .iter()
+            .map(|no| no.label())
+            .collect::<Vec<_>>()
+            .join("、");
+        content.push_str(&format!(
+            "出典 [{cite_no}] に{missing_labels}はありません。ある条番号: {available}。\n"
+        ));
+    }
+    let mut labels = Vec::new();
+    for span in &found {
+        let label = span.no.label();
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let body = found
+        .iter()
+        .map(|span| span.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    content.push_str(&format_saved_body(
+        &rows[0],
+        &format!("（{}）\n{body}", labels.join("、")),
+    ));
+    finish_read(content, consumed)
+}
+
+fn read_saved_range(
+    cite_no: i64,
+    rows: &[LlmSourceRow],
+    args: &Value,
+    consumed: Vec<(String, i64)>,
+) -> ToolExec {
+    let text = saved_plain_text(rows);
+    if text.is_empty() {
+        return finish_read(format!("出典 [{cite_no}] の本文は空です。"), consumed);
+    }
+    let start = match optional_char_pos(args.get("start"), "start") {
+        Ok(Some(start)) => start,
+        Ok(None) => 1,
+        Err(message) => return finish_read(message, consumed),
+    };
+    let end = match optional_char_pos(args.get("end"), "end") {
+        Ok(end) => end,
+        Err(message) => return finish_read(message, consumed),
+    };
+    match crate::llm::articles::char_range(&text, start, end) {
+        Ok(range) => {
+            let note = if range.clamped {
+                format!(
+                    "（{}文字目から{}文字目まで。指定した終了位置は全{}文字を超えていたため末尾まで）",
+                    range.start, range.end, range.len
+                )
+            } else {
+                format!("（{}文字目から{}文字目）", range.start, range.end)
+            };
+            finish_read(
+                format_saved_body(&rows[0], &format!("{note}\n{}", range.text)),
+                consumed,
+            )
+        }
+        Err(err) => finish_read(char_range_message(err), consumed),
+    }
+}
+
+fn optional_char_pos(value: Option<&Value>, name: &str) -> Result<Option<usize>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(n) = arg_i64(Some(value)) else {
+        return Err(format!(
+            "{name} は 1 以上の文字位置です（1文字目から数えます）。"
+        ));
+    };
+    if n < 1 {
+        return Err(format!(
+            "{name} は 1 以上の文字位置です（1文字目から数えます）。"
+        ));
+    }
+    let n = usize::try_from(n).map_err(|_| format!("{name} が大きすぎます。"))?;
+    Ok(Some(n))
+}
+
+fn char_range_message(err: crate::llm::articles::CharRangeError) -> String {
+    use crate::llm::articles::CharRangeError;
+    match err {
+        CharRangeError::Start => "start は 1 以上の文字位置です（1文字目から数えます）。".into(),
+        CharRangeError::Order => "end は start 以上にしてください。".into(),
+        CharRangeError::PastEnd { len } => {
+            format!("start が文書の長さ（{len}文字）を超えています。")
+        }
     }
 }
 
@@ -1963,8 +2217,18 @@ fn execute_tool_inner(
             })
         }
         TOOL_READ => {
-            if let Some(cite_no) = arg_i64(args.get("cite_no")).filter(|n| *n > 0) {
-                return Ok(read_saved_cite(&state.db, thread_id, cite_no));
+            let cite_no = arg_i64(args.get("cite_no")).filter(|n| *n > 0);
+            let wants_saved = cite_no.is_some()
+                || args.get("articles").is_some()
+                || args.get("start").is_some()
+                || args.get("end").is_some();
+            if wants_saved {
+                let Some(cite_no) = cite_no else {
+                    return Ok(ToolExec::text(
+                        "cite_no に出典番号 [n] を指定してください。",
+                    ));
+                };
+                return Ok(read_saved_selection(&state.db, thread_id, cite_no, &args));
             }
             let paragraph_id = args
                 .get("paragraph_id")
@@ -2607,6 +2871,11 @@ mod tests {
         let schema = tools_schema(false, false, false).to_string();
         assert!(schema.contains("cite_no"), "{schema}");
         assert!(schema.contains("既読"), "{schema}");
+        assert!(schema.contains("articles"), "{schema}");
+        assert!(schema.contains("6の2"), "{schema}");
+        assert!(schema.contains("答える前に読み直す"), "{schema}");
+        assert!(schema.contains("文字範囲の開始"), "{schema}");
+        assert!(schema.contains("文字範囲の終了"), "{schema}");
     }
 
     #[test]
@@ -2673,6 +2942,197 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn temp_db(name: &str) -> (std::path::PathBuf, crate::db::Db, crate::db::LlmThreadRow) {
+        let dir = std::env::temp_dir().join(format!("argos-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        let thread = db.create_llm_thread("t", true).unwrap();
+        (dir, db, thread)
+    }
+
+    fn attach_text(db: &crate::db::Db, thread_id: &str, body: &str) -> crate::db::LlmSourceRow {
+        db.insert_llm_source_full(
+            thread_id,
+            "attach",
+            r"C:\docs\契約書.txt",
+            "契約書.txt",
+            "",
+            body,
+            "",
+            "file",
+            "text",
+            "",
+            "",
+            None,
+        )
+        .unwrap()
+        .0
+    }
+
+    const CONTRACT: &str = "\
+前文。第3条の規定は前文の中にある。
+
+第6条（解除）
+甲は、乙が義務に違反したときは解除できる。
+
+第6条の2（中途解約）
+甲は30日前に通知して解約できる。
+
+第7条（準拠法）
+日本法による。
+";
+
+    #[test]
+    fn read_unit_returns_requested_articles_verbatim_and_lists_missing_ones() {
+        let (dir, db, thread) = temp_db("articles");
+        let row = attach_text(&db, &thread.id, CONTRACT);
+        let whole = read_saved_selection(&db, &thread.id, row.cite_no, &json!({}));
+        assert!(whole.content.contains("前文。"));
+        assert!(whole.content.contains("日本法による。"));
+        assert!(whole.content.contains("30日前に通知して解約できる。"));
+
+        let spans = crate::llm::articles::article_spans(CONTRACT.trim());
+        let article6 = spans
+            .iter()
+            .find(|span| span.no.main == 6 && span.no.branch.is_none())
+            .unwrap();
+        let both = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [6, 7]}));
+        assert!(both.content.contains(&article6.text), "{}", both.content);
+        assert!(both.content.contains("日本法による。"), "{}", both.content);
+        assert!(!both.content.contains("30日前"), "{}", both.content);
+        assert!(both.content.contains(&format!("[{}]", row.cite_no)), "{}", both.content);
+        assert_eq!(both.consumed, vec![(row.id.clone(), row.cite_no)]);
+
+        let branch = read_saved_selection(
+            &db,
+            &thread.id,
+            row.cite_no,
+            &json!({"articles": ["6の2", "第六条の二"]}),
+        );
+        assert!(branch.content.contains("甲は30日前に通知して解約できる。"), "{}", branch.content);
+        assert!(!branch.content.contains("解除できる"), "{}", branch.content);
+
+        let missing = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [9]}));
+        assert!(missing.content.contains("第9条はありません"), "{}", missing.content);
+        assert!(
+            missing.content.contains("ある条番号: 第6条、第6条の2、第7条。"),
+            "{}",
+            missing.content
+        );
+        assert!(!missing.content.contains("解除できる"), "{}", missing.content);
+
+        let partial = read_saved_selection(
+            &db,
+            &thread.id,
+            row.cite_no,
+            &json!({"articles": [6, 99]}),
+        );
+        assert!(partial.content.contains("第99条はありません"), "{}", partial.content);
+        assert!(partial.content.contains(&article6.text), "{}", partial.content);
+        assert!(!partial.content.contains("30日前"), "{}", partial.content);
+
+        let bad = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": ["解除"]}));
+        assert!(bad.content.contains("条番号として読めません"), "{}", bad.content);
+        assert!(bad.consumed.is_empty(), "{:?}", bad.consumed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_unit_reads_a_character_range_when_the_document_has_no_articles() {
+        let (dir, db, thread) = temp_db("range");
+        let memo = "これは条立てではないメモです。日付は令和2年。";
+        let row = attach_text(&db, &thread.id, memo);
+        let no_articles = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [1]}));
+        assert!(no_articles.content.contains("条の見出し"), "{}", no_articles.content);
+        assert!(no_articles.content.contains("start と end"), "{}", no_articles.content);
+        assert!(
+            no_articles.content.contains(&format!("全{}文字", memo.chars().count())),
+            "{}",
+            no_articles.content
+        );
+        assert!(!no_articles.content.contains("令和2年"), "{}", no_articles.content);
+
+        let range = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 1, "end": 4}));
+        assert!(range.content.contains("これは条"), "{}", range.content);
+        assert!(!range.content.contains("立てではない"), "{}", range.content);
+        assert!(range.content.contains("1文字目から4文字目"), "{}", range.content);
+
+        let tail = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 5}));
+        assert!(tail.content.contains("立てではないメモです。"), "{}", tail.content);
+        assert!(!tail.content.contains("これは条"), "{}", tail.content);
+
+        let clamped = read_saved_selection(
+            &db,
+            &thread.id,
+            row.cite_no,
+            &json!({"start": 1, "end": 1000}),
+        );
+        assert!(clamped.content.contains(memo), "{}", clamped.content);
+        assert!(clamped.content.contains("末尾まで"), "{}", clamped.content);
+
+        let backwards = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 4, "end": 2}));
+        assert!(backwards.content.contains("end は start 以上"), "{}", backwards.content);
+        let past = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 80}));
+        assert!(past.content.contains("文書の長さ"), "{}", past.content);
+        assert!(past.content.contains(&format!("{}文字", memo.chars().count())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_attachment_keeps_the_full_text_so_a_later_article_can_be_reread() {
+        let (dir, db, thread) = temp_db("trunc");
+        let mut body = String::from("第1条（目的）\n");
+        body.push_str(&"甲".repeat(12_000));
+        body.push_str("\n\n");
+        for n in 2..=8 {
+            body.push_str(&format!("第{n}条（第{n}条の見出し）\n第{n}条だけの固有文言。\n\n"));
+        }
+        let row = attach_text(&db, &thread.id, &body);
+        let history = vec![crate::db::LlmMessageRow {
+            id: "u1".into(),
+            thread_id: thread.id.clone(),
+            role: "user".into(),
+            content: "第8条の解除事由は何ですか。".into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+        }];
+        let (turns, stats) = crate::llm::context::assemble_turns(
+            "役割",
+            std::slice::from_ref(&row),
+            &history,
+            1_000,
+        );
+        assert!(stats.truncated);
+        assert!(!stats.question_exceeds);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(user.content.contains(crate::llm::context::ATTACHMENT_REREAD_NOTE), "{}", user.content);
+        assert!(user.content.contains("第1条"), "{}", user.content);
+        assert!(!user.content.contains("第8条だけの固有文言"));
+        let stored = db
+            .list_llm_sources(&thread.id)
+            .unwrap()
+            .into_iter()
+            .find(|source| source.id == row.id)
+            .unwrap();
+        assert_eq!(stored.body, body, "the stored copy stays the full text");
+        let reread = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [8]}));
+        assert!(
+            reread.content.contains("第8条（第8条の見出し）\n第8条だけの固有文言。"),
+            "{}",
+            reread.content
+        );
+        assert!(!reread.content.contains("第7条だけの固有文言"), "{}", reread.content);
+        assert!(!reread.content.contains(&"甲".repeat(12_000)));
+        let whole = read_saved_cite(&db, &thread.id, row.cite_no);
+        assert!(whole.content.contains("第8条だけの固有文言"));
+        assert!(whole.content.contains(&"甲".repeat(100)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn arg_i64_reads_numbers_and_numeric_strings() {
         assert_eq!(arg_i64(Some(&json!(12))), Some(12));
@@ -2693,7 +3153,7 @@ mod tests {
             tool_schema_tokens(&tools_schema(true, false, true)),
         ];
         // src/features/chat/contextEstimate.ts TOOL_SCHEMA_TOKENS, same order.
-        let expected = [2105, 2357, 2150, 2402, 2112, 2365];
+        let expected = [2384, 2637, 2429, 2682, 2392, 2644];
         assert_eq!(actual, expected, "update TOOL_SCHEMA_TOKENS to {actual:?}");
     }
 

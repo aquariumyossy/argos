@@ -12,7 +12,7 @@ fn is_unit(c: char) -> bool {
     matches!(c, '条' | '項' | '号' | '編' | '章' | '節' | '款' | '目')
 }
 
-fn is_numeral_char(c: char) -> bool {
+pub(crate) fn is_numeral_char(c: char) -> bool {
     c.is_ascii_digit()
         || ('０'..='９').contains(&c)
         || matches!(

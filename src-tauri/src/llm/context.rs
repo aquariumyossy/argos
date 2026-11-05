@@ -519,6 +519,31 @@ pub(crate) fn cap_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Shown when a pending attachment is cut to a head for this request.
+/// The stored body is left whole, so `read_unit` can still reach the rest.
+pub(crate) const ATTACHMENT_REREAD_NOTE: &str =
+    "…（先頭のみ。続きは read_unit に cite_no と articles、または start と end を指定して読み直せます）";
+
+/// Head of `full` that fits in `max_chars`. A cut excerpt ends with
+/// [`ATTACHMENT_REREAD_NOTE`] when that note fits.
+pub(crate) fn attachment_excerpt(full: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let full_len = char_len(full);
+    if full_len <= max_chars {
+        return full.to_string();
+    }
+    let note_len = char_len(ATTACHMENT_REREAD_NOTE);
+    if max_chars < note_len {
+        return cap_chars(full, max_chars);
+    }
+    let take = max_chars - note_len;
+    let mut out: String = full.chars().take(take).collect();
+    out.push_str(ATTACHMENT_REREAD_NOTE);
+    out
+}
+
 fn cite_no_of(s: &LlmSourceRow) -> i64 {
     s.cite_no
 }
@@ -786,7 +811,7 @@ fn fit_pending_prefix(rows: &mut [LlmSourceRow], idx: usize, pool: &[LlmSourceRo
         rows[idx].body = if mid == 0 {
             String::new()
         } else {
-            cap_chars(&full, mid)
+            attachment_excerpt(&full, mid)
         };
         let fits = char_len(&format_sources_with_pool(rows, pool)) <= budget;
         if fits {
@@ -807,7 +832,7 @@ fn fit_pending_prefix(rows: &mut [LlmSourceRow], idx: usize, pool: &[LlmSourceRo
     rows[idx].body = if best == 0 {
         String::new()
     } else {
-        cap_chars(&full, best)
+        attachment_excerpt(&full, best)
     };
 }
 
@@ -1398,12 +1423,21 @@ fn shrink_unsent_attachment(
         else {
             break;
         };
+        let source_id = built[turn_idx].sources[src_idx].id.clone();
+        // Halve what is on screen, but take the characters from the original text
+        // so a previous re-read note is not cut in half.
+        let full = built[turn_idx]
+            .original_sources
+            .iter()
+            .find(|source| source.id == source_id)
+            .map(|source| source.body.clone())
+            .unwrap_or_else(|| built[turn_idx].sources[src_idx].body.clone());
         let len = char_len(&built[turn_idx].sources[src_idx].body);
         let next = len / 2;
         built[turn_idx].sources[src_idx].body = if next == 0 {
             String::new()
         } else {
-            cap_chars(&built[turn_idx].sources[src_idx].body, next)
+            attachment_excerpt(&full, next)
         };
         drop_empty_image_pages(&mut built[turn_idx].sources);
         let question = built[turn_idx].question.clone();
@@ -2537,6 +2571,25 @@ mod tests {
             user.content.chars().take(240).collect::<String>()
         );
         assert!(!user.content.contains("既読 [5]"), "{}", user.content);
+        assert!(
+            user.content.contains(ATTACHMENT_REREAD_NOTE),
+            "a cut attachment must say the rest can be re-read"
+        );
+    }
+
+    #[test]
+    fn attachment_that_fits_is_not_marked_for_reread() {
+        let body = "第1条（目的）\n短い契約。";
+        let mut file = src_file("f", "attach", 0, body);
+        file.cite_no = 1;
+        file.path = r"C:\docs\a.txt".into();
+        file.title = "a.txt".into();
+        file.paragraph_id.clear();
+        let (turns, stats) = assemble_turns("役割", &[file], &[msg("u1", "user", "見て")], 8_000);
+        assert!(!stats.truncated);
+        let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+        assert!(user.content.contains(body), "{}", user.content);
+        assert!(!user.content.contains(ATTACHMENT_REREAD_NOTE), "{}", user.content);
     }
 
     #[test]
