@@ -25,38 +25,104 @@ impl ArticleNo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticleSpan {
     pub no: ArticleNo,
-    /// Exact slice of the saved text, from this heading through the line before the next.
+    /// 附則 / 別紙 / 以上, or a later duplicate of the same number (`2`).
+    pub part: Option<String>,
+    /// Exact slice of the saved text. A caption line `（…）` immediately above the heading is included.
     pub text: String,
+    /// 1-based character index of `text` in the indexed document.
+    pub start_char: usize,
 }
 
-/// Article headings in document order. The text of each span is a substring of `text`.
+impl ArticleSpan {
+    pub fn display_label(&self) -> String {
+        match &self.part {
+            Some(part) => format!("{}（{part}）", self.no.label()),
+            None => self.no.label(),
+        }
+    }
+}
+
+struct Mark {
+    start: usize,
+    no: ArticleNo,
+    part: Option<String>,
+}
+
+/// Article headings in document order. Each span is a substring of `text`.
+/// A line that is only `附則`, `別紙`, or `以上` ends the previous article and
+/// does not become part of its body. The same article number later in the
+/// document keeps its own span and label.
 pub fn article_spans(text: &str) -> Vec<ArticleSpan> {
-    let mut marks: Vec<(usize, ArticleNo)> = Vec::new();
+    let mut marks: Vec<Mark> = Vec::new();
+    let mut boundaries: Vec<usize> = Vec::new();
+    let mut region: Option<String> = None;
     let mut offset = 0usize;
+    let mut prev: Option<(usize, String)> = None;
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
         let lead = line.len() - trimmed.len();
-        if let Some(no) = article_no_at_line_start(trimmed) {
-            marks.push((offset + lead, no));
+        let at = offset + lead;
+        let logical = strip_hashes(trimmed.trim_end());
+        if let Some(part) = boundary_part(&logical) {
+            boundaries.push(at);
+            region = Some(part.to_string());
+        } else if let Some(no) = article_no_at_line_start(trimmed) {
+            let mut start = at;
+            if let Some((prev_at, prev_text)) = &prev {
+                if is_standalone_caption(prev_text) {
+                    start = *prev_at;
+                }
+            }
+            marks.push(Mark {
+                start,
+                no,
+                part: region.clone(),
+            });
+        }
+        if !logical.is_empty() {
+            prev = Some((at, logical));
         }
         offset += line.len();
     }
     let mut out = Vec::with_capacity(marks.len());
-    for (index, (start, no)) in marks.iter().enumerate() {
-        let end = marks
-            .get(index + 1)
-            .map(|(next, _)| *next)
-            .unwrap_or(text.len());
-        let slice = text[*start..end].trim_end();
+    for (index, mark) in marks.iter().enumerate() {
+        let next_mark = marks.get(index + 1).map(|next| next.start);
+        let next_boundary = boundaries.iter().copied().find(|at| *at > mark.start);
+        let end = match (next_mark, next_boundary) {
+            (Some(mark_at), Some(boundary_at)) => mark_at.min(boundary_at),
+            (Some(mark_at), None) => mark_at,
+            (None, Some(boundary_at)) => boundary_at,
+            (None, None) => text.len(),
+        };
+        if end <= mark.start || !text.is_char_boundary(mark.start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let slice = text[mark.start..end].trim_end();
         if slice.is_empty() {
             continue;
         }
         out.push(ArticleSpan {
-            no: *no,
+            no: mark.no,
+            part: mark.part.clone(),
             text: slice.to_string(),
+            start_char: text[..mark.start].chars().count() + 1,
         });
     }
+    disambiguate_duplicate_numbers(&mut out);
     out
+}
+
+fn disambiguate_duplicate_numbers(spans: &mut [ArticleSpan]) {
+    for index in 0..spans.len() {
+        if spans[index].part.is_some() {
+            continue;
+        }
+        let no = spans[index].no;
+        let earlier = spans[..index].iter().filter(|span| span.no == no).count();
+        if earlier > 0 {
+            spans[index].part = Some((earlier + 1).to_string());
+        }
+    }
 }
 
 /// `6`, `6の2`, `第6条の2`, `第六条の二`, `第６条の２`.
@@ -150,12 +216,69 @@ pub fn char_range(
 pub fn available_labels(spans: &[ArticleSpan]) -> Vec<String> {
     let mut out = Vec::new();
     for span in spans {
-        let label = span.no.label();
+        let label = span.display_label();
         if !out.contains(&label) {
             out.push(label);
         }
     }
     out
+}
+
+fn strip_hashes(line: &str) -> String {
+    let mut s = line.trim();
+    loop {
+        if let Some(rest) = s.strip_prefix('#') {
+            s = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    s.to_string()
+}
+
+fn boundary_part(line: &str) -> Option<&'static str> {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact == "附則" || compact == "附則。" {
+        return Some("附則");
+    }
+    if compact == "別紙"
+        || compact == "（別紙）"
+        || compact == "(別紙)"
+        || (compact.starts_with("別紙") && compact.chars().count() <= 4)
+    {
+        return Some("別紙");
+    }
+    if compact == "以上" || compact == "以上。" || compact == "（以上）" {
+        return Some("以上");
+    }
+    None
+}
+
+fn is_standalone_caption(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let (open, close) = if s.starts_with('（') && s.ends_with('）') {
+        ('（', '）')
+    } else if s.starts_with('(') && s.ends_with(')') {
+        ('(', ')')
+    } else {
+        return false;
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut depth = 0i32;
+    for (index, c) in chars.iter().enumerate() {
+        if *c == open {
+            depth += 1;
+        } else if *c == close {
+            depth -= 1;
+            if depth == 0 {
+                return index + 1 == chars.len() && s.chars().count() <= 42;
+            }
+        }
+    }
+    false
 }
 
 fn article_no_at_line_start(line: &str) -> Option<ArticleNo> {
@@ -230,33 +353,78 @@ fn is_heading_tail(tail: &str) -> bool {
     false
 }
 
-/// Text after a short `（見出し）` / `(heading)`, when the tail begins with one.
+/// Text after a `（見出し）` whose closer is the matching outer paren.
 fn title_remainder(tail: &str) -> Option<&str> {
     let (open, close) = if tail.starts_with('（') {
-        ("（", "）")
+        ('（', '）')
     } else if tail.starts_with('(') {
-        ("(", ")")
+        ('(', ')')
     } else {
         return None;
     };
-    let rest = tail.get(open.len()..)?;
-    let end = rest.find(close)?;
-    let inner = &rest[..end];
-    if inner.chars().count() > 40 {
+    let chars: Vec<(usize, char)> = tail.char_indices().collect();
+    let mut depth = 0i32;
+    let mut close_byte: Option<usize> = None;
+    for (byte, c) in &chars {
+        if *c == open {
+            depth += 1;
+        } else if *c == close {
+            depth -= 1;
+            if depth == 0 {
+                close_byte = Some(*byte);
+                break;
+            }
+        }
+    }
+    let close_byte = close_byte?;
+    let inner = tail.get(open.len_utf8()..close_byte)?;
+    if inner.chars().count() > 80 {
         return None;
     }
-    Some(&rest[end + close.len()..])
+    let after = close_byte + close.len_utf8();
+    Some(tail.get(after..).unwrap_or(""))
 }
 
+/// A same-line continuation that points at another provision, not the article's own body.
+/// Bare は / に / の / を / において stay headings: 約款 often writes the body on the heading line.
 fn starts_with_cross_ref(after: &str) -> bool {
+    let after = after.trim_start();
     if after.is_empty() {
         return false;
     }
-    const PREFIXES: &[&str] = &[
-        "について",
+    if item_provision_ref(after) {
+        return true;
+    }
+    const PHRASES: &[&str] = &[
+        "に定める",
+        "に定め",
+        "に従",
+        "にかか",
+        "に関わ",
+        "に係わ",
+        "に基",
         "により",
         "によって",
         "による",
+        "に規定",
+        "に掲",
+        "に記載",
+        "に該当",
+        "に準",
+        "に反",
+        "に違反",
+        "に抵触",
+        "につき",
+        "について",
+        "にいう",
+        "の規定",
+        "の定め",
+        "の場合",
+        "の趣旨",
+        "の適用",
+        "を除",
+        "を準用",
+        "を適用",
         "及び",
         "および",
         "又は",
@@ -265,17 +433,30 @@ fn starts_with_cross_ref(after: &str) -> bool {
         "もしくは",
         "から",
         "まで",
-        "に",
-        "の",
-        "を",
-        "が",
-        "は",
-        "と",
-        "で",
-        "へ",
-        "や",
     ];
-    PREFIXES.iter().any(|prefix| after.starts_with(prefix))
+    PHRASES.iter().any(|phrase| after.starts_with(phrase))
+}
+
+/// `第1項の規定` / `第一項の規定` after a title is a cross-reference, not the article body.
+fn item_provision_ref(after: &str) -> bool {
+    let chars: Vec<char> = after.chars().collect();
+    if chars.first() != Some(&'第') {
+        return false;
+    }
+    let mut i = 1usize;
+    let start = i;
+    while i < chars.len() && is_numeral_char(chars[i]) {
+        i += 1;
+    }
+    if i == start || i >= chars.len() {
+        return false;
+    }
+    if chars[i] != '項' && chars[i] != '号' {
+        return false;
+    }
+    let rest: String = chars[i + 1..].iter().collect();
+    let rest = rest.trim_start();
+    rest.is_empty() || rest.starts_with('の') || rest.starts_with('に')
 }
 
 #[cfg(test)]
@@ -345,6 +526,7 @@ mod tests {
                 "第1条".to_string(),
                 "第6条".to_string(),
                 "第6条の2".to_string(),
+                "第6条（2）".to_string(),
                 "第121条の2".to_string()
             ]
         );
@@ -518,5 +700,114 @@ mod tests {
         let text = "第7条（後）\n後。\n\n第6条（前）\n前。\n";
         let labels = available_labels(&article_spans(text));
         assert_eq!(labels, vec!["第7条".to_string(), "第6条".to_string()]);
+    }
+
+    #[test]
+    fn caption_line_starts_the_following_article() {
+        let text = "\
+第1条（目的）
+目的の本文。
+
+（解除）
+第2条
+解除の本文。
+";
+        let spans = article_spans(text);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert!(!spans[0].text.contains("（解除）"), "{}", spans[0].text);
+        assert!(spans[0].text.contains("目的の本文"));
+        assert!(spans[1].text.starts_with("（解除）"), "{}", spans[1].text);
+        assert!(spans[1].text.contains("解除の本文"));
+        assert!(!spans[1].text.contains("目的の本文"));
+    }
+
+    #[test]
+    fn titled_item_cross_reference_is_not_a_heading() {
+        let text = "\
+第4条（通知）
+通知は書面による。
+第6条（解除）第1項の規定にかかわらず、甲は通知できる。
+第六条（解除）第一項の規定にかかわらず、乙は解除できない。
+
+第6条（解除）
+解除の本文。
+";
+        let spans = article_spans(text);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert!(spans[0].text.contains("第1項の規定にかかわらず"));
+        assert!(spans[0].text.contains("第一項の規定にかかわらず"));
+        assert_eq!(spans[1].text, "第6条（解除）\n解除の本文。");
+        assert!(article_spans("第6条の規定により解除する。\n").is_empty());
+    }
+
+    #[test]
+    fn nested_title_parentheses_belong_to_the_heading() {
+        let text = "第3条（秘密情報（個人情報を含む。）の管理）\n甲は秘密を守る。\n";
+        let spans = article_spans(text);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].no.main, 3);
+        assert!(spans[0].text.contains("個人情報を含む"));
+        assert!(spans[0].text.contains("の管理"));
+        assert!(spans[0].text.contains("甲は秘密を守る"));
+    }
+
+    #[test]
+    fn supplement_and_closing_do_not_merge_into_the_last_article() {
+        let text = "\
+第1条（本則）
+本則の本文。
+
+第2条（終了）
+終了の本文。
+以上
+
+甲　署名
+
+附則
+第1条（施行）
+施行の本文。
+
+別紙
+第1条（仕様）
+仕様の本文。
+";
+        let spans = article_spans(text);
+        assert_eq!(spans.len(), 4, "{spans:?}");
+        assert!(spans[0].text.contains("本則の本文"));
+        assert!(!spans[0].text.contains("以上"));
+        assert!(!spans[0].text.contains("署名"));
+        assert!(spans[1].text.contains("終了の本文"));
+        assert!(!spans[1].text.contains("以上"), "{}", spans[1].text);
+        assert!(!spans[1].text.contains("署名"));
+        assert_eq!(spans[2].display_label(), "第1条（附則）");
+        assert!(spans[2].text.contains("施行の本文"));
+        assert!(!spans[2].text.contains("仕様の本文"));
+        assert_eq!(spans[3].display_label(), "第1条（別紙）");
+        assert!(spans[3].text.contains("仕様の本文"));
+        let labels = available_labels(&spans);
+        assert!(labels.contains(&"第1条".to_string()), "{labels:?}");
+        assert!(labels.contains(&"第1条（附則）".to_string()), "{labels:?}");
+        assert!(labels.contains(&"第1条（別紙）".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn one_line_yakkan_body_is_its_own_article() {
+        let text = "\
+第1条（定義）において「本件製品」とは製品をいう。
+第5条（契約期間）は、令和2年4月1日から1年間とする。
+第6条（解除）に定める場合を除く。
+";
+        let spans = article_spans(text);
+        assert!(
+            spans.iter().any(|span| {
+                span.no.main == 1 && span.text.contains("本件製品") && span.text.contains("において")
+            }),
+            "{spans:?}"
+        );
+        let fifth = spans.iter().find(|span| span.no.main == 5).expect("第5条");
+        assert!(fifth.text.contains("令和2年4月1日"), "{}", fifth.text);
+        assert!(fifth.text.contains("に定める場合を除く"), "{}", fifth.text);
+        assert!(spans.iter().all(|span| span.no.main != 6), "{spans:?}");
+        assert!(article_spans("第6条（解除）に定める場合を除く。\n").is_empty());
     }
 }

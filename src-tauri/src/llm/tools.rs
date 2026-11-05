@@ -238,11 +238,11 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
                         "articles": {
                             "type": "array",
                             "description": "読み直す条番号。例: [6, 7]。第6条の2 は \"6の2\"。文書にある条だけを原文のまま、文書の順で返す。無い番号では、ある条番号の一覧を返す。",
-                            "items": { "description": "条番号。6 または \"6の2\"。" }
+                            "items": { "type": ["integer", "string"], "description": "条番号。6 または \"6の2\"。" }
                         },
                         "start": {
                             "type": "integer",
-                            "description": "文字範囲の開始（1文字目から、含む）。条の見出しが無い文書で使う。保存された本文の文字数で数える。"
+                            "description": "文字範囲の開始（1文字目から、含む）。条の見出しが無い文書で使う。複数ページは ## nページ目 を含む書き起こしで数える。"
                         },
                         "end": {
                             "type": "integer",
@@ -1689,7 +1689,7 @@ fn read_saved_selection(
     if !articles.is_empty() {
         return read_saved_articles(cite_no, &rows, &articles, consumed);
     }
-    if args.get("start").is_some() || args.get("end").is_some() {
+    if range_arg_active(args.get("start")) || range_arg_active(args.get("end")) {
         return read_saved_range(cite_no, &rows, args, consumed);
     }
     ToolExec {
@@ -1729,19 +1729,18 @@ fn parse_article_args(value: Option<&Value>) -> Result<Vec<crate::llm::articles:
 }
 
 fn article_item_token(value: &Value) -> Result<String, String> {
+    if value.is_null() {
+        return Ok(String::new());
+    }
     if let Some(n) = value.as_i64() {
         if n <= 0 {
-            return Err(format!(
-                "条番号として読めません: {n}。1 以上の条を指定してください。"
-            ));
+            return Ok(String::new());
         }
         return Ok(n.to_string());
     }
     if let Some(n) = value.as_u64() {
         if n == 0 || n > u32::MAX as u64 {
-            return Err(format!(
-                "条番号として読めません: {n}。1 以上の条を指定してください。"
-            ));
+            return Ok(String::new());
         }
         return Ok(n.to_string());
     }
@@ -1757,6 +1756,66 @@ fn saved_plain_text(rows: &[LlmSourceRow]) -> String {
         .filter(|body| !body.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Text the model sees inside a 出典 block. Multi-page OCR includes `## nページ目`.
+fn saved_visible_text(rows: &[LlmSourceRow]) -> String {
+    let refs: Vec<&LlmSourceRow> = rows.iter().collect();
+    let pages = refs
+        .iter()
+        .filter(|row| crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id).is_some())
+        .count();
+    if pages >= 2 {
+        return crate::llm::transcript::transcript_body(&refs, true);
+    }
+    saved_plain_text(rows)
+}
+
+fn range_arg_active(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if value.is_null() {
+        return false;
+    }
+    match arg_i64(Some(value)) {
+        Some(n) => n > 0,
+        None => !value.as_str().is_some_and(|text| text.trim().is_empty()),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ReadRoute {
+    Saved(i64),
+    Paragraph(String),
+    NeedCite,
+    Empty,
+}
+
+pub(crate) fn route_read_unit(args: &Value) -> ReadRoute {
+    let cite = arg_i64(args.get("cite_no")).filter(|n| *n > 0);
+    let articles_on = match parse_article_args(args.get("articles")) {
+        Ok(list) => !list.is_empty(),
+        Err(_) => true,
+    };
+    let range_on = range_arg_active(args.get("start")) || range_arg_active(args.get("end"));
+    if cite.is_some() || articles_on || range_on {
+        return match cite {
+            Some(n) => ReadRoute::Saved(n),
+            None => ReadRoute::NeedCite,
+        };
+    }
+    let paragraph_id = args
+        .get("paragraph_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if paragraph_id.is_empty() {
+        ReadRoute::Empty
+    } else {
+        ReadRoute::Paragraph(paragraph_id)
+    }
 }
 
 fn format_saved_body(row: &LlmSourceRow, body: &str) -> String {
@@ -1779,7 +1838,7 @@ fn read_saved_articles(
     articles: &[crate::llm::articles::ArticleNo],
     consumed: Vec<(String, i64)>,
 ) -> ToolExec {
-    let text = saved_plain_text(rows);
+    let text = saved_visible_text(rows);
     if text.is_empty() {
         return finish_read(format!("出典 [{cite_no}] の本文は空です。"), consumed);
     }
@@ -1826,23 +1885,54 @@ fn read_saved_articles(
             "出典 [{cite_no}] に{missing_labels}はありません。ある条番号: {available}。\n"
         ));
     }
-    let mut labels = Vec::new();
-    for span in &found {
-        let label = span.no.label();
-        if !labels.contains(&label) {
-            labels.push(label);
-        }
-    }
-    let body = found
-        .iter()
-        .map(|span| span.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    content.push_str(&format_saved_body(
-        &rows[0],
-        &format!("（{}）\n{body}", labels.join("、")),
-    ));
+    content.push_str(&format_saved_body(&rows[0], &pack_article_blocks(&found)));
     finish_read(content, consumed)
+}
+
+fn pack_article_blocks(found: &[&crate::llm::articles::ArticleSpan]) -> String {
+    let mut used = 0usize;
+    let mut out = String::new();
+    for span in found {
+        let label = span.display_label();
+        let span_len = span.text.chars().count();
+        let full_end = span.start_char + span_len.saturating_sub(1);
+        let header = format!(
+            "［再読］{label}。{}文字目から{full_end}文字目。全{span_len}文字\n",
+            span.start_char
+        );
+        let block_len = header.chars().count() + span_len + 1;
+        if used > 0 && used + block_len > READ_BODY_CAP {
+            let room = READ_BODY_CAP.saturating_sub(used);
+            if room < header.chars().count() + 8 {
+                break;
+            }
+            let take = room.saturating_sub(header.chars().count() + 24).max(1);
+            let take = take.min(span_len);
+            let prefix: String = span.text.chars().take(take).collect();
+            let end = span.start_char + prefix.chars().count() - 1;
+            out.push_str(&format!(
+                "［再読］{label}の先頭。{}文字目から{end}文字目。全{span_len}文字。続きは start={}\n{prefix}\n",
+                span.start_char,
+                end + 1
+            ));
+            break;
+        }
+        if span_len > READ_BODY_CAP && used == 0 {
+            let prefix: String = span.text.chars().take(READ_BODY_CAP).collect();
+            let end = span.start_char + prefix.chars().count() - 1;
+            out.push_str(&format!(
+                "［再読］{label}の先頭。{}文字目から{end}文字目。全{span_len}文字。続きは start={}\n{prefix}\n",
+                span.start_char,
+                end + 1
+            ));
+            break;
+        }
+        out.push_str(&header);
+        out.push_str(&span.text);
+        out.push('\n');
+        used += block_len;
+    }
+    out
 }
 
 fn read_saved_range(
@@ -1851,7 +1941,7 @@ fn read_saved_range(
     args: &Value,
     consumed: Vec<(String, i64)>,
 ) -> ToolExec {
-    let text = saved_plain_text(rows);
+    let text = saved_visible_text(rows);
     if text.is_empty() {
         return finish_read(format!("出典 [{cite_no}] の本文は空です。"), consumed);
     }
@@ -1866,21 +1956,37 @@ fn read_saved_range(
     };
     match crate::llm::articles::char_range(&text, start, end) {
         Ok(range) => {
-            let note = if range.clamped {
-                format!(
-                    "（{}文字目から{}文字目まで。指定した終了位置は全{}文字を超えていたため末尾まで）",
-                    range.start, range.end, range.len
-                )
-            } else {
-                format!("（{}文字目から{}文字目）", range.start, range.end)
-            };
+            let pages = text.contains("## ") && text.contains("ページ目");
+            let (body, _, capped) = cap_delivered_slice(&range.text, range.start, READ_BODY_CAP);
+            let delivered_end = range.start + body.chars().count().saturating_sub(1);
+            let note = range_note(range.start, delivered_end, range.len, capped, pages);
             finish_read(
-                format_saved_body(&rows[0], &format!("{note}\n{}", range.text)),
+                format_saved_body(&rows[0], &format!("{note}\n{body}")),
                 consumed,
             )
         }
         Err(err) => finish_read(char_range_message(err), consumed),
     }
+}
+
+fn cap_delivered_slice(text: &str, start: usize, cap: usize) -> (String, usize, bool) {
+    let len = text.chars().count();
+    if len <= cap {
+        return (text.to_string(), start + len.saturating_sub(1), false);
+    }
+    let body: String = text.chars().take(cap).collect();
+    (body, start + cap - 1, true)
+}
+
+fn range_note(start: usize, end: usize, total: usize, more: bool, pages: bool) -> String {
+    let mut note = format!("［再読］{start}文字目から{end}文字目。全{total}文字");
+    if pages {
+        note.push_str("。ページ見出しを含む");
+    }
+    if more {
+        note.push_str(&format!("。続きは start={}", end.saturating_add(1)));
+    }
+    note
 }
 
 fn optional_char_pos(value: Option<&Value>, name: &str) -> Result<Option<usize>, String> {
@@ -1895,10 +2001,8 @@ fn optional_char_pos(value: Option<&Value>, name: &str) -> Result<Option<usize>,
             "{name} は 1 以上の文字位置です（1文字目から数えます）。"
         ));
     };
-    if n < 1 {
-        return Err(format!(
-            "{name} は 1 以上の文字位置です（1文字目から数えます）。"
-        ));
+    if n <= 0 {
+        return Ok(None);
     }
     let n = usize::try_from(n).map_err(|_| format!("{name} が大きすぎます。"))?;
     Ok(Some(n))
@@ -1913,6 +2017,184 @@ fn char_range_message(err: crate::llm::articles::CharRangeError) -> String {
             format!("start が文書の長さ（{len}文字）を超えています。")
         }
     }
+}
+
+/// If `text` is a re-read result that does not fit in `max_chars`, rewrite the
+/// `［再読］` claim so it describes only the characters that remain.
+pub(crate) fn refit_reread_text(text: &str, max_chars: usize) -> Option<String> {
+    let marker = "［再読］";
+    let pos = text.find(marker)?;
+    if max_chars == 0 {
+        return Some(String::new());
+    }
+    if text.chars().count() <= max_chars {
+        return Some(text.to_string());
+    }
+    let preamble = &text[..pos];
+    let sections = split_reread_sections(&text[pos..]);
+    if sections.is_empty() {
+        return None;
+    }
+    if sections.len() == 1 && section_is_range(&sections[0].header) {
+        return Some(refit_range_section(preamble, &sections[0], max_chars));
+    }
+    Some(refit_article_sections(preamble, &sections, max_chars))
+}
+
+struct RereadSection {
+    header: String,
+    body: String,
+}
+
+fn split_reread_sections(text: &str) -> Vec<RereadSection> {
+    let mut sections = Vec::new();
+    let mut current: Option<RereadSection> = None;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("［再読］") {
+            if let Some(done) = current.take() {
+                sections.push(done);
+            }
+            let header = line.trim_end_matches(['\n', '\r']).to_string();
+            current = Some(RereadSection {
+                header,
+                body: String::new(),
+            });
+        } else if let Some(section) = current.as_mut() {
+            section.body.push_str(line);
+        }
+    }
+    if let Some(done) = current {
+        sections.push(done);
+    }
+    for section in &mut sections {
+        let trimmed = section.body.trim_end();
+        section.body = trimmed.to_string();
+    }
+    sections
+}
+
+fn section_is_range(header: &str) -> bool {
+    header
+        .trim_start_matches("［再読］")
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit())
+}
+
+fn refit_range_section(preamble: &str, section: &RereadSection, max_chars: usize) -> String {
+    let Some((start, _end, total, pages)) = parse_range_header(&section.header) else {
+        return trim_plain(preamble, &section.header, &section.body, max_chars);
+    };
+    let body: Vec<char> = section.body.chars().collect();
+    let mut best = String::new();
+    for k in 0..=body.len() {
+        let end = if k == 0 { start.saturating_sub(1) } else { start + k - 1 };
+        let more = k < body.len() || end < total;
+        let note = if k == 0 {
+            format!("［再読］全{total}文字。続きは start={start}")
+        } else {
+            range_note(start, end, total, more, pages)
+        };
+        let text_body: String = body.iter().take(k).collect();
+        let rendered = if k == 0 {
+            format!("{preamble}{note}")
+        } else {
+            format!("{preamble}{note}\n{text_body}")
+        };
+        if rendered.chars().count() <= max_chars {
+            best = rendered;
+        } else {
+            break;
+        }
+    }
+    if best.is_empty() {
+        let note = format!("［再読］全{total}文字。続きは start={start}");
+        let note_len = note.chars().count();
+        if note_len >= max_chars {
+            return note.chars().take(max_chars).collect();
+        }
+        let head: String = preamble.chars().take(max_chars - note_len).collect();
+        format!("{head}{note}")
+    } else {
+        best
+    }
+}
+
+fn parse_range_header(header: &str) -> Option<(usize, usize, usize, bool)> {
+    let rest = header.trim_start_matches("［再読］");
+    let (start_s, rest) = rest.split_once("文字目から")?;
+    let (end_s, rest) = rest.split_once("文字目。全")?;
+    let total_s = rest.split("文字").next()?;
+    let start = start_s.trim().parse().ok()?;
+    let end = end_s.trim().parse().ok()?;
+    let total = total_s.trim().parse().ok()?;
+    let pages = header.contains("ページ見出し");
+    Some((start, end, total, pages))
+}
+
+fn refit_article_sections(preamble: &str, sections: &[RereadSection], max_chars: usize) -> String {
+    let mut out = preamble.to_string();
+    for section in sections {
+        let full = format!("{}\n{}\n", section.header, section.body);
+        if out.chars().count() + full.chars().count() <= max_chars {
+            out.push_str(&full);
+            continue;
+        }
+        if let Some((start, _end, total, label)) = parse_article_header(&section.header) {
+            let body: Vec<char> = section.body.chars().collect();
+            let mut best = String::new();
+            for k in 0..=body.len() {
+                let end = if k == 0 { start.saturating_sub(1) } else { start + k - 1 };
+                let note = if k == 0 || end >= start + total.saturating_sub(1) {
+                    format!("［再読］{label}。{start}文字目から{end}文字目。全{total}文字")
+                } else {
+                    format!(
+                        "［再読］{label}の先頭。{start}文字目から{end}文字目。全{total}文字。続きは start={}",
+                        end.saturating_add(1)
+                    )
+                };
+                let text_body: String = body.iter().take(k).collect();
+                let rendered = format!("{out}{note}\n{text_body}\n");
+                if rendered.chars().count() <= max_chars {
+                    best = rendered;
+                } else {
+                    break;
+                }
+            }
+            if !best.is_empty() {
+                return best;
+            }
+        }
+        break;
+    }
+    if out.chars().count() > max_chars {
+        out.chars().take(max_chars).collect()
+    } else {
+        out
+    }
+}
+
+fn parse_article_header(header: &str) -> Option<(usize, usize, usize, String)> {
+    let rest = header.trim_start_matches("［再読］");
+    let (label, rest) = rest.split_once('。')?;
+    let label = label.trim_end_matches("の先頭").to_string();
+    let (start_s, rest) = rest.split_once("文字目から")?;
+    let (end_s, rest) = rest.split_once("文字目。全")?;
+    let total_s = rest.split('字').next()?;
+    Some((
+        start_s.trim().parse().ok()?,
+        end_s.trim().parse().ok()?,
+        total_s.trim().parse().ok()?,
+        label,
+    ))
+}
+
+fn trim_plain(preamble: &str, header: &str, body: &str, max_chars: usize) -> String {
+    let mut out = format!("{preamble}{header}\n{body}");
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect();
+    }
+    out
 }
 
 pub fn execute_tool(
@@ -2217,32 +2499,24 @@ fn execute_tool_inner(
             })
         }
         TOOL_READ => {
-            let cite_no = arg_i64(args.get("cite_no")).filter(|n| *n > 0);
-            let wants_saved = cite_no.is_some()
-                || args.get("articles").is_some()
-                || args.get("start").is_some()
-                || args.get("end").is_some();
-            if wants_saved {
-                let Some(cite_no) = cite_no else {
+            let paragraph_id = match route_read_unit(&args) {
+                ReadRoute::NeedCite => {
                     return Ok(ToolExec::text(
                         "cite_no に出典番号 [n] を指定してください。",
                     ));
-                };
-                return Ok(read_saved_selection(&state.db, thread_id, cite_no, &args));
-            }
-            let paragraph_id = args
-                .get("paragraph_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if paragraph_id.is_empty() {
-                return Ok(ToolExec {
-                    content: "paragraph_id が空です。".into(),
-                    consumed: Vec::new(),
-                    wrote_note_id: None,
-                });
-            }
+                }
+                ReadRoute::Saved(cite_no) => {
+                    return Ok(read_saved_selection(&state.db, thread_id, cite_no, &args));
+                }
+                ReadRoute::Empty => {
+                    return Ok(ToolExec {
+                        content: "paragraph_id が空です。".into(),
+                        consumed: Vec::new(),
+                        wrote_note_id: None,
+                    });
+                }
+                ReadRoute::Paragraph(id) => id,
+            };
             let also_remote = thread_scope.is_some_and(is_remote_only_thread);
             let Some(hit) = preview_hit(state, &paragraph_id, also_remote)? else {
                 return Ok(ToolExec {
@@ -2876,6 +3150,7 @@ mod tests {
         assert!(schema.contains("答える前に読み直す"), "{schema}");
         assert!(schema.contains("文字範囲の開始"), "{schema}");
         assert!(schema.contains("文字範囲の終了"), "{schema}");
+        assert!(schema.contains("[\"integer\",\"string\"]"), "{schema}");
     }
 
     #[test]
@@ -3068,7 +3343,12 @@ mod tests {
             &json!({"start": 1, "end": 1000}),
         );
         assert!(clamped.content.contains(memo), "{}", clamped.content);
-        assert!(clamped.content.contains("末尾まで"), "{}", clamped.content);
+        assert!(
+            clamped.content.contains(&format!("全{}文字", memo.chars().count())),
+            "{}",
+            clamped.content
+        );
+        assert!(!clamped.content.contains("1000文字目"), "{}", clamped.content);
 
         let backwards = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 4, "end": 2}));
         assert!(backwards.content.contains("end は start 以上"), "{}", backwards.content);
@@ -3109,7 +3389,16 @@ mod tests {
         assert!(stats.truncated);
         assert!(!stats.question_exceeds);
         let user = turns.iter().find(|turn| turn.role == "user").unwrap();
-        assert!(user.content.contains(crate::llm::context::ATTACHMENT_REREAD_NOTE), "{}", user.content);
+        assert!(
+            user.content.contains("文字のみ") && user.content.contains("続きは start="),
+            "{}",
+            user.content
+        );
+        assert!(
+            user.content.contains(&format!("全{}文字", body.trim().chars().count())),
+            "{}",
+            user.content
+        );
         assert!(user.content.contains("第1条"), "{}", user.content);
         assert!(!user.content.contains("第8条だけの固有文言"));
         let stored = db
@@ -3134,6 +3423,192 @@ mod tests {
     }
 
     #[test]
+    fn empty_placeholders_still_read_the_paragraph_and_zero_start_is_the_whole_text() {
+        for args in [
+            json!({"paragraph_id": "unit-9", "articles": null}),
+            json!({"paragraph_id": "unit-9", "articles": []}),
+            json!({"paragraph_id": "unit-9", "start": 0}),
+            json!({"paragraph_id": "unit-9", "end": 0}),
+            json!({"paragraph_id": "unit-9", "articles": [0], "start": null, "end": 0}),
+        ] {
+            match route_read_unit(&args) {
+                ReadRoute::Paragraph(id) => assert_eq!(id, "unit-9"),
+                other => panic!("paragraph read was refused: {args} -> {other:?}"),
+            }
+        }
+        assert!(matches!(
+            route_read_unit(&json!({"articles": [6]})),
+            ReadRoute::NeedCite
+        ));
+        assert!(matches!(
+            route_read_unit(&json!({"cite_no": 3, "start": 0})),
+            ReadRoute::Saved(3)
+        ));
+
+        let (dir, db, thread) = temp_db("zero-start");
+        let row = attach_text(&db, &thread.id, CONTRACT);
+        let whole = read_saved_selection(
+            &db,
+            &thread.id,
+            row.cite_no,
+            &json!({"start": 0, "end": 0, "articles": []}),
+        );
+        assert!(whole.content.contains("前文。"), "{}", whole.content);
+        assert!(whole.content.contains("日本法による。"), "{}", whole.content);
+        assert!(!whole.content.contains("1 以上"), "{}", whole.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn range_cap_reports_the_delivered_end_and_the_next_start() {
+        let (dir, db, thread) = temp_db("cap");
+        let body = "あ".repeat(READ_BODY_CAP + 500);
+        let row = attach_text(&db, &thread.id, &body);
+        let exec = read_saved_selection(
+            &db,
+            &thread.id,
+            row.cite_no,
+            &json!({"start": 1, "end": 100_000}),
+        );
+        let delivered = READ_BODY_CAP;
+        assert!(
+            exec.content.contains(&format!("1文字目から{delivered}文字目")),
+            "{}",
+            exec.content
+        );
+        assert!(
+            exec.content.contains(&format!("続きは start={}", delivered + 1)),
+            "{}",
+            exec.content
+        );
+        assert!(
+            exec.content.contains(&format!("全{}文字", body.chars().count())),
+            "{}",
+            exec.content
+        );
+        assert_eq!(exec.content.matches('あ').count(), delivered, "{}", exec.content.chars().take(80).collect::<String>());
+        let trimmed = crate::llm::context::fit_tool_text(exec.content.clone(), 200, 0);
+        assert!(trimmed.contains("続きは start="), "{trimmed}");
+        let claimed = claimed_span(&trimmed);
+        let a_count = trimmed.matches('あ').count();
+        assert_eq!(claimed, a_count, "claim {claimed} vs delivered {a_count}: {trimmed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn claimed_span(text: &str) -> usize {
+        let line = text.lines().find(|line| line.contains("文字目から")).unwrap();
+        let start: usize = line
+            .split("文字目から")
+            .next()
+            .unwrap()
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let end: usize = line
+            .split("文字目から")
+            .nth(1)
+            .unwrap()
+            .split("文字目")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        end - start + 1
+    }
+
+    #[test]
+    fn multi_article_read_does_not_claim_a_cut_off_article() {
+        let (dir, db, thread) = temp_db("multi");
+        let mut body = String::new();
+        for n in 1..=3 {
+            body.push_str(&format!("第{n}条（条）\n"));
+            body.push_str(&format!("UNIQUE{n}"));
+            body.push_str(&"文".repeat(4_000));
+            body.push_str("\n\n");
+        }
+        let row = attach_text(&db, &thread.id, &body);
+        let exec = read_saved_selection(
+            &db,
+            &thread.id,
+            row.cite_no,
+            &json!({"articles": [1, 2, 3]}),
+        );
+        assert!(exec.content.contains("UNIQUE1"), "{}", exec.content);
+        assert!(exec.content.contains("続きは start="), "{}", exec.content);
+        assert!(!exec.content.contains("UNIQUE3"), "{}", exec.content);
+        let trimmed = crate::llm::context::fit_tool_text(exec.content, 90, 0);
+        assert!(
+            !trimmed.lines().any(|line| line.starts_with("［再読］第3条")),
+            "{trimmed}"
+        );
+        assert!(!trimmed.contains("UNIQUE3"), "{trimmed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_page_range_uses_the_page_headings_the_prompt_shows() {
+        let (dir, db, thread) = temp_db("pages");
+        let path = r"C:\docs\scan.pdf";
+        let _first = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                path,
+                "scan.pdf",
+                "pdf-page:1",
+                "甲ページ本文",
+                "",
+                "file",
+                "image",
+                "",
+                "",
+                None,
+            )
+            .unwrap()
+            .0;
+        let second = db
+            .insert_llm_source_full(
+                &thread.id,
+                "attach",
+                path,
+                "scan.pdf",
+                "pdf-page:2",
+                "乙ページ本文",
+                "",
+                "file",
+                "image",
+                "",
+                "",
+                None,
+            )
+            .unwrap()
+            .0;
+        let rows = db.list_llm_sources_by_cite(&thread.id, second.cite_no).unwrap();
+        assert!(rows.len() >= 2, "pages share a cite: {rows:?}");
+        let visible = crate::llm::transcript::transcript_body(
+            &rows.iter().collect::<Vec<_>>(),
+            true,
+        );
+        assert!(visible.contains("## 1ページ目"), "{visible}");
+        assert!(visible.contains("## 2ページ目"), "{visible}");
+        let start = visible.chars().position(|c| c == '乙').unwrap() + 1;
+        let exec = read_saved_selection(
+            &db,
+            &thread.id,
+            second.cite_no,
+            &json!({"start": start, "end": start + 2}),
+        );
+        assert!(exec.content.contains("乙ペ"), "{}", exec.content);
+        assert!(exec.content.contains("ページ見出しを含む"), "{}", exec.content);
+        let joined = format!("{}\n\n{}", "甲ページ本文", "乙ページ本文");
+        let wrong: String = joined.chars().skip(start - 1).take(3).collect();
+        assert_ne!(wrong, "乙ペ", "the no-heading join must not be the index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn arg_i64_reads_numbers_and_numeric_strings() {
         assert_eq!(arg_i64(Some(&json!(12))), Some(12));
         assert_eq!(arg_i64(Some(&json!("12"))), Some(12));
@@ -3153,7 +3628,7 @@ mod tests {
             tool_schema_tokens(&tools_schema(true, false, true)),
         ];
         // src/features/chat/contextEstimate.ts TOOL_SCHEMA_TOKENS, same order.
-        let expected = [2384, 2637, 2429, 2682, 2392, 2644];
+        let expected = [2410, 2662, 2455, 2707, 2417, 2670];
         assert_eq!(actual, expected, "update TOOL_SCHEMA_TOKENS to {actual:?}");
     }
 
