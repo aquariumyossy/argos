@@ -3964,6 +3964,184 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn empty_sibling_page_keeps_the_read_index_on_the_stored_transcript() {
+        let glyphs: Vec<char> = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめも"
+            .chars()
+            .collect();
+        let page: String = (0..2_400).map(|i| glyphs[i % glyphs.len()]).collect();
+        for status in ["error", ""] {
+            let (dir, db, thread) = temp_db(&format!("sib-{status}"));
+            let path = r"C:\docs\scan.pdf";
+            let filled = insert_page(&db, &thread.id, path, 1, &page, "");
+            insert_page(&db, &thread.id, path, 2, "", status);
+            assert_page_cut_matches_stored(&db, &thread.id, &filled, &page, &[400, 800, 1_200]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let (dir, db, thread) = temp_db("page10");
+        let path = r"C:\docs\scan.pdf";
+        insert_page(&db, &thread.id, path, 1, "", "error");
+        let filled = insert_page(&db, &thread.id, path, 10, &page, "");
+        assert_page_cut_matches_stored(&db, &thread.id, &filled, &page, &[400, 800, 1_200]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, db, thread) = temp_db("between");
+        let path = r"C:\docs\scan.pdf";
+        let page1 = "甲".repeat(2_400);
+        insert_page(&db, &thread.id, path, 1, &page1, "");
+        insert_page(&db, &thread.id, path, 2, "", "error");
+        let third = insert_page(&db, &thread.id, path, 3, "乙PAGE_MARKER", "");
+        let rows = db.list_llm_sources_by_cite(&thread.id, third.cite_no).unwrap();
+        let history = vec![user_msg(&thread.id)];
+        let mut saw = false;
+        for budget in [500usize, 900, 1_400] {
+            let (turns, _) = crate::llm::context::assemble_turns("役割", &rows, &history, budget);
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            if user.content.contains(&page1) {
+                continue;
+            }
+            let Some(start) = notice_start(&user.content) else {
+                continue;
+            };
+            saw = true;
+            let exec = read_saved_selection(
+                &db,
+                &thread.id,
+                third.cite_no,
+                &json!({"start": start, "end": start + 4_000}),
+            );
+            assert!(
+                exec.content.contains("乙PAGE_MARKER"),
+                "budget {budget} start={start} missed the later page: {}",
+                exec.content.chars().take(180).collect::<String>()
+            );
+        }
+        assert!(saw, "no budget shortened page 1 around the empty page");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, db, thread) = temp_db("p10p11");
+        let path = r"C:\docs\ten.pdf";
+        let page10 = "甲".repeat(2_400);
+        insert_page(&db, &thread.id, path, 10, &page10, "");
+        let eleventh = insert_page(&db, &thread.id, path, 11, "乙PAGE_MARKER", "");
+        let rows = db.list_llm_sources_by_cite(&thread.id, eleventh.cite_no).unwrap();
+        let history = vec![user_msg(&thread.id)];
+        let mut saw = false;
+        for budget in [500usize, 900, 1_400] {
+            let (turns, _) = crate::llm::context::assemble_turns("役割", &rows, &history, budget);
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            if user.content.contains(&page10) {
+                continue;
+            }
+            let Some(start) = notice_start(&user.content) else {
+                continue;
+            };
+            saw = true;
+            let exec = read_saved_selection(
+                &db,
+                &thread.id,
+                eleventh.cite_no,
+                &json!({"start": start, "end": start + 4_000}),
+            );
+            assert!(
+                exec.content.contains("乙PAGE_MARKER"),
+                "budget {budget} start={start} missed page 11: {}",
+                exec.content.chars().take(180).collect::<String>()
+            );
+        }
+        assert!(saw, "no budget shortened page 10");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn insert_page(
+        db: &crate::db::Db,
+        thread_id: &str,
+        path: &str,
+        page: u32,
+        body: &str,
+        ocr_status: &str,
+    ) -> crate::db::LlmSourceRow {
+        db.insert_llm_source_full(
+            thread_id,
+            "attach",
+            path,
+            "scan.pdf",
+            &format!("pdf-page:{page}"),
+            body,
+            "",
+            "file",
+            "image",
+            "",
+            ocr_status,
+            None,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn user_msg(thread_id: &str) -> crate::db::LlmMessageRow {
+        crate::db::LlmMessageRow {
+            id: "u1".into(),
+            thread_id: thread_id.into(),
+            role: "user".into(),
+            content: "読んで".into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+        }
+    }
+
+    fn assert_page_cut_matches_stored(
+        db: &crate::db::Db,
+        thread_id: &str,
+        filled: &crate::db::LlmSourceRow,
+        page: &str,
+        budgets: &[usize],
+    ) {
+        let rows = db.list_llm_sources_by_cite(thread_id, filled.cite_no).unwrap();
+        let stored = saved_visible_text(&rows);
+        let history = vec![user_msg(thread_id)];
+        let mut saw = false;
+        for budget in budgets {
+            let (turns, _) =
+                crate::llm::context::assemble_turns("役割", &rows, &history, *budget);
+            let user = turns.iter().find(|turn| turn.role == "user").unwrap();
+            if !user.content.contains("このページは先頭") {
+                continue;
+            }
+            let start = notice_start(&user.content).expect("start");
+            let shown = shown_page_chars(&user.content).expect("shown");
+            let from_stored: String = stored.chars().skip(start as usize - 1).take(8).collect();
+            let from_page: String = page.chars().skip(shown).take(8).collect();
+            assert_eq!(
+                from_stored, from_page,
+                "budget {budget} start={start} shown={shown} stored={}",
+                stored.chars().take(24).collect::<String>()
+            );
+            assert!(
+                user.content.contains(&format!("書き起こし全{}文字", stored.chars().count())),
+                "{}",
+                user.content
+            );
+            saw = true;
+            let exec = read_saved_selection(
+                db,
+                thread_id,
+                filled.cite_no,
+                &json!({"start": start, "end": start + 20}),
+            );
+            assert!(
+                exec.content.contains(&from_page),
+                "start={start} expected {from_page}: {}",
+                exec.content.chars().take(180).collect::<String>()
+            );
+        }
+        assert!(saw, "no budget shortened the surviving page");
+    }
+
     fn shown_page_chars(text: &str) -> Option<usize> {
         let line = text.lines().find(|line| line.contains("このページは先頭"))?;
         let digits: String = line

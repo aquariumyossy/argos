@@ -595,7 +595,8 @@ fn page_index(pool: &[LlmSourceRow], id: &str) -> Option<PageIndex> {
         })
         .collect();
     siblings.sort_by_key(|source| crate::llm::transcript::parse_pdf_page_no(&source.paragraph_id));
-    // One page is shown and re-read without `## nページ目`. Two or more keep it.
+    // Same rule as `saved_visible_text`: every `pdf-page:` row counts, including a
+    // blank or OCR-error page that is not injected. One real page has no heading.
     let multi = siblings.len() > 1;
     let transcript = crate::llm::transcript::transcript_body(&siblings, multi);
     let prefix = if multi {
@@ -789,6 +790,7 @@ fn select_sources(
     pool: &[LlmSourceRow],
     budget: usize,
     pending_ids: &HashSet<String>,
+    ledger: &[LlmSourceRow],
 ) -> (Vec<LlmSourceRow>, usize, bool) {
     let original = sources.len();
     let mut rows: Vec<LlmSourceRow> = sources
@@ -843,7 +845,7 @@ fn select_sources(
             pending_ids.contains(&rows[idx].id) && rows[idx].origin == "attach";
         if pending_attach {
             let before = rows[idx].body.clone();
-            fit_pending_prefix(&mut rows, idx, pool, budget);
+            fit_pending_prefix(&mut rows, idx, pool, budget, ledger);
             if rows[idx].body == before {
                 break;
             }
@@ -856,7 +858,7 @@ fn select_sources(
                 .find(|source| source.id == id)
                 .map(|source| source.body.trim().to_string())
                 .unwrap_or_else(|| rows[idx].body.clone());
-            let page = page_index(pool, &id);
+            let page = page_index(ledger, &id);
             rows[idx].body = attachment_excerpt(&full, next, page.as_ref());
         } else {
             rows[idx].body = cap_chars(&rows[idx].body, next);
@@ -877,9 +879,15 @@ fn select_sources(
 
 /// Longest body prefix that keeps the rendered block inside `budget`.
 /// An empty body leaves the citation header. The row itself stays.
-fn fit_pending_prefix(rows: &mut [LlmSourceRow], idx: usize, pool: &[LlmSourceRow], budget: usize) {
+fn fit_pending_prefix(
+    rows: &mut [LlmSourceRow],
+    idx: usize,
+    pool: &[LlmSourceRow],
+    budget: usize,
+    ledger: &[LlmSourceRow],
+) {
     let full = rows[idx].body.clone();
-    let page = page_index(pool, &rows[idx].id);
+    let page = page_index(ledger, &rows[idx].id);
     let mut lo = 0usize;
     let mut hi = char_len(&full);
     let mut best = 0usize;
@@ -1089,16 +1097,18 @@ pub fn assemble_turns(
     // Keep the last two user turns while they fit. If a recent source is what
     // overflows, shorten it before dropping the previous question and answer.
     trim_keeping(&mut built, max_tokens, RECENT_USER_TURNS, &mut truncated);
-    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids) {
+    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources)
+    {
         truncated = true;
     }
-    if tokens_of(&built) > max_tokens && shrink_recent_sources(&mut built, pool, max_tokens) {
+    if tokens_of(&built) > max_tokens && shrink_recent_sources(&mut built, pool, max_tokens, sources) {
         truncated = true;
     }
     if tokens_of(&built) > max_tokens {
         trim_keeping(&mut built, max_tokens, 1, &mut truncated);
     }
-    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids) {
+    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources)
+    {
         truncated = true;
     }
     if tokens_of(&built) > max_tokens {
@@ -1109,7 +1119,7 @@ pub fn assemble_turns(
     }
     // The first refit can drop a pending attachment while an older exchange is
     // still protected. Put the original sources back into the room that trim freed.
-    if refit_freed_budget(&mut built, pool, max_tokens, &pending_ids) {
+    if refit_freed_budget(&mut built, pool, max_tokens, &pending_ids, sources) {
         truncated = true;
     }
     if restore_recent_rereads(&mut built, max_tokens) {
@@ -1358,7 +1368,14 @@ fn restore_recent_rereads(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
         }
         // Only this cite's rendered attachment counts. The new question, and
         // another source that happens to quote the same ending, do not.
+        // A shared ただし書 can sit in an earlier article of this same excerpt,
+        // so the last 24 characters are not enough: the ［再読］ range has to
+        // fall past the characters this excerpt actually showed.
         let excerpt = excerpt_for_cite(built, &backup);
+        if reread_extends_past_excerpt(&backup, &excerpt) {
+            restore_at.push((index, backup));
+            continue;
+        }
         if excerpt.contains(&sample) || row.turn.content.contains(&sample) {
             continue;
         }
@@ -1450,6 +1467,47 @@ fn first_cite_no(content: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// `［再読］` end index, when the header says `N文字目からM文字目`.
+fn reread_claimed_ends(content: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    for line in content.lines() {
+        if !line.contains("［再読］") {
+            continue;
+        }
+        let Some((_, rest)) = line.split_once("文字目から") else {
+            continue;
+        };
+        let Some(end_s) = rest.split("文字目").next() else {
+            continue;
+        };
+        if let Ok(end) = end_s.trim().parse::<usize>() {
+            ends.push(end);
+        }
+    }
+    ends
+}
+
+/// Last stored character the attachment note says is on screen.
+/// `続きは start=K` means characters through K-1 were shown, including a page heading.
+fn excerpt_covers_through(excerpt: &str) -> Option<usize> {
+    let line = excerpt.lines().find(|line| line.contains("続きは start="))?;
+    let digits: String = line
+        .split("続きは start=")
+        .nth(1)?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let next: usize = digits.parse().ok()?;
+    next.checked_sub(1)
+}
+
+fn reread_extends_past_excerpt(backup: &str, excerpt: &str) -> bool {
+    let Some(covered) = excerpt_covers_through(excerpt) else {
+        return false;
+    };
+    reread_claimed_ends(backup).into_iter().any(|end| end > covered)
 }
 
 fn reread_body_sample(content: &str) -> String {
@@ -1574,6 +1632,7 @@ fn refit_freed_budget(
     pool: &[LlmSourceRow],
     max_tokens: usize,
     pending_ids: &HashSet<String>,
+    ledger: &[LlmSourceRow],
 ) -> bool {
     let recent = recent_user_ids(built);
     let mut changed = false;
@@ -1598,16 +1657,21 @@ fn refit_freed_budget(
     if !changed {
         return false;
     }
-    let fitted = refit_sources(built, pool, max_tokens, pending_ids);
+    let fitted = refit_sources(built, pool, max_tokens, pending_ids, ledger);
     if tokens_of(built) > max_tokens {
-        shrink_recent_sources(built, pool, max_tokens);
+        shrink_recent_sources(built, pool, max_tokens, ledger);
     }
     changed || fitted
 }
 
 /// Replace remaining recent source bodies with stubs so the previous question can stay.
 /// The latest turn's unsent attachment is shortened instead of stubbed.
-fn shrink_recent_sources(built: &mut [BuiltTurn], pool: &[LlmSourceRow], max_tokens: usize) -> bool {
+fn shrink_recent_sources(
+    built: &mut [BuiltTurn],
+    pool: &[LlmSourceRow],
+    max_tokens: usize,
+    ledger: &[LlmSourceRow],
+) -> bool {
     if tokens_of(built) <= max_tokens {
         return false;
     }
@@ -1631,7 +1695,7 @@ fn shrink_recent_sources(built: &mut [BuiltTurn], pool: &[LlmSourceRow], max_tok
             changed = true;
         }
     }
-    changed || shrink_unsent_attachment(built, pool, max_tokens)
+    changed || shrink_unsent_attachment(built, pool, max_tokens, ledger)
 }
 
 fn has_unsent_attachment(row: &BuiltTurn) -> bool {
@@ -1644,6 +1708,7 @@ fn shrink_unsent_attachment(
     built: &mut [BuiltTurn],
     pool: &[LlmSourceRow],
     max_tokens: usize,
+    ledger: &[LlmSourceRow],
 ) -> bool {
     let mut changed = false;
     let mut guard = 0;
@@ -1678,7 +1743,7 @@ fn shrink_unsent_attachment(
             .unwrap_or_else(|| built[turn_idx].sources[src_idx].body.clone());
         let len = char_len(&built[turn_idx].sources[src_idx].body);
         let next = len / 2;
-        let page = page_index(pool, &source_id);
+        let page = page_index(ledger, &source_id);
         built[turn_idx].sources[src_idx].body = if next == 0 {
             empty_attachment_body(&full, page.as_ref())
         } else {
@@ -1748,6 +1813,7 @@ fn refit_sources(
     pool: &[LlmSourceRow],
     max_tokens: usize,
     pending_ids: &HashSet<String>,
+    ledger: &[LlmSourceRow],
 ) -> bool {
     let recent = recent_user_ids(built);
     let current = full_sources_on_recent_turns(built);
@@ -1759,6 +1825,7 @@ fn refit_sources(
         pool,
         source_char_room(built, max_tokens),
         pending_ids,
+        ledger,
     );
     if dropped == 0 && !shortened {
         return false;
@@ -3078,6 +3145,67 @@ mod tests {
             );
         }
         assert!(saw_other, "no budget showed the other cite's copy of the ending");
+    }
+
+    #[test]
+    fn shared_proviso_in_an_earlier_article_does_not_drop_the_later_reread() {
+        let proviso = "ただし、甲の事前の書面による承諾を得た場合は、この限りでない。";
+        let early = "再委託はできない。";
+        let late = "譲渡はできない固有。";
+        let head = format!("第2条（再委託）\n{early}\n{proviso}\n\n");
+        let gap = "甲".repeat(20_000);
+        let article = format!("第18条（権利義務の譲渡禁止）\n{late}\n{proviso}\n");
+        let body = format!("{head}{gap}{article}");
+        let start = head.chars().count() + gap.chars().count() + 1;
+        let end = start + article.trim_end().chars().count() - 1;
+        let mut file = src_file("big", "attach", 0, &body);
+        file.cite_no = 1;
+        file.path = r"C:\docs\契約.txt".into();
+        file.title = "契約.txt".into();
+        file.paragraph_id.clear();
+        file.injected_user_message_id = "u1".into();
+        let tool_body = format!(
+            "【出典】\n[1] 契約.txt — C:\\docs\\契約.txt\n［再読］第18条。{start}文字目から{end}文字目。全{}文字\n{}\n",
+            article.trim_end().chars().count(),
+            article.trim_end()
+        );
+        let mut assistant = msg("a1", "assistant", "第18条です [1]");
+        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        let mut tool = msg("t1", "tool", &tool_body);
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "read_unit".into();
+        let sample: String = {
+            let compact: String = proviso.chars().filter(|c| !c.is_whitespace()).collect();
+            let n = compact.chars().count();
+            compact.chars().skip(n.saturating_sub(24)).collect()
+        };
+        let mut saw = false;
+        for budget in (1_000usize..9_200).step_by(400) {
+            let history = vec![
+                msg("u1", "user", "契約を見て"),
+                assistant.clone(),
+                tool.clone(),
+                msg("u2", "user", "その承諾は口頭でもよいですか"),
+            ];
+            let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
+            let Some(user) = turns.iter().find(|turn| turn.content.contains("契約を見て")) else {
+                continue;
+            };
+            let source_part = user.content.split("【質問】").next().unwrap_or("");
+            if !source_part.contains(&sample) || source_part.contains(late) {
+                continue;
+            }
+            saw = true;
+            let tool_turn = turns.iter().find(|turn| turn.role == "tool");
+            assert!(
+                tool_turn.is_some_and(|turn| {
+                    turn.content.contains(late) || turn.content.contains("続きは")
+                }),
+                "budget {budget} dropped 第18条 because 第2条 ends with the same proviso: {}",
+                tool_turn.map(|turn| turn.content.as_str()).unwrap_or("")
+            );
+        }
+        assert!(saw, "no budget showed 第2条 and hid 第18条");
     }
 
     #[test]
