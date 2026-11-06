@@ -111,7 +111,7 @@ pub const DEFAULT_LLM_TIMEOUT_MS: u32 = 120_000;
 /// Previous default, stored as characters. Unedited copies move to the token default.
 pub const LEGACY_DEFAULT_LLM_MAX_CONTEXT_CHARS: u32 = 80_000;
 pub const DEFAULT_LLM_MAX_CONTEXT_TOKENS: u32 = 131_072;
-pub const MIN_LLM_CONTEXT_TOKENS: u32 = 4_096;
+pub const MIN_LLM_CONTEXT_TOKENS: u32 = 16_384;
 pub const MAX_LLM_CONTEXT_TOKENS: u32 = 1_048_576;
 pub const DEFAULT_LLM_THINKING: &str = "on";
 pub const DEFAULT_LLM_MAX_TOOL_ROUNDS: u32 = 8;
@@ -3699,6 +3699,11 @@ impl Db {
         self.insert_llm_message_full(thread_id, role, content, "", "", "", "", "")
     }
 
+    pub fn delete_llm_message(&self, id: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM llm_messages WHERE id=?1", [id])
+    }
+
     pub fn insert_llm_notice(
         &self,
         thread_id: &str,
@@ -4220,6 +4225,26 @@ impl Db {
         Ok(())
     }
 
+    /// Sources that share a citation number (an image group uses one number for every page).
+    pub fn list_llm_sources_by_cite(
+        &self,
+        thread_id: &str,
+        cite_no: i64,
+    ) -> Result<Vec<LlmSourceRow>, rusqlite::Error> {
+        if cite_no <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_SOURCE_COLS} FROM llm_thread_sources
+             WHERE thread_id=?1 AND cite_no=?2
+             ORDER BY sort_order ASC, created_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![thread_id, cite_no], map_llm_source)?;
+        Ok(rows.flatten().collect())
+    }
+
     pub fn find_cited_llm_source(
         &self,
         thread_id: &str,
@@ -4279,7 +4304,7 @@ impl Db {
             conn.execute(
                 "UPDATE llm_thread_sources
                  SET injected_user_message_id=?1, cited_assistant_message_id=?2, cite_no=?3
-                 WHERE id=?4",
+                 WHERE id=?4 AND injected_user_message_id=''",
                 rusqlite::params![user_message_id, assistant_message_id, cite_no, id],
             )?;
         }
@@ -5856,7 +5881,7 @@ mod folder_index_status_tests {
         );
         let s = db.load_settings();
         assert_eq!(s.llm_thinking, "on");
-        assert_eq!(s.llm_max_context_tokens, 10_000);
+        assert_eq!(s.llm_max_context_tokens, MIN_LLM_CONTEXT_TOKENS);
         assert_eq!(s.llm_system_prompt, "独自の指示です");
         assert_eq!(s.llm_max_tool_rounds, 16);
 
@@ -5874,6 +5899,11 @@ mod folder_index_status_tests {
         assert_eq!(s.llm_max_context_tokens, 20_000);
         assert_eq!(s.llm_max_tool_rounds, 0);
         assert_eq!(s.llm_system_prompt, DEFAULT_LLM_SYSTEM_PROMPT);
+
+        put_settings(&db, &[("llm_max_context_tokens", "4096")]);
+        let s = db.load_settings();
+        assert_eq!(s.llm_max_context_tokens, MIN_LLM_CONTEXT_TOKENS);
+        assert_eq!(s.llm_max_context_tokens, 16_384);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

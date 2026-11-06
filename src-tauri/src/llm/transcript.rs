@@ -244,6 +244,7 @@ pub fn omission_note(shown: &[&LlmSourceRow], pool: &[LlmSourceRow]) -> Option<S
     if pool_n > shown_n && shown_n > 0 {
         let last = shown
             .iter()
+            .filter(|s| !s.body.trim().is_empty())
             .filter_map(|s| parse_pdf_page_no(&s.paragraph_id))
             .max()
             .unwrap_or(shown_n as u32);
