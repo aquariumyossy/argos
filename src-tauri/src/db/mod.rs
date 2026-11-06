@@ -101,6 +101,10 @@ pub const LLM_FORMAT_SENTINEL: &str = "生のHTMLは書かないでください"
 pub const LLM_NOTE_HINT: &str =
     "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。書いたと報告してよいです。採否はユーザーがノートで行います。読む前に消さないでください。全文を書き換えるときは、変えない箇所もそのまま含めてください。対象ノートが無いときは list_notes か create_note を使います。";
 pub const LLM_NOTE_SENTINEL: &str = "書いた内容はすぐメモに反映されます";
+/// Appended on each request, including a prompt the user edited.
+pub const LLM_REREAD_HINT: &str =
+    "添付された契約書などの文書について答えるときは、根拠にする条を read_unit で読み直してから答えてください。cite_no に出典番号、articles に条番号を渡します。条の見出しが無い文書は start と end で文字範囲を指定します。";
+pub const LLM_REREAD_SENTINEL: &str = "根拠にする条を read_unit で読み直して";
 /// Previous default, before third-party text and counts were called out.
 /// Unedited copies are replaced. A prompt the user changed is left alone.
 pub const LEGACY_PRE_MATERIAL_LLM_SYSTEM_PROMPT: &str =

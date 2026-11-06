@@ -1,5 +1,6 @@
 //! OpenAI-compatible local LLM client (chat completions + /models).
 
+pub mod articles;
 pub mod commands;
 pub mod context;
 pub mod fetch_url;
@@ -22,7 +23,10 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::db::{Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, LLM_NOTE_HINT, LLM_NOTE_SENTINEL};
+use crate::db::{
+    Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, LLM_NOTE_HINT, LLM_NOTE_SENTINEL,
+    LLM_REREAD_HINT, LLM_REREAD_SENTINEL,
+};
 use crate::llm::context::ChatTurn;
 
 pub fn normalize_base_url(raw: &str) -> String {
@@ -188,6 +192,12 @@ pub fn system_for_request(settings: &Settings) -> String {
             s.push('\n');
         }
         s.push_str(LLM_NOTE_HINT);
+    }
+    if !s.contains(LLM_REREAD_SENTINEL) && !s.contains(LLM_REREAD_HINT) {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(LLM_REREAD_HINT);
     }
     s
 }
@@ -1534,6 +1544,24 @@ mod tests {
         s.llm_thinking = "off".into();
         let sys = system_for_request(&s);
         assert_eq!(sys.matches("生のHTMLは書かないでください").count(), 1);
+    }
+
+    #[test]
+    fn reread_hint_is_added_once_before_answering_about_an_attachment() {
+        let def = system_for_request(&Settings::default());
+        assert_eq!(def.matches(crate::db::LLM_REREAD_SENTINEL).count(), 1, "{def}");
+        assert!(def.contains("articles"));
+        assert!(def.contains("start と end"));
+        let mut custom = Settings::default();
+        custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+        let sys = system_for_request(&custom);
+        assert!(sys.contains("事務所の独自ルール"));
+        assert_eq!(sys.matches(crate::db::LLM_REREAD_SENTINEL).count(), 1, "{sys}");
+        let again = system_for_request(&Settings {
+            llm_system_prompt: sys,
+            ..Settings::default()
+        });
+        assert_eq!(again.matches(crate::db::LLM_REREAD_SENTINEL).count(), 1, "{again}");
     }
 
     #[test]

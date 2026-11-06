@@ -12,12 +12,12 @@ export const REPLY_HEADROOM_RATIO = 0.1;
  * `tool_schema_token_counts_match_the_chat_meter` locks these numbers.
  */
 export const TOOL_SCHEMA_TOKENS = {
-  base: 2105,
-  web: 2357,
-  remote: 2150,
-  webRemote: 2402,
-  remoteOnly: 2112,
-  webRemoteOnly: 2365,
+  base: 2410,
+  web: 2662,
+  remote: 2455,
+  webRemote: 2707,
+  remoteOnly: 2417,
+  webRemoteOnly: 2670,
 } as const;
 
 export function charCount(text: string): number {
