@@ -30,21 +30,30 @@ export function applyChatDelta(live: LiveGeneration, delta: ChatDelta): LiveGene
   return { ...live, stream: live.stream + delta.text };
 }
 
-/** Slack used only when deciding that the user has returned to the bottom. */
-export const SCROLL_FOLLOW_SLACK_PX = 48;
+/** Subpixel rounding still counts as the bottom. Anything larger is scrolled up. */
+export const SCROLL_BOTTOM_SLACK_PX = 2;
 
-export function isNearBottom(
+export function distanceFromBottom(
   scrollTop: number,
   scrollHeight: number,
   clientHeight: number,
-  slack = SCROLL_FOLLOW_SLACK_PX,
+): number {
+  return scrollHeight - scrollTop - clientHeight;
+}
+
+export function isAtBottom(
+  scrollTop: number,
+  scrollHeight: number,
+  clientHeight: number,
+  slack = SCROLL_BOTTOM_SLACK_PX,
 ): boolean {
-  return scrollHeight - scrollTop - clientHeight <= slack;
+  return distanceFromBottom(scrollTop, scrollHeight, clientHeight) <= slack;
 }
 
 /**
- * Any upward movement stops following, including a step inside the bottom slack.
- * Moving downward resumes only once the viewport is back at the bottom.
+ * Stop only when scrollTop decreased and the log is no longer at the bottom.
+ * A clamp, shrink, or resize that leaves it at the bottom does not stop.
+ * Resume only when a later scroll rests at the bottom.
  */
 export function followAfterUserScroll(input: {
   follow: boolean;
@@ -53,13 +62,11 @@ export function followAfterUserScroll(input: {
   scrollHeight: number;
   clientHeight: number;
 }): { follow: boolean; anchor: number } {
-  const { scrollTop, anchor } = input;
-  if (scrollTop < anchor) return { follow: false, anchor: scrollTop };
-  if (
-    scrollTop > anchor &&
-    isNearBottom(scrollTop, input.scrollHeight, input.clientHeight)
-  ) {
-    return { follow: true, anchor: scrollTop };
+  const { scrollTop, anchor, scrollHeight, clientHeight, follow } = input;
+  const atBottom = isAtBottom(scrollTop, scrollHeight, clientHeight);
+  if (scrollTop < anchor) {
+    return { follow: atBottom ? follow : false, anchor: scrollTop };
   }
-  return { follow: input.follow, anchor: scrollTop };
+  if (atBottom) return { follow: true, anchor: scrollTop };
+  return { follow, anchor: scrollTop };
 }

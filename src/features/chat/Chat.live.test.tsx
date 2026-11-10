@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Chat from "./Chat";
 import { contextMeterLabel, contextMeterLimit } from "./contextEstimate";
@@ -93,14 +93,52 @@ function sendCalls() {
   return mockInvoke.mock.calls.filter((call) => call[0] === "llm_send");
 }
 
-async function emitDelta(threadId: string, text: string) {
+async function emitDelta(threadId: string, text: string, kind = "content") {
   const handler = listeners.get("llm-chat-delta");
   if (!handler) throw new Error("llm-chat-delta is not listening");
   await act(async () => {
     handler({
-      payload: { requestId: "req-1", threadId, text, kind: "content" },
+      payload: { requestId: "req-1", threadId, text, kind },
     });
   });
+}
+
+/** jsdom does not clamp scrollTop. A real log cannot scroll past scrollHeight - clientHeight. */
+function installLogGeometry(
+  log: HTMLElement,
+  initial: { scrollHeight: number; clientHeight: number },
+) {
+  let scrollHeight = initial.scrollHeight;
+  let clientHeight = initial.clientHeight;
+  let scrollTop = 0;
+  const maxTop = () => Math.max(0, scrollHeight - clientHeight);
+  Object.defineProperty(log, "scrollHeight", {
+    configurable: true,
+    get: () => scrollHeight,
+  });
+  Object.defineProperty(log, "clientHeight", {
+    configurable: true,
+    get: () => clientHeight,
+  });
+  Object.defineProperty(log, "scrollTop", {
+    configurable: true,
+    get: () => scrollTop,
+    set(value: number) {
+      scrollTop = Math.min(Math.max(0, value), maxTop());
+    },
+  });
+  return {
+    maxTop,
+    resize(next: { scrollHeight?: number; clientHeight?: number }) {
+      if (next.scrollHeight != null) scrollHeight = next.scrollHeight;
+      if (next.clientHeight != null) clientHeight = next.clientHeight;
+      const max = maxTop();
+      if (scrollTop > max) {
+        scrollTop = max;
+        fireEvent.scroll(log);
+      }
+    },
+  };
 }
 
 async function renderChat() {
@@ -279,79 +317,129 @@ describe("background generation", () => {
 });
 
 describe("scroll follow during generation", () => {
-  async function startPinnedLog(): Promise<HTMLElement> {
+  const jump = () => screen.queryByRole("button", { name: "↓最新へ" });
+
+  async function startPinnedLog() {
     await renderChat();
     fireEvent.click(screen.getByRole("button", { name: "再送" }));
     await screen.findByText("生成中…");
     const log = document.querySelector(".chat-log");
     if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
-    Object.defineProperty(log, "clientHeight", { configurable: true, value: 120 });
-    Object.defineProperty(log, "scrollHeight", { configurable: true, value: 800 });
+    const box = installLogGeometry(log, { scrollHeight: 800, clientHeight: 120 });
     await emitDelta("thread-a", "底");
-    expect(log.scrollTop).toBe(800);
-    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
-    return log;
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+    return { log, box };
   }
 
   it("stops following when scrolled up, resumes at the bottom, and the button jumps back", async () => {
-    const log = await startPinnedLog();
+    const { log, box } = await startPinnedLog();
+    const bottom = box.maxTop();
 
     log.scrollTop = 0;
     fireEvent.scroll(log);
-    expect(screen.getByRole("button", { name: "↓最新へ" })).toBeTruthy();
+    expect(jump()).toBeTruthy();
     await emitDelta("thread-a", "一行");
     expect(log.scrollTop).toBe(0);
 
-    log.scrollTop = 700;
+    log.scrollTop = bottom;
     fireEvent.scroll(log);
-    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+    expect(jump()).toBeNull();
     await emitDelta("thread-a", "つづき");
-    expect(log.scrollTop).toBe(800);
+    expect(log.scrollTop).toBe(bottom);
 
     log.scrollTop = 0;
     fireEvent.scroll(log);
     fireEvent.click(screen.getByRole("button", { name: "↓最新へ" }));
-    expect(log.scrollTop).toBe(800);
-    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+    expect(log.scrollTop).toBe(bottom);
+    expect(jump()).toBeNull();
     await emitDelta("thread-a", "さらに");
-    expect(log.scrollTop).toBe(800);
+    expect(log.scrollTop).toBe(bottom);
   });
 
-  it("stops following on an upward step smaller than the bottom slack", async () => {
-    const log = await startPinnedLog();
-    log.scrollTop = 790;
-    fireEvent.scroll(log);
-    expect(screen.getByRole("button", { name: "↓最新へ" })).toBeTruthy();
-    await emitDelta("thread-a", "少し上");
-    expect(log.scrollTop).toBe(790);
+  it("keeps following when reasoning, a tool hint, or a reset shrinks the log", async () => {
+    const { log, box } = await startPinnedLog();
 
-    log.scrollTop = 800;
-    fireEvent.scroll(log);
-    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
-    await emitDelta("thread-a", "戻った");
-    expect(log.scrollTop).toBe(800);
+    await emitDelta("thread-a", "考えている", "reasoning");
+    await waitFor(() => expect(screen.queryByText("生成中…")).toBeNull());
+    box.resize({ scrollHeight: 760 });
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+    await emitDelta("thread-a", "続き", "reasoning");
+    expect(log.scrollTop).toBe(box.maxTop());
+
+    await emitDelta("thread-a", "search_index…", "tool");
+    box.resize({ scrollHeight: 720 });
+    expect(jump()).toBeNull();
+    await emitDelta("thread-a", "本文");
+    expect(log.scrollTop).toBe(box.maxTop());
+
+    await emitDelta("thread-a", "", "reset");
+    box.resize({ scrollHeight: 680 });
+    expect(jump()).toBeNull();
+    await emitDelta("thread-a", "再開");
+    expect(log.scrollTop).toBe(box.maxTop());
   });
 
-  it("stops following on wheel, arrow key, and touch before the next delta", async () => {
-    const log = await startPinnedLog();
+  it("keeps following a short log when the wheel cannot move it", async () => {
+    const { log, box } = await startPinnedLog();
+    box.resize({ scrollHeight: 80, clientHeight: 120 });
+    expect(log.scrollTop).toBe(0);
+    fireEvent.wheel(log, { deltaY: -40 });
+    expect(jump()).toBeNull();
+    box.resize({ scrollHeight: 400 });
+    await emitDelta("thread-a", "伸びた");
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+  });
 
-    fireEvent.wheel(log, { deltaY: -4 });
-    log.scrollTop = 796;
-    await emitDelta("thread-a", "ホイール");
-    expect(log.scrollTop).toBe(796);
+  it("keeps following when ArrowUp does not move the log", async () => {
+    const { log, box } = await startPinnedLog();
+    fireEvent.keyDown(document.body, { key: "ArrowUp" });
+    expect(log.scrollTop).toBe(box.maxTop());
+    await emitDelta("thread-a", "続く");
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+  });
+
+  it("stays stopped after scrolling up 16px and then 1px down", async () => {
+    const { log, box } = await startPinnedLog();
+    const bottom = box.maxTop();
+    log.scrollTop = bottom - 16;
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    log.scrollTop = bottom - 15;
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    await emitDelta("thread-a", "止まっている");
+    expect(log.scrollTop).toBe(bottom - 15);
+  });
+
+  it("keeps following when the window grows while the log is at the bottom", async () => {
+    const { log, box } = await startPinnedLog();
+    box.resize({ clientHeight: 200 });
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+    await emitDelta("thread-a", "広い");
+    expect(log.scrollTop).toBe(box.maxTop());
+  });
+
+  it("stops on an 8px upward step and on an arrow key that moves the log", async () => {
+    const { log, box } = await startPinnedLog();
+    const bottom = box.maxTop();
+    log.scrollTop = bottom - 8;
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    await emitDelta("thread-a", "タッチパッド");
+    expect(log.scrollTop).toBe(bottom - 8);
+
     fireEvent.click(screen.getByRole("button", { name: "↓最新へ" }));
-    expect(log.scrollTop).toBe(800);
-
-    fireEvent.keyDown(window, { key: "ArrowUp" });
-    log.scrollTop = 794;
-    await emitDelta("thread-a", "キー");
-    expect(log.scrollTop).toBe(794);
-    fireEvent.click(screen.getByRole("button", { name: "↓最新へ" }));
-
-    fireEvent.touchStart(log, { touches: [{ clientY: 100 }] });
-    fireEvent.touchMove(log, { touches: [{ clientY: 128 }] });
-    log.scrollTop = 792;
-    await emitDelta("thread-a", "タッチ");
-    expect(log.scrollTop).toBe(792);
+    expect(log.scrollTop).toBe(box.maxTop());
+    await act(async () => {});
+    log.scrollTop = box.maxTop() - 16;
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    await emitDelta("thread-a", "矢印");
+    expect(log.scrollTop).toBe(box.maxTop() - 16);
   });
 });

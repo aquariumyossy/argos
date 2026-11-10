@@ -7,8 +7,6 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
-  type TouchEvent as ReactTouchEvent,
-  type WheelEvent as ReactWheelEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -575,7 +573,6 @@ export default function Chat() {
   const followRef = useRef(true);
   const programmaticScroll = useRef(false);
   const scrollAnchor = useRef(0);
-  const touchYRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
   const threadDragRef = useRef<ThreadDragSession | null>(null);
@@ -873,12 +870,6 @@ export default function Chat() {
     });
   }, []);
 
-  const stopFollow = useCallback(() => {
-    if (!followRef.current) return;
-    followRef.current = false;
-    setFollowBottom(false);
-  }, []);
-
   const scrollLog = useCallback(() => {
     const el = listRef.current;
     if (!el || !followRef.current) return;
@@ -902,33 +893,6 @@ export default function Chat() {
     followRef.current = next.follow;
     setFollowBottom(next.follow);
   }, []);
-
-  const onLogWheel = useCallback((event: ReactWheelEvent) => {
-    if (event.deltaY < 0) stopFollow();
-  }, [stopFollow]);
-
-  const onLogTouchStart = useCallback((event: ReactTouchEvent) => {
-    touchYRef.current = event.touches[0]?.clientY ?? null;
-  }, []);
-
-  const onLogTouchMove = useCallback((event: ReactTouchEvent) => {
-    const y = event.touches[0]?.clientY;
-    if (y == null || touchYRef.current == null) return;
-    const movedUp = y > touchYRef.current;
-    touchYRef.current = y;
-    if (movedUp) stopFollow();
-  }, [stopFollow]);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "ArrowUp" && event.key !== "PageUp" && event.key !== "Home") return;
-      const target = event.target;
-      if (target instanceof HTMLElement && target.closest("input, textarea, select")) return;
-      stopFollow();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [stopFollow]);
 
   function pinFollow() {
     followRef.current = true;
@@ -1846,14 +1810,7 @@ export default function Chat() {
 
       <main className="chat-main">
         <div className="chat-log-wrap">
-        <div
-          className="chat-log"
-          ref={listRef}
-          onScroll={onLogScroll}
-          onWheel={onLogWheel}
-          onTouchStart={onLogTouchStart}
-          onTouchMove={onLogTouchMove}
-        >
+        <div className="chat-log" ref={listRef} onScroll={onLogScroll}>
           {messages.length === 0 && !showLive ? (
             <p className="chat-muted chat-empty">
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
