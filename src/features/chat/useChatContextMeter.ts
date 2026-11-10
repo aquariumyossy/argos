@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { contextIsNearLimit, contextMeterLimit } from "./contextEstimate";
 
@@ -17,15 +17,14 @@ export function useChatContextMeter(args: {
   sources: unknown;
 }): { used: number | null; limit: number; warn: boolean } {
   const limit = contextMeterLimit(args.maxContextTokens);
-  const [used, setUsed] = useState<number | null>(null);
-  const threadRef = useRef(args.threadId);
+  const [reading, setReading] = useState<{ threadId: string; used: number | null } | null>(
+    null,
+  );
+  const used = reading != null && reading.threadId === args.threadId ? reading.used : null;
 
   useEffect(() => {
     let cancelled = false;
-    if (threadRef.current !== args.threadId) {
-      threadRef.current = args.threadId;
-      setUsed(null);
-    }
+    const threadId = args.threadId;
     const timer = window.setTimeout(() => {
       void invoke<number>("llm_context_meter", {
         threadId: args.threadId,
@@ -35,13 +34,13 @@ export function useChatContextMeter(args: {
         .then((next) => {
           if (cancelled) return;
           if (!Number.isFinite(next)) {
-            setUsed(null);
+            setReading({ threadId, used: null });
             return;
           }
-          setUsed(next);
+          setReading({ threadId, used: next });
         })
         .catch(() => {
-          if (!cancelled) setUsed(null);
+          if (!cancelled) setReading({ threadId, used: null });
         });
     }, METER_DEBOUNCE_MS);
     return () => {

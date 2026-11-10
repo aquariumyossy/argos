@@ -1,3 +1,4 @@
+import { useLayoutEffect } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { METER_DEBOUNCE_MS, useChatContextMeter } from "./useChatContextMeter";
@@ -86,6 +87,30 @@ describe("chat context meter", () => {
     expect(result.current.used).toBeNull();
     expect(result.current.warn).toBe(false);
     expect(result.current.limit).toBe(78_000);
+  });
+
+  it("does not commit the previous thread's reading on the new thread", async () => {
+    const seen: { thread: string; used: number | null; warn: boolean }[] = [];
+    const { rerender } = renderHook(
+      (props: typeof base) => {
+        const meter = useChatContextMeter(props);
+        useLayoutEffect(() => {
+          seen.push({ thread: props.threadId, used: meter.used, warn: meter.warn });
+        });
+        return meter;
+      },
+      { initialProps: base },
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
+    });
+    rerender({ ...base, threadId: "thread-b" });
+    const forB = seen.filter((row) => row.thread === "thread-b");
+    expect(seen.some((row) => row.thread === "thread-a" && row.used === 64_968 && row.warn)).toBe(
+      true,
+    );
+    expect(forB.length).toBeGreaterThan(0);
+    expect(forB.every((row) => row.used == null && row.warn === false)).toBe(true);
   });
 
   it("clears the reading when the meter command fails", async () => {
