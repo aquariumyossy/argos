@@ -1,6 +1,7 @@
 import { useLayoutEffect } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { contextMeterLabel } from "./contextEstimate";
 import { METER_DEBOUNCE_MS, useChatContextMeter } from "./useChatContextMeter";
 
 const { mockInvoke } = vi.hoisted(() => ({
@@ -70,6 +71,65 @@ describe("chat context meter", () => {
       await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
     });
     expect(mockInvoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("hides the previous numerator until a reading for the new limit arrives", async () => {
+    const seen: { limit: number; used: number | null; warn: boolean }[] = [];
+    const { result, rerender } = renderHook(
+      (props: typeof base) => {
+        const meter = useChatContextMeter(props);
+        useLayoutEffect(() => {
+          seen.push({ limit: meter.limit, used: meter.used, warn: meter.warn });
+        });
+        return meter;
+      },
+      { initialProps: base },
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
+    });
+    expect(result.current.used).toBe(64_968);
+    expect(result.current.limit).toBe(78_000);
+    expect(result.current.warn).toBe(true);
+
+    mockInvoke.mockResolvedValue(10);
+    rerender({ ...base, maxContextTokens: 32_000 });
+    expect(result.current.used).toBeNull();
+    expect(result.current.warn).toBe(false);
+    expect(result.current.limit).toBe(20_800);
+    expect(contextMeterLabel(result.current.used, result.current.limit)).toBe(
+      "— / 20,800 トークン",
+    );
+    const forNewLimit = seen.filter((row) => row.limit === 20_800);
+    expect(forNewLimit.length).toBeGreaterThan(0);
+    expect(forNewLimit.every((row) => row.used == null && row.warn === false)).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
+    });
+    expect(result.current.used).toBe(10);
+    expect(result.current.warn).toBe(false);
+    expect(result.current.limit).toBe(20_800);
+  });
+
+  it("hides the numerator when the setting changes but the denominator does not", async () => {
+    const first = { ...base, maxContextTokens: 16_387 };
+    const { result, rerender } = renderHook(
+      (props: typeof base) => useChatContextMeter(props),
+      { initialProps: first },
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
+    });
+    expect(result.current.used).toBe(64_968);
+    const denom = result.current.limit;
+    rerender({ ...base, maxContextTokens: 16_388 });
+    expect(result.current.limit).toBe(denom);
+    expect(result.current.used).toBeNull();
+    expect(result.current.warn).toBe(false);
+    expect(contextMeterLabel(result.current.used, result.current.limit)).toBe(
+      `— / ${denom.toLocaleString("ja-JP")} トークン`,
+    );
   });
 
   it("drops the previous thread's warning until the new reading arrives", async () => {

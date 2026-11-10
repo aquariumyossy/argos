@@ -3927,7 +3927,9 @@ mod tests {
             kind: String::new(),
         }];
         let mut saw = false;
-        for budget in [400usize, 600, 800, 1_000, 1_400] {
+        // MARK sits about 400 characters in. 400 tokens already keeps it on
+        // screen, so the smaller budgets are the ones that hide it.
+        for budget in [200usize, 280, 320, 400, 600, 800, 1_000, 1_400] {
             let (turns, _) =
                 crate::llm::context::assemble_turns("役割", &[row.clone()], &history, budget);
             let user = turns.iter().find(|turn| turn.role == "user").unwrap();
@@ -4159,22 +4161,6 @@ mod tests {
         assert_eq!(arg_i64(Some(&json!("12"))), Some(12));
         assert_eq!(arg_i64(Some(&json!("no"))), None);
         assert_eq!(arg_i64(None), None);
-    }
-
-    #[test]
-    fn tool_schema_token_counts_match_the_chat_meter() {
-        use crate::llm::context::tool_schema_tokens;
-        let actual = [
-            tool_schema_tokens(&tools_schema(false, false, false)),
-            tool_schema_tokens(&tools_schema(true, false, false)),
-            tool_schema_tokens(&tools_schema(false, true, false)),
-            tool_schema_tokens(&tools_schema(true, true, false)),
-            tool_schema_tokens(&tools_schema(false, false, true)),
-            tool_schema_tokens(&tools_schema(true, false, true)),
-        ];
-        // src/features/chat/contextEstimate.ts TOOL_SCHEMA_TOKENS, same order.
-        let expected = [2410, 2662, 2455, 2707, 2417, 2670];
-        assert_eq!(actual, expected, "update TOOL_SCHEMA_TOKENS to {actual:?}");
     }
 
     #[test]

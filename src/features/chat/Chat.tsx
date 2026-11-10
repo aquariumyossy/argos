@@ -17,7 +17,11 @@ import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
-import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
+import {
+  contextMeterLabel,
+  fileGrainConfirmMessage,
+  fileGrainExceedsMeter,
+} from "./contextEstimate";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -1026,14 +1030,19 @@ export default function Chat() {
         setSources(result.sources);
         return;
       }
-      const preview = await invoke<LlmFilePreview>("llm_preview_source_file", {
+      // Reject a missing or oversized file before asking. The confirm itself
+      // uses the meter, not this character count.
+      await invoke<LlmFilePreview>("llm_preview_source_file", {
         id: s.id,
       });
-      const fileTokens = Math.ceil(preview.chars / CHARS_PER_TOKEN);
-      if (fileTokens > maxContextTokens) {
-        const ok = window.confirm(
-          `このファイルは約 ${fileTokens.toLocaleString()} トークンです。送信の上限は ${maxContextTokens.toLocaleString()} トークンです。全文にしますか？`,
-        );
+      const measured = await invoke<number>("llm_file_grain_meter", {
+        threadId: active?.id || s.threadId,
+        sourceId: s.id,
+        draft,
+        webSearch: webSearch && !!searxngUrl,
+      });
+      if (fileGrainExceedsMeter(measured, maxContextTokens)) {
+        const ok = window.confirm(fileGrainConfirmMessage(measured, maxContextTokens));
         if (!ok) return;
       }
       const result = await invoke<LlmGrainResult>("llm_set_source_grain", {
