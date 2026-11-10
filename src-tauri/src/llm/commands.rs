@@ -1114,16 +1114,18 @@ async fn llm_send_inner<R: Runtime>(
                     .into_iter()
                     .map(|row| row.id)
                     .collect();
+                // Reasoning-only calls on a request that sent no tools are not a tool turn.
+                let acts_as_tool_call = !out.tool_calls.is_empty()
+                    && (tools_sent || out.tool_calls_from_content_or_structured);
                 remember_recovered_cut(
                     &mut recovered_cut,
                     cut_hold.thinking_off,
                     &out.content,
                     &out.reasoning,
-                    !out.tool_calls.is_empty(),
+                    acts_as_tool_call,
                     source_ids,
                 );
-                let stripped_without_tools =
-                    !tools_sent && out.tool_call_stripped_from_content;
+                let stripped_without_tools = acts_as_tool_call && !tools_sent;
                 let answer_body = if stripped_without_tools {
                     ""
                 } else {
@@ -1167,7 +1169,7 @@ async fn llm_send_inner<R: Runtime>(
                     }
                     break;
                 }
-                if with_tools
+                if tools_sent
                     && llm::thinking::thinking_enabled(&settings)
                     && !out.request_id.is_empty()
                 {
@@ -4538,6 +4540,169 @@ mod tests {
                 reasoning_over_cap(),
                 content_and_search("確認します。", "OrionContract"),
                 content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("本文も操作も返さず")
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content == llm::thinking::THINKING_CUT_NOTICE));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn stage2_reasoning_body_then(last: Vec<u8>) -> Vec<Vec<u8>> {
+        vec![
+            content_and_search("", "OrionContract"),
+            reasoning_over_cap(),
+            content_and_search("確認します。", "OrionContract"),
+            reasoning_only_tool_call("結論は三か月です。"),
+            last,
+        ]
+    }
+
+    fn assert_stage2_reasoning_body_kept(messages: &[crate::db::LlmMessageRow]) {
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "結論は三か月です。")
+            .expect("the stage-2 body is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(messages.iter().any(|message| {
+            message.role == "tool" && message.content.contains("OrionContract")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.content.contains("本文も操作も返さず")
+                || message.content.contains("まだ調べます。")
+                || message.content.contains("続きの回答は失敗しました")
+        }));
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_stage2_reasoning_body_when_the_source_retry_fails() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-reason-500",
+            8,
+            stage2_reasoning_body_then(http_status(
+                500,
+                "Internal Server Error",
+                r#"{"error":"failed"}"#,
+            )),
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_stage2_reasoning_body_kept(&messages);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_stage2_reasoning_body_when_the_source_retry_is_empty() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-reason-empty",
+            8,
+            stage2_reasoning_body_then(content_stop("")),
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_stage2_reasoning_body_kept(&messages);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_stage2_reasoning_body_when_the_source_retry_embeds_a_tool_call() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-reason-embed",
+            8,
+            stage2_reasoning_body_then(content_stop(
+                "まだ調べます。<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>",
+            )),
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_stage2_reasoning_body_kept(&messages);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_has_structured_tool_calls() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("", "OrionContract"));
+        script.push(content_and_search("まだ調べます。", "OrionContract"));
+        let (dir, db, thread, result) = send_script("round-structured", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_earlier_answer_when_stage2_returns_structured_tool_calls() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-structured-kept",
+            8,
+            vec![
+                content_stop("根拠は [9] です。"),
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_and_search("まだ調べます。", "OrionContract"),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "根拠は [9] です。")
+            .expect("the earlier answer is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_shows_the_empty_notice_when_stage2_structured_tool_calls_have_nothing_kept() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-structured-empty",
+            8,
+            vec![
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_and_search("まだ調べます。", "OrionContract"),
             ],
             false,
         )

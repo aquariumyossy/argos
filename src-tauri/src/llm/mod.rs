@@ -435,22 +435,22 @@ pub struct StreamOutcome {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: String,
     pub request_id: String,
-    /// True only when `<tool_call>` was removed from the message body.
-    /// A call found only in reasoning does not set this.
-    pub tool_call_stripped_from_content: bool,
+    /// Structured `tool_calls` or a `<tool_call>` removed from the body.
+    /// A call found only in reasoning leaves this false.
+    pub tool_calls_from_content_or_structured: bool,
 }
 
 impl StreamParse {
     fn into_outcome(self) -> StreamOutcome {
         let mut calls = self.tool_calls;
         let mut content = self.content;
-        let mut tool_call_stripped_from_content = false;
+        let mut tool_calls_from_content_or_structured = !calls.is_empty();
         if calls.is_empty() {
             let (stripped, embedded) = pull_embedded_tool_calls(&content);
             if !embedded.is_empty() {
                 content = stripped;
                 calls.extend(embedded);
-                tool_call_stripped_from_content = true;
+                tool_calls_from_content_or_structured = true;
             } else {
                 let (_, from_think) = pull_embedded_tool_calls(&self.reasoning);
                 calls.extend(from_think);
@@ -462,7 +462,7 @@ impl StreamParse {
             reasoning: self.reasoning,
             finish_reason: self.finish_reason,
             request_id: self.request_id,
-            tool_call_stripped_from_content,
+            tool_calls_from_content_or_structured,
             tool_calls: calls
                 .into_iter()
                 .filter(|c| !c.name.is_empty() || !c.arguments.is_empty())
@@ -1737,7 +1737,7 @@ mod tests {
         assert!(out.tool_calls[0].arguments.contains("民法555条"));
         assert!(!out.content.contains("<tool_call>"));
         assert!(out.content.contains("調べます。"));
-        assert!(out.tool_call_stripped_from_content);
+        assert!(out.tool_calls_from_content_or_structured);
     }
 
     #[test]
@@ -1751,10 +1751,27 @@ mod tests {
             request_id: String::new(),
         };
         let out = parse.into_outcome();
-        assert!(!out.tool_call_stripped_from_content);
+        assert!(!out.tool_calls_from_content_or_structured);
         assert_eq!(out.content, "結論は三か月です。");
         assert_eq!(out.tool_calls.len(), 1);
         assert_eq!(out.tool_calls[0].name, "search_index");
+
+        let structured = StreamParse {
+            content: "まだ調べます。".into(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCallAcc {
+                index: 0,
+                id: "c1".into(),
+                name: "search_index".into(),
+                arguments: "{}".into(),
+            }],
+            finish_reason: "tool_calls".into(),
+            request_id: String::new(),
+        };
+        let out = structured.into_outcome();
+        assert!(out.tool_calls_from_content_or_structured);
+        assert_eq!(out.content, "まだ調べます。");
+        assert_eq!(out.tool_calls.len(), 1);
     }
 
     #[test]
