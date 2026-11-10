@@ -224,7 +224,9 @@ beforeEach(() => {
       case "llm_set_active_thread":
         return args?.id === threadB.id ? threadB : threadA;
       case "llm_list_messages":
-        return args?.threadId === threadB.id ? messagesB : messagesA;
+        return (args?.threadId === threadB.id ? messagesB : messagesA).map((row) => ({
+          ...row,
+        }));
       case "llm_list_sources":
         return args?.threadId === threadB.id ? [] : sourcesA;
       case "llm_preview_source_file":
@@ -720,13 +722,24 @@ describe("finished answer stays put", () => {
     return { log, box, parked };
   }
 
+  async function reloadMessages() {
+    const before = mockInvoke.mock.calls.filter((call) => call[0] === "llm_list_messages").length;
+    await waitFor(() => {
+      const after = mockInvoke.mock.calls.filter((call) => call[0] === "llm_list_messages").length;
+      expect(after).toBeGreaterThan(before);
+    });
+    await act(async () => {});
+  }
+
   it("does not jump when focus reloads the same messages", async () => {
     const { log, parked } = await openThinkingAwayFromBottom();
     const onFocus = focusHandlers[focusHandlers.length - 1];
     if (!onFocus) throw new Error("focus handler missing");
+    const pending = reloadMessages();
     await act(async () => {
       onFocus({ payload: true });
     });
+    await pending;
     expect(log.scrollTop).toBe(parked);
   });
 
@@ -734,9 +747,11 @@ describe("finished answer stays put", () => {
     const { log, parked } = await openThinkingAwayFromBottom();
     const onSources = listeners.get("llm-sources-updated");
     if (!onSources) throw new Error("sources listener missing");
+    const pending = reloadMessages();
     await act(async () => {
       onSources({ payload: { threadId: "thread-a" } });
     });
+    await pending;
     expect(log.scrollTop).toBe(parked);
   });
 
@@ -767,9 +782,11 @@ describe("finished answer stays put", () => {
       },
     ];
     const { log, parked } = await openThinkingAwayFromBottom();
+    const pending = reloadMessages();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "準備書面.pdf" }));
     });
+    await pending;
     expect(mockInvoke).toHaveBeenCalledWith(
       "llm_set_source_grain",
       expect.objectContaining({ id: "src-1", grain: "file" }),
