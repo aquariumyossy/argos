@@ -1025,16 +1025,25 @@ async fn llm_send_inner<R: Runtime>(
                     note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
                 });
             }
+            Err(e) if round_limit_final => {
+                if let Some(kept) = take_kept_answer(&mut phantom_fallback, &mut recovered_cut) {
+                    final_reasoning = kept.reasoning;
+                    result_text = kept.content;
+                    kept_source_ids = Some(kept.source_ids);
+                    round_limit_aside = Some(tools::tool_round_limit_short_notice(max_rounds));
+                } else {
+                    let finished = tools::round_limit_failure(max_rounds, &e);
+                    result_text = finished.text;
+                    round_limit_aside = finished.notice;
+                }
+                break;
+            }
             Err(_)
                 if recovered_cut_to_keep(&recovered_cut).is_some() || phantom_fallback.is_some() =>
             {
                 // A later phantom or citation retry failed. Keep the cut answer,
                 // and only the sources that existed when it was written.
-                if let Some(original) = phantom_fallback.take() {
-                    final_reasoning = original.reasoning;
-                    result_text = original.content;
-                    kept_source_ids = Some(original.source_ids);
-                } else if let Some(kept) = recovered_cut.take() {
+                if let Some(kept) = take_kept_answer(&mut phantom_fallback, &mut recovered_cut) {
                     final_reasoning = kept.reasoning;
                     result_text = kept.content;
                     kept_source_ids = Some(kept.source_ids);
@@ -1042,12 +1051,6 @@ async fn llm_send_inner<R: Runtime>(
                     final_reasoning = String::new();
                     result_text = String::new();
                 }
-                break;
-            }
-            Err(e) if round_limit_final => {
-                let finished = tools::round_limit_failure(max_rounds, &e);
-                result_text = finished.text;
-                round_limit_aside = finished.notice;
                 break;
             }
             Err(e)
@@ -1115,13 +1118,48 @@ async fn llm_send_inner<R: Runtime>(
                     !out.tool_calls.is_empty(),
                     source_ids,
                 );
+                let stripped_without_tools = !with_tools && !out.tool_calls.is_empty();
+                let answer_body = if stripped_without_tools {
+                    ""
+                } else {
+                    out.content.trim()
+                };
                 if round_limit_final {
-                    let finished = tools::round_limit_answer(Some(&out.content), max_rounds);
-                    if finished.notice.is_some() {
-                        final_reasoning = out.reasoning;
+                    if answer_body.is_empty() {
+                        if let Some(kept) =
+                            take_kept_answer(&mut phantom_fallback, &mut recovered_cut)
+                        {
+                            final_reasoning = kept.reasoning;
+                            result_text = kept.content;
+                            kept_source_ids = Some(kept.source_ids);
+                            round_limit_aside =
+                                Some(tools::tool_round_limit_short_notice(max_rounds));
+                        } else {
+                            let finished = tools::round_limit_answer(None, max_rounds);
+                            result_text = finished.text;
+                            round_limit_aside = finished.notice;
+                        }
+                    } else {
+                        let finished = tools::round_limit_answer(Some(answer_body), max_rounds);
+                        if finished.notice.is_some() {
+                            final_reasoning = out.reasoning;
+                        }
+                        result_text = finished.text;
+                        round_limit_aside = finished.notice;
                     }
-                    result_text = finished.text;
-                    round_limit_aside = finished.notice;
+                    break;
+                }
+                if stripped_without_tools {
+                    if let Some(kept) = take_kept_answer(&mut phantom_fallback, &mut recovered_cut)
+                    {
+                        final_reasoning = kept.reasoning;
+                        result_text = kept.content;
+                        kept_source_ids = Some(kept.source_ids);
+                    } else {
+                        empty_reply = true;
+                        final_reasoning = out.reasoning;
+                        result_text = silent_end_notice(&out.finish_reason);
+                    }
                     break;
                 }
                 if with_tools
@@ -2762,6 +2800,26 @@ fn recovered_cut_to_keep(slot: &Option<RecoveredCut>) -> Option<&RecoveredCut> {
     slot.as_ref().filter(|row| !row.content.trim().is_empty())
 }
 
+/// Phantom text wins, then the cut answer. Sources are those from that moment.
+fn take_kept_answer(
+    phantom: &mut Option<PhantomOriginal>,
+    recovered: &mut Option<RecoveredCut>,
+) -> Option<RecoveredCut> {
+    if let Some(original) = phantom.take() {
+        return Some(RecoveredCut {
+            content: original.content,
+            reasoning: original.reasoning,
+            source_ids: original.source_ids,
+        });
+    }
+    let kept = recovered.take()?;
+    if kept.content.trim().is_empty() {
+        None
+    } else {
+        Some(kept)
+    }
+}
+
 /// Remember the first phantom answer and the source ids that existed then.
 /// A later retry must not replace it, and must not bind a newly fetched row to it.
 fn remember_phantom_answer(
@@ -4199,28 +4257,54 @@ mod tests {
         (dir, db, result.thread.clone(), result)
     }
 
-    #[tokio::test]
-    async fn llm_send_keeps_the_cut_answer_when_a_tool_preamble_then_fails() {
-        let (dir, db, thread, result) = send_script(
-            "preamble",
-            1,
-            vec![
-                reasoning_over_cap(),
-                content_stop("根拠は [9] です。"),
-                content_and_search("調べます。", "OrionContract"),
-                http_status(500, "Internal Server Error", r#"{"error":"failed"}"#),
-            ],
-            false,
-        )
-        .await;
-        assert!(result.error.is_none(), "{:?}", result.error);
-        let messages = db.list_llm_messages(&thread.id).unwrap();
-        let answer = final_answer(&messages);
-        assert_eq!(answer.content, "根拠は [9] です。");
+    fn seven_searches() -> Vec<Vec<u8>> {
+        (0..7).map(|_| content_and_search("", "OrionContract")).collect()
+    }
+
+    fn assert_kept_round_limit_answer(
+        messages: &[crate::db::LlmMessageRow],
+        body: &str,
+        cut_notice: bool,
+    ) {
+        let answer = messages
+            .iter()
+            .find(|message| message.content == body)
+            .expect("the recovered answer is saved");
+        assert_eq!(answer.kind, "", "a kept answer is a normal turn, not a notice");
         assert!(messages.iter().any(|message| {
             message.kind == crate::db::LLM_MESSAGE_NOTICE
-                && message.content == llm::thinking::THINKING_CUT_NOTICE
+                && message.content.contains("上限の 8 回")
+                && message.content.contains("ここまでの資料で答えています")
         }));
+        assert_eq!(
+            messages
+                .iter()
+                .any(|message| message.content == llm::thinking::THINKING_CUT_NOTICE),
+            cut_notice
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("続きの回答は失敗しました")),
+            "the round-limit failure text must not replace the kept answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_fails() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(http_status(
+            500,
+            "Internal Server Error",
+            r#"{"error":"failed"}"#,
+        ));
+        let (dir, db, thread, result) = send_script("round-fail", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
         assert_eq!(
             messages
                 .iter()
@@ -4228,6 +4312,104 @@ mod tests {
                 .count(),
             1,
             "the preamble stays on the tool-call row only"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_phantom_answer_when_the_round_limit_final_fails_without_a_cut() {
+        let mut script = seven_searches();
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(http_status(
+            500,
+            "Internal Server Error",
+            r#"{"error":"failed"}"#,
+        ));
+        let (dir, db, thread, result) = send_script("round-plain", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", false);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_is_empty() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(content_stop(""));
+        let (dir, db, thread, result) = send_script("round-empty", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("続きはもう一度指示するか")),
+            "an empty final must not replace the kept answer with the long limit notice"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_embeds_a_tool_call() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(content_stop(
+            "まだ調べます。<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>",
+        ));
+        let (dir, db, thread, result) = send_script("round-embed", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("まだ調べます。")),
+            "a stripped tool call on the final no-tools call must not replace the answer"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_ignores_an_embedded_tool_call_when_tools_were_not_sent() {
+        let rejected = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#;
+        let embedded = "まだ調べます。<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>";
+        let (dir, db, thread, result) = send_script(
+            "embedded",
+            8,
+            vec![
+                http_status(400, "Bad Request", rejected),
+                http_status(400, "Bad Request", rejected),
+                reasoning_over_cap(),
+                content_stop("根拠は [9] です。"),
+                content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "根拠は [9] です。")
+            .expect("the cut answer is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(
+            !messages.iter().any(|message| message.content.contains("まだ調べます。")),
+            "a stripped tool call must not become the answer"
         );
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
