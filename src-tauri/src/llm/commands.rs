@@ -1476,17 +1476,25 @@ pub async fn llm_context_meter(
     let state = state.inner().clone();
     let thread_id = thread_id.unwrap_or_default();
     let web_search = web_search.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    let (tokens, _) = tauri::async_runtime::spawn_blocking(move || {
         measure_context_meter(state, thread_id, draft, web_search, None)
     })
     .await
-    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())??;
+    Ok(tokens)
 }
 
-/// Tokens the next request would use if `source_id` were the whole file.
-/// Same count as [`llm_context_meter`], including that pending attachment,
-/// before the send budget cuts it down. The full-file confirm compares this
-/// with the meter denominator.
+/// Next request if `source_id` were the whole file, assembled with the same
+/// budget `llm_send` passes to `assemble_turns`. `tokens` is that request's
+/// size, the meter numerator after the switch. `body_trimmed` is set only when
+/// this file's own body is cut. Old exchanges are dropped before that.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmFileGrainMeter {
+    pub tokens: usize,
+    pub body_trimmed: bool,
+}
+
 #[tauri::command]
 pub async fn llm_file_grain_meter(
     state: State<'_, Arc<AppState>>,
@@ -1494,37 +1502,78 @@ pub async fn llm_file_grain_meter(
     source_id: String,
     draft: String,
     web_search: Option<bool>,
-) -> Result<usize, String> {
+) -> Result<LlmFileGrainMeter, String> {
     let state = state.inner().clone();
     let web_search = web_search.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    let (tokens, body_trimmed) = tauri::async_runtime::spawn_blocking(move || {
         measure_context_meter(state, thread_id, draft, web_search, Some(source_id))
     })
     .await
-    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())??;
+    Ok(LlmFileGrainMeter {
+        tokens,
+        body_trimmed,
+    })
 }
 
-/// Assemble budget for the full-file confirm. Large enough that the pending
-/// attachment is counted whole. The live meter may cut it to the send budget
-/// after the user agrees; the dialog compares this full size with the meter
-/// denominator, which is the limit minus the reply and tool reserves.
-const FILE_GRAIN_METER_BUDGET: usize = 8_000_000;
+struct FileGrainReading {
+    tokens: usize,
+    body_trimmed: bool,
+}
 
-fn file_grain_request_tokens(
+/// Same extra user row `meter_usage_tokens` appends. Kept in step with
+/// `history_including_draft` so this count is the meter numerator.
+fn history_with_meter_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMessageRow> {
+    let mut history = history.to_vec();
+    history.push(LlmMessageRow {
+        id: "meter-draft".into(),
+        thread_id: history
+            .last()
+            .map(|row| row.thread_id.clone())
+            .unwrap_or_default(),
+        role: "user".into(),
+        content: meter_question(draft).to_string(),
+        created_at: 0,
+        reasoning: String::new(),
+        tool_calls: String::new(),
+        tool_call_id: String::new(),
+        tool_name: String::new(),
+        kind: String::new(),
+    });
+    history
+}
+
+fn file_grain_reading(
     system: &str,
     sources: &[LlmSourceRow],
     history: &[LlmMessageRow],
     draft: &str,
     schema_tokens: usize,
-) -> usize {
-    meter_usage_tokens(
-        system,
-        sources,
-        history,
-        draft,
-        schema_tokens,
-        FILE_GRAIN_METER_BUDGET,
-    )
+    message_budget: usize,
+    source_id: &str,
+) -> FileGrainReading {
+    let history = history_with_meter_draft(history, draft);
+    let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
+    let sent: usize = turns
+        .iter()
+        .filter(|turn| turn.role != "system")
+        .map(crate::llm::context::turn_tokens)
+        .sum();
+    let full = sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .map(|source| source.body.trim().to_string())
+        .unwrap_or_default();
+    let latest = turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == "user")
+        .map(|turn| turn.content.as_str())
+        .unwrap_or("");
+    FileGrainReading {
+        tokens: sent + schema_tokens,
+        body_trimmed: !full.is_empty() && !latest.contains(full.as_str()),
+    }
 }
 
 /// Pending rows of the same path are dropped, matching `llm_set_source_grain`.
@@ -1590,7 +1639,7 @@ fn measure_context_meter(
     draft: String,
     web_search: bool,
     expand_source_id: Option<String>,
-) -> Result<usize, String> {
+) -> Result<(usize, bool), String> {
     let question = meter_question(&draft).to_string();
     let settings = state.settings.read().clone();
     let (thread, history, mut sources) = if thread_id.trim().is_empty() {
@@ -1628,22 +1677,28 @@ fn measure_context_meter(
         &sources,
         None,
     );
-    if expand_id.is_some() {
-        return Ok(file_grain_request_tokens(
+    if let Some(id) = expand_id.as_deref() {
+        let reading = file_grain_reading(
             &plan.system,
             &sources,
             &history,
             &draft,
             plan.schema_tokens,
-        ));
+            plan.prompt_budget,
+            id,
+        );
+        return Ok((reading.tokens, reading.body_trimmed));
     }
-    Ok(meter_usage_tokens(
-        &plan.system,
-        &sources,
-        &history,
-        &draft,
-        plan.schema_tokens,
-        plan.prompt_budget,
+    Ok((
+        meter_usage_tokens(
+            &plan.system,
+            &sources,
+            &history,
+            &draft,
+            plan.schema_tokens,
+            plan.prompt_budget,
+        ),
+        false,
     ))
 }
 
@@ -3346,8 +3401,24 @@ mod tests {
         }
     }
 
+    fn chat_message(id: &str, role: &str, content: &str) -> LlmMessageRow {
+        LlmMessageRow {
+            id: id.into(),
+            thread_id: "t".into(),
+            role: role.into(),
+            content: content.into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+        }
+    }
+
     #[test]
     fn file_grain_meter_counts_the_pending_attachment_on_the_meter_basis() {
+        let budget = 200_000;
         let expanded = sources_with_file_body(
             vec![pending_contract("段落")],
             "f1",
@@ -3355,10 +3426,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(expanded[0].grain, "file");
-        let used = file_grain_request_tokens("役割", &expanded, &[], "", 2_410);
+        let reading = file_grain_reading("役割", &expanded, &[], "", 2_410, budget, "f1");
+        assert!(!reading.body_trimmed);
         assert_eq!(
-            used, 64_932,
+            reading.tokens, 64_932,
             "same count as the chat meter for a pending attachment"
+        );
+        assert_eq!(
+            reading.tokens,
+            meter_usage_tokens("役割", &expanded, &[], "", 2_410, budget)
         );
 
         let mut sibling = pending_contract("別段落");
@@ -3383,22 +3459,54 @@ mod tests {
         assert_eq!(kept[0].body, "本文");
         assert_eq!(kept[0].grain, "file");
 
-        let body = "あ".repeat(180_000);
-        let raw = estimate_tokens(&body);
-        let configured = 131_072usize;
+    }
+
+    #[test]
+    fn file_grain_confirm_asks_only_when_the_file_body_is_cut() {
+        let budget = 40_000usize;
+        let exchange = "あ".repeat(2_000);
+        let mut history = Vec::new();
+        for i in 0..80 {
+            history.push(chat_message(&format!("u{i}"), "user", &exchange));
+            history.push(chat_message(&format!("a{i}"), "assistant", &exchange));
+        }
+
+        let small = sources_with_file_body(
+            vec![pending_contract("段落")],
+            "f1",
+            "あ".repeat(3_000),
+        )
+        .unwrap();
+        let small_reading = file_grain_reading("役割", &small, &history, "", 2_410, budget, "f1");
         assert!(
-            raw <= configured,
-            "raw file tokens {raw} still fit the configured limit {configured}"
+            !small_reading.body_trimmed,
+            "a short file stays whole after old exchanges are dropped"
         );
-        let full = sources_with_file_body(vec![pending_contract("段落")], "f1", body).unwrap();
-        let measured = file_grain_request_tokens("役割", &full, &[], "", 2_410);
-        let denom = configured
-            .saturating_sub(crate::llm::context::reply_headroom_tokens(configured))
-            .saturating_sub(crate::llm::context::tool_result_allowance_tokens(configured));
-        assert_eq!(denom, 85_197);
+        assert_eq!(
+            small_reading.tokens,
+            meter_usage_tokens("役割", &small, &history, "", 2_410, budget)
+        );
+        let whole_history = meter_usage_tokens("役割", &small, &history, "", 2_410, 8_000_000);
         assert!(
-            measured > denom,
-            "the confirm uses the meter denominator: {measured} > {denom}"
+            whole_history > small_reading.tokens,
+            "the untrimmed history is larger than the send: {whole_history} vs {}",
+            small_reading.tokens
+        );
+
+        let large = sources_with_file_body(
+            vec![pending_contract("段落")],
+            "f1",
+            "あ".repeat(100_000),
+        )
+        .unwrap();
+        let large_reading = file_grain_reading("役割", &large, &history, "", 2_410, budget, "f1");
+        assert!(
+            large_reading.body_trimmed,
+            "a file that does not fit is cut"
+        );
+        assert_eq!(
+            large_reading.tokens,
+            meter_usage_tokens("役割", &large, &history, "", 2_410, budget)
         );
     }
 }

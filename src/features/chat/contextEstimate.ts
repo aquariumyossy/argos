@@ -39,15 +39,7 @@ export function contextMeterLimit(limit: number): number {
   return Math.max(0, limit - replyHeadroomTokens(limit) - toolResultAllowanceTokens(limit));
 }
 
-/**
- * Full-file confirm. `measuredTokens` is `llm_file_grain_meter`: the next
- * request with that pending attachment counted in full, on the same basis as
- * the meter. The limit is the meter denominator, not the raw setting.
- */
-export function fileGrainExceedsMeter(measuredTokens: number, maxContextTokens: number): boolean {
-  return measuredTokens > contextMeterLimit(maxContextTokens);
-}
-
+/** Confirm copy. `measuredTokens` is the next request after switching to the whole file. */
 export function fileGrainConfirmMessage(measuredTokens: number, maxContextTokens: number): string {
   const jp = (n: number) => n.toLocaleString("ja-JP");
   const limit = contextMeterLimit(maxContextTokens);

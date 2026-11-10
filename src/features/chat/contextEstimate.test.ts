@@ -9,7 +9,6 @@ import {
   contextMeterLimit,
   estimateTokens,
   fileGrainConfirmMessage,
-  fileGrainExceedsMeter,
   replyHeadroomTokens,
   toolResultAllowanceTokens,
   toolSchemaTokens,
@@ -55,18 +54,10 @@ describe("context tokens", () => {
     expect(contextIsNearLimit(62_399, contextMeterLimit(limit))).toBe(false);
   });
 
-  it("confirms a full file from the measured request and the meter limit", () => {
-    const max = 131_072;
-    const measured = 90_000;
-    expect(measured).toBeLessThanOrEqual(max);
-    expect(contextMeterLimit(max)).toBe(85_197);
-    expect(fileGrainExceedsMeter(measured, max)).toBe(true);
-    expect(fileGrainExceedsMeter(85_197, max)).toBe(false);
-    expect(fileGrainConfirmMessage(measured, max)).toBe(
-      "全文にすると約 90,000 トークンです。送信の上限は 85,197 トークンです。全文にしますか？",
+  it("states the assembled size and the meter limit in the full-file confirm", () => {
+    expect(contextMeterLimit(131_072)).toBe(85_197);
+    expect(fileGrainConfirmMessage(80_087, 131_072)).toBe(
+      "全文にすると約 80,087 トークンです。送信の上限は 85,197 トークンです。全文にしますか？",
     );
-    // 100,000 characters measure as 64,932 on the meter, under a 120,000 setting.
-    expect(contextMeterLimit(120_000)).toBe(78_000);
-    expect(fileGrainExceedsMeter(64_932, 120_000)).toBe(false);
   });
 });

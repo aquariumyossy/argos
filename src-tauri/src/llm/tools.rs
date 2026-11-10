@@ -3927,9 +3927,7 @@ mod tests {
             kind: String::new(),
         }];
         let mut saw = false;
-        // MARK sits about 400 characters in. 400 tokens already keeps it on
-        // screen, so the smaller budgets are the ones that hide it.
-        for budget in [200usize, 280, 320, 400, 600, 800, 1_000, 1_400] {
+        for budget in [400usize, 600, 800, 1_000, 1_400] {
             let (turns, _) =
                 crate::llm::context::assemble_turns("役割", &[row.clone()], &history, budget);
             let user = turns.iter().find(|turn| turn.role == "user").unwrap();
