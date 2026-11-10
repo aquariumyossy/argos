@@ -897,6 +897,10 @@ export default function Chat() {
   const showLive =
     !!viewingLive && (busy || stream.length > 0 || thinking.length > 0 || toolHint.length > 0);
   showLiveRef.current = showLive;
+  useEffect(() => {
+    if (showLive) return;
+    listRef.current?.classList.remove("chat-log-no-anchor");
+  }, [showLive]);
   const generatingThreadId = busy ? (live?.threadId ?? null) : null;
   const onGeneratingThread = !!generatingThreadId && active?.id === generatingThreadId;
 
@@ -929,7 +933,7 @@ export default function Chat() {
     wasAtBottomRef.current = false;
     // Class is applied before the browser clamps or anchors this frame.
     detailsHoldRef.current = true;
-    listRef.current?.classList.add("chat-log-no-anchor");
+    if (showLiveRef.current) listRef.current?.classList.add("chat-log-no-anchor");
     setDetailsHold(true);
     setFollowBottom(false);
   }, []);
@@ -2039,7 +2043,7 @@ export default function Chat() {
       <main className="chat-main">
         <div className="chat-log-wrap">
         <div
-          className={detailsHold ? "chat-log chat-log-no-anchor" : "chat-log"}
+          className={detailsHold && showLive ? "chat-log chat-log-no-anchor" : "chat-log"}
           ref={listRef}
           onScroll={onLogScroll}
           onWheel={noteUserScroll}

@@ -882,6 +882,38 @@ describe("scroll follow during generation", () => {
     expect(jump()).toBeNull();
   });
 
+  it("drops the no-anchor class when generation ends and keeps the jump button", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-old",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "前の回答",
+        reasoning: "前の思考",
+        createdAt: 2,
+      },
+    ];
+    const { log } = await startPinnedLog();
+    fireEvent.click(screen.getByText("思考"));
+    await act(async () => {});
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(true);
+    expect(jump()).toBeTruthy();
+    const parked = log.scrollTop;
+    await act(async () => {
+      releaseSend();
+    });
+    await screen.findByText("完成した回答");
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(false);
+    expect(jump()).toBeTruthy();
+    expect(log.scrollTop).toBe(parked);
+    log.scrollTop = Math.max(0, parked - 200);
+    fireEvent.scroll(log);
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(false);
+    expect(jump()).toBeTruthy();
+    expect(log.scrollTop).toBe(Math.max(0, parked - 200));
+  });
+
   it("resumes following when enlarging the window clamps onto the bottom", async () => {
     const { log, box } = await startPinnedLog();
     log.scrollTop = 500;
