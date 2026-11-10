@@ -946,20 +946,7 @@ pub async fn llm_send(
     thread.summary = folded.summary;
     thread.summary_through_id = folded.through_id;
     let (assembled, stats) = assemble_turns(&system, &sources, &folded.messages, prompt_budget);
-    if let Some(turn) = assembled.iter().find(|turn| {
-        turn.role == "user" && turn.content.starts_with(summary::SUMMARY_PREFIX)
-    }) {
-        let injected = summary::stored_text_from_turn(&turn.content);
-        if !injected.is_empty() && injected != thread.summary.trim() {
-            if state
-                .db
-                .set_llm_thread_summary(&thread.id, &injected, &thread.summary_through_id)
-                .is_ok()
-            {
-                thread.summary = injected;
-            }
-        }
-    }
+    // A long question may clip the summary inside this request. That clip is not stored.
     if stats.question_exceeds {
         discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(

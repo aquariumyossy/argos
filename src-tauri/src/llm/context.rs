@@ -1155,9 +1155,19 @@ pub fn assemble_turns(
 
     for m in &hist {
         let summary = m.id == SUMMARY_TURN_ID;
+        let merged = !summary
+            && m.role == "user"
+            && m.content.starts_with(crate::llm::summary::SUMMARY_PREFIX);
+        let (summary_block, user_text) = if merged {
+            crate::llm::summary::split_merged_user(&m.content)
+        } else {
+            (String::new(), String::new())
+        };
         let mut turn = history_turn(m);
         let question = if summary || m.role != "user" {
             String::new()
+        } else if merged {
+            user_text.clone()
         } else {
             m.content.clone()
         };
@@ -1183,6 +1193,23 @@ pub fn assemble_turns(
                 source.body.clear();
             }
             append_summary_stubs(&mut turn.content, &attached);
+        } else if merged {
+            let user_part = if attached.is_empty() {
+                user_text
+            } else {
+                render_user_content(&question, &attached, pool, false)
+            };
+            turn.content = if user_part.trim().is_empty() {
+                summary_block
+            } else {
+                format!("{summary_block}\n\n{user_part}")
+            };
+            let mut orphans = covered_sources(&kept, &hist);
+            for source in &mut orphans {
+                source.body.clear();
+            }
+            append_summary_stubs(&mut turn.content, &orphans);
+            attached.extend(orphans);
         } else if !attached.is_empty() {
             turn.content = render_user_content(&question, &attached, pool, false);
         }
@@ -1266,6 +1293,19 @@ pub fn assemble_turns(
         .filter(|row| row.summary)
         .flat_map(|row| row.sources.iter().map(|s| s.id.clone()))
         .collect();
+    // Covered sources ride along on the merged user turn as empty-body stubs.
+    let merged_stub_ids: HashSet<String> = built
+        .iter()
+        .filter(|row| {
+            !row.summary && row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX)
+        })
+        .flat_map(|row| {
+            row.sources
+                .iter()
+                .filter(|source| source.body.trim().is_empty())
+                .map(|source| source.id.clone())
+        })
+        .collect();
     let shown: Vec<LlmSourceRow> = built
         .iter()
         .filter(|row| !row.summary)
@@ -1273,7 +1313,7 @@ pub fn assemble_turns(
         .collect();
     let source_chars = char_len(&format_sources_with_pool(&shown, pool));
     let shortened = shown.iter().any(|s| {
-        if summary_source_ids.contains(&s.id) {
+        if summary_source_ids.contains(&s.id) || merged_stub_ids.contains(&s.id) {
             return false;
         }
         pool.iter()
@@ -1309,6 +1349,31 @@ fn render_user_content(
         format_sources_with_pool(sources, pool)
     };
     wrap_user(&block, question)
+}
+
+/// Keep a summary block that was merged into this user turn when the user text is re-rendered.
+fn assign_user_content(row: &mut BuiltTurn, user_part: String) {
+    let merged = row
+        .turn
+        .content
+        .starts_with(crate::llm::summary::SUMMARY_PREFIX);
+    if !merged {
+        row.turn.content = user_part;
+        return;
+    }
+    let block = crate::llm::summary::split_merged_user(&row.turn.content).0;
+    row.turn.content = if user_part.trim().is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{}", user_part.trim())
+    };
+    let stubs: Vec<LlmSourceRow> = row
+        .sources
+        .iter()
+        .filter(|source| source.body.trim().is_empty())
+        .cloned()
+        .collect();
+    append_summary_stubs(&mut row.turn.content, &stubs);
 }
 
 fn tokens_of(built: &[BuiltTurn]) -> usize {
@@ -1789,7 +1854,8 @@ fn apply_age_stubs(built: &mut [BuiltTurn], pool: &[LlmSourceRow]) {
             continue;
         }
         if row.turn.role == "user" && !row.sources.is_empty() && !recent.contains(&row.message_id) {
-            row.turn.content = render_user_content(&row.question, &row.sources, pool, true);
+            let rendered = render_user_content(&row.question, &row.sources, pool, true);
+            assign_user_content(row, rendered);
         } else if row.turn.role == "tool" && index < recent_from {
             row.turn.content = stub_old_tool(&row.turn.content, pool, row.turn.name.as_deref());
         }
@@ -1855,7 +1921,8 @@ fn refit_freed_budget(
             continue;
         }
         row.sources = row.original_sources.clone();
-        row.turn.content = render_user_content(&row.question, &row.sources, pool, false);
+        let rendered = render_user_content(&row.question, &row.sources, pool, false);
+        assign_user_content(row, rendered);
         changed = true;
     }
     if !changed {
@@ -1894,8 +1961,17 @@ fn shrink_recent_sources(
             continue;
         }
         let next = render_user_content(&row.question, &row.sources, pool, true);
-        if next != row.turn.content {
-            row.turn.content = next;
+        let current = if row
+            .turn
+            .content
+            .starts_with(crate::llm::summary::SUMMARY_PREFIX)
+        {
+            crate::llm::summary::split_merged_user(&row.turn.content).1
+        } else {
+            row.turn.content.clone()
+        };
+        if next != current {
+            assign_user_content(row, next);
             changed = true;
         }
     }
@@ -1956,7 +2032,8 @@ fn shrink_unsent_attachment(
         drop_empty_image_pages(&mut built[turn_idx].sources);
         let question = built[turn_idx].question.clone();
         let sources = built[turn_idx].sources.clone();
-        built[turn_idx].turn.content = render_user_content(&question, &sources, pool, false);
+        let rendered = render_user_content(&question, &sources, pool, false);
+        assign_user_content(&mut built[turn_idx], rendered);
         changed = true;
     }
     changed
@@ -2045,7 +2122,8 @@ fn refit_sources(
             .iter()
             .filter_map(|source| kept_by_id.get(&source.id).cloned())
             .collect();
-        row.turn.content = render_user_content(&row.question, &row.sources, pool, false);
+        let rendered = render_user_content(&row.question, &row.sources, pool, false);
+        assign_user_content(row, rendered);
     }
     true
 }
