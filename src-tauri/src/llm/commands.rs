@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
@@ -147,7 +147,7 @@ async fn execute_tool_off_runtime(
     }
 }
 
-fn emit_chat_reset(app: &AppHandle, request_id: &str, thread_id: &str) {
+fn emit_chat_reset<R: Runtime>(app: &AppHandle<R>, request_id: &str, thread_id: &str) {
     let _ = app.emit(
         "llm-chat-delta",
         LlmChatDelta {
@@ -391,7 +391,7 @@ pub struct NoteReviewEvent {
     pub note_id: String,
 }
 
-fn emit_note_review(app: &AppHandle, thread_id: &str, note_id: &str) {
+fn emit_note_review<R: Runtime>(app: &AppHandle<R>, thread_id: &str, note_id: &str) {
     let _ = app.emit(
         "llm-note-review",
         NoteReviewEvent {
@@ -401,7 +401,12 @@ fn emit_note_review(app: &AppHandle, thread_id: &str, note_id: &str) {
     );
 }
 
-fn after_llm_note_write(app: &AppHandle, state: &AppState, thread_id: &str, note_id: &str) {
+fn after_llm_note_write<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    thread_id: &str,
+    note_id: &str,
+) {
     crate::commands::emit_note_updated_from(app, note_id, "memo", "llm");
     emit_note_review(app, thread_id, note_id);
     if !crate::notes_window_visible(app) {
@@ -725,6 +730,16 @@ pub async fn llm_send(
     content: String,
     web_search: Option<bool>,
 ) -> Result<LlmSendResult, String> {
+    llm_send_inner(&app, state.inner(), thread_id, content, web_search).await
+}
+
+async fn llm_send_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &Arc<AppState>,
+    thread_id: Option<String>,
+    content: String,
+    web_search: Option<bool>,
+) -> Result<LlmSendResult, String> {
     let web_search = web_search.unwrap_or(false);
     let content = content.trim().to_string();
     if content.is_empty() {
@@ -765,7 +780,7 @@ pub async fn llm_send(
         .map_err(|e| e.to_string())?;
 
     let paste = if crate::llm::fetch_url::message_may_contain_url(&content) {
-        let state_for_fetch = state.inner().clone();
+        let state_for_fetch = Arc::clone(state);
         let tid = thread.id.clone();
         let msg = content.clone();
         tokio::task::spawn_blocking(move || {
@@ -838,7 +853,7 @@ pub async fn llm_send(
     persist_image_group_cites(&state.db, &sources, &consumed);
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
-    let state_arc = state.inner().clone();
+    let state_arc = Arc::clone(state);
     if !state.start_llm(
         request_id.clone(),
         thread.id.clone(),
@@ -865,12 +880,19 @@ pub async fn llm_send(
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
     let mut empty_reply = false;
+    // Once a cut answers, later passes in this turn stay thinking-off.
+    let mut cut_hold = llm::thinking::CutHold::default();
     // First answer kept when a phantom retry (hint or source-block) comes back empty.
     let mut phantom_fallback: Option<PhantomOriginal> = None;
+    // Cut answer kept when a later phantom or citation retry fails.
+    let mut recovered_cut: Option<RecoveredCut> = None;
     let mut kept_source_ids: Option<std::collections::HashSet<String>> = None;
     let result_text;
 
     loop {
+        if cut_hold.tools_off {
+            use_tools = false;
+        }
         if use_tools && !unlimited_rounds && rounds >= max_rounds {
             // One answer from what this turn already collected. No further tool calls.
             use_tools = false;
@@ -893,15 +915,37 @@ pub async fn llm_send(
         }
         let turns_now = current_turns.clone();
         let mut bridge_retried = false;
+        let thinking_on =
+            llm::thinking::thinking_enabled(&settings) && !cut_hold.thinking_off;
+        let mut cut = if cut_hold.thinking_off {
+            llm::thinking::ThinkingCut::held(with_tools)
+        } else {
+            llm::thinking::ThinkingCut::start(thinking_on, with_tools)
+        };
+        let mut thinking_off_settings = None;
+        // The round-start flag stays true when stage 2 drops tools mid-round.
+        // This follows the request that actually produced the response.
+        let mut tools_sent;
         let outcome = loop {
             let app2 = app.clone();
             let req = request_id.clone();
             let tid = thread.id.clone();
+            let request = cut.request();
+            tools_sent = request.tools;
+            let call_settings: &crate::db::Settings = if request.thinking_off {
+                thinking_off_settings.get_or_insert_with(|| {
+                    let mut off = settings.clone();
+                    off.llm_thinking = "off".into();
+                    off
+                })
+            } else {
+                &settings
+            };
             let streamed = llm::stream_chat(
-                &settings,
+                call_settings,
                 &turns_now,
                 cancel.clone(),
-                if with_tools {
+                if request.tools {
                     Some(&tools_schema)
                 } else {
                     None
@@ -920,7 +964,7 @@ pub async fn llm_send(
                 },
             )
             .await;
-            match streamed {
+            match &streamed {
                 Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR && !bridge_retried => {
                     bridge_retried = true;
                     emit_chat_reset(&app, &request_id, &thread.id);
@@ -929,14 +973,34 @@ pub async fn llm_send(
                 Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR => {
                     break Err(llm::thinking::thinking_bridge_error());
                 }
-                Err(e) if e.starts_with(llm::thinking::THINKING_RUNAWAY_PREFIX) => {
-                    let chars = e
-                        .strip_prefix(llm::thinking::THINKING_RUNAWAY_PREFIX)
-                        .unwrap_or("");
-                    let n: usize = chars.parse().unwrap_or(0);
-                    break Err(llm::thinking::runaway_thinking_error(n));
+                _ => {}
+            }
+            let reply = cut_reply(&streamed);
+            let step = if cut.in_recovery() || matches!(reply, llm::thinking::CutReply::OverCap) {
+                cut.observe(reply)
+            } else {
+                llm::thinking::CutStep::Pass
+            };
+            match step {
+                llm::thinking::CutStep::Pass => break streamed,
+                llm::thinking::CutStep::Again(_) => {
+                    // The cap stopped this thinking stream. Ask again from the
+                    // materials already in the turn. This is not a tool round.
+                    emit_chat_reset(&app, &request_id, &thread.id);
+                    continue;
                 }
-                other => break other,
+                llm::thinking::CutStep::Answer { tools } => {
+                    cut_hold.observe_answer(tools);
+                    if !tools {
+                        use_tools = false;
+                    }
+                    break streamed;
+                }
+                llm::thinking::CutStep::Stop { over_cap: true } => {
+                    let err = streamed.as_ref().err().map(String::as_str).unwrap_or("");
+                    break Err(llm::thinking::finish_runaway(err));
+                }
+                llm::thinking::CutStep::Stop { over_cap: false } => break streamed,
             }
         };
 
@@ -962,13 +1026,35 @@ pub async fn llm_send(
                     thinking_budget_state: budget_fields(&settings.llm_base_url).0,
                     thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
-                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+                    note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
                 });
             }
             Err(e) if round_limit_final => {
-                let finished = tools::round_limit_failure(max_rounds, &e);
-                result_text = finished.text;
-                round_limit_aside = finished.notice;
+                if let Some(kept) = take_kept_answer(&mut phantom_fallback, &mut recovered_cut) {
+                    final_reasoning = kept.reasoning;
+                    result_text = kept.content;
+                    kept_source_ids = Some(kept.source_ids);
+                    round_limit_aside = Some(tools::tool_round_limit_short_notice(max_rounds));
+                } else {
+                    let finished = tools::round_limit_failure(max_rounds, &e);
+                    result_text = finished.text;
+                    round_limit_aside = finished.notice;
+                }
+                break;
+            }
+            Err(_)
+                if recovered_cut_to_keep(&recovered_cut).is_some() || phantom_fallback.is_some() =>
+            {
+                // A later phantom or citation retry failed. Keep the cut answer,
+                // and only the sources that existed when it was written.
+                if let Some(kept) = take_kept_answer(&mut phantom_fallback, &mut recovered_cut) {
+                    final_reasoning = kept.reasoning;
+                    result_text = kept.content;
+                    kept_source_ids = Some(kept.source_ids);
+                } else {
+                    final_reasoning = String::new();
+                    result_text = String::new();
+                }
                 break;
             }
             Err(e)
@@ -1017,20 +1103,73 @@ pub async fn llm_send(
                     thinking_budget_state: budget_fields(&settings.llm_base_url).0,
                     thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
-                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+                    note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
                 });
             }
             Ok(out) => {
+                let source_ids = state
+                    .db
+                    .list_llm_sources(&thread.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect();
+                // Reasoning-only calls on a request that sent no tools are not a tool turn.
+                let acts_as_tool_call = !out.tool_calls.is_empty()
+                    && (tools_sent || out.tool_calls_from_content_or_structured);
+                remember_recovered_cut(
+                    &mut recovered_cut,
+                    cut_hold.thinking_off,
+                    &out.content,
+                    &out.reasoning,
+                    acts_as_tool_call,
+                    source_ids,
+                );
+                let stripped_without_tools = acts_as_tool_call && !tools_sent;
+                let answer_body = if stripped_without_tools {
+                    ""
+                } else {
+                    out.content.trim()
+                };
                 if round_limit_final {
-                    let finished = tools::round_limit_answer(Some(&out.content), max_rounds);
-                    if finished.notice.is_some() {
-                        final_reasoning = out.reasoning;
+                    if answer_body.is_empty() {
+                        if let Some(kept) =
+                            take_kept_answer(&mut phantom_fallback, &mut recovered_cut)
+                        {
+                            final_reasoning = kept.reasoning;
+                            result_text = kept.content;
+                            kept_source_ids = Some(kept.source_ids);
+                            round_limit_aside =
+                                Some(tools::tool_round_limit_short_notice(max_rounds));
+                        } else {
+                            let finished = tools::round_limit_answer(None, max_rounds);
+                            result_text = finished.text;
+                            round_limit_aside = finished.notice;
+                        }
+                    } else {
+                        let finished = tools::round_limit_answer(Some(answer_body), max_rounds);
+                        if finished.notice.is_some() {
+                            final_reasoning = out.reasoning;
+                        }
+                        result_text = finished.text;
+                        round_limit_aside = finished.notice;
                     }
-                    result_text = finished.text;
-                    round_limit_aside = finished.notice;
                     break;
                 }
-                if with_tools
+                if stripped_without_tools {
+                    if let Some(kept) = take_kept_answer(&mut phantom_fallback, &mut recovered_cut)
+                    {
+                        final_reasoning = kept.reasoning;
+                        result_text = kept.content;
+                        kept_source_ids = Some(kept.source_ids);
+                    } else {
+                        empty_reply = true;
+                        final_reasoning = out.reasoning;
+                        result_text = silent_end_notice(&out.finish_reason);
+                    }
+                    break;
+                }
+                if tools_sent
                     && llm::thinking::thinking_enabled(&settings)
                     && !out.request_id.is_empty()
                 {
@@ -1124,7 +1263,7 @@ pub async fn llm_send(
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
                         if let Some(nid) = exec.wrote_note_id.clone() {
-                            after_llm_note_write(&app, state.inner().as_ref(), &thread.id, &nid);
+                            after_llm_note_write(&app, state.as_ref(), &thread.id, &nid);
                             if !wrote_note_ids.iter().any(|x| x == &nid) {
                                 wrote_note_ids.push(nid);
                             }
@@ -1208,8 +1347,14 @@ pub async fn llm_send(
                         phantom_retried = true;
                         // At the cap, turning tools back on makes the next pass the
                         // round-limit final answer (notice and stream reset).
-                        let tools_on =
-                            phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds);
+                        // A server that already rejected tools stays tool-less too.
+                        let tools_on = phantom_retry_tools_on(
+                            unlimited_rounds,
+                            rounds,
+                            max_rounds,
+                            cut_hold.tools_off,
+                            retried_without_tools,
+                        );
                         current_turns.push(ChatTurn::text("user", phantom_cite_hint(tools_on)));
                         use_tools = tools_on;
                         remember_phantom_answer(
@@ -1235,9 +1380,19 @@ pub async fn llm_send(
                         kept_source_ids = Some(original.source_ids);
                     }
                     PhantomRetryAnswer::EmptyNotice => {
-                        empty_reply = true;
-                        final_reasoning = out.reasoning;
-                        result_text = silent_end_notice(&out.finish_reason);
+                        if let Some(original) = phantom_fallback.take() {
+                            final_reasoning = original.reasoning;
+                            result_text = original.content;
+                            kept_source_ids = Some(original.source_ids);
+                        } else if let Some(kept) = recovered_cut_to_keep(&recovered_cut) {
+                            final_reasoning = kept.reasoning.clone();
+                            result_text = kept.content.clone();
+                            kept_source_ids = Some(kept.source_ids.clone());
+                        } else {
+                            empty_reply = true;
+                            final_reasoning = out.reasoning;
+                            result_text = silent_end_notice(&out.finish_reason);
+                        }
                     }
                     PhantomRetryAnswer::Retry => {
                         final_reasoning = out.reasoning;
@@ -1269,6 +1424,10 @@ pub async fn llm_send(
         )?)
     };
     if let Some(notice) = round_limit_aside.as_deref() {
+        let _ = state.db.insert_llm_notice(&thread.id, notice);
+    }
+    if let Some(notice) = cut_hold.notice(result_kind == crate::db::LLM_MESSAGE_NOTICE, &result_text)
+    {
         let _ = state.db.insert_llm_notice(&thread.id, notice);
     }
     let unset_notice = llm::thinking::thinking_budget_unset_notice();
@@ -1308,7 +1467,7 @@ pub async fn llm_send(
         thinking_budget_state: budget_fields(&settings.llm_base_url).0,
         thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
         warning,
-        note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+        note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
     })
 }
 
@@ -1339,7 +1498,7 @@ pub struct LlmAttachResult {
     pub created_thread: bool,
 }
 
-fn emit_sources_updated(app: &AppHandle, thread_id: &str) {
+fn emit_sources_updated<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     let _ = app.emit(
         "llm-sources-updated",
         LlmSourcesUpdated {
@@ -1348,7 +1507,7 @@ fn emit_sources_updated(app: &AppHandle, thread_id: &str) {
     );
 }
 
-fn emit_ocr_status(app: &AppHandle, thread_id: &str, active: bool) {
+fn emit_ocr_status<R: Runtime>(app: &AppHandle<R>, thread_id: &str, active: bool) {
     let _ = app.emit(
         "llm-ocr-status",
         LlmOcrStatus {
@@ -1358,14 +1517,14 @@ fn emit_ocr_status(app: &AppHandle, thread_id: &str, active: bool) {
     );
 }
 
-fn kick_pending_ocr(app: &AppHandle, state: Arc<AppState>) {
+fn kick_pending_ocr<R: Runtime>(app: &AppHandle<R>, state: Arc<AppState>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         run_ocr_queue(app, state).await;
     });
 }
 
-async fn run_ocr_queue(app: AppHandle, state: Arc<AppState>) {
+async fn run_ocr_queue<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
     loop {
         if state.is_llm_busy() {
             return;
@@ -1381,7 +1540,11 @@ async fn run_ocr_queue(app: AppHandle, state: Arc<AppState>) {
     }
 }
 
-async fn run_ocr_for_thread(app: &AppHandle, state: Arc<AppState>, thread_id: String) {
+async fn run_ocr_for_thread<R: Runtime>(
+    app: &AppHandle<R>,
+    state: Arc<AppState>,
+    thread_id: String,
+) {
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     if !state.start_llm(request_id.clone(), thread_id.clone(), "ocr", cancel.clone()) {
@@ -2548,10 +2711,39 @@ pub fn llm_attached_file_path(
     Err("ファイルが見つかりません。".into())
 }
 
+fn cut_reply(result: &Result<llm::StreamOutcome, String>) -> llm::thinking::CutReply {
+    match result {
+        Err(e) if e.starts_with(llm::thinking::THINKING_RUNAWAY_PREFIX) => {
+            llm::thinking::CutReply::OverCap
+        }
+        Err(e) if llm::is_tools_unsupported_error(e) => llm::thinking::CutReply::ToolsRejected,
+        Err(_) => llm::thinking::CutReply::Other,
+        Ok(out) if !out.tool_calls.is_empty() || out.finish_reason == "tool_calls" => {
+            llm::thinking::CutReply::NeedsTools
+        }
+        Ok(_) => llm::thinking::CutReply::Answer,
+    }
+}
+
 /// A phantom [n] may call tools again only while rounds remain.
 /// At the cap the retry stays tool-free, so it is not the round-limit final answer.
 fn phantom_retry_enables_tools(unlimited_rounds: bool, rounds: usize, max_rounds: usize) -> bool {
     unlimited_rounds || rounds < max_rounds
+}
+
+/// Tools stay off when this turn already learned the server rejects them, and
+/// when cut recovery itself removed them. A tool-less citation re-request on a
+/// tool-capable server does not set `tools_locked_off`, so rounds may restore tools.
+fn phantom_retry_tools_on(
+    unlimited_rounds: bool,
+    rounds: usize,
+    max_rounds: usize,
+    tools_locked_off: bool,
+    retried_without_tools: bool,
+) -> bool {
+    phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds)
+        && !tools_locked_off
+        && !retried_without_tools
 }
 
 fn phantom_cite_hint(tools_on: bool) -> &'static str {
@@ -2583,6 +2775,56 @@ struct PhantomOriginal {
     content: String,
     reasoning: String,
     source_ids: std::collections::HashSet<String>,
+}
+
+struct RecoveredCut {
+    content: String,
+    reasoning: String,
+    /// Sources that already existed when this answer was produced.
+    source_ids: std::collections::HashSet<String>,
+}
+
+/// The cut already answered. A later retry must not replace this with a failure.
+/// Text that rides along with a tool call is a preamble, not a new answer.
+fn remember_recovered_cut(
+    slot: &mut Option<RecoveredCut>,
+    thinking_was_cut: bool,
+    content: &str,
+    reasoning: &str,
+    has_tool_calls: bool,
+    source_ids: std::collections::HashSet<String>,
+) {
+    if thinking_was_cut && !has_tool_calls && !content.trim().is_empty() {
+        *slot = Some(RecoveredCut {
+            content: content.to_string(),
+            reasoning: reasoning.to_string(),
+            source_ids,
+        });
+    }
+}
+
+fn recovered_cut_to_keep(slot: &Option<RecoveredCut>) -> Option<&RecoveredCut> {
+    slot.as_ref().filter(|row| !row.content.trim().is_empty())
+}
+
+/// Phantom text wins, then the cut answer. Sources are those from that moment.
+fn take_kept_answer(
+    phantom: &mut Option<PhantomOriginal>,
+    recovered: &mut Option<RecoveredCut>,
+) -> Option<RecoveredCut> {
+    if let Some(original) = phantom.take() {
+        return Some(RecoveredCut {
+            content: original.content,
+            reasoning: original.reasoning,
+            source_ids: original.source_ids,
+        });
+    }
+    let kept = recovered.take()?;
+    if kept.content.trim().is_empty() {
+        None
+    } else {
+        Some(kept)
+    }
 }
 
 /// Remember the first phantom answer and the source ids that existed then.
@@ -3378,6 +3620,175 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn cut_reply_notices_a_cap_a_tool_call_and_a_tools_rejection() {
+        let runaway = Err(format!("{}12", llm::thinking::THINKING_RUNAWAY_PREFIX));
+        assert_eq!(cut_reply(&runaway), llm::thinking::CutReply::OverCap);
+        let rejected = Err(crate::llm::http_error::TOOLS_UNSUPPORTED_ERROR.to_string());
+        assert_eq!(cut_reply(&rejected), llm::thinking::CutReply::ToolsRejected);
+        assert_eq!(
+            cut_reply(&Err("cancelled".into())),
+            llm::thinking::CutReply::Other
+        );
+        let answer = llm::StreamOutcome {
+            content: "答え".into(),
+            ..llm::StreamOutcome::default()
+        };
+        assert_eq!(cut_reply(&Ok(answer)), llm::thinking::CutReply::Answer);
+        let tools = llm::StreamOutcome {
+            content: String::new(),
+            tool_calls: vec![llm::ToolCall {
+                id: "c".into(),
+                name: "search_index".into(),
+                arguments: "{}".into(),
+            }],
+            ..llm::StreamOutcome::default()
+        };
+        assert_eq!(cut_reply(&Ok(tools)), llm::thinking::CutReply::NeedsTools);
+        let finish = llm::StreamOutcome {
+            finish_reason: "tool_calls".into(),
+            ..llm::StreamOutcome::default()
+        };
+        assert_eq!(cut_reply(&Ok(finish)), llm::thinking::CutReply::NeedsTools);
+    }
+
+    #[test]
+    fn thinking_cut_notice_is_stored_as_a_chat_notice() {
+        let (dir, db) = temp_db("think-cut");
+        let thread = db.create_llm_thread("会話", true).unwrap();
+        let row = db
+            .insert_llm_notice(&thread.id, llm::thinking::THINKING_CUT_NOTICE)
+            .unwrap();
+        assert_eq!(row.kind, crate::db::LLM_MESSAGE_NOTICE);
+        assert_eq!(row.role, "assistant");
+        assert_eq!(
+            row.content,
+            "考えが長くなったため途中で打ち切り、集めた資料から答えています"
+        );
+        let history = db.list_llm_messages(&thread.id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind, "notice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn phantom_tools_after(answer_tools: bool, rounds: usize, max_rounds: usize) -> bool {
+        let mut hold = llm::thinking::CutHold::default();
+        hold.observe_answer(answer_tools);
+        phantom_retry_tools_on(false, rounds, max_rounds, hold.tools_off, false)
+    }
+
+    #[test]
+    fn tool_less_cut_keeps_the_phantom_tools_hint_while_rounds_remain() {
+        let mut cut = llm::thinking::ThinkingCut::start(true, false);
+        assert!(matches!(
+            cut.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(_)
+        ));
+        let llm::thinking::CutStep::Answer { tools } =
+            cut.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the tool-less re-request should answer");
+        };
+        assert!(tools);
+        assert!(
+            phantom_tools_after(tools, 1, 8),
+            "rounds remain, so the phantom retry still has tools"
+        );
+        assert_eq!(phantom_cite_hint(true), PHANTOM_CITE_HINT);
+
+        let mut stripped = llm::thinking::ThinkingCut::start(true, true);
+        stripped.observe(llm::thinking::CutReply::OverCap);
+        stripped.observe(llm::thinking::CutReply::ToolsRejected);
+        let llm::thinking::CutStep::Answer { tools: kept } =
+            stripped.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the tools-off fallback should answer");
+        };
+        assert!(!kept);
+        assert!(
+            !phantom_tools_after(kept, 1, 8),
+            "recovery that stripped tools keeps the phantom retry tool-free"
+        );
+        assert_eq!(phantom_cite_hint(false), PHANTOM_CITE_HINT_NO_TOOLS);
+    }
+
+    /// A vLLM-style 400 (`"auto" tool choice requires`) falls back once. The
+    /// phantom-cite retry must not send tools again, or the second rejection
+    /// discards the answer because `retried_without_tools` is already set.
+    #[test]
+    fn tools_rejecting_server_keeps_the_phantom_answer_without_resending_tools() {
+        let rejected = crate::llm::http_error::chat_failure(
+            400,
+            r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#,
+        );
+        assert_eq!(rejected, crate::llm::http_error::TOOLS_UNSUPPORTED_ERROR);
+        assert!(llm::is_tools_unsupported_error(&rejected));
+
+        let mut use_tools = true;
+        let mut retried_without_tools = false;
+        assert!(use_tools && !retried_without_tools);
+        use_tools = false;
+        retried_without_tools = true;
+
+        let answer = "根拠は [9] です。";
+        assert!(answer_has_phantom_cites(answer, &[]));
+
+        // Plain call after the fallback hits the cap, then answers with [9].
+        let mut cut = llm::thinking::ThinkingCut::start(true, use_tools);
+        assert!(matches!(
+            cut.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(req) if req.thinking_off && !req.tools
+        ));
+        let llm::thinking::CutStep::Answer { tools } = cut.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the thinking-off resend should answer");
+        };
+        assert!(
+            tools,
+            "a tool-capable citation re-request must still be allowed to restore tools"
+        );
+        let mut hold = llm::thinking::CutHold::default();
+        hold.observe_answer(tools);
+        assert!(!hold.tools_off);
+        let tools_on = phantom_retry_tools_on(false, 0, 8, hold.tools_off, retried_without_tools);
+        assert!(!tools_on, "do not re-send tools after the server rejected them");
+        assert_eq!(phantom_cite_hint(tools_on), PHANTOM_CITE_HINT_NO_TOOLS);
+        use_tools = tools_on;
+        assert!(
+            !(use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&rejected)),
+            "a second rejection is not the one-time fallback, so it would drop the answer"
+        );
+        let mut kept = None;
+        remember_phantom_answer(&mut kept, answer, "", &[]);
+        assert!(matches!(
+            answer_after_phantom_retry(true, kept.is_some()),
+            PhantomRetryAnswer::Original
+        ));
+        let kept = kept.expect("the phantom answer is kept");
+        assert_eq!(kept.content, answer);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+
+        // The same gate without a cut: a short phantom answer stays tool-less
+        // and does not store the cut notice.
+        let mut plain = llm::thinking::ThinkingCut::start(true, false);
+        assert_eq!(
+            plain.observe(llm::thinking::CutReply::Answer),
+            llm::thinking::CutStep::Pass
+        );
+        let hold_plain = llm::thinking::CutHold::default();
+        let tools_plain = phantom_retry_tools_on(false, 0, 8, hold_plain.tools_off, true);
+        assert!(!tools_plain);
+        assert_eq!(phantom_cite_hint(tools_plain), PHANTOM_CITE_HINT_NO_TOOLS);
+        assert!(hold_plain.notice(false, answer).is_none());
+        assert!(matches!(
+            answer_after_phantom_retry(true, true),
+            PhantomRetryAnswer::Original
+        ));
+    }
+
     fn pending_contract(body: &str) -> LlmSourceRow {
         LlmSourceRow {
             id: "f1".into(),
@@ -3508,5 +3919,845 @@ mod tests {
             large_reading.tokens,
             meter_usage_tokens("役割", &large, &history, "", 2_410, budget)
         );
+    }
+
+    fn cut_then_answer(tools: bool, body: &str) -> (llm::thinking::CutHold, Option<RecoveredCut>) {
+        let mut turn = llm::thinking::ThinkingCut::start(true, tools);
+        assert!(matches!(
+            turn.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(_)
+        ));
+        let llm::thinking::CutStep::Answer { tools: still } =
+            turn.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the thinking-off resend should answer");
+        };
+        let mut hold = llm::thinking::CutHold::default();
+        hold.observe_answer(still);
+        let mut recovered = None;
+        remember_recovered_cut(
+            &mut recovered,
+            hold.thinking_off,
+            body,
+            "",
+            false,
+            std::collections::HashSet::new(),
+        );
+        (hold, recovered)
+    }
+
+    #[test]
+    fn phantom_retry_http_500_keeps_the_cut_answer() {
+        let body = "根拠は [9] です。";
+        let (hold, recovered) = cut_then_answer(true, body);
+        let err = crate::llm::http_error::chat_failure(500, "internal");
+        assert!(!llm::is_cancelled_error(&err));
+        let kept = recovered_cut_to_keep(&recovered).expect("the cut answer is saved");
+        assert_eq!(kept.content, body);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+        let mut phantom = None;
+        remember_phantom_answer(&mut phantom, body, "", &[]);
+        assert!(phantom.is_some());
+        assert!(matches!(
+            answer_after_phantom_retry(true, true),
+            PhantomRetryAnswer::Original
+        ));
+    }
+
+    #[test]
+    fn second_cap_on_the_phantom_retry_keeps_the_cut_answer() {
+        let body = "根拠は [9] です。";
+        let (hold, recovered) = cut_then_answer(false, body);
+        assert!(hold.thinking_off);
+        let tools_on = phantom_retry_tools_on(false, 0, 8, hold.tools_off, true);
+        assert!(!tools_on, "a tools-rejecting server does not resend tools");
+        let mut retry = llm::thinking::ThinkingCut::held(tools_on);
+        assert_eq!(
+            retry.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Stop { over_cap: true }
+        );
+        let err = llm::thinking::finish_runaway("thinking-runaway:32768");
+        assert!(!llm::is_cancelled_error(&err));
+        let kept = recovered_cut_to_keep(&recovered).expect("the cut answer survives the second cap");
+        assert_eq!(kept.content, body);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+
+        let mut first = llm::thinking::ThinkingCut::start(true, true);
+        assert!(matches!(
+            first.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(_)
+        ));
+        assert_eq!(
+            first.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Stop { over_cap: true }
+        );
+        let mut none = None;
+        remember_recovered_cut(
+            &mut none,
+            false,
+            body,
+            "",
+            false,
+            std::collections::HashSet::new(),
+        );
+        assert!(
+            recovered_cut_to_keep(&none).is_none(),
+            "the first thinking-off resend still fails when it hits the cap"
+        );
+    }
+
+    #[test]
+    fn citation_rerequest_cap_keeps_the_uncited_cut_body() {
+        let body = "三か月以内です。";
+        let (hold, recovered) = cut_then_answer(true, body);
+        let mut phantom = None;
+        remember_phantom_answer(&mut phantom, body, "", &[]);
+        assert!(
+            phantom.is_none(),
+            "this body has no [n], so the phantom slot does not keep it"
+        );
+        let mut retry = llm::thinking::ThinkingCut::held(false);
+        assert_eq!(
+            retry.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Stop { over_cap: true }
+        );
+        let kept = recovered_cut_to_keep(&recovered).expect("the uncited body is saved");
+        assert_eq!(kept.content, body);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+    }
+
+    #[test]
+    fn tool_call_preamble_does_not_overwrite_the_recovered_answer() {
+        let mut slot = None;
+        remember_recovered_cut(
+            &mut slot,
+            true,
+            "根拠は [9] です。",
+            "",
+            false,
+            std::collections::HashSet::new(),
+        );
+        remember_recovered_cut(
+            &mut slot,
+            true,
+            "確認します。",
+            "",
+            true,
+            std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            recovered_cut_to_keep(&slot).unwrap().content,
+            "根拠は [9] です。"
+        );
+    }
+
+    fn sse_message(payload: serde_json::Value) -> Vec<u8> {
+        let data = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{data}"
+        )
+        .into_bytes()
+    }
+
+    fn http_status(code: u16, reason: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn serve_script(script: Vec<Vec<u8>>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for response in script {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut sock, &mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        if name.eq_ignore_ascii_case("content-length") {
+                                            value.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() - (header_end + 4) >= len {
+                                    break;
+                                }
+                            }
+                            if buf.len() > 4_000_000 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = std::io::Write::write_all(&mut sock, &response);
+                let _ = std::io::Write::flush(&mut sock);
+            }
+        });
+        port
+    }
+
+    fn reasoning_over_cap() -> Vec<u8> {
+        let payload = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "あ".repeat(100_000) } }]
+        });
+        sse_message(payload)
+    }
+
+    fn content_stop(text: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{ "delta": { "content": text }, "finish_reason": "stop" }]
+        }))
+    }
+
+    fn content_with_reasoning(content: &str, reasoning: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": { "content": content, "reasoning_content": reasoning },
+                "finish_reason": "stop"
+            }]
+        }))
+    }
+
+    fn reasoning_only_tool_call(body: &str) -> Vec<u8> {
+        content_with_reasoning(
+            body,
+            r#"<tool_call>{"name":"search_index","arguments":{"query":"OrionContract"}}</tool_call>"#,
+        )
+    }
+
+    fn content_and_search(text: &str, query: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": text,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "c1",
+                        "function": {
+                            "name": "search_index",
+                            "arguments": serde_json::json!({ "query": query }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+
+    fn test_state(dir: &std::path::Path, port: u16, max_rounds: u32) -> std::sync::Arc<crate::state::AppState> {
+        let db = std::sync::Arc::new(crate::db::Db::open(&dir.join("argos.db")).unwrap());
+        let mut settings = crate::db::Settings::default();
+        settings.llm_base_url = format!("http://127.0.0.1:{port}/v1");
+        settings.llm_model = "test-model".into();
+        settings.llm_timeout_ms = 20_000;
+        settings.llm_thinking = "on".into();
+        settings.llm_max_tool_rounds = max_rounds;
+        settings.search_mode = "local".into();
+        let backend = std::sync::Arc::new(
+            crate::search::tantivy_backend::TantivyBackend::open(&dir.join("index"))
+                .unwrap()
+                .backend,
+        );
+        let mail_backend = std::sync::Arc::new(
+            crate::search::tantivy_backend::TantivyBackend::open_mail(&dir.join("index-mail"))
+                .unwrap()
+                .backend,
+        );
+        let indexer = std::sync::Arc::new(crate::indexer::Indexer::new(
+            db.clone(),
+            backend.clone(),
+        ));
+        let mail = crate::mail::MailStaHandle::start(db.clone(), mail_backend.clone()).unwrap();
+        std::sync::Arc::new(crate::state::AppState {
+            db,
+            settings: std::sync::Arc::new(parking_lot::RwLock::new(settings)),
+            data_dir: dir.to_path_buf(),
+            backend,
+            mail_backend,
+            indexer,
+            remote_server: crate::remote_server::RemoteServerHandle::new(),
+            watcher: parking_lot::RwLock::new(None),
+            user_dict: std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::UserDictMatcher::from_words(std::iter::empty::<String>()),
+            )),
+            mail,
+            calendar_sync: parking_lot::Mutex::new(()),
+            llm_job: parking_lot::RwLock::new(None),
+            preview_target: parking_lot::RwLock::new(None),
+        })
+    }
+
+    fn final_answer(messages: &[crate::db::LlmMessageRow]) -> &crate::db::LlmMessageRow {
+        messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == "assistant"
+                    && message.tool_calls.trim().is_empty()
+                    && message.kind != crate::db::LLM_MESSAGE_NOTICE
+            })
+            .expect("a final assistant answer")
+    }
+
+    async fn send_script(
+        label: &str,
+        max_rounds: u32,
+        script: Vec<Vec<u8>>,
+        index: bool,
+    ) -> (
+        std::path::PathBuf,
+        crate::db::Db,
+        crate::db::LlmThreadRow,
+        LlmSendResult,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-send-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = serve_script(script);
+        let state = test_state(&dir, port, max_rounds);
+        if index {
+            let path = dir.join("contract.txt");
+            std::fs::write(&path, "OrionContract の期間は三か月です。").unwrap();
+            state
+                .backend
+                .index_file(
+                    &path,
+                    &path.to_string_lossy(),
+                    "",
+                    1,
+                    20,
+                    &crate::extractor::ExtractedDoc {
+                        title: "contract.txt".into(),
+                        pages: vec!["OrionContract の期間は三か月です。".into()],
+                    },
+                )
+                .unwrap();
+        }
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            None,
+            "調べて".into(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db, result.thread.clone(), result)
+    }
+
+    fn seven_searches() -> Vec<Vec<u8>> {
+        (0..7).map(|_| content_and_search("", "OrionContract")).collect()
+    }
+
+    fn assert_kept_round_limit_answer(
+        messages: &[crate::db::LlmMessageRow],
+        body: &str,
+        cut_notice: bool,
+    ) {
+        let answer = messages
+            .iter()
+            .find(|message| message.content == body)
+            .expect("the recovered answer is saved");
+        assert_eq!(answer.kind, "", "a kept answer is a normal turn, not a notice");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("上限の 8 回")
+                && message.content.contains("ここまでの資料で答えています")
+        }));
+        assert_eq!(
+            messages
+                .iter()
+                .any(|message| message.content == llm::thinking::THINKING_CUT_NOTICE),
+            cut_notice
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("続きの回答は失敗しました")),
+            "the round-limit failure text must not replace the kept answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_fails() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(http_status(
+            500,
+            "Internal Server Error",
+            r#"{"error":"failed"}"#,
+        ));
+        let (dir, db, thread, result) = send_script("round-fail", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == "調べます。")
+                .count(),
+            1,
+            "the preamble stays on the tool-call row only"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_phantom_answer_when_the_round_limit_final_fails_without_a_cut() {
+        let mut script = seven_searches();
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(http_status(
+            500,
+            "Internal Server Error",
+            r#"{"error":"failed"}"#,
+        ));
+        let (dir, db, thread, result) = send_script("round-plain", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", false);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_is_empty() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(content_stop(""));
+        let (dir, db, thread, result) = send_script("round-empty", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("続きはもう一度指示するか")),
+            "an empty final must not replace the kept answer with the long limit notice"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_embeds_a_tool_call() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("調べます。", "OrionContract"));
+        script.push(content_stop(
+            "まだ調べます。<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>",
+        ));
+        let (dir, db, thread, result) = send_script("round-embed", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("まだ調べます。")),
+            "a stripped tool call on the final no-tools call must not replace the answer"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_ignores_an_embedded_tool_call_when_tools_were_not_sent() {
+        let rejected = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#;
+        let embedded = "まだ調べます。<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>";
+        let (dir, db, thread, result) = send_script(
+            "embedded",
+            8,
+            vec![
+                http_status(400, "Bad Request", rejected),
+                http_status(400, "Bad Request", rejected),
+                reasoning_over_cap(),
+                content_stop("根拠は [9] です。"),
+                content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "根拠は [9] です。")
+            .expect("the cut answer is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(
+            !messages.iter().any(|message| message.content.contains("まだ調べます。")),
+            "a stripped tool call must not become the answer"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_body_when_the_round_limit_final_calls_a_tool_only_in_reasoning() {
+        let mut script = seven_searches();
+        script.push(content_and_search("", "OrionContract"));
+        script.push(reasoning_only_tool_call("結論は三か月です。"));
+        let (dir, db, thread, result) = send_script("round-reason", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "結論は三か月です。")
+            .expect("the body is the answer");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("上限の 8 回")
+                && message.content.contains("ここまでの資料で答えています")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.content.contains("続きはもう一度指示するか")
+                || message.content.contains("本文も操作も返さず")
+        }));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_body_when_a_tool_refused_phantom_retry_calls_a_tool_only_in_reasoning()
+    {
+        let rejected = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#;
+        let (dir, db, thread, result) = send_script(
+            "phantom-reason",
+            8,
+            vec![
+                http_status(400, "Bad Request", rejected),
+                http_status(400, "Bad Request", rejected),
+                content_stop("根拠は [9] です。"),
+                reasoning_only_tool_call("結論は三か月です。"),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "結論は三か月です。")
+            .expect("the phantom retry body is the answer");
+        assert_eq!(answer.kind, "");
+        assert!(!messages
+            .iter()
+            .any(|message| message.content == "根拠は [9] です。"));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("本文も操作も返さず")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_earlier_answer_when_stage2_embeds_a_tool_call() {
+        let embedded = "まだ調べます。[1]<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>";
+        let (dir, db, thread, result) = send_script(
+            "stage2-kept",
+            8,
+            vec![
+                content_stop("根拠は [9] です。"),
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "根拠は [9] です。")
+            .expect("the earlier answer is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_does_not_save_a_stage2_tool_call_preamble_when_nothing_is_kept() {
+        let embedded = "まだ調べます。[1]<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>";
+        let (dir, db, thread, result) = send_script(
+            "stage2-empty",
+            8,
+            vec![
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("本文も操作も返さず")
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content == llm::thinking::THINKING_CUT_NOTICE));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn stage2_reasoning_body_then(last: Vec<u8>) -> Vec<Vec<u8>> {
+        vec![
+            content_and_search("", "OrionContract"),
+            reasoning_over_cap(),
+            content_and_search("確認します。", "OrionContract"),
+            reasoning_only_tool_call("結論は三か月です。"),
+            last,
+        ]
+    }
+
+    fn assert_stage2_reasoning_body_kept(messages: &[crate::db::LlmMessageRow]) {
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "結論は三か月です。")
+            .expect("the stage-2 body is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(messages.iter().any(|message| {
+            message.role == "tool" && message.content.contains("OrionContract")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.content.contains("本文も操作も返さず")
+                || message.content.contains("まだ調べます。")
+                || message.content.contains("続きの回答は失敗しました")
+        }));
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_stage2_reasoning_body_when_the_source_retry_fails() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-reason-500",
+            8,
+            stage2_reasoning_body_then(http_status(
+                500,
+                "Internal Server Error",
+                r#"{"error":"failed"}"#,
+            )),
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_stage2_reasoning_body_kept(&messages);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_stage2_reasoning_body_when_the_source_retry_is_empty() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-reason-empty",
+            8,
+            stage2_reasoning_body_then(content_stop("")),
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_stage2_reasoning_body_kept(&messages);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_stage2_reasoning_body_when_the_source_retry_embeds_a_tool_call() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-reason-embed",
+            8,
+            stage2_reasoning_body_then(content_stop(
+                "まだ調べます。<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>",
+            )),
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_stage2_reasoning_body_kept(&messages);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_the_round_limit_final_has_structured_tool_calls() {
+        let mut script = seven_searches();
+        script.push(reasoning_over_cap());
+        script.push(content_stop("根拠は [9] です。"));
+        script.push(content_and_search("", "OrionContract"));
+        script.push(content_and_search("まだ調べます。", "OrionContract"));
+        let (dir, db, thread, result) = send_script("round-structured", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_kept_round_limit_answer(&messages, "根拠は [9] です。", true);
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_earlier_answer_when_stage2_returns_structured_tool_calls() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-structured-kept",
+            8,
+            vec![
+                content_stop("根拠は [9] です。"),
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_and_search("まだ調べます。", "OrionContract"),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "根拠は [9] です。")
+            .expect("the earlier answer is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_shows_the_empty_notice_when_stage2_structured_tool_calls_have_nothing_kept() {
+        let (dir, db, thread, result) = send_script(
+            "stage2-structured-empty",
+            8,
+            vec![
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_and_search("まだ調べます。", "OrionContract"),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("本文も操作も返さず")
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content == llm::thinking::THINKING_CUT_NOTICE));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_does_not_bind_a_source_fetched_after_the_cut_answer() {
+        let (dir, db, thread, result) = send_script(
+            "bind",
+            8,
+            vec![
+                reasoning_over_cap(),
+                content_stop("根拠は [1] です。"),
+                content_and_search("確認します。", "OrionContract"),
+                http_status(500, "Internal Server Error", r#"{"error":"failed"}"#),
+            ],
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, "根拠は [1] です。");
+        let tool = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("search_index ran");
+        assert!(
+            tool.content.contains("OrionContract"),
+            "the retry must have registered a hit: {}",
+            tool.content
+        );
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert!(
+            sources
+                .iter()
+                .all(|source| source.cited_assistant_message_id != answer.id),
+            "a source fetched during the retry must not bind to the kept answer: {sources:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

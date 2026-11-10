@@ -435,17 +435,22 @@ pub struct StreamOutcome {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: String,
     pub request_id: String,
+    /// Structured `tool_calls` or a `<tool_call>` removed from the body.
+    /// A call found only in reasoning leaves this false.
+    pub tool_calls_from_content_or_structured: bool,
 }
 
 impl StreamParse {
     fn into_outcome(self) -> StreamOutcome {
         let mut calls = self.tool_calls;
         let mut content = self.content;
+        let mut tool_calls_from_content_or_structured = !calls.is_empty();
         if calls.is_empty() {
             let (stripped, embedded) = pull_embedded_tool_calls(&content);
             if !embedded.is_empty() {
                 content = stripped;
                 calls.extend(embedded);
+                tool_calls_from_content_or_structured = true;
             } else {
                 let (_, from_think) = pull_embedded_tool_calls(&self.reasoning);
                 calls.extend(from_think);
@@ -457,6 +462,7 @@ impl StreamParse {
             reasoning: self.reasoning,
             finish_reason: self.finish_reason,
             request_id: self.request_id,
+            tool_calls_from_content_or_structured,
             tool_calls: calls
                 .into_iter()
                 .filter(|c| !c.name.is_empty() || !c.arguments.is_empty())
@@ -773,12 +779,39 @@ fn ingest_payload(
     for (kind, text) in pieces_from_payload(&v) {
         if kind == "content" {
             parse.content.push_str(&text);
+            on_delta(kind, &text);
         } else if kind == "reasoning" {
-            parse.reasoning.push_str(&text);
+            push_reasoning(parse, &text, runaway_chars, on_delta)?;
         }
-        on_delta(kind, &text);
     }
     guard_stream(parse, runaway_chars)
+}
+
+/// Keep reasoning up to the cap. The character that would pass it stops the stream.
+fn push_reasoning(
+    parse: &mut StreamParse,
+    text: &str,
+    runaway_chars: usize,
+    on_delta: &mut impl FnMut(&str, &str),
+) -> Result<(), String> {
+    let incoming = text.chars().count();
+    let have = parse.reasoning.chars().count();
+    if runaway_chars == 0 || have.saturating_add(incoming) <= runaway_chars {
+        parse.reasoning.push_str(text);
+        on_delta("reasoning", text);
+        return Ok(());
+    }
+    let room = runaway_chars.saturating_sub(have);
+    if room > 0 {
+        let clipped: String = text.chars().take(room).collect();
+        parse.reasoning.push_str(&clipped);
+        on_delta("reasoning", &clipped);
+    }
+    Err(format!(
+        "{}{}",
+        thinking::THINKING_RUNAWAY_PREFIX,
+        parse.reasoning.chars().count()
+    ))
 }
 
 fn value_text(v: Option<&Value>) -> String {
@@ -1215,6 +1248,39 @@ mod tests {
         .unwrap();
         assert_eq!(parse.content, "あ");
         assert_eq!(got, "あ");
+    }
+
+    #[test]
+    fn reasoning_stream_stops_at_the_cap_and_does_not_emit_the_rest() {
+        let first = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "あいう" } }]
+        });
+        let second = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "えおか", "content": "答え" } }]
+        });
+        let mut buf = format!("data: {first}\ndata: {second}\n");
+        let mut parse = StreamParse::default();
+        let mut seen = String::new();
+        let err = drain_sse_lines(&mut buf, &mut parse, 4, &mut |kind, delta| {
+            assert_eq!(kind, "reasoning");
+            seen.push_str(delta);
+        })
+        .expect_err("the fifth character stops the stream");
+        assert_eq!(seen, "あいうえ");
+        assert_eq!(parse.reasoning, "あいうえ");
+        assert!(parse.content.is_empty(), "{}", parse.content);
+        assert_eq!(err, format!("{}4", thinking::THINKING_RUNAWAY_PREFIX));
+    }
+
+    #[test]
+    fn reasoning_exactly_at_the_cap_stays_open() {
+        let payload = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "あいうえ" } }]
+        });
+        let mut buf = format!("data: {payload}\n");
+        let mut parse = StreamParse::default();
+        drain_sse_lines(&mut buf, &mut parse, 4, &mut |_, _| {}).unwrap();
+        assert_eq!(parse.reasoning.chars().count(), 4);
     }
 
     #[test]
@@ -1671,6 +1737,41 @@ mod tests {
         assert!(out.tool_calls[0].arguments.contains("民法555条"));
         assert!(!out.content.contains("<tool_call>"));
         assert!(out.content.contains("調べます。"));
+        assert!(out.tool_calls_from_content_or_structured);
+    }
+
+    #[test]
+    fn reasoning_only_tool_call_leaves_the_body() {
+        let call = r#"<tool_call>{"name":"search_index","arguments":{"query":"x"}}</tool_call>"#;
+        let parse = StreamParse {
+            content: "結論は三か月です。".into(),
+            reasoning: call.into(),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".into(),
+            request_id: String::new(),
+        };
+        let out = parse.into_outcome();
+        assert!(!out.tool_calls_from_content_or_structured);
+        assert_eq!(out.content, "結論は三か月です。");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "search_index");
+
+        let structured = StreamParse {
+            content: "まだ調べます。".into(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCallAcc {
+                index: 0,
+                id: "c1".into(),
+                name: "search_index".into(),
+                arguments: "{}".into(),
+            }],
+            finish_reason: "tool_calls".into(),
+            request_id: String::new(),
+        };
+        let out = structured.into_outcome();
+        assert!(out.tool_calls_from_content_or_structured);
+        assert_eq!(out.content, "まだ調べます。");
+        assert_eq!(out.tool_calls.len(), 1);
     }
 
     #[test]

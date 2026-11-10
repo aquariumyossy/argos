@@ -44,7 +44,12 @@ fn emit_note_updated(app: &AppHandle, note_id: &str, kind: &str) {
     emit_note_updated_from(app, note_id, kind, "");
 }
 
-pub(crate) fn emit_note_updated_from(app: &AppHandle, note_id: &str, kind: &str, source: &str) {
+pub(crate) fn emit_note_updated_from<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    note_id: &str,
+    kind: &str,
+    source: &str,
+) {
     let _ = app.emit(
         "note-updated",
         NoteUpdatedPayload {
