@@ -56,8 +56,8 @@ describe("context tokens", () => {
 
   it("states the assembled size and the meter limit in the full-file confirm", () => {
     expect(contextMeterLimit(131_072)).toBe(85_197);
-    expect(fileGrainConfirmMessage(80_087, 131_072)).toBe(
-      "全文にすると約 80,087 トークンです。送信の上限は 85,197 トークンです。全文にしますか？",
+    expect(fileGrainConfirmMessage(84_467, 131_072)).toBe(
+      "全文にすると約 84,467 トークンです。送信の上限は 85,197 トークンです。上限に収まらないため、本文の後半は切り詰められます。全文にしますか？",
     );
   });
 });
