@@ -117,14 +117,18 @@ class ContentResizeObserver {
   }
 }
 
+function notifyLogResize() {
+  const callback = contentObservers[contentObservers.length - 1];
+  if (!callback) throw new Error("content ResizeObserver is not attached");
+  callback([], {} as ResizeObserver);
+}
+
 function notifyContentResize(content: HTMLElement, height: number) {
   Object.defineProperty(content, "offsetHeight", {
     configurable: true,
     get: () => height,
   });
-  const callback = contentObservers[contentObservers.length - 1];
-  if (!callback) throw new Error("content ResizeObserver is not attached");
-  callback([], {} as ResizeObserver);
+  notifyLogResize();
 }
 
 /** jsdom does not clamp scrollTop. A real log cannot scroll past scrollHeight - clientHeight. */
@@ -523,6 +527,7 @@ describe("scroll follow during generation", () => {
     const box = installLogGeometry(log, { scrollHeight: 800, clientHeight: 120 });
     log.scrollTop = box.maxTop();
     fireEvent.scroll(log);
+    notifyLogResize();
     const parked = log.scrollTop;
     fireEvent.click(summary);
     box.setScrollHeight(box.scrollHeight() + 180);
@@ -531,5 +536,62 @@ describe("scroll follow during generation", () => {
     notifyContentResize(content, box.scrollHeight());
     expect(log.scrollTop).toBe(parked);
     expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+  });
+
+  it("pins when the composer grows and shrinks a finished thread's log", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-asst",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "回答です",
+        createdAt: 2,
+      },
+    ];
+    render(<Chat />);
+    await screen.findByText("回答です");
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, { scrollHeight: 1186, clientHeight: 610 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    expect(log.scrollTop).toBe(576);
+    box.resize({ clientHeight: 576 });
+    expect(1186 - log.scrollTop - 576).toBe(34);
+    notifyLogResize();
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(1186 - log.scrollTop - 576).toBe(0);
+    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+  });
+
+  it("pins when the window shrinks while following", async () => {
+    const { log, box } = await startPinnedLog();
+    box.resize({ scrollHeight: 1200, clientHeight: 400 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    expect(log.scrollTop).toBe(800);
+    box.resize({ clientHeight: 240 });
+    expect(1200 - log.scrollTop - 240).toBe(160);
+    notifyLogResize();
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(1200 - log.scrollTop - 240).toBe(0);
+  });
+
+  it("does not pin when the viewport shrinks while follow is off", async () => {
+    const { log, box } = await startPinnedLog();
+    box.resize({ scrollHeight: 1186, clientHeight: 610 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    await act(async () => {});
+    log.scrollTop = box.maxTop() - 80;
+    fireEvent.scroll(log);
+    const parked = log.scrollTop;
+    box.resize({ clientHeight: 576 });
+    notifyLogResize();
+    expect(log.scrollTop).toBe(parked);
   });
 });

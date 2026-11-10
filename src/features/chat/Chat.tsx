@@ -883,14 +883,22 @@ export default function Chat() {
 
   useEffect(() => {
     const content = logContentRef.current;
-    if (!content || typeof ResizeObserver === "undefined") return;
-    let lastHeight = content.offsetHeight;
+    const log = listRef.current;
+    if (!content || !log || typeof ResizeObserver === "undefined") return;
+    let lastContentHeight = content.offsetHeight;
+    let lastClientHeight = log.clientHeight;
     const observer = new ResizeObserver(() => {
-      const next = content.offsetHeight;
-      if (next > lastHeight && showLiveRef.current) scrollLog();
-      lastHeight = next;
+      const contentHeight = content.offsetHeight;
+      const clientHeight = log.clientHeight;
+      const contentGrew = contentHeight > lastContentHeight;
+      const viewportChanged = clientHeight !== lastClientHeight;
+      lastContentHeight = contentHeight;
+      lastClientHeight = clientHeight;
+      if (!followRef.current) return;
+      if (viewportChanged || (contentGrew && showLiveRef.current)) scrollLog();
     });
     observer.observe(content);
+    observer.observe(log);
     return () => observer.disconnect();
   }, [scrollLog]);
 
