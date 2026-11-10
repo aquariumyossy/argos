@@ -1236,7 +1236,8 @@ pub fn assemble_turns(
     let full = full_sources_on_recent_turns(&built);
     dedupe_tool_bodies(&mut built, &full);
 
-    let carried_summary = carried_summary(&built);
+    let covered = covered_sources(&kept, &hist);
+    let carried_summary = carried_summary(&built, &covered);
     let mut truncated = false;
     // Keep the last two user turns while they fit. If a recent source is what
     // overflows, shorten it before dropping the previous question and answer.
@@ -1773,15 +1774,39 @@ fn covered_sources(kept: &[LlmSourceRow], hist: &[&LlmMessageRow]) -> Vec<LlmSou
         .collect()
 }
 
+fn sources_for_user_render(row: &BuiltTurn) -> Vec<LlmSourceRow> {
+    row.sources
+        .iter()
+        .filter(|source| {
+            let id = source.injected_user_message_id.trim();
+            id.is_empty() || id == row.message_id
+        })
+        .cloned()
+        .collect()
+}
+
 fn append_summary_stubs(content: &mut String, sources: &[LlmSourceRow]) {
+    let lines: Vec<String> = sources.iter().map(summary_stub_line).collect();
+    append_stub_lines(content, &lines);
+}
+
+/// A `既読` line inside the summary body is not the stub we keep. Only a line after
+/// the disclaimer counts, so halving the body cannot drop the covered file.
+fn stub_kept_after_disclaimer(content: &str, stub: &str) -> bool {
+    let after = content
+        .find(crate::llm::summary::SUMMARY_DISCLAIMER)
+        .map(|pos| &content[pos + crate::llm::summary::SUMMARY_DISCLAIMER.len()..])
+        .unwrap_or("");
+    after.lines().any(|line| line.trim() == stub)
+}
+
+fn append_stub_lines(content: &mut String, stubs: &[String]) {
     let mut extra = Vec::new();
-    for source in sources {
-        let line = summary_stub_line(source);
-        if content.lines().any(|existing| existing.trim() == line) || extra.iter().any(|have| have == &line)
-        {
+    for line in stubs {
+        if stub_kept_after_disclaimer(content, line) || extra.iter().any(|have| have == line) {
             continue;
         }
-        extra.push(line);
+        extra.push(line.clone());
     }
     if extra.is_empty() {
         return;
@@ -1860,9 +1885,13 @@ fn apply_age_stubs(built: &mut [BuiltTurn], pool: &[LlmSourceRow]) {
         if row.summary {
             continue;
         }
-        if row.turn.role == "user" && !row.sources.is_empty() && !recent.contains(&row.message_id) {
-            let rendered = render_user_content(&row.question, &row.sources, pool, true);
-            assign_user_content(row, rendered);
+        if row.turn.role == "user" && !recent.contains(&row.message_id) {
+            // Covered sources belong to the summary, not this user's 出典 block.
+            let own = sources_for_user_render(row);
+            if !own.is_empty() {
+                let rendered = render_user_content(&row.question, &own, pool, true);
+                assign_user_content(row, rendered);
+            }
         } else if row.turn.role == "tool" && index < recent_from {
             row.turn.content = stub_old_tool(&row.turn.content, pool, row.turn.name.as_deref());
         }
@@ -2307,32 +2336,19 @@ struct CarriedSummary {
     stubs: Vec<String>,
 }
 
-fn carried_summary(built: &[BuiltTurn]) -> Option<CarriedSummary> {
+fn carried_summary(built: &[BuiltTurn], covered: &[LlmSourceRow]) -> Option<CarriedSummary> {
     let row = built
         .iter()
         .find(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))?;
     let (block, _) = crate::llm::summary::split_merged_user(&row.turn.content);
-    Some(CarriedSummary {
-        block,
-        stubs: trailing_read_stubs(&row.turn.content),
-    })
-}
-
-fn trailing_read_stubs(content: &str) -> Vec<String> {
     let mut stubs = Vec::new();
-    for line in content.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    for source in covered {
+        let line = summary_stub_line(source);
+        if !stubs.iter().any(|have| have == &line) {
+            stubs.push(line);
         }
-        if trimmed.starts_with("既読 ") {
-            stubs.push(trimmed.to_string());
-            continue;
-        }
-        break;
     }
-    stubs.reverse();
-    stubs
+    Some(CarriedSummary { block, stubs })
 }
 
 fn combine_user_text(left: &str, right: &str) -> String {
@@ -2402,6 +2418,9 @@ fn normalize_summary_placement(
     }
     merge_adjacent_user_turns(built);
     let shrunk = shrink_carried_summary(built, max_tokens);
+    if let Some(carried) = carried {
+        restore_carried_stubs(built, &carried.stubs);
+    }
     let stubs = carried.map(|item| item.stubs.as_slice()).unwrap_or(&[]);
     let dropped = drop_summary_if_over_budget(built, max_tokens, stubs);
     if dropped {
@@ -2450,25 +2469,24 @@ fn ensure_summary_on_first_user(built: &mut [BuiltTurn], block: &str, stubs: &[S
     };
     let user = user_text_beside_summary(&built[index]);
     let mut next = join_summary_and_user(block, &user);
-    let missing: Vec<&str> = stubs
-        .iter()
-        .map(String::as_str)
-        .filter(|stub| !next.lines().any(|line| line.trim() == *stub))
-        .collect();
-    if !missing.is_empty() {
-        if !next.is_empty() && !next.ends_with('\n') {
-            next.push('\n');
-        }
-        if !next.ends_with("\n\n") {
-            next.push('\n');
-        }
-        next.push_str(&missing.join("\n"));
-    }
+    append_stub_lines(&mut next, stubs);
     if built[index].turn.content != next {
         built[index].turn.content = next;
     }
 }
 
+fn restore_carried_stubs(built: &mut [BuiltTurn], stubs: &[String]) {
+    if stubs.is_empty() {
+        return;
+    }
+    let Some(row) = built
+        .iter_mut()
+        .find(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))
+    else {
+        return;
+    };
+    append_stub_lines(&mut row.turn.content, stubs);
+}
 /// The disclaimer and 既読 lines are the smallest summary this request can send.
 /// When that still exceeds the message budget, omit them. The stored summary stays.
 fn drop_summary_if_over_budget(built: &mut Vec<BuiltTurn>, max_tokens: usize, stubs: &[String]) -> bool {

@@ -1380,6 +1380,91 @@ mod tests {
         assert_eq!(summary_saved_after_request(&stored, &blob), stored.trim());
     }
 
+    #[test]
+    fn file_attach_stub_stays_with_the_summary_after_the_host_is_dropped() {
+        let mut file = source("s1", "u0", 1, "契約書本文SECRET");
+        file.grain = "file".into();
+        file.paragraph_id.clear();
+        let stored = format!("要点です。\n{SUMMARY_DISCLAIMER}");
+        let history = vec![
+            msg("u0", "user", "添付した"),
+            msg("a0", "assistant", "読みました"),
+            msg("u1", "user", "ホストの質問"),
+            msg("a1", "assistant", &"あ".repeat(8_000)),
+            msg("u2", "user", "その次"),
+            msg("a2", "assistant", "了解"),
+            msg("u3", "user", &"問".repeat(12_000)),
+        ];
+        let system = "役割";
+        let required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", &"問".repeat(12_000)));
+        let split = context_budget(16_384, 0, required).expect("question fits");
+        let prepared = prepare_model_history(&history, &stored, "a0");
+        let (turns, stats) = assemble_turns(system, std::slice::from_ref(&file), &prepared, split.messages);
+        assert!(!stats.question_exceeds);
+        assert!(stats.total_tokens <= split.messages, "{}", stats.total_tokens);
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains(SUMMARY_PREFIX), "{blob}");
+        assert!(blob.contains("既読 [1] 契約書.docx"), "{blob}");
+        assert!(!blob.contains("ホストの質問"), "{blob}");
+        assert!(!blob.contains("契約書本文SECRET"), "{blob}");
+        assert!(!blob.contains("【出典】"), "{blob}");
+        let summary_turn = turns
+            .iter()
+            .find(|turn| turn.content.contains(SUMMARY_DISCLAIMER))
+            .expect("summary stays");
+        let after = summary_turn.content.split(SUMMARY_DISCLAIMER).nth(1).unwrap();
+        assert!(after.contains("既読 [1] 契約書.docx"), "{after}");
+    }
+
+    #[test]
+    fn stub_line_inside_the_summary_body_survives_halving() {
+        let filler = "要".repeat(tokens_to_chars(1_800));
+        let stored = format!("{filler}\n既読 [1] 契約書.docx\n{SUMMARY_DISCLAIMER}");
+        let mut file = source("s1", "u0", 1, "契約書本文SECRET");
+        file.grain = "file".into();
+        file.paragraph_id.clear();
+        let question = "問".repeat(15_300);
+        let history = vec![
+            msg("u0", "user", "添付した"),
+            msg("a0", "assistant", "読みました"),
+            msg("u1", "user", "ホストの質問"),
+            msg("a1", "assistant", &"あ".repeat(4_000)),
+            msg("u2", "user", "その次"),
+            msg("a2", "assistant", "了解"),
+            msg("u3", "user", &question),
+        ];
+        let system = "役割";
+        let required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", &question));
+        let split = context_budget(16_384, 0, required).expect("question fits");
+        let prepared = prepare_model_history(&history, &stored, "a0");
+        let (turns, stats) = assemble_turns(system, std::slice::from_ref(&file), &prepared, split.messages);
+        assert!(!stats.question_exceeds);
+        assert!(stats.total_tokens <= split.messages, "{}", stats.total_tokens);
+        let summary_turn = turns
+            .iter()
+            .find(|turn| turn.content.contains(SUMMARY_PREFIX))
+            .expect("summary stays");
+        let mut parts = summary_turn.content.split(SUMMARY_DISCLAIMER);
+        let before = parts.next().unwrap();
+        let after = parts.next().expect("disclaimer stays");
+        assert!(
+            !before.contains("既読 [1] 契約書.docx"),
+            "the line in the body was not halved away: {before}"
+        );
+        assert!(
+            after.contains("既読 [1] 契約書.docx"),
+            "the covered stub must stay with the summary: {after}"
+        );
+        assert!(!summary_turn.content.contains("契約書本文SECRET"));
+        assert_eq!(summary_saved_after_request(&stored, ""), stored.trim());
+    }
+
     fn assert_no_orphan_tool(turns: &[ChatTurn]) {
         let mut open = false;
         for turn in turns {
