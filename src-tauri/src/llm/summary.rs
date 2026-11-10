@@ -156,8 +156,9 @@ pub fn summary_turn_content(summary: &str) -> String {
     format!("{SUMMARY_PREFIX}\n{}", summary.trim())
 }
 
-/// Split a user turn that starts with the summary block. The block is the summary;
-/// the rest is that user's own text.
+/// Split an injected summary block from the user text that follows it.
+/// Callers must pass a turn already marked as carrying the summary. A message
+/// that merely begins with the heading is not a summary.
 pub(crate) fn split_merged_user(content: &str) -> (String, String) {
     let content = content.trim();
     if let Some(pos) = content.find(SUMMARY_DISCLAIMER) {
@@ -470,6 +471,7 @@ pub fn prepare_model_history(
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
+        carries_summary: true,
     };
     // Notices are not replayed. The next row that is actually sent decides merge vs standalone.
     let Some(index) = rest.iter().position(message_is_replayed) else {
@@ -484,6 +486,7 @@ pub fn prepare_model_history(
         } else {
             format!("{block}\n\n{user_text}")
         };
+        rest[index].carries_summary = true;
         return rest;
     }
     rest.insert(index, summary_row);
@@ -562,6 +565,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }
     }
 
@@ -1694,6 +1698,104 @@ mod tests {
             .find(|turn| turn.content.contains("期限は3月末"))
             .expect("the quoting answer was removed");
         assert_eq!(quoted.content, quote);
+    }
+
+    #[test]
+    fn heading_text_is_not_the_injected_summary() {
+        let assistant = "【ここまでの要約】期限は3月末です。";
+        let user = "【ここまでの要約】確認します。";
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a0", "assistant", "読んだ"),
+            msg("a-head", "assistant", assistant),
+            msg("u-head", "user", user),
+        ];
+        let (turns, _) = assemble_turns("役割", &[], &history, 16_384);
+        let blob = turns.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(blob.contains(assistant), "{blob}");
+        assert!(blob.contains(user), "{blob}");
+        assert_eq!(
+            turns.iter().find(|t| t.role == "assistant" && t.content.contains("3月末")).unwrap().content,
+            assistant
+        );
+        assert_eq!(
+            turns.iter().find(|t| t.role == "user" && t.content.contains("確認します")).unwrap().content,
+            user
+        );
+
+        let summary = format!("{}\n{SUMMARY_DISCLAIMER}", "要".repeat(tokens_to_chars(200)));
+        let question = "今回の質問";
+        for limit in [16_384usize, 32_768, 131_072] {
+            let mut file = source("big", "", 1, &"添".repeat(200_000));
+            file.grain = "file".into();
+            file.paragraph_id.clear();
+            file.injected_user_message_id.clear();
+            let history = vec![
+                msg("u0", "user", "古い"),
+                msg("a0", "assistant", "読んだ"),
+                msg("u1", "user", "ホストの質問"),
+                msg("u-head", "user", user),
+                msg("a-head", "assistant", assistant),
+                msg("u3", "user", question),
+            ];
+            let budget = message_budget(limit, question);
+            let prepared = prepare_model_history(&history, &summary, "a0");
+            let (turns, stats) = assemble_turns("役割", std::slice::from_ref(&file), &prepared, budget);
+            assert!(stats.total_tokens <= budget, "{limit} {}", stats.total_tokens);
+            let blob = turns.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(blob.contains(SUMMARY_DISCLAIMER), "{limit} {blob}");
+            assert!(blob.contains(user), "{limit} {blob}");
+            assert!(blob.contains(assistant), "{limit} {blob}");
+            assert_eq!(
+                turns.iter().find(|t| t.content.contains("3月末")).unwrap().content,
+                assistant,
+                "{limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_drops_oldest_tool_sources_and_keeps_their_bodies() {
+        let summary = format!("要点です。\n{SUMMARY_DISCLAIMER}");
+        let question = "今の質問";
+        let mut sources = Vec::new();
+        for i in 0..60 {
+            let mut row = source(&format!("t{i}"), "u2", i + 1, &format!("SRC{i:02}{}", "x".repeat(500)));
+            row.origin = "tool".into();
+            row.grain = "unit".into();
+            row.sort_order = i;
+            row.path = format!(r"C:\docs\hit{i}.txt");
+            row.title = format!("hit{i}");
+            sources.push(row);
+        }
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a0", "assistant", "読んだ"),
+            msg("u1", "user", "前の質問"),
+            msg("u2", "user", question),
+        ];
+        let budget = message_budget(16_384, question);
+        let prepared = prepare_model_history(&history, &summary, "a0");
+        let (turns, stats) = assemble_turns("役割", &sources, &prepared, budget);
+        assert!(stats.total_tokens <= budget, "{}", stats.total_tokens);
+        let blob = turns.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(blob.contains("SRC59"), "{blob}");
+        assert!(!blob.contains("SRC00"), "{blob}");
+        assert!(blob.contains(&"x".repeat(100)), "kept tool sources lost their bodies");
+        let lines: Vec<&str> = blob.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.contains(']') {
+                let next = lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty());
+                assert!(
+                    next.is_some_and(|l| !l.starts_with('[') && !l.starts_with('【')),
+                    "0-char stub: {trimmed} in {blob}"
+                );
+            }
+        }
     }
 
     fn assert_no_orphan_tool(turns: &[ChatTurn]) {

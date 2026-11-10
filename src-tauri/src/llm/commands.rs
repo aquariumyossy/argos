@@ -1665,6 +1665,7 @@ fn history_with_meter_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMe
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
+        carries_summary: false,
     });
     history
 }
@@ -3541,6 +3542,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }
     }
 

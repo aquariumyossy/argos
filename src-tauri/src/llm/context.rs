@@ -838,8 +838,8 @@ fn select_sources(
     let over = |rows: &[LlmSourceRow]| char_len(&format_sources_with_pool(rows, pool)) > budget;
     let is_protected = |s: &LlmSourceRow| pending_ids.contains(&s.id) && s.origin == "attach";
 
-    while !precise && over(&rows) {
-        if let Some(idx) = rows
+    while over(&rows) {
+        let droppable: Vec<usize> = rows
             .iter()
             .enumerate()
             .filter(|(_, s)| {
@@ -847,13 +847,16 @@ fn select_sources(
                     && s.origin != "attach"
                     && !crate::llm::grain::is_file_grain(&s.grain)
             })
-            .min_by_key(|(_, s)| s.sort_order)
             .map(|(i, _)| i)
-        {
-            rows.remove(idx);
-            continue;
+            .collect();
+        if droppable.is_empty() || (precise && droppable.len() == 1) {
+            break;
         }
-        break;
+        let idx = droppable
+            .into_iter()
+            .min_by_key(|i| rows[*i].sort_order)
+            .unwrap();
+        rows.remove(idx);
     }
 
     while over(&rows) && !rows.is_empty() {
@@ -875,6 +878,13 @@ fn select_sources(
         if precise || pending_attach {
             let before = rows[idx].body.clone();
             fit_pending_prefix(&mut rows, idx, pool, budget, ledger);
+            let empty_stub = rows[idx].body.trim().is_empty()
+                && rows[idx].origin != "attach"
+                && !crate::llm::grain::is_file_grain(&rows[idx].grain);
+            if empty_stub {
+                rows.remove(idx);
+                continue;
+            }
             if rows[idx].body == before {
                 break;
             }
@@ -1010,8 +1020,10 @@ struct BuiltTurn {
     message_id: String,
     /// Tool text before cite-dedupe. Restored when the user excerpt no longer has it.
     tool_backup: Option<String>,
-    /// Stored conversation summary. Not a real user turn.
+    /// Stored conversation summary as its own turn. Not a real user turn.
     summary: bool,
+    /// This turn holds the injected summary block, either alone or merged into a user.
+    carries_summary: bool,
 }
 
 /// Stand-in used only by the meter when the composer is empty.
@@ -1080,6 +1092,7 @@ fn history_including_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMes
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
+        carries_summary: false,
     });
     history
 }
@@ -1151,14 +1164,14 @@ pub fn assemble_turns(
             message_id: String::new(),
             tool_backup: None,
             summary: false,
+            carries_summary: false,
         });
     }
 
     for m in &hist {
         let summary = m.id == SUMMARY_TURN_ID;
-        let merged = !summary
-            && m.role == "user"
-            && m.content.starts_with(crate::llm::summary::SUMMARY_PREFIX);
+        let carries_summary = summary || m.carries_summary;
+        let merged = carries_summary && !summary && m.role == "user";
         let (summary_block, user_text) = if merged {
             crate::llm::summary::split_merged_user(&m.content)
         } else {
@@ -1227,6 +1240,7 @@ pub fn assemble_turns(
             message_id: m.id.clone(),
             tool_backup,
             summary,
+            carries_summary,
         });
     }
 
@@ -1305,9 +1319,7 @@ pub fn assemble_turns(
     // Covered sources ride along on the merged user turn as empty-body stubs.
     let merged_stub_ids: HashSet<String> = built
         .iter()
-        .filter(|row| {
-            !row.summary && row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX)
-        })
+        .filter(|row| row.carries_summary && !row.summary)
         .flat_map(|row| {
             row.sources
                 .iter()
@@ -1362,11 +1374,7 @@ fn render_user_content(
 
 /// Keep a summary block that was merged into this user turn when the user text is re-rendered.
 fn assign_user_content(row: &mut BuiltTurn, user_part: String) {
-    let merged = row
-        .turn
-        .content
-        .starts_with(crate::llm::summary::SUMMARY_PREFIX);
-    if !merged {
+    if !row.carries_summary {
         row.turn.content = user_part;
         return;
     }
@@ -2001,11 +2009,7 @@ fn shrink_recent_sources(
         }
         let own = sources_for_user_render(row);
         let next = render_user_content(&row.question, &own, pool, true);
-        let current = if row
-            .turn
-            .content
-            .starts_with(crate::llm::summary::SUMMARY_PREFIX)
-        {
+        let current = if row.carries_summary {
             crate::llm::summary::split_merged_user(&row.turn.content).1
         } else {
             row.turn.content.clone()
@@ -2123,15 +2127,17 @@ fn source_char_room(
             {
                 let shell = wrap_user("【出典】\n", &row.question);
                 turn_tokens(&ChatTurn::text("user", shell))
-                    + summary_overhead_tokens(&row.turn.content)
+                    + if row.carries_summary {
+                        summary_overhead_tokens(&row.turn.content)
+                    } else {
+                        0
+                    }
             } else {
                 turn_tokens(&row.turn)
             }
         })
         .sum();
-    let summary_in_turns = built
-        .iter()
-        .any(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX));
+    let summary_in_turns = built.iter().any(|row| row.carries_summary);
     if !summary_in_turns {
         if let Some(carried) = carried {
             // The host turn was dropped. Keep room for the disclaimer and 既読 lines
@@ -2391,9 +2397,7 @@ struct CarriedSummary {
 }
 
 fn carried_summary(built: &[BuiltTurn], covered: &[LlmSourceRow]) -> Option<CarriedSummary> {
-    let row = built
-        .iter()
-        .find(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))?;
+    let row = built.iter().find(|row| row.carries_summary)?;
     let (block, _) = crate::llm::summary::split_merged_user(&row.turn.content);
     let mut stubs = Vec::new();
     for source in covered {
@@ -2405,7 +2409,12 @@ fn carried_summary(built: &[BuiltTurn], covered: &[LlmSourceRow]) -> Option<Carr
     Some(CarriedSummary { block, stubs })
 }
 
-fn combine_user_text(left: &str, right: &str) -> String {
+fn combine_user_text(
+    left: &str,
+    right: &str,
+    left_summary: bool,
+    right_summary: bool,
+) -> String {
     let left = left.trim();
     let right = right.trim();
     if left.is_empty() {
@@ -2414,7 +2423,7 @@ fn combine_user_text(left: &str, right: &str) -> String {
     if right.is_empty() {
         return left.to_string();
     }
-    if left.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+    if left_summary {
         let (block, user) = crate::llm::summary::split_merged_user(left);
         let rest = if user.is_empty() {
             right.to_string()
@@ -2423,7 +2432,7 @@ fn combine_user_text(left: &str, right: &str) -> String {
         };
         return join_summary_and_user(&block, &rest);
     }
-    if right.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+    if right_summary {
         let (block, user) = crate::llm::summary::split_merged_user(right);
         let rest = if user.is_empty() {
             left.to_string()
@@ -2446,10 +2455,10 @@ fn join_summary_and_user(block: &str, user: &str) -> String {
 }
 
 fn user_text_beside_summary(row: &BuiltTurn) -> String {
-    let content = row.turn.content.trim();
-    if !content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
-        return content.to_string();
+    if !row.carries_summary {
+        return row.turn.content.trim().to_string();
     }
+    let content = row.turn.content.trim();
     let (_, user) = crate::llm::summary::split_merged_user(content);
     if content.contains(crate::llm::summary::SUMMARY_DISCLAIMER) {
         return user;
@@ -2494,8 +2503,12 @@ fn merge_adjacent_user_turns(built: &mut Vec<BuiltTurn>) {
         let left_sources = built[index].sources.clone();
         let left_original = built[index].original_sources.clone();
         let left_question = built[index].question.clone();
+        let left_summary = built[index].carries_summary;
+        let right_summary = built[index + 1].carries_summary;
         let right_content = built[index + 1].turn.content.clone();
-        built[index + 1].turn.content = combine_user_text(&left_content, &right_content);
+        built[index + 1].turn.content =
+            combine_user_text(&left_content, &right_content, left_summary, right_summary);
+        built[index + 1].carries_summary = left_summary || right_summary;
         for source in left_sources {
             if !built[index + 1].sources.iter().any(|have| have.id == source.id) {
                 built[index + 1].sources.push(source);
@@ -2524,6 +2537,7 @@ fn ensure_summary_on_first_user(built: &mut [BuiltTurn], block: &str, stubs: &[S
     let user = user_text_beside_summary(&built[index]);
     let mut next = join_summary_and_user(block, &user);
     append_stub_lines(&mut next, stubs);
+    built[index].carries_summary = true;
     if built[index].turn.content != next {
         built[index].turn.content = next;
     }
@@ -2535,7 +2549,7 @@ fn restore_carried_stubs(built: &mut [BuiltTurn], stubs: &[String]) {
     }
     let Some(row) = built
         .iter_mut()
-        .find(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))
+        .find(|row| row.carries_summary)
     else {
         return;
     };
@@ -2549,13 +2563,14 @@ fn drop_summary_if_over_budget(built: &mut Vec<BuiltTurn>, max_tokens: usize, st
     }
     let mut changed = false;
     for row in built.iter_mut() {
-        if !row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+        if !row.carries_summary {
             continue;
         }
         let next = strip_summary_and_stubs(&row.turn.content, stubs);
         if next != row.turn.content {
             row.turn.content = next;
             row.summary = false;
+            row.carries_summary = false;
             changed = true;
         }
     }
@@ -2604,7 +2619,7 @@ fn shrink_carried_summary(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
         guard += 1;
         let Some(index) = built
             .iter()
-            .position(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))
+            .position(|row| row.carries_summary)
         else {
             break;
         };
@@ -2741,6 +2756,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }
     }
 
@@ -5164,6 +5180,7 @@ mod tests {
             message_id: id.into(),
             tool_backup: None,
             summary,
+            carries_summary: summary,
         }
     }
 
@@ -5194,6 +5211,7 @@ mod tests {
             message_id: String::new(),
             tool_backup: None,
             summary: false,
+            carries_summary: false,
         };
         let mut built = vec![system.clone(), summary.clone(), older, latest.clone()];
         let ids = recent_user_ids(&built);

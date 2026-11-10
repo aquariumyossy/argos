@@ -244,6 +244,9 @@ pub struct LlmMessageRow {
     /// Empty for a normal turn. "notice" is an app message: shown in the chat, not sent to the model.
     #[serde(default)]
     pub kind: String,
+    /// Set by `prepare_model_history` on the injected summary. Not stored.
+    #[serde(skip, default)]
+    pub carries_summary: bool,
 }
 
 /// App-generated chat row. Saved and shown, but left out of later model context.
@@ -3724,6 +3727,7 @@ impl Db {
                 tool_call_id: row.get(7)?,
                 tool_name: row.get(8)?,
                 kind: row.get(9)?,
+                carries_summary: false,
             })
         })?;
         Ok(rows.flatten().collect())
@@ -3807,6 +3811,7 @@ impl Db {
             tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             kind: kind.to_string(),
+            carries_summary: false,
         })
     }
 
