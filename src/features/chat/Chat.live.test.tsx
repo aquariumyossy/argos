@@ -5,10 +5,11 @@ import { contextMeterLabel, contextMeterLimit } from "./contextEstimate";
 
 type Handler = (event: { payload: unknown }) => void;
 
-const { mockInvoke, mockWriteText, listeners } = vi.hoisted(() => ({
+const { mockInvoke, mockWriteText, listeners, focusHandlers } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
   mockWriteText: vi.fn(async (_text: string) => {}),
   listeners: new Map<string, Handler>(),
+  focusHandlers: [] as Array<(event: { payload: boolean }) => void>,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -26,8 +27,21 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
-    onFocusChanged: async () => () => {},
+    onFocusChanged: async (cb: (event: { payload: boolean }) => void) => {
+      focusHandlers.push(cb);
+      return () => {
+        const index = focusHandlers.indexOf(cb);
+        if (index >= 0) focusHandlers.splice(index, 1);
+      };
+    },
   }),
+}));
+
+vi.mock("mermaid", () => ({
+  default: {
+    initialize: () => {},
+    render: async () => ({ svg: "<svg></svg>" }),
+  },
 }));
 
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -83,6 +97,7 @@ const messagesB = [
 ];
 
 let messagesA: Array<typeof originalUser & { reasoning?: string }> = [originalUser];
+let sourcesA: Array<Record<string, unknown>> = [];
 let releaseSend: () => void = () => {};
 
 const meterLimit = contextMeterLimit(131_072);
@@ -180,8 +195,10 @@ async function renderChat() {
 
 beforeEach(() => {
   contentObservers.length = 0;
+  focusHandlers.length = 0;
   vi.stubGlobal("ResizeObserver", ContentResizeObserver);
   messagesA = [originalUser];
+  sourcesA = [];
   releaseSend = () => {};
   listeners.clear();
   mockWriteText.mockReset();
@@ -209,7 +226,22 @@ beforeEach(() => {
       case "llm_list_messages":
         return args?.threadId === threadB.id ? messagesB : messagesA;
       case "llm_list_sources":
-        return [];
+        return args?.threadId === threadB.id ? [] : sourcesA;
+      case "llm_preview_source_file":
+        return { chars: 20, units: 1, hardCap: 100 };
+      case "llm_file_grain_meter":
+        return { tokens: 40, bodyTrimmed: false };
+      case "llm_set_source_grain": {
+        const onSources = listeners.get("llm-sources-updated");
+        queueMicrotask(() => {
+          onSources?.({ payload: { threadId: threadA.id } });
+        });
+        return {
+          source: sourcesA[0] ?? null,
+          sources: sourcesA,
+          removed: 0,
+        };
+      }
       case "llm_context_meter":
         return args?.threadId === threadB.id ? 1111 : 2222;
       case "llm_send": {
@@ -615,6 +647,32 @@ describe("scroll follow during generation", () => {
     expect(1200 - log.scrollTop - 240).toBe(0);
   });
 
+  it("resumes following when enlarging the window clamps onto the bottom", async () => {
+    const { log, box } = await startPinnedLog();
+    log.scrollTop = 500;
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    box.resize({ clientHeight: 400 });
+    expect(log.scrollTop).toBe(400);
+    expect(800 - log.scrollTop - 400).toBe(0);
+    expect(jump()).toBeNull();
+    await emitDelta("thread-a", "続く");
+    expect(log.scrollTop).toBe(box.maxTop());
+  });
+
+  it("resumes following when a reset shrinks content onto the bottom", async () => {
+    const { log, box } = await startPinnedLog();
+    log.scrollTop = 500;
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    box.resize({ scrollHeight: 520 });
+    expect(log.scrollTop).toBe(400);
+    expect(520 - log.scrollTop - 120).toBe(0);
+    expect(jump()).toBeNull();
+    await emitDelta("thread-a", "再開");
+    expect(log.scrollTop).toBe(box.maxTop());
+  });
+
   it("does not pin when the viewport shrinks while follow is off", async () => {
     const { log, box } = await startPinnedLog();
     box.resize({ scrollHeight: 1186, clientHeight: 610 });
@@ -627,6 +685,95 @@ describe("scroll follow during generation", () => {
     const parked = log.scrollTop;
     box.resize({ clientHeight: 576 });
     notifyLogResize();
+    expect(log.scrollTop).toBe(parked);
+  });
+});
+
+const finishedAnswer = {
+  id: "m-asst",
+  threadId: "thread-a",
+  role: "assistant",
+  content: "回答です\n\n```mermaid\nflowchart LR\nA-->B\n```",
+  reasoning: "隠れた思考です",
+  createdAt: 2,
+};
+
+describe("finished answer stays put", () => {
+  async function openThinkingAwayFromBottom() {
+    messagesA = [originalUser, finishedAnswer];
+    render(<Chat />);
+    const summary = await screen.findByText("思考");
+    await screen.findByRole("button", { name: "図" });
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, { scrollHeight: 1200, clientHeight: 405 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    fireEvent.click(summary);
+    box.setScrollHeight(box.scrollHeight() + 736);
+    const content = log.querySelector(".chat-log-content");
+    if (!(content instanceof HTMLElement)) throw new Error("log content missing");
+    notifyContentResize(content, box.scrollHeight());
+    const parked = log.scrollTop;
+    expect(box.scrollHeight() - parked - log.clientHeight).toBe(736);
+    return { log, box, parked };
+  }
+
+  it("does not jump when focus reloads the same messages", async () => {
+    const { log, parked } = await openThinkingAwayFromBottom();
+    const onFocus = focusHandlers[focusHandlers.length - 1];
+    if (!onFocus) throw new Error("focus handler missing");
+    await act(async () => {
+      onFocus({ payload: true });
+    });
+    expect(log.scrollTop).toBe(parked);
+  });
+
+  it("does not jump when sources update reloads the same messages", async () => {
+    const { log, parked } = await openThinkingAwayFromBottom();
+    const onSources = listeners.get("llm-sources-updated");
+    if (!onSources) throw new Error("sources listener missing");
+    await act(async () => {
+      onSources({ payload: { threadId: "thread-a" } });
+    });
+    expect(log.scrollTop).toBe(parked);
+  });
+
+  it("does not jump when a diagram lays out away from the bottom", async () => {
+    const { log, parked } = await openThinkingAwayFromBottom();
+    fireEvent.click(screen.getByRole("button", { name: "ソース" }));
+    fireEvent.click(screen.getByRole("button", { name: "図" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(log.scrollTop).toBe(parked);
+  });
+
+  it("does not jump when a full-text chip reloads the same messages", async () => {
+    sourcesA = [
+      {
+        id: "src-1",
+        threadId: "thread-a",
+        sortOrder: 0,
+        origin: "attach",
+        path: "C:\\case\\準備書面.pdf",
+        title: "準備書面.pdf",
+        paragraphId: "p1",
+        body: "本文",
+        query: "",
+        createdAt: 1,
+        grain: "unit",
+      },
+    ];
+    const { log, parked } = await openThinkingAwayFromBottom();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "準備書面.pdf" }));
+    });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "llm_set_source_grain",
+      expect.objectContaining({ id: "src-1", grain: "file" }),
+    );
     expect(log.scrollTop).toBe(parked);
   });
 });

@@ -3,6 +3,8 @@ import {
   applyChatDelta,
   distanceFromBottom,
   followAfterUserScroll,
+  messageListKey,
+  shouldFollowScrollToBottom,
   type LiveGeneration,
 } from "./chatLive";
 
@@ -94,6 +96,35 @@ describe("scroll follow", () => {
     const down = step(false, up.anchor, BOTTOM - 15);
     expect(distanceFromBottom(BOTTOM - 15, LONG_H, VIEW_H)).toBe(15);
     expect(down).toEqual({ follow: false, anchor: BOTTOM - 15 });
+  });
+
+  it("does not jump for a same-id reload or a diagram layout away from the bottom", () => {
+    const ids = messageListKey(["u1", "a1"]);
+    expect(messageListKey(["u1", "a1"])).toBe(ids);
+    expect(messageListKey(["u1", "a1", "a2"])).not.toBe(ids);
+    expect(
+      shouldFollowScrollToBottom({ live: false, listChanged: false, atBottom: false }),
+    ).toBe(false);
+    expect(
+      shouldFollowScrollToBottom({ live: false, listChanged: true, atBottom: false }),
+    ).toBe(true);
+    expect(
+      shouldFollowScrollToBottom({ live: false, listChanged: false, atBottom: true }),
+    ).toBe(true);
+    expect(
+      shouldFollowScrollToBottom({ live: true, listChanged: false, atBottom: false }),
+    ).toBe(true);
+  });
+
+  it("resumes when a clamp moves up onto the bottom", () => {
+    const up = step(true, BOTTOM, 500);
+    expect(up.follow).toBe(false);
+    const enlarged = step(false, 500, 400, LONG_H, 400);
+    expect(distanceFromBottom(400, LONG_H, 400)).toBe(0);
+    expect(enlarged).toEqual({ follow: true, anchor: 400 });
+    const reset = step(false, 500, 400, 520, VIEW_H);
+    expect(distanceFromBottom(400, 520, VIEW_H)).toBe(0);
+    expect(reset).toEqual({ follow: true, anchor: 400 });
   });
 
   it("stops on an 8px upward step and resumes only at the bottom", () => {

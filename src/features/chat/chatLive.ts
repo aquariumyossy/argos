@@ -50,10 +50,27 @@ export function isAtBottom(
   return distanceFromBottom(scrollTop, scrollHeight, clientHeight) <= slack;
 }
 
+/** Ids or count. Same messages in a new array do not count. */
+export function messageListKey(ids: readonly string[]): string {
+  return ids.join("\0");
+}
+
+/**
+ * Outside a live reply, only a real message-list change or an already-bottom
+ * log may jump. A reload of the same ids must not.
+ */
+export function shouldFollowScrollToBottom(input: {
+  live: boolean;
+  listChanged: boolean;
+  atBottom: boolean;
+}): boolean {
+  if (input.live) return true;
+  return input.listChanged || input.atBottom;
+}
+
 /**
  * Stop only when scrollTop decreased and the log is no longer at the bottom.
- * A clamp, shrink, or resize that leaves it at the bottom does not stop.
- * Resume only when a later scroll rests at the bottom.
+ * Reaching the bottom resumes following in either direction, including a clamp.
  */
 export function followAfterUserScroll(input: {
   follow: boolean;
@@ -64,9 +81,7 @@ export function followAfterUserScroll(input: {
 }): { follow: boolean; anchor: number } {
   const { scrollTop, anchor, scrollHeight, clientHeight, follow } = input;
   const atBottom = isAtBottom(scrollTop, scrollHeight, clientHeight);
-  if (scrollTop < anchor) {
-    return { follow: atBottom ? follow : false, anchor: scrollTop };
-  }
   if (atBottom) return { follow: true, anchor: scrollTop };
+  if (scrollTop < anchor) return { follow: false, anchor: scrollTop };
   return { follow, anchor: scrollTop };
 }

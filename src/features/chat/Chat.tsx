@@ -23,6 +23,8 @@ import {
   applyChatDelta,
   followAfterUserScroll,
   isAtBottom,
+  messageListKey,
+  shouldFollowScrollToBottom,
   type LiveGeneration,
 } from "./chatLive";
 import { useChatContextMeter } from "./useChatContextMeter";
@@ -583,8 +585,11 @@ export default function Chat() {
   const scrollAnchor = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
+  const messagesRef = useRef(messages);
+  const seenMessageKeyRef = useRef("");
   const threadDragRef = useRef<ThreadDragSession | null>(null);
   threadsRef.current = threads;
+  messagesRef.current = messages;
 
   useEffect(() => {
     const id = active?.id ?? null;
@@ -879,13 +884,32 @@ export default function Chat() {
     });
   }, []);
 
-  const scrollLog = useCallback(() => {
+  const pinLogToBottom = useCallback(() => {
     const el = listRef.current;
     if (!el || !followRef.current) return;
     noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
     scrollAnchor.current = el.scrollTop;
   }, [noteProgrammaticScroll]);
+
+  const scrollLog = useCallback(() => {
+    const el = listRef.current;
+    const key = messageListKey(messagesRef.current.map((m) => m.id));
+    const listChanged = key !== seenMessageKeyRef.current;
+    seenMessageKeyRef.current = key;
+    if (!el || !followRef.current) return;
+    const atBottom = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    if (
+      !shouldFollowScrollToBottom({
+        live: showLiveRef.current,
+        listChanged,
+        atBottom,
+      })
+    ) {
+      return;
+    }
+    pinLogToBottom();
+  }, [pinLogToBottom]);
 
   useEffect(() => {
     const content = logContentRef.current;
@@ -904,12 +928,16 @@ export default function Chat() {
       lastClientHeight = clientHeight;
       lastScrollHeight = log.scrollHeight;
       if (!followRef.current) return;
-      if ((viewportShrank && wasAtBottom) || (contentGrew && showLiveRef.current)) scrollLog();
+      if (viewportShrank && wasAtBottom) {
+        pinLogToBottom();
+        return;
+      }
+      if (contentGrew && showLiveRef.current) scrollLog();
     });
     observer.observe(content);
     observer.observe(log);
     return () => observer.disconnect();
-  }, [scrollLog]);
+  }, [pinLogToBottom, scrollLog]);
 
   const onLogScroll = useCallback(() => {
     const el = listRef.current;
