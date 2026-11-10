@@ -4,20 +4,31 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type SyntheticEvent as ReactSyntheticEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
 import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
+import {
+  applyChatDelta,
+  followAfterUserScroll,
+  isAtBottom,
+  messageListKey,
+  shouldFollowScrollToBottom,
+  type LiveGeneration,
+} from "./chatLive";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -36,6 +47,19 @@ import {
   openableCitesFromGroups,
 } from "./sourceGroups";
 import "./chat.css";
+
+const USER_SCROLL_TAIL_MS = 300;
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 
 type LlmThreadRow = {
   id: string;
@@ -143,6 +167,40 @@ type LlmChatDelta = {
   text: string;
   kind?: string;
 };
+
+type ThreadBanner = {
+  error: string;
+  notice: string;
+  restoreDraft: string | null;
+};
+
+function bannerFromResult(
+  text: string,
+  source: "draft" | "resend",
+  result: LlmSendResult,
+): ThreadBanner {
+  if (result.cancelled) {
+    return { error: "生成を停止しました。", notice: "", restoreDraft: null };
+  }
+  if (result.error) {
+    return {
+      error: result.error,
+      notice: "",
+      restoreDraft: source === "draft" && shouldRestoreDraft(result.error) ? text : null,
+    };
+  }
+  if (result.warning) {
+    return { error: "", notice: result.warning, restoreDraft: null };
+  }
+  if (result.truncated) {
+    return {
+      error: "",
+      notice: "トークン上限のため、古いやり取りや出典から切り詰めて送りました。",
+      restoreDraft: null,
+    };
+  }
+  return { error: "", notice: "", restoreDraft: null };
+}
 
 const TPL_SUMMARY =
   "添付した出典を日本語で要約してください。重要な結論と根拠を短く。";
@@ -502,9 +560,9 @@ export default function Chat() {
   const [ocrBusy, setOcrBusy] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [dropActive, setDropActive] = useState(false);
-  const [stream, setStream] = useState("");
-  const [thinking, setThinking] = useState("");
-  const [toolHint, setToolHint] = useState("");
+  const [live, setLive] = useState<LiveGeneration | null>(null);
+  const [followBottom, setFollowBottom] = useState(true);
+  const [detailsHold, setDetailsHold] = useState(false);
   const [noteReviews, setNoteReviews] = useState<NoteReview[]>([]);
   const [appendUndo, setAppendUndo] = useState<{
     noteId: string;
@@ -526,19 +584,41 @@ export default function Chat() {
   const [listQuery, setListQuery] = useState("");
   const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const logContentRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bootstrappingRef = useRef(false);
   const activeIdRef = useRef<string | null>(null);
   const busyRef = useRef(false);
   const ocrBusyRef = useRef(false);
   const attachingRef = useRef(false);
+  const liveRef = useRef<LiveGeneration | null>(null);
+  const pendingThreadId = useRef<string | null>(null);
+  const contentEpoch = useRef(0);
+  const heldBanners = useRef(new Map<string, ThreadBanner>());
+  const followRef = useRef(true);
+  const showLiveRef = useRef(false);
+  const programmaticScroll = useRef(false);
+  const scrollAnchor = useRef(0);
+  const wasAtBottomRef = useRef(true);
+  const detailsHoldRef = useRef(false);
+  const userScrollUntilRef = useRef(0);
+  const scrollbarPointerRef = useRef(false);
+  const liveMessageRef = useRef<HTMLElement | null>(null);
+  const liveHeightRef = useRef(0);
+  const logObserverRef = useRef<ResizeObserver | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
+  const messagesRef = useRef(messages);
+  const seenMessageKeyRef = useRef("");
   const threadDragRef = useRef<ThreadDragSession | null>(null);
   threadsRef.current = threads;
+  messagesRef.current = messages;
 
   useEffect(() => {
-    activeIdRef.current = active?.id ?? null;
+    const id = active?.id ?? null;
+    const pending = pendingThreadId.current;
+    if (pending && pending !== id) return;
+    activeIdRef.current = id;
   }, [active]);
 
   useEffect(() => {
@@ -570,23 +650,28 @@ export default function Chat() {
     }
   }, []);
 
-  const loadThreadContent = useCallback(async (thread: LlmThreadRow | null) => {
+  const loadThreadContent = useCallback(async (thread: LlmThreadRow | null): Promise<boolean> => {
+    const epoch = ++contentEpoch.current;
     if (!thread) {
+      if (contentEpoch.current !== epoch) return false;
       setMessages([]);
       setSources([]);
       setNoteReviews([]);
-      return;
+      return true;
     }
     const [msgs, srcs] = await Promise.all([
       invoke<LlmMessageRow[]>("llm_list_messages", { threadId: thread.id }),
       invoke<LlmSourceRow[]>("llm_list_sources", { threadId: thread.id }),
     ]);
+    if (contentEpoch.current !== epoch) return false;
     setMessages(msgs);
     setSources(srcs);
     setNoteReviews([]);
     if (thread.noteId) {
       await loadNoteReview(thread.noteId);
+      if (contentEpoch.current !== epoch) return false;
     }
+    return true;
   }, [loadNoteReview]);
 
   const loadThreads = useCallback(async () => {
@@ -729,25 +814,30 @@ export default function Chat() {
     let unlistenOcr: (() => void) | undefined;
     let unlistenReview: (() => void) | undefined;
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
-      if (event.payload.threadId !== activeIdRef.current) return;
-      const kind = event.payload.kind ?? "content";
-      if (kind === "reset") {
-        setStream("");
-        setThinking("");
-        setToolHint("");
-      } else if (kind === "reasoning") {
-        setThinking((prev) => prev + event.payload.text);
-      } else if (kind === "tool") {
-        setToolHint(event.payload.text || "インデックスを検索しています…");
-      } else {
-        setStream((prev) => prev + event.payload.text);
-      }
+      const current = liveRef.current;
+      if (!current || event.payload.threadId !== current.threadId) return;
+      const next = applyChatDelta(current, event.payload);
+      if (next === current) return;
+      liveRef.current = next;
+      setLive(next);
     }).then((fn) => {
       unlistenDelta = fn;
     });
     void listen<{ threadId: string; message: string }>("llm-chat-error", (event) => {
-      if (event.payload.threadId !== activeIdRef.current) return;
-      setError(event.payload.message);
+      const tid = event.payload.threadId;
+      const generating = liveRef.current?.threadId;
+      if (generating && tid !== generating) return;
+      if (!generating && tid !== activeIdRef.current) return;
+      if (activeIdRef.current === tid) {
+        setError(event.payload.message);
+        return;
+      }
+      const prev = heldBanners.current.get(tid);
+      heldBanners.current.set(tid, {
+        error: event.payload.message,
+        notice: prev?.notice ?? "",
+        restoreDraft: prev?.restoreDraft ?? null,
+      });
     }).then((fn) => {
       unlistenError = fn;
     });
@@ -756,8 +846,13 @@ export default function Chat() {
       if (busyRef.current || ocrBusyRef.current || attachingRef.current) {
         if (tid === activeIdRef.current) {
           void invoke<LlmSourceRow[]>("llm_list_sources", { threadId: tid })
-            .then(setSources)
-            .catch((e) => setError(formatInvokeError(e)));
+            .then((rows) => {
+              if (activeIdRef.current !== tid) return;
+              setSources(rows);
+            })
+            .catch((e) => {
+              if (activeIdRef.current === tid) setError(formatInvokeError(e));
+            });
         }
         return;
       }
@@ -766,9 +861,8 @@ export default function Chat() {
         .then(() => {
           if (tid !== prev) {
             setDraft("");
-            setStream("");
-            setThinking("");
-            setToolHint("");
+            liveRef.current = null;
+            setLive(null);
             setError("");
           }
         })
@@ -796,15 +890,253 @@ export default function Chat() {
     };
   }, [loadThreads, loadNoteReview]);
 
-  const scrollLog = useCallback(() => {
+  const viewingLive = live && active?.id === live.threadId ? live : null;
+  const stream = viewingLive?.stream ?? "";
+  const thinking = viewingLive?.thinking ?? "";
+  const toolHint = viewingLive?.toolHint ?? "";
+  const showLive =
+    !!viewingLive && (busy || stream.length > 0 || thinking.length > 0 || toolHint.length > 0);
+  showLiveRef.current = showLive;
+  useEffect(() => {
+    if (showLive) return;
+    listRef.current?.classList.remove("chat-log-no-anchor");
+  }, [showLive]);
+  const generatingThreadId = busy ? (live?.threadId ?? null) : null;
+  const onGeneratingThread = !!generatingThreadId && active?.id === generatingThreadId;
+
+  const noteProgrammaticScroll = useCallback(() => {
+    programmaticScroll.current = true;
+    queueMicrotask(() => {
+      programmaticScroll.current = false;
+    });
+  }, []);
+
+  const pinLogToBottom = useCallback(() => {
     const el = listRef.current;
-    if (!el) return;
+    if (!el || !followRef.current) return;
+    noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
+    scrollAnchor.current = el.scrollTop;
+    wasAtBottomRef.current = true;
+  }, [noteProgrammaticScroll]);
+
+  const releaseDetailsHold = useCallback(() => {
+    if (!detailsHoldRef.current) return;
+    detailsHoldRef.current = false;
+    listRef.current?.classList.remove("chat-log-no-anchor");
+    setDetailsHold(false);
+  }, []);
+
+  const pauseFollow = useCallback(() => {
+    if (!followRef.current) return;
+    followRef.current = false;
+    wasAtBottomRef.current = false;
+    // Class is applied before the browser clamps or anchors this frame.
+    detailsHoldRef.current = true;
+    if (showLiveRef.current) listRef.current?.classList.add("chat-log-no-anchor");
+    setDetailsHold(true);
+    setFollowBottom(false);
+  }, []);
+
+  const scrollLog = useCallback((layout = false) => {
+    const el = listRef.current;
+    const key = messageListKey(messagesRef.current.map((m) => m.id));
+    const listChanged = key !== seenMessageKeyRef.current;
+    seenMessageKeyRef.current = key;
+    if (!el || !followRef.current) return;
+    // Layout runs after the DOM has already grown, so the pre-growth flag is the one that matters.
+    const atBottom = layout
+      ? wasAtBottomRef.current
+      : isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    if (
+      !shouldFollowScrollToBottom({
+        live: showLiveRef.current && !layout,
+        listChanged,
+        atBottom,
+      })
+    ) {
+      return;
+    }
+    pinLogToBottom();
+  }, [pinLogToBottom]);
+
+  const scrollAfterLayout = useCallback(() => {
+    scrollLog(true);
+  }, [scrollLog]);
+
+  const setLiveMessageEl = useCallback((node: HTMLElement | null) => {
+    const observer = logObserverRef.current;
+    const prev = liveMessageRef.current;
+    if (prev && prev !== node && observer) observer.unobserve(prev);
+    liveMessageRef.current = node;
+    // The article often mounts after the observer. Snapshot its height now, then
+    // keep watching it: a short log stretches `.chat-log-content`, so token growth
+    // does not resize that box and would otherwise leave this height stale.
+    liveHeightRef.current = node?.offsetHeight ?? 0;
+    if (node && observer) observer.observe(node);
   }, []);
 
   useEffect(() => {
+    const log = listRef.current;
+    if (!log) return;
+    const outsideLiveDetails = (details: Element | null) => {
+      if (!(details instanceof HTMLDetailsElement)) return false;
+      const live = liveMessageRef.current;
+      return !live || !live.contains(details);
+    };
+    // Click is synchronous, before the details box grows. Toggle is the same
+    // open/close for keyboard; both must pause before ResizeObserver can pin.
+    const onClick = (event: MouseEvent) => {
+      if (!showLiveRef.current || !followRef.current) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const summary = target.closest("summary");
+      if (!summary || !outsideLiveDetails(summary.closest("details"))) return;
+      pauseFollow();
+    };
+    const onToggle = (event: Event) => {
+      if (!showLiveRef.current || !followRef.current) return;
+      const details = event.target;
+      if (!(details instanceof Element) || !outsideLiveDetails(details)) return;
+      pauseFollow();
+    };
+    log.addEventListener("click", onClick);
+    log.addEventListener("toggle", onToggle, true);
+    return () => {
+      log.removeEventListener("click", onClick);
+      log.removeEventListener("toggle", onToggle, true);
+    };
+  }, [pauseFollow]);
+
+  useEffect(() => {
+    const content = logContentRef.current;
+    const log = listRef.current;
+    if (!content || !log || typeof ResizeObserver === "undefined") return;
+    let lastContentHeight = content.offsetHeight;
+    let lastClientHeight = log.clientHeight;
+    let lastClientWidth = log.clientWidth;
+    let lastScrollHeight = log.scrollHeight;
+    const observer = new ResizeObserver(() => {
+      const contentHeight = content.offsetHeight;
+      const clientHeight = log.clientHeight;
+      const clientWidth = log.clientWidth;
+      const scrollHeight = log.scrollHeight;
+      const contentGrew = contentHeight > lastContentHeight;
+      const scrollGrew = scrollHeight > lastScrollHeight;
+      const widthChanged = clientWidth !== lastClientWidth;
+      const viewportChanged = clientHeight !== lastClientHeight;
+      const viewportShrank = clientHeight < lastClientHeight;
+      const wasGeoBottom = isAtBottom(log.scrollTop, lastScrollHeight, lastClientHeight);
+      const liveEl = liveMessageRef.current;
+      const liveHeight = liveEl?.offsetHeight ?? 0;
+      const liveGrew = liveEl != null && liveHeight > liveHeightRef.current;
+      lastContentHeight = contentHeight;
+      lastClientHeight = clientHeight;
+      lastClientWidth = clientWidth;
+      lastScrollHeight = scrollHeight;
+      liveHeightRef.current = liveHeight;
+      if (showLiveRef.current) {
+        if (!followRef.current) return;
+        // Details outside the live message pause in the click/toggle handler.
+        // Diagram layout and width reflow stay pinned while the user is following.
+        if (
+          wasAtBottomRef.current &&
+          (liveGrew || contentGrew || scrollGrew || widthChanged)
+        ) {
+          pinLogToBottom();
+          return;
+        }
+        if (viewportShrank && wasGeoBottom) pinLogToBottom();
+        return;
+      }
+      if (!followRef.current) return;
+      if (wasGeoBottom && (widthChanged || viewportChanged)) {
+        pinLogToBottom();
+        return;
+      }
+      if (contentGrew || scrollGrew) {
+        wasAtBottomRef.current = isAtBottom(log.scrollTop, scrollHeight, clientHeight);
+      }
+    });
+    logObserverRef.current = observer;
+    observer.observe(content);
+    observer.observe(log);
+    if (liveMessageRef.current) observer.observe(liveMessageRef.current);
+    return () => {
+      observer.disconnect();
+      if (logObserverRef.current === observer) logObserverRef.current = null;
+    };
+  }, [pauseFollow, pinLogToBottom, scrollLog]);
+
+  const userScrollActive = useCallback(() => {
+    return scrollbarPointerRef.current || performance.now() < userScrollUntilRef.current;
+  }, []);
+
+  const noteUserScroll = useCallback((event: ReactSyntheticEvent) => {
+    if (event.type === "pointerdown") {
+      if (event.target !== event.currentTarget) return;
+      scrollbarPointerRef.current = true;
+    } else if (event.type === "pointerup" || event.type === "pointercancel") {
+      const wasScrollbar = scrollbarPointerRef.current;
+      scrollbarPointerRef.current = false;
+      if (!wasScrollbar) return;
+    } else if (event.type === "pointermove") {
+      if (!scrollbarPointerRef.current) return;
+    } else if (event.type === "touchmove") {
+      const target = event.target;
+      if (target instanceof Element && target.closest("summary")) return;
+    } else if (event.type === "keydown") {
+      const key = (event as ReactKeyboardEvent).key;
+      if (!SCROLL_KEYS.has(key)) return;
+    }
+    userScrollUntilRef.current = performance.now() + USER_SCROLL_TAIL_MS;
+  }, []);
+
+  const onLogScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el || programmaticScroll.current) return;
+    const atBottom = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    // A details close clamps onto the bottom, and later growth can anchor there.
+    // Neither is a user scroll, so they must not resume following.
+    if (detailsHoldRef.current && !(userScrollActive() && atBottom)) {
+      scrollAnchor.current = el.scrollTop;
+      wasAtBottomRef.current = false;
+      return;
+    }
+    const next = followAfterUserScroll({
+      follow: followRef.current,
+      scrollTop: el.scrollTop,
+      anchor: scrollAnchor.current,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    });
+    scrollAnchor.current = next.anchor;
+    wasAtBottomRef.current = atBottom;
+    if (next.follow) releaseDetailsHold();
+    if (followRef.current === next.follow) return;
+    followRef.current = next.follow;
+    setFollowBottom(next.follow);
+  }, [releaseDetailsHold, userScrollActive]);
+
+  function pinFollow() {
+    followRef.current = true;
+    releaseDetailsHold();
+    setFollowBottom(true);
+  }
+
+  function jumpToLatest() {
+    pinFollow();
+    const el = listRef.current;
+    if (!el) return;
+    noteProgrammaticScroll();
+    el.scrollTop = el.scrollHeight;
+    scrollAnchor.current = el.scrollTop;
+    wasAtBottomRef.current = true;
+  }
+
+  useEffect(() => {
     scrollLog();
-  }, [messages, stream, thinking, toolHint, busy, scrollLog]);
+  }, [messages, stream, thinking, toolHint, showLive, scrollLog]);
 
   const meter = useChatContextMeter({
     threadId: active?.id ?? "",
@@ -848,18 +1180,41 @@ export default function Chat() {
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
-    if (blocked) return;
+    // Generation keeps running. OCR and attach still belong to the open thread.
+    if (ocrBusy || attaching || !id || id === activeIdRef.current) return;
+    const prev = activeIdRef.current;
+    pendingThreadId.current = id;
+    activeIdRef.current = id;
+    pinFollow();
     try {
       const t = await invoke<LlmThreadRow>("llm_set_active_thread", { id });
+      if (activeIdRef.current !== id) {
+        if (pendingThreadId.current === id) pendingThreadId.current = null;
+        return;
+      }
       setActive(t);
-      await loadThreadContent(t);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      pendingThreadId.current = null;
+      const applied = await loadThreadContent(t);
+      if (activeIdRef.current !== id) return;
+      const held = heldBanners.current.get(id) ?? null;
+      if (held) heldBanners.current.delete(id);
+      if (!applied && !held) return;
+      if (held) {
+        setError(held.error);
+        setNotice(held.notice);
+        if (held.restoreDraft) setDraft(held.restoreDraft);
+        return;
+      }
       setError("");
       setNotice("");
     } catch (e) {
-      setError(formatInvokeError(e));
+      if (activeIdRef.current === id) {
+        activeIdRef.current = prev;
+        pendingThreadId.current = null;
+        setError(formatInvokeError(e));
+      } else if (pendingThreadId.current === id) {
+        pendingThreadId.current = null;
+      }
     }
   }
 
@@ -868,12 +1223,14 @@ export default function Chat() {
     try {
       const t = await invoke<LlmThreadRow>("llm_create_thread", { title: "" });
       setThreads((prev) => [t, ...prev.filter((x) => x.id !== t.id)]);
+      contentEpoch.current += 1;
       setActive(t);
+      activeIdRef.current = t.id;
       setMessages([]);
       setSources([]);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      liveRef.current = null;
+      setLive(null);
+      pinFollow();
       setError("");
       setNotice("");
       textareaRef.current?.focus();
@@ -886,9 +1243,12 @@ export default function Chat() {
     if (blocked) return;
     try {
       await invoke("llm_delete_thread", { id });
+      if (liveRef.current?.threadId === id) {
+        liveRef.current = null;
+        setLive(null);
+      }
+      heldBanners.current.delete(id);
       await loadThreads();
-      setStream("");
-      setThinking("");
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1167,16 +1527,38 @@ export default function Chat() {
     };
   }, [attachFiles]);
 
-  async function send() {
-    const text = draft.trim();
+  function publishBanner(threadId: string, banner: ThreadBanner) {
+    if (activeIdRef.current === threadId) {
+      heldBanners.current.delete(threadId);
+      setError(banner.error);
+      setNotice(banner.notice);
+      if (banner.restoreDraft) setDraft(banner.restoreDraft);
+      return;
+    }
+    if (banner.error || banner.notice || banner.restoreDraft) {
+      heldBanners.current.set(threadId, banner);
+    } else {
+      heldBanners.current.delete(threadId);
+    }
+  }
+
+  async function copyMessage(text: string) {
+    try {
+      await writeText(text);
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function send(raw?: string, source: "draft" | "resend" = "draft") {
+    const text = (source === "draft" ? draft : (raw ?? "")).trim();
     if (!text || blocked) return;
+    busyRef.current = true;
     setBusy(true);
     setError("");
     setNotice("");
-    setDraft("");
-    setStream("");
-    setThinking("");
-    setToolHint("");
+    if (source === "draft") setDraft("");
+    pinFollow();
     let thread: LlmThreadRow;
     try {
       thread =
@@ -1188,66 +1570,61 @@ export default function Chat() {
         setThreads((prev) => [created, ...prev.filter((x) => x.id !== created.id)]);
       }
     } catch (e) {
+      busyRef.current = false;
       setBusy(false);
-      setDraft(text);
+      if (source === "draft") setDraft(text);
       setError(formatInvokeError(e));
       return;
     }
+    const originId = thread.id;
+    const started: LiveGeneration = {
+      threadId: originId,
+      stream: "",
+      thinking: "",
+      toolHint: "",
+    };
+    liveRef.current = started;
+    setLive(started);
     const optimistic: LlmMessageRow = {
       id: `tmp-${Date.now()}`,
-      threadId: thread.id,
+      threadId: originId,
       role: "user",
       content: text,
       createdAt: Math.floor(Date.now() / 1000),
     };
-    setMessages((prev) => [...prev, optimistic]);
+    if (activeIdRef.current === originId) {
+      setMessages((prev) => [...prev, optimistic]);
+    }
     try {
       const result = await invoke<LlmSendResult>("llm_send", {
-        threadId: thread.id,
+        threadId: originId,
         content: text,
         webSearch: webSearch && !!searxngUrl,
       });
-      setActive(result.thread);
-      setThreads((prev) =>
-        prev.map((x) => (x.id === result.thread.id ? result.thread : x)),
-      );
-      const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
-        threadId: result.thread.id,
-      });
-      const srcs = await invoke<LlmSourceRow[]>("llm_list_sources", {
-        threadId: result.thread.id,
-      });
-      setMessages(msgs);
-      setSources(srcs);
-      for (const w of result.noteWrites ?? []) {
-        if (w.noteId) await loadNoteReview(w.noteId);
-      }
-      if (result.thread.noteId) await loadNoteReview(result.thread.noteId);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      const finishedId = result.thread.id;
+      setThreads((prev) => prev.map((x) => (x.id === finishedId ? result.thread : x)));
       if (result.thinkingBudgetState) {
         setThinkingBudget({
           state: result.thinkingBudgetState,
           tokens: result.thinkingBudgetTokens ?? null,
         });
       }
-      if (result.cancelled) {
-        setError("生成を停止しました。");
-      } else if (result.error) {
-        setError(result.error);
-        if (shouldRestoreDraft(result.error)) {
-          setDraft(text);
-        }
-      } else if (result.warning) {
-        setNotice(result.warning);
-      } else if (result.truncated) {
-        setNotice("トークン上限のため、古いやり取りや出典から切り詰めて送りました。");
+      const [msgs, srcs] = await Promise.all([
+        invoke<LlmMessageRow[]>("llm_list_messages", { threadId: finishedId }),
+        invoke<LlmSourceRow[]>("llm_list_sources", { threadId: finishedId }),
+      ]);
+      for (const w of result.noteWrites ?? []) {
+        if (w.noteId) await loadNoteReview(w.noteId);
       }
+      if (result.thread.noteId) await loadNoteReview(result.thread.noteId);
+      if (activeIdRef.current === finishedId) {
+        contentEpoch.current += 1;
+        setActive(result.thread);
+        setMessages(msgs);
+        setSources(srcs);
+      }
+      publishBanner(finishedId, bannerFromResult(text, source, result));
     } catch (e) {
-      setStream("");
-      setThinking("");
-      setToolHint("");
       const msg = formatInvokeError(e);
       if (msg.includes("生成中です")) {
         try {
@@ -1255,22 +1632,33 @@ export default function Chat() {
         } catch {
           /* ignore */
         }
-        setDraft(text);
-        setError(
-          "前の生成が途中で止まっていました。停止したので、もう一度送信してください。",
-        );
-      } else {
-        setError(msg);
-      }
-      try {
-        const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
-          threadId: thread.id,
+        publishBanner(originId, {
+          error: "前の生成が途中で止まっていました。停止したので、もう一度送信してください。",
+          notice: "",
+          restoreDraft: source === "draft" ? text : null,
         });
-        setMessages(msgs);
-      } catch {
-        /* keep optimistic */
+      } else {
+        publishBanner(originId, { error: msg, notice: "", restoreDraft: null });
+      }
+      if (activeIdRef.current === originId) {
+        try {
+          const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
+            threadId: originId,
+          });
+          if (activeIdRef.current === originId) {
+            contentEpoch.current += 1;
+            setMessages(msgs);
+          }
+        } catch {
+          /* keep optimistic */
+        }
       }
     } finally {
+      if (liveRef.current?.threadId === originId) {
+        liveRef.current = null;
+        setLive(null);
+      }
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -1544,6 +1932,7 @@ export default function Chat() {
                   className={[
                     t.id === active?.id ? "chat-thread-item active" : "chat-thread-item",
                     threadDragId === t.id ? "chat-thread-item--dragging" : "",
+                    generatingThreadId === t.id ? "chat-thread-item--generating" : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
@@ -1587,6 +1976,9 @@ export default function Chat() {
                       {q && titleHit ? highlightText(title, q) : title}
                     </button>
                   )}
+                  {generatingThreadId === t.id ? (
+                    <span className="chat-thread-generating">生成中</span>
+                  ) : null}
                   {q && !titleHit ? (
                     <span className="chat-thread-hit">内容</span>
                   ) : null}
@@ -1649,8 +2041,21 @@ export default function Chat() {
       />
 
       <main className="chat-main">
-        <div className="chat-log" ref={listRef}>
-          {messages.length === 0 && !stream && !thinking && !toolHint && !busy ? (
+        <div className="chat-log-wrap">
+        <div
+          className={detailsHold && showLive ? "chat-log chat-log-no-anchor" : "chat-log"}
+          ref={listRef}
+          onScroll={onLogScroll}
+          onWheel={noteUserScroll}
+          onPointerDown={noteUserScroll}
+          onPointerMove={noteUserScroll}
+          onPointerUp={noteUserScroll}
+          onPointerCancel={noteUserScroll}
+          onTouchMove={noteUserScroll}
+          onKeyDown={noteUserScroll}
+        >
+          <div className="chat-log-content" ref={logContentRef}>
+          {messages.length === 0 && !showLive ? (
             <p className="chat-muted chat-empty">
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
             </p>
@@ -1698,13 +2103,32 @@ export default function Chat() {
                           }}
                           onChoice={applyTemplate}
                           choicesDisabled={blocked}
-                          onLayout={scrollLog}
+                          onLayout={scrollAfterLayout}
                         />
                       ) : null}
                     </>
                   ) : (
                     <div className="chat-msg-body">{m.content}</div>
                   )}
+                  {m.role === "user" ? (
+                    <div className="chat-msg-actions">
+                      <button
+                        type="button"
+                        className="chat-tpl"
+                        disabled={blocked}
+                        onClick={() => void send(m.content, "resend")}
+                      >
+                        再送
+                      </button>
+                      <button
+                        type="button"
+                        className="chat-tpl"
+                        onClick={() => void copyMessage(m.content)}
+                      >
+                        コピー
+                      </button>
+                    </div>
+                  ) : null}
                   {citeGroups.length > 0 ? (
                     <div className="chat-msg-cites" aria-label="出典">
                       {citeGroups.map((g) => {
@@ -1747,8 +2171,8 @@ export default function Chat() {
               );
             })
           )}
-          {busy || stream || thinking || toolHint ? (
-            <article className="chat-msg assistant streaming">
+          {showLive ? (
+            <article className="chat-msg assistant streaming" ref={setLiveMessageEl}>
               {toolHint ? <p className="chat-tool-hint">{toolHint}</p> : null}
               {thinking ? (
                 <details className="chat-thinking">
@@ -1767,7 +2191,7 @@ export default function Chat() {
                 choicesDisabled
                 streaming={!!stream}
                 showCaret={!!stream || (!thinking && !toolHint)}
-                onLayout={scrollLog}
+                onLayout={scrollAfterLayout}
               />
               {liveCiteGroups.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
@@ -1800,6 +2224,13 @@ export default function Chat() {
           {ocrBusy && !busy ? (
             <p className="chat-tool-hint">画像を読み取っています…</p>
           ) : null}
+          </div>
+        </div>
+        {!followBottom ? (
+          <button type="button" className="chat-jump-latest" onClick={jumpToLatest}>
+            ↓最新へ
+          </button>
+        ) : null}
         </div>
         {error ? <p className="chat-error">{error}</p> : null}
         {noteReviews.map((r) => (
@@ -2044,7 +2475,7 @@ export default function Chat() {
               rows={3}
               value={draft}
               placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"
-              disabled={busy || attaching}
+              disabled={attaching || onGeneratingThread}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -2054,7 +2485,7 @@ export default function Chat() {
               }}
             />
             <div className="chat-composer-actions">
-              {busy || ocrBusy ? (
+              {ocrBusy || onGeneratingThread ? (
                 <button type="button" className="chat-btn" onClick={() => void stop()}>
                   停止
                 </button>
@@ -2062,7 +2493,7 @@ export default function Chat() {
                 <button
                   type="submit"
                   className="chat-btn primary"
-                  disabled={!draft.trim() || attaching}
+                  disabled={busy || !draft.trim() || attaching}
                 >
                   送信
                 </button>
