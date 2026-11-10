@@ -82,7 +82,7 @@ const messagesB = [
   },
 ];
 
-let messagesA = [originalUser];
+let messagesA: Array<typeof originalUser & { reasoning?: string }> = [originalUser];
 let releaseSend: () => void = () => {};
 
 const meterLimit = contextMeterLimit(131_072);
@@ -502,5 +502,34 @@ describe("scroll follow during generation", () => {
     box.setScrollHeight(box.scrollHeight() + 621);
     notifyContentResize(content, box.scrollHeight());
     expect(log.scrollTop).toBe(parked);
+  });
+
+  it("does not move when finished thinking is opened while following", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-asst",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "回答です",
+        reasoning: "隠れた思考です",
+        createdAt: 2,
+      },
+    ];
+    render(<Chat />);
+    const summary = await screen.findByText("思考");
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, { scrollHeight: 800, clientHeight: 120 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    const parked = log.scrollTop;
+    fireEvent.click(summary);
+    box.setScrollHeight(box.scrollHeight() + 180);
+    const content = log.querySelector(".chat-log-content");
+    if (!(content instanceof HTMLElement)) throw new Error("log content missing");
+    notifyContentResize(content, box.scrollHeight());
+    expect(log.scrollTop).toBe(parked);
+    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
   });
 });

@@ -572,6 +572,7 @@ export default function Chat() {
   const contentEpoch = useRef(0);
   const heldBanners = useRef(new Map<string, ThreadBanner>());
   const followRef = useRef(true);
+  const showLiveRef = useRef(false);
   const programmaticScroll = useRef(false);
   const scrollAnchor = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -861,6 +862,7 @@ export default function Chat() {
   const toolHint = viewingLive?.toolHint ?? "";
   const showLive =
     !!viewingLive && (busy || stream.length > 0 || thinking.length > 0 || toolHint.length > 0);
+  showLiveRef.current = showLive;
   const generatingThreadId = busy ? (live?.threadId ?? null) : null;
   const onGeneratingThread = !!generatingThreadId && active?.id === generatingThreadId;
 
@@ -885,7 +887,7 @@ export default function Chat() {
     let lastHeight = content.offsetHeight;
     const observer = new ResizeObserver(() => {
       const next = content.offsetHeight;
-      if (next > lastHeight) scrollLog();
+      if (next > lastHeight && showLiveRef.current) scrollLog();
       lastHeight = next;
     });
     observer.observe(content);
