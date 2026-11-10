@@ -976,20 +976,21 @@ mod tests {
         let split = context_budget(32_768, 0, required).expect("question fits");
         let (turns, stats) = assemble_turns(system, &[], &prepared, split.messages);
         assert!(!stats.question_exceeds);
-        let request = turns
-            .iter()
-            .find(|turn| turn.content.starts_with(SUMMARY_PREFIX))
-            .expect("the request still carries the summary");
         assert!(
-            !request.content.contains(&"要".repeat(200)),
-            "request summary was not clipped: {} chars",
-            request.content.chars().count()
+            stats.total_tokens <= split.messages,
+            "{} > {}",
+            stats.total_tokens,
+            split.messages
         );
-        assert!(request.content.contains(SUMMARY_DISCLAIMER));
-        let kept = summary_saved_after_request(&stored, &request.content);
-        assert_eq!(kept, stored.trim());
-        assert!(kept.contains(&"要".repeat(1_000)));
-        assert!(estimate_tokens(kept.trim_end_matches(SUMMARY_DISCLAIMER).trim()) >= 1_900);
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!blob.contains(SUMMARY_PREFIX), "{blob}");
+        assert!(blob.contains(&"問".repeat(100)), "{blob}");
+        assert_eq!(summary_saved_after_request(&stored, ""), stored.trim());
+        assert!(stored.contains(&"要".repeat(1_000)));
     }
 
     #[test]
@@ -1188,6 +1189,195 @@ mod tests {
         assert!(!chunk.transcript.contains(&"あ".repeat(80)), "{}", chunk.transcript);
         let next = next_summary_chunk(&covered, &[], "要点", &chunk.through_id, budget);
         assert!(next.is_none() || next.unwrap().through_id != "n-empty");
+    }
+
+    #[test]
+    fn notice_and_unanswered_user_never_leave_two_user_turns() {
+        let mut notice = msg(
+            "n-empty",
+            "assistant",
+            "モデルが本文も操作も返さずに終わりました（終了理由: stop）。",
+        );
+        notice.kind = LLM_MESSAGE_NOTICE.into();
+        let history = vec![
+            msg("u1", "user", "最初"),
+            msg("a1", "assistant", "一つ目"),
+            msg("u2", "user", "次"),
+            msg("a2", "assistant", "二つ目"),
+            msg("u3", "user", "未回答"),
+            notice,
+            msg("u4", "user", "続き"),
+        ];
+        let (turns, _) = assemble_turns("役割", &[], &history, 131_072);
+        let roles: Vec<&str> = turns
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .map(|turn| turn.role.as_str())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
+        let last = turns.last().unwrap();
+        assert!(last.content.contains("未回答"), "{}", last.content);
+        assert!(last.content.contains("続き"), "{}", last.content);
+        assert!(turns.iter().all(|turn| !turn.content.contains("終わりました")));
+    }
+
+    #[test]
+    fn dropped_summary_host_does_not_leave_adjacent_users() {
+        let body = "要".repeat(tokens_to_chars(1_924));
+        let stored = format!("{body}\n{SUMMARY_DISCLAIMER}");
+        for (limit, question_chars) in [(32_768usize, 32_000usize), (16_384, 15_000)] {
+            let question = "問".repeat(question_chars);
+            let history = vec![
+                msg("u0", "user", "古い"),
+                msg("a1", "assistant", "答え"),
+                msg("u-host", "user", "ホスト"),
+                msg("u-next", "user", "隣の質問"),
+                msg("q", "user", &question),
+            ];
+            let system = "役割";
+            let required = turn_tokens(&ChatTurn::text("system", system))
+                + turn_tokens(&ChatTurn::text("user", &question));
+            let split = context_budget(limit, 0, required).expect("question fits");
+            let prepared = prepare_model_history(&history, &stored, "a1");
+            let (turns, stats) = assemble_turns(system, &[], &prepared, split.messages);
+            assert!(!stats.question_exceeds, "{limit}");
+            assert!(stats.total_tokens <= split.messages, "{limit} {}", stats.total_tokens);
+            let roles: Vec<&str> = turns
+                .iter()
+                .filter(|turn| turn.role != "system")
+                .map(|turn| turn.role.as_str())
+                .collect();
+            assert!(
+                roles.windows(2).all(|pair| pair[0] != pair[1]),
+                "{limit} {roles:?}"
+            );
+            let blob = turns
+                .iter()
+                .map(|turn| turn.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(blob.contains(SUMMARY_PREFIX), "{limit} {blob}");
+            assert!(blob.contains("隣の質問"), "{limit} {blob}");
+            assert!(blob.contains(&"問".repeat(40)), "{limit}");
+            assert_eq!(summary_saved_after_request(&stored, &blob), stored.trim());
+
+            let folded = fold_summary(&history, &stored, "a1", SummaryAttempt::Failed);
+            let (again, again_stats) = assemble_turns(system, &[], &folded.messages, split.messages);
+            assert!(again_stats.total_tokens <= split.messages, "{limit}");
+            let again_roles: Vec<&str> = again
+                .iter()
+                .filter(|turn| turn.role != "system")
+                .map(|turn| turn.role.as_str())
+                .collect();
+            assert!(
+                again_roles.windows(2).all(|pair| pair[0] != pair[1]),
+                "failure {limit} {again_roles:?}"
+            );
+            assert!(again.iter().any(|turn| turn.content.contains(SUMMARY_PREFIX)));
+        }
+    }
+
+    #[test]
+    fn minimum_summary_that_does_not_fit_is_omitted_from_the_request() {
+        let body = "要".repeat(tokens_to_chars(1_924));
+        let stored = format!("{body}\n{SUMMARY_DISCLAIMER}");
+        let question = "問".repeat(36_000);
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a1", "assistant", "答え"),
+            msg("u-mid", "user", "途中"),
+            msg("a-mid", "assistant", "途中の答え"),
+            msg("q", "user", &question),
+        ];
+        let system = "役割";
+        let required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", &question));
+        let split = context_budget(32_768, 0, required).expect("question fits");
+        assert_eq!(split.messages, 22_510);
+        let prepared = prepare_model_history(&history, &stored, "a1");
+        let (turns, stats) = assemble_turns(system, &[], &prepared, split.messages);
+        assert!(!stats.question_exceeds);
+        assert!(stats.total_tokens <= split.messages, "{}", stats.total_tokens);
+        let chars: usize = turns.iter().map(|turn| turn.content.chars().count()).sum();
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!blob.contains(SUMMARY_PREFIX), "{blob}");
+        assert!(!blob.contains(SUMMARY_DISCLAIMER), "{blob}");
+        assert!(blob.contains(&"問".repeat(80)), "{chars}");
+        assert_eq!(summary_saved_after_request(&stored, ""), stored.trim());
+
+        let mut sources = Vec::new();
+        for n in 1..=12 {
+            let mut row = source(&format!("s{n}"), "u0", n, "出典本文SECRET");
+            row.path = format!(r"C:\docs\資料{n}.docx");
+            sources.push(row);
+        }
+        let wide = "問".repeat(33_800);
+        let wide_history = vec![
+            msg("u0", "user", "古い"),
+            msg("a1", "assistant", "答え"),
+            msg("a-keep", "assistant", "残る答え"),
+            msg("u-recent", "user", "残す"),
+            msg("q", "user", &wide),
+        ];
+        let wide_required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", &wide));
+        let wide_split = context_budget(32_768, 0, wide_required).unwrap();
+        assert_eq!(wide_split.messages, 21_300);
+        let wide_prepared = prepare_model_history(&wide_history, &stored, "a1");
+        let (wide_turns, wide_stats) =
+            assemble_turns(system, &sources, &wide_prepared, wide_split.messages);
+        assert!(!wide_stats.question_exceeds);
+        assert!(
+            wide_stats.total_tokens <= wide_split.messages,
+            "{}",
+            wide_stats.total_tokens
+        );
+        let wide_blob = wide_turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!wide_blob.contains(SUMMARY_PREFIX), "{wide_blob}");
+        assert!(!wide_blob.contains("既読 ["), "{wide_blob}");
+        assert!(!wide_blob.contains("出典本文SECRET"), "{wide_blob}");
+        assert!(wide_blob.contains(&"問".repeat(40)), "{wide_blob}");
+        assert_eq!(summary_saved_after_request(&stored, &wide_blob), stored.trim());
+    }
+
+    #[test]
+    fn read_stub_moves_with_the_summary_when_the_host_turn_is_dropped() {
+        let body = "要".repeat(tokens_to_chars(1_924));
+        let stored = format!("{body}\n{SUMMARY_DISCLAIMER}");
+        let question = "問".repeat(32_000);
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a1", "assistant", "答え"),
+            msg("u-mid", "user", "途中"),
+            msg("a-mid", "assistant", "途中の答え"),
+            msg("q", "user", &question),
+        ];
+        let sources = vec![source("s1", "u0", 1, "出典本文SECRET")];
+        let system = "役割";
+        let required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", &question));
+        let split = context_budget(32_768, 0, required).unwrap();
+        let prepared = prepare_model_history(&history, &stored, "a1");
+        let (turns, stats) = assemble_turns(system, &sources, &prepared, split.messages);
+        assert!(stats.total_tokens <= split.messages, "{}", stats.total_tokens);
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains(SUMMARY_PREFIX), "{blob}");
+        assert!(blob.contains("既読 [1] 契約書.docx"), "{blob}");
+        assert!(!blob.contains("途中"), "{blob}");
+        assert!(!blob.contains("出典本文SECRET"), "{blob}");
+        assert_eq!(summary_saved_after_request(&stored, &blob), stored.trim());
     }
 
     fn assert_no_orphan_tool(turns: &[ChatTurn]) {

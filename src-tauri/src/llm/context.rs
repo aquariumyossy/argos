@@ -1236,7 +1236,7 @@ pub fn assemble_turns(
     let full = full_sources_on_recent_turns(&built);
     dedupe_tool_bodies(&mut built, &full);
 
-    let carried_summary = carried_summary_block(&built);
+    let carried_summary = carried_summary(&built);
     let mut truncated = false;
     // Keep the last two user turns while they fit. If a recent source is what
     // overflows, shorten it before dropping the previous question and answer.
@@ -1269,11 +1269,10 @@ pub fn assemble_turns(
     if restore_recent_rereads(&mut built, max_tokens) {
         truncated = true;
     }
-    // Drops can remove the user turn the summary was merged into, and a skipped
-    // notice can leave two user turns in a row. Put the summary back on the first
-    // kept user, merge adjacent users, and shrink only the summary if it still
-    // does not fit. The stored summary is not replaced by this clip.
-    if normalize_summary_placement(&mut built, carried_summary.as_deref(), max_tokens) {
+    // Put the summary back on the first kept user, then merge every adjacent
+    // user pair so the request alternates. If the disclaimer and 既読 lines
+    // still do not fit, drop them from this request. Nothing here is saved.
+    if normalize_summary_placement(&mut built, carried_summary.as_ref(), max_tokens) {
         truncated = true;
     }
     // Only the system prompt and the typed question (plus the 【質問】 wrapper) can
@@ -2303,14 +2302,37 @@ fn drop_oldest_exchange(built: &mut Vec<BuiltTurn>, keep_users: usize) -> bool {
     removed
 }
 
-fn carried_summary_block(built: &[BuiltTurn]) -> Option<String> {
-    built.iter().find_map(|row| {
-        if row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
-            Some(crate::llm::summary::split_merged_user(&row.turn.content).0)
-        } else {
-            None
-        }
+struct CarriedSummary {
+    block: String,
+    stubs: Vec<String>,
+}
+
+fn carried_summary(built: &[BuiltTurn]) -> Option<CarriedSummary> {
+    let row = built
+        .iter()
+        .find(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))?;
+    let (block, _) = crate::llm::summary::split_merged_user(&row.turn.content);
+    Some(CarriedSummary {
+        block,
+        stubs: trailing_read_stubs(&row.turn.content),
     })
+}
+
+fn trailing_read_stubs(content: &str) -> Vec<String> {
+    let mut stubs = Vec::new();
+    for line in content.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("既読 ") {
+            stubs.push(trimmed.to_string());
+            continue;
+        }
+        break;
+    }
+    stubs.reverse();
+    stubs
 }
 
 fn combine_user_text(left: &str, right: &str) -> String {
@@ -2369,33 +2391,29 @@ fn user_text_beside_summary(row: &BuiltTurn) -> String {
 }
 
 /// After drops, the summary belongs on the first user that is still sent.
-/// A summary turn sitting next to another user is merged into that user.
+/// Every adjacent user pair is then merged, summary or not.
 fn normalize_summary_placement(
     built: &mut Vec<BuiltTurn>,
-    summary_block: Option<&str>,
+    carried: Option<&CarriedSummary>,
     max_tokens: usize,
 ) -> bool {
-    merge_adjacent_user_turns(built);
-    if let Some(block) = summary_block {
-        ensure_summary_on_first_user(built, block);
+    if let Some(carried) = carried {
+        ensure_summary_on_first_user(built, &carried.block, &carried.stubs);
     }
-    shrink_carried_summary(built, max_tokens)
+    merge_adjacent_user_turns(built);
+    let shrunk = shrink_carried_summary(built, max_tokens);
+    let stubs = carried.map(|item| item.stubs.as_slice()).unwrap_or(&[]);
+    let dropped = drop_summary_if_over_budget(built, max_tokens, stubs);
+    if dropped {
+        merge_adjacent_user_turns(built);
+    }
+    shrunk || dropped
 }
 
 fn merge_adjacent_user_turns(built: &mut Vec<BuiltTurn>) {
     let mut index = 0;
     while index + 1 < built.len() {
-        let carries = built[index].summary
-            || built[index + 1].summary
-            || built[index]
-                .turn
-                .content
-                .starts_with(crate::llm::summary::SUMMARY_PREFIX)
-            || built[index + 1]
-                .turn
-                .content
-                .starts_with(crate::llm::summary::SUMMARY_PREFIX);
-        if built[index].turn.role != "user" || built[index + 1].turn.role != "user" || !carries {
+        if built[index].turn.role != "user" || built[index + 1].turn.role != "user" {
             index += 1;
             continue;
         }
@@ -2426,15 +2444,80 @@ fn merge_adjacent_user_turns(built: &mut Vec<BuiltTurn>) {
     }
 }
 
-fn ensure_summary_on_first_user(built: &mut [BuiltTurn], block: &str) {
+fn ensure_summary_on_first_user(built: &mut [BuiltTurn], block: &str, stubs: &[String]) {
     let Some(index) = built.iter().position(|row| row.turn.role == "user") else {
         return;
     };
     let user = user_text_beside_summary(&built[index]);
-    let next = join_summary_and_user(block, &user);
+    let mut next = join_summary_and_user(block, &user);
+    let missing: Vec<&str> = stubs
+        .iter()
+        .map(String::as_str)
+        .filter(|stub| !next.lines().any(|line| line.trim() == *stub))
+        .collect();
+    if !missing.is_empty() {
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        if !next.ends_with("\n\n") {
+            next.push('\n');
+        }
+        next.push_str(&missing.join("\n"));
+    }
     if built[index].turn.content != next {
         built[index].turn.content = next;
     }
+}
+
+/// The disclaimer and 既読 lines are the smallest summary this request can send.
+/// When that still exceeds the message budget, omit them. The stored summary stays.
+fn drop_summary_if_over_budget(built: &mut Vec<BuiltTurn>, max_tokens: usize, stubs: &[String]) -> bool {
+    if tokens_of(built) <= max_tokens {
+        return false;
+    }
+    let mut changed = false;
+    for row in built.iter_mut() {
+        if !row.turn.content.contains(crate::llm::summary::SUMMARY_PREFIX) {
+            continue;
+        }
+        let next = strip_summary_and_stubs(&row.turn.content, stubs);
+        if next != row.turn.content {
+            row.turn.content = next;
+            row.summary = false;
+            changed = true;
+        }
+    }
+    let before = built.len();
+    built.retain(|row| !(row.turn.role == "user" && row.turn.content.trim().is_empty()));
+    changed || built.len() != before
+}
+
+fn strip_summary_and_stubs(content: &str, stubs: &[String]) -> String {
+    let Some(pos) = content.find(crate::llm::summary::SUMMARY_PREFIX) else {
+        return content.to_string();
+    };
+    let after = &content[pos + crate::llm::summary::SUMMARY_PREFIX.len()..];
+    let rest = if let Some(disclaimer_at) = after.find(crate::llm::summary::SUMMARY_DISCLAIMER) {
+        let end = pos
+            + crate::llm::summary::SUMMARY_PREFIX.len()
+            + disclaimer_at
+            + crate::llm::summary::SUMMARY_DISCLAIMER.len();
+        format!(
+            "{}{}",
+            content[..pos].trim_end(),
+            content[end..].trim_start_matches(['\n', '\r'])
+        )
+    } else {
+        crate::llm::summary::split_merged_user(content).1
+    };
+    let kept: Vec<&str> = rest
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !stubs.iter().any(|stub| stub == trimmed)
+        })
+        .collect();
+    kept.join("\n").trim().to_string()
 }
 
 /// Same halving as [`force_under_budget`] uses for a standalone summary turn.
@@ -3124,16 +3207,21 @@ mod tests {
         history.push(msg("u9", "user", "追加"));
         let (second, _) = assemble_turns("役割", &[], &history, budget);
         assert!(
-            second.len() >= first.len(),
+            second.len() >= first.len().saturating_sub(1),
             "the next send must not drop another batch: first {} second {}",
             first.len(),
             second.len()
         );
-        for (index, turn) in first.iter().enumerate() {
+        // The new user sits directly after the previous user, so those two turns become one.
+        let merged_at = first.len() - 1;
+        for (index, turn) in first.iter().take(merged_at).enumerate() {
             assert_eq!(second[index].role, turn.role);
             assert_eq!(second[index].content, turn.content);
         }
-        assert!(second.last().unwrap().content.contains("追加"));
+        let tail = second.last().unwrap();
+        assert_eq!(tail.role, "user");
+        assert!(tail.content.contains(&"あ".repeat(80)), "{}", tail.content);
+        assert!(tail.content.contains("追加"), "{}", tail.content);
     }
 
     #[test]
@@ -4834,7 +4922,7 @@ mod tests {
         let assistant_turn = turns.iter().find(|turn| turn.role == "assistant").unwrap();
         assert!(turn_tokens(assistant_turn) < estimate_tokens(calls) + 4);
         assert_eq!(before, 47_567);
-        assert_eq!(used, 2_502);
+        assert_eq!(used, 2_499);
         assert_eq!(naive, 92_560);
         assert_eq!(used, assembled);
         assert!(used < 62_400, "warning stays off: {used} / 78,000");
@@ -4909,7 +4997,7 @@ mod tests {
                 .all(|turn| !turn.content.contains(&body))
         );
         assert_eq!(before, 64_947);
-        assert_eq!(used, 2_488);
+        assert_eq!(used, 2_485);
         assert!(before > 62_400, "empty meter without the extra turn warned: {before}");
         assert!(used < 62_400, "the next send does not warn: {used}");
     }
@@ -4940,7 +5028,7 @@ mod tests {
         let (turns, _) = assemble_turns("役割", std::slice::from_ref(&hit), &next, 200_000);
         assert!(turns.iter().all(|turn| !turn.content.contains(&body)));
         assert_eq!(before, 27_513);
-        assert_eq!(used, 2_479);
+        assert_eq!(used, 2_476);
     }
 
     #[test]
@@ -4965,7 +5053,7 @@ mod tests {
         assert!(turns.iter().all(|turn| !turn.content.contains(&note)));
         assert!(turns.iter().any(|turn| turn.content.contains(OLD_TOOL_STUB)));
         assert_eq!(before, 9_938);
-        assert_eq!(used, 2_456);
+        assert_eq!(used, 2_453);
     }
 
     #[test]
