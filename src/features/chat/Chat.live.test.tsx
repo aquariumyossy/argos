@@ -538,6 +538,41 @@ describe("scroll follow during generation", () => {
     expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
   });
 
+  it("does not jump after thinking is open when the viewport shrinks or grows", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-asst",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "回答です",
+        reasoning: "隠れた思考です",
+        createdAt: 2,
+      },
+    ];
+    render(<Chat />);
+    const summary = await screen.findByText("思考");
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, { scrollHeight: 1200, clientHeight: 405 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    fireEvent.click(summary);
+    box.setScrollHeight(box.scrollHeight() + 736);
+    const content = log.querySelector(".chat-log-content");
+    if (!(content instanceof HTMLElement)) throw new Error("log content missing");
+    notifyContentResize(content, box.scrollHeight());
+    const parked = log.scrollTop;
+    expect(1200 + 736 - parked - 405).toBe(736);
+    box.resize({ clientHeight: 377 });
+    notifyLogResize();
+    expect(log.scrollTop).toBe(parked);
+    box.resize({ clientHeight: 700 });
+    notifyLogResize();
+    expect(log.scrollTop).toBe(parked);
+  });
+
   it("pins when the composer grows and shrinks a finished thread's log", async () => {
     messagesA = [
       originalUser,

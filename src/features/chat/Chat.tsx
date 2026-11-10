@@ -22,6 +22,7 @@ import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
 import {
   applyChatDelta,
   followAfterUserScroll,
+  isAtBottom,
   type LiveGeneration,
 } from "./chatLive";
 import { useChatContextMeter } from "./useChatContextMeter";
@@ -887,15 +888,18 @@ export default function Chat() {
     if (!content || !log || typeof ResizeObserver === "undefined") return;
     let lastContentHeight = content.offsetHeight;
     let lastClientHeight = log.clientHeight;
+    let lastScrollHeight = log.scrollHeight;
     const observer = new ResizeObserver(() => {
       const contentHeight = content.offsetHeight;
       const clientHeight = log.clientHeight;
       const contentGrew = contentHeight > lastContentHeight;
-      const viewportChanged = clientHeight !== lastClientHeight;
+      const viewportShrank = clientHeight < lastClientHeight;
+      const wasAtBottom = isAtBottom(log.scrollTop, lastScrollHeight, lastClientHeight);
       lastContentHeight = contentHeight;
       lastClientHeight = clientHeight;
+      lastScrollHeight = log.scrollHeight;
       if (!followRef.current) return;
-      if (viewportChanged || (contentGrew && showLiveRef.current)) scrollLog();
+      if ((viewportShrank && wasAtBottom) || (contentGrew && showLiveRef.current)) scrollLog();
     });
     observer.observe(content);
     observer.observe(log);
