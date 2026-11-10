@@ -118,24 +118,53 @@ async function emitDelta(threadId: string, text: string, kind = "content") {
   });
 }
 
-const contentObservers: ResizeObserverCallback[] = [];
+type ObservedResize = {
+  callback: ResizeObserverCallback;
+  target: Element;
+};
+
+const observedResizes: ObservedResize[] = [];
 
 class ContentResizeObserver {
   constructor(private readonly callback: ResizeObserverCallback) {}
-  observe() {
-    contentObservers.push(this.callback);
+  observe(target: Element) {
+    observedResizes.push({ callback: this.callback, target });
   }
-  unobserve() {}
+  unobserve(target: Element) {
+    const index = observedResizes.findIndex(
+      (entry) => entry.callback === this.callback && entry.target === target,
+    );
+    if (index >= 0) observedResizes.splice(index, 1);
+  }
   disconnect() {
-    const index = contentObservers.indexOf(this.callback);
-    if (index >= 0) contentObservers.splice(index, 1);
+    for (let index = observedResizes.length - 1; index >= 0; index -= 1) {
+      if (observedResizes[index].callback === this.callback) observedResizes.splice(index, 1);
+    }
   }
 }
 
+function notifyResizeObservers(target?: Element) {
+  const callbacks: ResizeObserverCallback[] = [];
+  for (const entry of observedResizes) {
+    if (target && entry.target !== target) continue;
+    if (!callbacks.includes(entry.callback)) callbacks.push(entry.callback);
+  }
+  if (callbacks.length === 0) {
+    throw new Error(
+      target
+        ? "ResizeObserver is not observing this element"
+        : "content ResizeObserver is not attached",
+    );
+  }
+  for (const callback of callbacks) callback([], {} as ResizeObserver);
+}
+
 function notifyLogResize() {
-  const callback = contentObservers[contentObservers.length - 1];
-  if (!callback) throw new Error("content ResizeObserver is not attached");
-  callback([], {} as ResizeObserver);
+  notifyResizeObservers();
+}
+
+function notifyElementResize(target: Element) {
+  notifyResizeObservers(target);
 }
 
 function notifyContentResize(content: HTMLElement, height: number) {
@@ -202,7 +231,7 @@ async function renderChat() {
 }
 
 beforeEach(() => {
-  contentObservers.length = 0;
+  observedResizes.length = 0;
   focusHandlers.length = 0;
   vi.stubGlobal("ResizeObserver", ContentResizeObserver);
   messagesA = [originalUser];
@@ -661,6 +690,118 @@ describe("scroll follow during generation", () => {
     notifyLogResize();
     expect(log.scrollTop).toBe(box.maxTop());
     expect(1200 - log.scrollTop - 240).toBe(0);
+  });
+
+  it("does not jump when earlier thinking opens on a short stretched log", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-old",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "前の回答",
+        reasoning: "前の思考",
+        createdAt: 2,
+      },
+    ];
+    await renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "再送" }));
+    await screen.findByText("生成中…");
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, { scrollHeight: 400, clientHeight: 400 });
+    log.scrollTop = 0;
+    fireEvent.scroll(log);
+    await emitDelta("thread-a", "底");
+    expect(log.scrollTop).toBe(0);
+    const content = log.querySelector(".chat-log-content");
+    const live = log.querySelector(".chat-msg.assistant.streaming");
+    if (!(content instanceof HTMLElement) || !(live instanceof HTMLElement)) {
+      throw new Error("stretched log is missing");
+    }
+    let contentHeight = 400;
+    let liveHeight = 48;
+    Object.defineProperty(content, "offsetHeight", {
+      configurable: true,
+      get: () => contentHeight,
+    });
+    Object.defineProperty(live, "offsetHeight", {
+      configurable: true,
+      get: () => liveHeight,
+    });
+    notifyElementResize(live);
+    liveHeight = 160;
+    notifyElementResize(live);
+    expect(log.scrollTop).toBe(0);
+    expect(jump()).toBeNull();
+
+    const parked = log.scrollTop;
+    fireEvent.click(screen.getByText("思考"));
+    contentHeight = 560;
+    box.setScrollHeight(560);
+    notifyElementResize(content);
+    await act(async () => {});
+    expect(log.scrollTop).toBe(parked);
+    expect(jump()).toBeTruthy();
+    box.setScrollHeight(640);
+    await emitDelta("thread-a", "次のトークン");
+    expect(log.scrollTop).toBe(parked);
+    expect(jump()).toBeTruthy();
+  });
+
+  it("keeps following when an earlier diagram lays out during generation", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-diagram",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "回答です\n\n```mermaid\nflowchart LR\nA-->B\n```",
+        createdAt: 2,
+      },
+    ];
+    const { log, box } = await startPinnedLog();
+    await screen.findByRole("button", { name: "図" });
+    const content = log.querySelector(".chat-log-content");
+    const live = log.querySelector(".chat-msg.assistant.streaming");
+    if (!(content instanceof HTMLElement) || !(live instanceof HTMLElement)) {
+      throw new Error("diagram log is missing");
+    }
+    let liveHeight = 80;
+    Object.defineProperty(live, "offsetHeight", {
+      configurable: true,
+      get: () => liveHeight,
+    });
+    notifyElementResize(live);
+    box.setScrollHeight(box.scrollHeight() + 197);
+    fireEvent.click(screen.getByRole("button", { name: "ソース" }));
+    fireEvent.click(screen.getByRole("button", { name: "図" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    notifyContentResize(content, box.scrollHeight());
+    expect(box.scrollHeight() - log.scrollTop - 120).toBe(0);
+    expect(jump()).toBeNull();
+    box.setScrollHeight(box.scrollHeight() + 40);
+    await emitDelta("thread-a", "次のトークン");
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+  });
+
+  it("keeps following when the log gets narrower during generation", async () => {
+    const { log, box } = await startPinnedLog();
+    box.setClientWidth(800);
+    notifyLogResize();
+    expect(log.scrollTop).toBe(box.maxTop());
+    box.setClientWidth(560);
+    box.setScrollHeight(box.scrollHeight() + 200);
+    notifyLogResize();
+    expect(box.scrollHeight() - log.scrollTop - log.clientHeight).toBe(0);
+    expect(jump()).toBeNull();
+    box.setScrollHeight(box.scrollHeight() + 30);
+    await emitDelta("thread-a", "狭い");
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
   });
 
   it("keeps an earlier heading in place when its thinking is opened during generation", async () => {

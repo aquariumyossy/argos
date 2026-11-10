@@ -585,6 +585,8 @@ export default function Chat() {
   const scrollAnchor = useRef(0);
   const wasAtBottomRef = useRef(true);
   const liveMessageRef = useRef<HTMLElement | null>(null);
+  const liveHeightRef = useRef(0);
+  const logObserverRef = useRef<ResizeObserver | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
   const messagesRef = useRef(messages);
@@ -928,6 +930,50 @@ export default function Chat() {
     scrollLog(true);
   }, [scrollLog]);
 
+  const setLiveMessageEl = useCallback((node: HTMLElement | null) => {
+    const observer = logObserverRef.current;
+    const prev = liveMessageRef.current;
+    if (prev && prev !== node && observer) observer.unobserve(prev);
+    liveMessageRef.current = node;
+    // The article often mounts after the observer. Snapshot its height now, then
+    // keep watching it: a short log stretches `.chat-log-content`, so token growth
+    // does not resize that box and would otherwise leave this height stale.
+    liveHeightRef.current = node?.offsetHeight ?? 0;
+    if (node && observer) observer.observe(node);
+  }, []);
+
+  useEffect(() => {
+    const log = listRef.current;
+    if (!log) return;
+    const outsideLiveDetails = (details: Element | null) => {
+      if (!(details instanceof HTMLDetailsElement)) return false;
+      const live = liveMessageRef.current;
+      return !live || !live.contains(details);
+    };
+    // Click is synchronous, before the details box grows. Toggle is the same
+    // open/close for keyboard; both must pause before ResizeObserver can pin.
+    const onClick = (event: MouseEvent) => {
+      if (!showLiveRef.current || !followRef.current) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const summary = target.closest("summary");
+      if (!summary || !outsideLiveDetails(summary.closest("details"))) return;
+      pauseFollow();
+    };
+    const onToggle = (event: Event) => {
+      if (!showLiveRef.current || !followRef.current) return;
+      const details = event.target;
+      if (!(details instanceof Element) || !outsideLiveDetails(details)) return;
+      pauseFollow();
+    };
+    log.addEventListener("click", onClick);
+    log.addEventListener("toggle", onToggle, true);
+    return () => {
+      log.removeEventListener("click", onClick);
+      log.removeEventListener("toggle", onToggle, true);
+    };
+  }, [pauseFollow]);
+
   useEffect(() => {
     const content = logContentRef.current;
     const log = listRef.current;
@@ -936,7 +982,6 @@ export default function Chat() {
     let lastClientHeight = log.clientHeight;
     let lastClientWidth = log.clientWidth;
     let lastScrollHeight = log.scrollHeight;
-    let lastLiveHeight = liveMessageRef.current?.offsetHeight ?? 0;
     const observer = new ResizeObserver(() => {
       const contentHeight = content.offsetHeight;
       const clientHeight = log.clientHeight;
@@ -950,20 +995,21 @@ export default function Chat() {
       const wasGeoBottom = isAtBottom(log.scrollTop, lastScrollHeight, lastClientHeight);
       const liveEl = liveMessageRef.current;
       const liveHeight = liveEl?.offsetHeight ?? 0;
-      const liveGrew = liveEl != null && liveHeight > lastLiveHeight;
+      const liveGrew = liveEl != null && liveHeight > liveHeightRef.current;
       lastContentHeight = contentHeight;
       lastClientHeight = clientHeight;
       lastClientWidth = clientWidth;
       lastScrollHeight = scrollHeight;
-      lastLiveHeight = liveHeight;
+      liveHeightRef.current = liveHeight;
       if (showLiveRef.current) {
         if (!followRef.current) return;
-        if (liveGrew && wasAtBottomRef.current) {
+        // Details outside the live message pause in the click/toggle handler.
+        // Diagram layout and width reflow stay pinned while the user is following.
+        if (
+          wasAtBottomRef.current &&
+          (liveGrew || contentGrew || scrollGrew || widthChanged)
+        ) {
           pinLogToBottom();
-          return;
-        }
-        if (contentGrew && !liveGrew && wasAtBottomRef.current) {
-          pauseFollow();
           return;
         }
         if (viewportShrank && wasGeoBottom) pinLogToBottom();
@@ -978,9 +1024,14 @@ export default function Chat() {
         wasAtBottomRef.current = isAtBottom(log.scrollTop, scrollHeight, clientHeight);
       }
     });
+    logObserverRef.current = observer;
     observer.observe(content);
     observer.observe(log);
-    return () => observer.disconnect();
+    if (liveMessageRef.current) observer.observe(liveMessageRef.current);
+    return () => {
+      observer.disconnect();
+      if (logObserverRef.current === observer) logObserverRef.current = null;
+    };
   }, [pauseFollow, pinLogToBottom, scrollLog]);
 
   const onLogScroll = useCallback(() => {
@@ -1012,6 +1063,7 @@ export default function Chat() {
     noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
     scrollAnchor.current = el.scrollTop;
+    wasAtBottomRef.current = true;
   }
 
   useEffect(() => {
@@ -2041,7 +2093,7 @@ export default function Chat() {
             })
           )}
           {showLive ? (
-            <article className="chat-msg assistant streaming" ref={liveMessageRef}>
+            <article className="chat-msg assistant streaming" ref={setLiveMessageEl}>
               {toolHint ? <p className="chat-tool-hint">{toolHint}</p> : null}
               {thinking ? (
                 <details className="chat-thinking">
