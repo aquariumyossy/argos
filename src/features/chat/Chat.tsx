@@ -13,11 +13,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
 import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
+import { applyChatDelta, isNearBottom, type LiveGeneration } from "./chatLive";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -138,6 +140,40 @@ type LlmChatDelta = {
   text: string;
   kind?: string;
 };
+
+type ThreadBanner = {
+  error: string;
+  notice: string;
+  restoreDraft: string | null;
+};
+
+function bannerFromResult(
+  text: string,
+  source: "draft" | "resend",
+  result: LlmSendResult,
+): ThreadBanner {
+  if (result.cancelled) {
+    return { error: "生成を停止しました。", notice: "", restoreDraft: null };
+  }
+  if (result.error) {
+    return {
+      error: result.error,
+      notice: "",
+      restoreDraft: source === "draft" && shouldRestoreDraft(result.error) ? text : null,
+    };
+  }
+  if (result.warning) {
+    return { error: "", notice: result.warning, restoreDraft: null };
+  }
+  if (result.truncated) {
+    return {
+      error: "",
+      notice: "トークン上限のため、古いやり取りや出典から切り詰めて送りました。",
+      restoreDraft: null,
+    };
+  }
+  return { error: "", notice: "", restoreDraft: null };
+}
 
 const TPL_SUMMARY =
   "添付した出典を日本語で要約してください。重要な結論と根拠を短く。";
@@ -497,9 +533,8 @@ export default function Chat() {
   const [ocrBusy, setOcrBusy] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [dropActive, setDropActive] = useState(false);
-  const [stream, setStream] = useState("");
-  const [thinking, setThinking] = useState("");
-  const [toolHint, setToolHint] = useState("");
+  const [live, setLive] = useState<LiveGeneration | null>(null);
+  const [followBottom, setFollowBottom] = useState(true);
   const [noteReviews, setNoteReviews] = useState<NoteReview[]>([]);
   const [appendUndo, setAppendUndo] = useState<{
     noteId: string;
@@ -527,13 +562,22 @@ export default function Chat() {
   const busyRef = useRef(false);
   const ocrBusyRef = useRef(false);
   const attachingRef = useRef(false);
+  const liveRef = useRef<LiveGeneration | null>(null);
+  const pendingThreadId = useRef<string | null>(null);
+  const contentEpoch = useRef(0);
+  const heldBanners = useRef(new Map<string, ThreadBanner>());
+  const followRef = useRef(true);
+  const programmaticScroll = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
   const threadDragRef = useRef<ThreadDragSession | null>(null);
   threadsRef.current = threads;
 
   useEffect(() => {
-    activeIdRef.current = active?.id ?? null;
+    const id = active?.id ?? null;
+    const pending = pendingThreadId.current;
+    if (pending && pending !== id) return;
+    activeIdRef.current = id;
   }, [active]);
 
   useEffect(() => {
@@ -565,23 +609,28 @@ export default function Chat() {
     }
   }, []);
 
-  const loadThreadContent = useCallback(async (thread: LlmThreadRow | null) => {
+  const loadThreadContent = useCallback(async (thread: LlmThreadRow | null): Promise<boolean> => {
+    const epoch = ++contentEpoch.current;
     if (!thread) {
+      if (contentEpoch.current !== epoch) return false;
       setMessages([]);
       setSources([]);
       setNoteReviews([]);
-      return;
+      return true;
     }
     const [msgs, srcs] = await Promise.all([
       invoke<LlmMessageRow[]>("llm_list_messages", { threadId: thread.id }),
       invoke<LlmSourceRow[]>("llm_list_sources", { threadId: thread.id }),
     ]);
+    if (contentEpoch.current !== epoch) return false;
     setMessages(msgs);
     setSources(srcs);
     setNoteReviews([]);
     if (thread.noteId) {
       await loadNoteReview(thread.noteId);
+      if (contentEpoch.current !== epoch) return false;
     }
+    return true;
   }, [loadNoteReview]);
 
   const loadThreads = useCallback(async () => {
@@ -724,25 +773,30 @@ export default function Chat() {
     let unlistenOcr: (() => void) | undefined;
     let unlistenReview: (() => void) | undefined;
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
-      if (event.payload.threadId !== activeIdRef.current) return;
-      const kind = event.payload.kind ?? "content";
-      if (kind === "reset") {
-        setStream("");
-        setThinking("");
-        setToolHint("");
-      } else if (kind === "reasoning") {
-        setThinking((prev) => prev + event.payload.text);
-      } else if (kind === "tool") {
-        setToolHint(event.payload.text || "インデックスを検索しています…");
-      } else {
-        setStream((prev) => prev + event.payload.text);
-      }
+      const current = liveRef.current;
+      if (!current || event.payload.threadId !== current.threadId) return;
+      const next = applyChatDelta(current, event.payload);
+      if (next === current) return;
+      liveRef.current = next;
+      setLive(next);
     }).then((fn) => {
       unlistenDelta = fn;
     });
     void listen<{ threadId: string; message: string }>("llm-chat-error", (event) => {
-      if (event.payload.threadId !== activeIdRef.current) return;
-      setError(event.payload.message);
+      const tid = event.payload.threadId;
+      const generating = liveRef.current?.threadId;
+      if (generating && tid !== generating) return;
+      if (!generating && tid !== activeIdRef.current) return;
+      if (activeIdRef.current === tid) {
+        setError(event.payload.message);
+        return;
+      }
+      const prev = heldBanners.current.get(tid);
+      heldBanners.current.set(tid, {
+        error: event.payload.message,
+        notice: prev?.notice ?? "",
+        restoreDraft: prev?.restoreDraft ?? null,
+      });
     }).then((fn) => {
       unlistenError = fn;
     });
@@ -761,9 +815,8 @@ export default function Chat() {
         .then(() => {
           if (tid !== prev) {
             setDraft("");
-            setStream("");
-            setThinking("");
-            setToolHint("");
+            liveRef.current = null;
+            setLive(null);
             setError("");
           }
         })
@@ -791,15 +844,54 @@ export default function Chat() {
     };
   }, [loadThreads, loadNoteReview]);
 
+  const viewingLive = live && active?.id === live.threadId ? live : null;
+  const stream = viewingLive?.stream ?? "";
+  const thinking = viewingLive?.thinking ?? "";
+  const toolHint = viewingLive?.toolHint ?? "";
+  const showLive =
+    !!viewingLive && (busy || stream.length > 0 || thinking.length > 0 || toolHint.length > 0);
+  const generatingThreadId = busy ? (live?.threadId ?? null) : null;
+  const onGeneratingThread = !!generatingThreadId && active?.id === generatingThreadId;
+
+  const noteProgrammaticScroll = useCallback(() => {
+    programmaticScroll.current = true;
+    queueMicrotask(() => {
+      programmaticScroll.current = false;
+    });
+  }, []);
+
   const scrollLog = useCallback(() => {
     const el = listRef.current;
-    if (!el) return;
+    if (!el || !followRef.current) return;
+    noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
+  }, [noteProgrammaticScroll]);
+
+  const onLogScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el || programmaticScroll.current) return;
+    const near = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    if (followRef.current === near) return;
+    followRef.current = near;
+    setFollowBottom(near);
   }, []);
+
+  function pinFollow() {
+    followRef.current = true;
+    setFollowBottom(true);
+  }
+
+  function jumpToLatest() {
+    pinFollow();
+    const el = listRef.current;
+    if (!el) return;
+    noteProgrammaticScroll();
+    el.scrollTop = el.scrollHeight;
+  }
 
   useEffect(() => {
     scrollLog();
-  }, [messages, stream, thinking, toolHint, busy, scrollLog]);
+  }, [messages, stream, thinking, toolHint, showLive, scrollLog]);
 
   const meter = useChatContextMeter({
     threadId: active?.id ?? "",
@@ -843,18 +935,41 @@ export default function Chat() {
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
-    if (blocked) return;
+    // A running reply stays on its own thread. Attaching still mutates the open one.
+    if (attaching || !id || id === activeIdRef.current) return;
+    const prev = activeIdRef.current;
+    pendingThreadId.current = id;
+    activeIdRef.current = id;
+    pinFollow();
     try {
       const t = await invoke<LlmThreadRow>("llm_set_active_thread", { id });
+      if (activeIdRef.current !== id) {
+        if (pendingThreadId.current === id) pendingThreadId.current = null;
+        return;
+      }
       setActive(t);
-      await loadThreadContent(t);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      pendingThreadId.current = null;
+      const applied = await loadThreadContent(t);
+      if (activeIdRef.current !== id) return;
+      const held = heldBanners.current.get(id) ?? null;
+      if (held) heldBanners.current.delete(id);
+      if (!applied && !held) return;
+      if (held) {
+        setError(held.error);
+        setNotice(held.notice);
+        if (held.restoreDraft) setDraft(held.restoreDraft);
+        return;
+      }
       setError("");
       setNotice("");
     } catch (e) {
-      setError(formatInvokeError(e));
+      if (activeIdRef.current === id) {
+        activeIdRef.current = prev;
+        pendingThreadId.current = null;
+        setError(formatInvokeError(e));
+      } else if (pendingThreadId.current === id) {
+        pendingThreadId.current = null;
+      }
     }
   }
 
@@ -863,12 +978,14 @@ export default function Chat() {
     try {
       const t = await invoke<LlmThreadRow>("llm_create_thread", { title: "" });
       setThreads((prev) => [t, ...prev.filter((x) => x.id !== t.id)]);
+      contentEpoch.current += 1;
       setActive(t);
+      activeIdRef.current = t.id;
       setMessages([]);
       setSources([]);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      liveRef.current = null;
+      setLive(null);
+      pinFollow();
       setError("");
       setNotice("");
       textareaRef.current?.focus();
@@ -881,9 +998,12 @@ export default function Chat() {
     if (blocked) return;
     try {
       await invoke("llm_delete_thread", { id });
+      if (liveRef.current?.threadId === id) {
+        liveRef.current = null;
+        setLive(null);
+      }
+      heldBanners.current.delete(id);
       await loadThreads();
-      setStream("");
-      setThinking("");
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1156,16 +1276,38 @@ export default function Chat() {
     };
   }, [attachFiles]);
 
-  async function send() {
-    const text = draft.trim();
+  function publishBanner(threadId: string, banner: ThreadBanner) {
+    if (activeIdRef.current === threadId) {
+      heldBanners.current.delete(threadId);
+      setError(banner.error);
+      setNotice(banner.notice);
+      if (banner.restoreDraft) setDraft(banner.restoreDraft);
+      return;
+    }
+    if (banner.error || banner.notice || banner.restoreDraft) {
+      heldBanners.current.set(threadId, banner);
+    } else {
+      heldBanners.current.delete(threadId);
+    }
+  }
+
+  async function copyMessage(text: string) {
+    try {
+      await writeText(text);
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function send(raw?: string, source: "draft" | "resend" = "draft") {
+    const text = (source === "draft" ? draft : (raw ?? "")).trim();
     if (!text || blocked) return;
+    busyRef.current = true;
     setBusy(true);
     setError("");
     setNotice("");
-    setDraft("");
-    setStream("");
-    setThinking("");
-    setToolHint("");
+    if (source === "draft") setDraft("");
+    pinFollow();
     let thread: LlmThreadRow;
     try {
       thread =
@@ -1177,66 +1319,61 @@ export default function Chat() {
         setThreads((prev) => [created, ...prev.filter((x) => x.id !== created.id)]);
       }
     } catch (e) {
+      busyRef.current = false;
       setBusy(false);
-      setDraft(text);
+      if (source === "draft") setDraft(text);
       setError(formatInvokeError(e));
       return;
     }
+    const originId = thread.id;
+    const started: LiveGeneration = {
+      threadId: originId,
+      stream: "",
+      thinking: "",
+      toolHint: "",
+    };
+    liveRef.current = started;
+    setLive(started);
     const optimistic: LlmMessageRow = {
       id: `tmp-${Date.now()}`,
-      threadId: thread.id,
+      threadId: originId,
       role: "user",
       content: text,
       createdAt: Math.floor(Date.now() / 1000),
     };
-    setMessages((prev) => [...prev, optimistic]);
+    if (activeIdRef.current === originId) {
+      setMessages((prev) => [...prev, optimistic]);
+    }
     try {
       const result = await invoke<LlmSendResult>("llm_send", {
-        threadId: thread.id,
+        threadId: originId,
         content: text,
         webSearch: webSearch && !!searxngUrl,
       });
-      setActive(result.thread);
-      setThreads((prev) =>
-        prev.map((x) => (x.id === result.thread.id ? result.thread : x)),
-      );
-      const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
-        threadId: result.thread.id,
-      });
-      const srcs = await invoke<LlmSourceRow[]>("llm_list_sources", {
-        threadId: result.thread.id,
-      });
-      setMessages(msgs);
-      setSources(srcs);
-      for (const w of result.noteWrites ?? []) {
-        if (w.noteId) await loadNoteReview(w.noteId);
-      }
-      if (result.thread.noteId) await loadNoteReview(result.thread.noteId);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      const finishedId = result.thread.id;
+      setThreads((prev) => prev.map((x) => (x.id === finishedId ? result.thread : x)));
       if (result.thinkingBudgetState) {
         setThinkingBudget({
           state: result.thinkingBudgetState,
           tokens: result.thinkingBudgetTokens ?? null,
         });
       }
-      if (result.cancelled) {
-        setError("生成を停止しました。");
-      } else if (result.error) {
-        setError(result.error);
-        if (shouldRestoreDraft(result.error)) {
-          setDraft(text);
-        }
-      } else if (result.warning) {
-        setNotice(result.warning);
-      } else if (result.truncated) {
-        setNotice("トークン上限のため、古いやり取りや出典から切り詰めて送りました。");
+      const [msgs, srcs] = await Promise.all([
+        invoke<LlmMessageRow[]>("llm_list_messages", { threadId: finishedId }),
+        invoke<LlmSourceRow[]>("llm_list_sources", { threadId: finishedId }),
+      ]);
+      for (const w of result.noteWrites ?? []) {
+        if (w.noteId) await loadNoteReview(w.noteId);
       }
+      if (result.thread.noteId) await loadNoteReview(result.thread.noteId);
+      if (activeIdRef.current === finishedId) {
+        contentEpoch.current += 1;
+        setActive(result.thread);
+        setMessages(msgs);
+        setSources(srcs);
+      }
+      publishBanner(finishedId, bannerFromResult(text, source, result));
     } catch (e) {
-      setStream("");
-      setThinking("");
-      setToolHint("");
       const msg = formatInvokeError(e);
       if (msg.includes("生成中です")) {
         try {
@@ -1244,22 +1381,31 @@ export default function Chat() {
         } catch {
           /* ignore */
         }
-        setDraft(text);
-        setError(
-          "前の生成が途中で止まっていました。停止したので、もう一度送信してください。",
-        );
-      } else {
-        setError(msg);
-      }
-      try {
-        const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
-          threadId: thread.id,
+        publishBanner(originId, {
+          error: "前の生成が途中で止まっていました。停止したので、もう一度送信してください。",
+          notice: "",
+          restoreDraft: source === "draft" ? text : null,
         });
-        setMessages(msgs);
-      } catch {
-        /* keep optimistic */
+      } else {
+        publishBanner(originId, { error: msg, notice: "", restoreDraft: null });
+      }
+      if (activeIdRef.current === originId) {
+        try {
+          const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
+            threadId: originId,
+          });
+          contentEpoch.current += 1;
+          setMessages(msgs);
+        } catch {
+          /* keep optimistic */
+        }
       }
     } finally {
+      if (liveRef.current?.threadId === originId) {
+        liveRef.current = null;
+        setLive(null);
+      }
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -1533,6 +1679,7 @@ export default function Chat() {
                   className={[
                     t.id === active?.id ? "chat-thread-item active" : "chat-thread-item",
                     threadDragId === t.id ? "chat-thread-item--dragging" : "",
+                    generatingThreadId === t.id ? "chat-thread-item--generating" : "",
                   ]
                     .filter(Boolean)
                     .join(" ")}
@@ -1576,6 +1723,9 @@ export default function Chat() {
                       {q && titleHit ? highlightText(title, q) : title}
                     </button>
                   )}
+                  {generatingThreadId === t.id ? (
+                    <span className="chat-thread-generating">生成中</span>
+                  ) : null}
                   {q && !titleHit ? (
                     <span className="chat-thread-hit">内容</span>
                   ) : null}
@@ -1638,8 +1788,9 @@ export default function Chat() {
       />
 
       <main className="chat-main">
-        <div className="chat-log" ref={listRef}>
-          {messages.length === 0 && !stream && !thinking && !toolHint && !busy ? (
+        <div className="chat-log-wrap">
+        <div className="chat-log" ref={listRef} onScroll={onLogScroll}>
+          {messages.length === 0 && !showLive ? (
             <p className="chat-muted chat-empty">
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
             </p>
@@ -1694,6 +1845,25 @@ export default function Chat() {
                   ) : (
                     <div className="chat-msg-body">{m.content}</div>
                   )}
+                  {m.role === "user" ? (
+                    <div className="chat-msg-actions">
+                      <button
+                        type="button"
+                        className="chat-tpl"
+                        disabled={blocked}
+                        onClick={() => void send(m.content, "resend")}
+                      >
+                        再送
+                      </button>
+                      <button
+                        type="button"
+                        className="chat-tpl"
+                        onClick={() => void copyMessage(m.content)}
+                      >
+                        コピー
+                      </button>
+                    </div>
+                  ) : null}
                   {citeGroups.length > 0 ? (
                     <div className="chat-msg-cites" aria-label="出典">
                       {citeGroups.map((g) => {
@@ -1736,7 +1906,7 @@ export default function Chat() {
               );
             })
           )}
-          {busy || stream || thinking || toolHint ? (
+          {showLive ? (
             <article className="chat-msg assistant streaming">
               {toolHint ? <p className="chat-tool-hint">{toolHint}</p> : null}
               {thinking ? (
@@ -1789,6 +1959,12 @@ export default function Chat() {
           {ocrBusy && !busy ? (
             <p className="chat-tool-hint">画像を読み取っています…</p>
           ) : null}
+        </div>
+        {!followBottom ? (
+          <button type="button" className="chat-jump-latest" onClick={jumpToLatest}>
+            ↓最新へ
+          </button>
+        ) : null}
         </div>
         {error ? <p className="chat-error">{error}</p> : null}
         {noteReviews.map((r) => (
@@ -2033,7 +2209,7 @@ export default function Chat() {
               rows={3}
               value={draft}
               placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"
-              disabled={busy || attaching}
+              disabled={attaching || onGeneratingThread}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
@@ -2043,7 +2219,7 @@ export default function Chat() {
               }}
             />
             <div className="chat-composer-actions">
-              {busy || ocrBusy ? (
+              {ocrBusy || onGeneratingThread ? (
                 <button type="button" className="chat-btn" onClick={() => void stop()}>
                   停止
                 </button>
@@ -2051,7 +2227,7 @@ export default function Chat() {
                 <button
                   type="submit"
                   className="chat-btn primary"
-                  disabled={!draft.trim() || attaching}
+                  disabled={busy || !draft.trim() || attaching}
                 >
                   送信
                 </button>
