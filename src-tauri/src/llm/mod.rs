@@ -435,17 +435,22 @@ pub struct StreamOutcome {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: String,
     pub request_id: String,
+    /// True only when `<tool_call>` was removed from the message body.
+    /// A call found only in reasoning does not set this.
+    pub tool_call_stripped_from_content: bool,
 }
 
 impl StreamParse {
     fn into_outcome(self) -> StreamOutcome {
         let mut calls = self.tool_calls;
         let mut content = self.content;
+        let mut tool_call_stripped_from_content = false;
         if calls.is_empty() {
             let (stripped, embedded) = pull_embedded_tool_calls(&content);
             if !embedded.is_empty() {
                 content = stripped;
                 calls.extend(embedded);
+                tool_call_stripped_from_content = true;
             } else {
                 let (_, from_think) = pull_embedded_tool_calls(&self.reasoning);
                 calls.extend(from_think);
@@ -457,6 +462,7 @@ impl StreamParse {
             reasoning: self.reasoning,
             finish_reason: self.finish_reason,
             request_id: self.request_id,
+            tool_call_stripped_from_content,
             tool_calls: calls
                 .into_iter()
                 .filter(|c| !c.name.is_empty() || !c.arguments.is_empty())
@@ -1731,6 +1737,24 @@ mod tests {
         assert!(out.tool_calls[0].arguments.contains("民法555条"));
         assert!(!out.content.contains("<tool_call>"));
         assert!(out.content.contains("調べます。"));
+        assert!(out.tool_call_stripped_from_content);
+    }
+
+    #[test]
+    fn reasoning_only_tool_call_leaves_the_body() {
+        let call = r#"<tool_call>{"name":"search_index","arguments":{"query":"x"}}</tool_call>"#;
+        let parse = StreamParse {
+            content: "結論は三か月です。".into(),
+            reasoning: call.into(),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".into(),
+            request_id: String::new(),
+        };
+        let out = parse.into_outcome();
+        assert!(!out.tool_call_stripped_from_content);
+        assert_eq!(out.content, "結論は三か月です。");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "search_index");
     }
 
     #[test]

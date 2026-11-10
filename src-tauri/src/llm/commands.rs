@@ -923,11 +923,15 @@ async fn llm_send_inner<R: Runtime>(
             llm::thinking::ThinkingCut::start(thinking_on, with_tools)
         };
         let mut thinking_off_settings = None;
+        // The round-start flag stays true when stage 2 drops tools mid-round.
+        // This follows the request that actually produced the response.
+        let mut tools_sent;
         let outcome = loop {
             let app2 = app.clone();
             let req = request_id.clone();
             let tid = thread.id.clone();
             let request = cut.request();
+            tools_sent = request.tools;
             let call_settings: &crate::db::Settings = if request.thinking_off {
                 thinking_off_settings.get_or_insert_with(|| {
                     let mut off = settings.clone();
@@ -1118,7 +1122,8 @@ async fn llm_send_inner<R: Runtime>(
                     !out.tool_calls.is_empty(),
                     source_ids,
                 );
-                let stripped_without_tools = !with_tools && !out.tool_calls.is_empty();
+                let stripped_without_tools =
+                    !tools_sent && out.tool_call_stripped_from_content;
                 let answer_body = if stripped_without_tools {
                     ""
                 } else {
@@ -4130,6 +4135,22 @@ mod tests {
         }))
     }
 
+    fn content_with_reasoning(content: &str, reasoning: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": { "content": content, "reasoning_content": reasoning },
+                "finish_reason": "stop"
+            }]
+        }))
+    }
+
+    fn reasoning_only_tool_call(body: &str) -> Vec<u8> {
+        content_with_reasoning(
+            body,
+            r#"<tool_call>{"name":"search_index","arguments":{"query":"OrionContract"}}</tool_call>"#,
+        )
+    }
+
     fn content_and_search(text: &str, query: &str) -> Vec<u8> {
         sse_message(serde_json::json!({
             "choices": [{
@@ -4411,6 +4432,128 @@ mod tests {
             !messages.iter().any(|message| message.content.contains("まだ調べます。")),
             "a stripped tool call must not become the answer"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_body_when_the_round_limit_final_calls_a_tool_only_in_reasoning() {
+        let mut script = seven_searches();
+        script.push(content_and_search("", "OrionContract"));
+        script.push(reasoning_only_tool_call("結論は三か月です。"));
+        let (dir, db, thread, result) = send_script("round-reason", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "結論は三か月です。")
+            .expect("the body is the answer");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("上限の 8 回")
+                && message.content.contains("ここまでの資料で答えています")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.content.contains("続きはもう一度指示するか")
+                || message.content.contains("本文も操作も返さず")
+        }));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_body_when_a_tool_refused_phantom_retry_calls_a_tool_only_in_reasoning()
+    {
+        let rejected = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#;
+        let (dir, db, thread, result) = send_script(
+            "phantom-reason",
+            8,
+            vec![
+                http_status(400, "Bad Request", rejected),
+                http_status(400, "Bad Request", rejected),
+                content_stop("根拠は [9] です。"),
+                reasoning_only_tool_call("結論は三か月です。"),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "結論は三か月です。")
+            .expect("the phantom retry body is the answer");
+        assert_eq!(answer.kind, "");
+        assert!(!messages
+            .iter()
+            .any(|message| message.content == "根拠は [9] です。"));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("本文も操作も返さず")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_earlier_answer_when_stage2_embeds_a_tool_call() {
+        let embedded = "まだ調べます。[1]<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>";
+        let (dir, db, thread, result) = send_script(
+            "stage2-kept",
+            8,
+            vec![
+                content_stop("根拠は [9] です。"),
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = messages
+            .iter()
+            .find(|message| message.content == "根拠は [9] です。")
+            .expect("the earlier answer is kept");
+        assert_eq!(answer.kind, "");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_does_not_save_a_stage2_tool_call_preamble_when_nothing_is_kept() {
+        let embedded = "まだ調べます。[1]<tool_call>{\"name\":\"search_index\",\"arguments\":{\"query\":\"OrionContract\"}}</tool_call>";
+        let (dir, db, thread, result) = send_script(
+            "stage2-empty",
+            8,
+            vec![
+                reasoning_over_cap(),
+                content_and_search("確認します。", "OrionContract"),
+                content_stop(embedded),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content.contains("本文も操作も返さず")
+        }));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("まだ調べます。")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.content == llm::thinking::THINKING_CUT_NOTICE));
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
