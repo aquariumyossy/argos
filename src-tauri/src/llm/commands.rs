@@ -865,14 +865,17 @@ pub async fn llm_send(
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
     let mut empty_reply = false;
-    // Set only when the thinking-cap retry actually answered.
-    let mut thinking_was_cut = false;
+    // Once a cut answers, later passes in this turn stay thinking-off.
+    let mut cut_hold = llm::thinking::CutHold::default();
     // First answer kept when a phantom retry (hint or source-block) comes back empty.
     let mut phantom_fallback: Option<PhantomOriginal> = None;
     let mut kept_source_ids: Option<std::collections::HashSet<String>> = None;
     let result_text;
 
     loop {
+        if cut_hold.tools_off {
+            use_tools = false;
+        }
         if use_tools && !unlimited_rounds && rounds >= max_rounds {
             // One answer from what this turn already collected. No further tool calls.
             use_tools = false;
@@ -895,10 +898,13 @@ pub async fn llm_send(
         }
         let turns_now = current_turns.clone();
         let mut bridge_retried = false;
-        let mut cut = llm::thinking::ThinkingCut::start(
-            llm::thinking::thinking_enabled(&settings),
-            with_tools,
-        );
+        let thinking_on =
+            llm::thinking::thinking_enabled(&settings) && !cut_hold.thinking_off;
+        let mut cut = if cut_hold.thinking_off {
+            llm::thinking::ThinkingCut::held(with_tools)
+        } else {
+            llm::thinking::ThinkingCut::start(thinking_on, with_tools)
+        };
         let mut thinking_off_settings = None;
         let outcome = loop {
             let app2 = app.clone();
@@ -963,11 +969,9 @@ pub async fn llm_send(
                     continue;
                 }
                 llm::thinking::CutStep::Answer { tools } => {
+                    cut_hold.observe_answer(tools);
                     if !tools {
                         use_tools = false;
-                    }
-                    if streamed.is_ok() {
-                        thinking_was_cut = true;
                     }
                     break streamed;
                 }
@@ -1247,8 +1251,11 @@ pub async fn llm_send(
                         phantom_retried = true;
                         // At the cap, turning tools back on makes the next pass the
                         // round-limit final answer (notice and stream reset).
-                        let tools_on =
-                            phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds);
+                        let tools_on = phantom_retry_enables_tools(
+                            unlimited_rounds,
+                            rounds,
+                            max_rounds,
+                        ) && !cut_hold.tools_off;
                         current_turns.push(ChatTurn::text("user", phantom_cite_hint(tools_on)));
                         use_tools = tools_on;
                         remember_phantom_answer(
@@ -1310,10 +1317,9 @@ pub async fn llm_send(
     if let Some(notice) = round_limit_aside.as_deref() {
         let _ = state.db.insert_llm_notice(&thread.id, notice);
     }
-    if thinking_was_cut {
-        let _ = state
-            .db
-            .insert_llm_notice(&thread.id, llm::thinking::THINKING_CUT_NOTICE);
+    if let Some(notice) = cut_hold.notice(result_kind == crate::db::LLM_MESSAGE_NOTICE, &result_text)
+    {
+        let _ = state.db.insert_llm_notice(&thread.id, notice);
     }
     let unset_notice = llm::thinking::thinking_budget_unset_notice();
     let already_told = history.iter().any(|message| {

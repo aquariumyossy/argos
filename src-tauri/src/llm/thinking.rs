@@ -177,6 +177,19 @@ impl ThinkingCut {
         }
     }
 
+    /// A later pass after this turn already cut thinking. A new cap stops.
+    /// It does not turn thinking back on.
+    pub fn held(tools: bool) -> Self {
+        Self {
+            thinking_was_on: false,
+            request: CutRequest {
+                thinking_off: true,
+                tools,
+            },
+            stage: 0,
+        }
+    }
+
     pub fn request(&self) -> CutRequest {
         self.request
     }
@@ -216,6 +229,41 @@ impl ThinkingCut {
             CutReply::Answer | CutReply::NeedsTools => CutStep::Answer { tools: false },
             CutReply::OverCap => CutStep::Stop { over_cap: true },
             CutReply::ToolsRejected | CutReply::Other => CutStep::Stop { over_cap: false },
+        }
+    }
+}
+
+/// What stays off for the rest of a turn after thinking was cut.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CutHold {
+    pub thinking_off: bool,
+    /// Set when the cut itself answered with tools disabled.
+    pub tools_off: bool,
+}
+
+impl CutHold {
+    pub fn observe_answer(&mut self, tools_still_on: bool) {
+        self.thinking_off = true;
+        if !tools_still_on {
+            self.tools_off = true;
+        }
+    }
+
+    /// A later pass may ask for thinking and tools again. A cut keeps thinking
+    /// off, and a cut that forced tools off keeps them off.
+    pub fn allow(self, settings_thinking: bool, tools_requested: bool) -> (bool, bool) {
+        (
+            settings_thinking && !self.thinking_off,
+            tools_requested && !self.tools_off,
+        )
+    }
+
+    /// The chat notice only when the kept text is the model's own answer.
+    pub fn notice(self, saved_is_notice: bool, text: &str) -> Option<&'static str> {
+        if !self.thinking_off || saved_is_notice || text.trim().is_empty() {
+            None
+        } else {
+            Some(THINKING_CUT_NOTICE)
         }
     }
 }
@@ -443,6 +491,73 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(step, CutStep::Stop { over_cap: true });
         assert!(step.notice().is_none());
+    }
+
+    #[test]
+    fn later_pass_after_a_cut_stays_thinking_off() {
+        let mut hold = CutHold::default();
+        let (thinking, tools) = hold.allow(true, true);
+        assert!(thinking && tools);
+        let mut cut = ThinkingCut::start(thinking, tools);
+        assert_eq!(
+            cut.observe(CutReply::OverCap),
+            CutStep::Again(CutRequest {
+                thinking_off: true,
+                tools: true
+            })
+        );
+        assert_eq!(cut.observe(CutReply::Answer), CutStep::Answer { tools: true });
+        hold.observe_answer(true);
+        let (thinking, tools) = hold.allow(true, true);
+        assert!(!thinking, "a source-block retry must not think again");
+        assert!(tools, "tools stay available when the cut did not force them off");
+        let later = ThinkingCut::held(tools);
+        assert_eq!(
+            later.request(),
+            CutRequest {
+                thinking_off: true,
+                tools: true
+            }
+        );
+        let mut later = later;
+        assert_eq!(
+            later.observe(CutReply::OverCap),
+            CutStep::Stop { over_cap: true },
+            "a later cap must not start another thinking-on retry"
+        );
+    }
+
+    #[test]
+    fn tools_forced_off_by_a_cut_stay_off_when_a_phantom_retry_asks() {
+        let mut hold = CutHold::default();
+        hold.observe_answer(false);
+        let (thinking, tools) = hold.allow(true, true);
+        assert!(!thinking);
+        assert!(!tools, "phantom must not open a new tool round");
+        assert_eq!(
+            ThinkingCut::held(tools).request(),
+            CutRequest {
+                thinking_off: true,
+                tools: false
+            }
+        );
+    }
+
+    #[test]
+    fn cut_notice_is_only_for_a_non_empty_model_answer() {
+        let mut hold = CutHold::default();
+        assert!(hold.notice(false, "答え").is_none());
+        hold.observe_answer(false);
+        assert_eq!(hold.notice(false, "集めた結論"), Some(THINKING_CUT_NOTICE));
+        assert!(hold.notice(false, "").is_none());
+        assert!(hold.notice(false, " \n").is_none());
+        let empty = crate::llm::context::silent_end_notice("stop");
+        assert!(
+            hold.notice(true, &empty).is_none(),
+            "an empty finish must not also store the cut notice"
+        );
+        let tools_only = crate::llm::context::silent_end_notice("tool_calls");
+        assert!(hold.notice(true, &tools_only).is_none());
     }
 
     #[test]
