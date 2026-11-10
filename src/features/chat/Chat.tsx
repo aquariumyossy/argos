@@ -18,7 +18,7 @@ import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
-import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
+import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
 import {
   applyChatDelta,
   emptyChatLive,
@@ -95,6 +95,11 @@ type LlmFilePreview = {
   chars: number;
   units: number;
   hardCap: number;
+};
+
+type LlmFileGrainMeter = {
+  tokens: number;
+  bodyTrimmed: boolean;
 };
 
 type LlmGrainResult = {
@@ -1017,13 +1022,19 @@ export default function Chat() {
         setSources(result.sources);
         return;
       }
-      const preview = await invoke<LlmFilePreview>("llm_preview_source_file", {
+      // Reject a missing or oversized file before asking.
+      await invoke<LlmFilePreview>("llm_preview_source_file", {
         id: s.id,
       });
-      const fileTokens = Math.ceil(preview.chars / CHARS_PER_TOKEN);
-      if (fileTokens > maxContextTokens) {
+      const measured = await invoke<LlmFileGrainMeter>("llm_file_grain_meter", {
+        threadId: active?.id || s.threadId,
+        sourceId: s.id,
+        draft,
+        webSearch: webSearch && !!searxngUrl,
+      });
+      if (measured.bodyTrimmed) {
         const ok = window.confirm(
-          `このファイルは約 ${fileTokens.toLocaleString()} トークンです。送信の上限は ${maxContextTokens.toLocaleString()} トークンです。全文にしますか？`,
+          fileGrainConfirmMessage(measured.tokens, maxContextTokens),
         );
         if (!ok) return;
       }

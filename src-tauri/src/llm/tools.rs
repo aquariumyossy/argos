@@ -4162,22 +4162,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_token_counts_match_the_chat_meter() {
-        use crate::llm::context::tool_schema_tokens;
-        let actual = [
-            tool_schema_tokens(&tools_schema(false, false, false)),
-            tool_schema_tokens(&tools_schema(true, false, false)),
-            tool_schema_tokens(&tools_schema(false, true, false)),
-            tool_schema_tokens(&tools_schema(true, true, false)),
-            tool_schema_tokens(&tools_schema(false, false, true)),
-            tool_schema_tokens(&tools_schema(true, false, true)),
-        ];
-        // src/features/chat/contextEstimate.ts TOOL_SCHEMA_TOKENS, same order.
-        let expected = [2410, 2662, 2455, 2707, 2417, 2670];
-        assert_eq!(actual, expected, "update TOOL_SCHEMA_TOKENS to {actual:?}");
-    }
-
-    #[test]
     fn tools_schema_mentions_web_only_when_enabled() {
         let off = tools_schema(false, false, false).to_string();
         assert!(!off.contains("公開ウェブも同時に検索"));

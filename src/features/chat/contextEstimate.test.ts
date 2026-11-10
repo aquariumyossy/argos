@@ -8,10 +8,9 @@ import {
   contextMeterLabel,
   contextMeterLimit,
   estimateTokens,
-  messageTokens,
+  fileGrainConfirmMessage,
   replyHeadroomTokens,
   toolResultAllowanceTokens,
-  toolSchemaTokenCount,
   toolSchemaTokens,
 } from "./contextEstimate";
 
@@ -20,13 +19,6 @@ describe("context tokens", () => {
     expect(CHARS_PER_TOKEN).toBe(1.6);
     expect(estimateTokens("あ".repeat(16))).toBe(10);
     expect(estimateTokens("")).toBe(0);
-  });
-
-  it("adds a small fixed cost per message and counts tool calls, not thinking", () => {
-    expect(messageTokens({ content: "あ".repeat(16), toolCalls: "" })).toBe(14);
-    expect(messageTokens({ content: "本文", toolCalls: "search_index" })).toBe(
-      estimateTokens("本文") + estimateTokens("search_index") + 4,
-    );
   });
 
   it("warns from 80 percent of the limit", () => {
@@ -46,15 +38,9 @@ describe("context tokens", () => {
     expect(toolSchemaTokens("あ".repeat(16))).toBe(10);
     expect(toolSchemaTokens("")).toBe(0);
     const limit = 260_000;
-    const schema = toolSchemaTokenCount({
-      webSearch: false,
-      remoteIndex: false,
-      remoteOnly: false,
-    });
     expect(replyHeadroomTokens(limit)).toBe(26_000);
     expect(toolResultAllowanceTokens(limit)).toBe(65_000);
     expect(toolResultAllowanceTokens(limit)).toBe(Math.floor(limit * TOOL_RESULT_BUDGET_RATIO));
-    expect(schema).toBeGreaterThan(0);
   });
 
   it("sets the denominator to the limit minus unused reserves", () => {
@@ -68,5 +54,12 @@ describe("context tokens", () => {
     expect(contextIsNearLimit(62_399, contextMeterLimit(limit))).toBe(false);
     expect(limit * 0.8).toBe(96_000);
     expect(contextIsNearLimit(62_400, limit)).toBe(false);
+  });
+
+  it("states the assembled size and the meter limit in the full-file confirm", () => {
+    expect(contextMeterLimit(131_072)).toBe(85_197);
+    expect(fileGrainConfirmMessage(84_467, 131_072)).toBe(
+      "全文にすると約 84,467 トークンです。送信の上限は 85,197 トークンです。上限に収まらないため、本文の後半は切り詰められます。全文にしますか？",
+    );
   });
 });

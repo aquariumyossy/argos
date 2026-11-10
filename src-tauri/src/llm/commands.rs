@@ -1602,11 +1602,161 @@ pub async fn llm_context_meter(
     let state = state.inner().clone();
     let thread_id = thread_id.unwrap_or_default();
     let web_search = web_search.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
-        measure_context_meter(state, thread_id, draft, web_search)
+    let (tokens, _) = tauri::async_runtime::spawn_blocking(move || {
+        measure_context_meter(state, thread_id, draft, web_search, None)
     })
     .await
-    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())??;
+    Ok(tokens)
+}
+
+/// Next request if `source_id` were the whole file, assembled with the same
+/// budget `llm_send` passes to `assemble_turns`. `tokens` is that request's
+/// size, the meter numerator after the switch. `body_trimmed` is set only when
+/// this file's own body is cut. Old exchanges are dropped before that.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmFileGrainMeter {
+    pub tokens: usize,
+    pub body_trimmed: bool,
+}
+
+#[tauri::command]
+pub async fn llm_file_grain_meter(
+    state: State<'_, Arc<AppState>>,
+    thread_id: String,
+    source_id: String,
+    draft: String,
+    web_search: Option<bool>,
+) -> Result<LlmFileGrainMeter, String> {
+    let state = state.inner().clone();
+    let web_search = web_search.unwrap_or(false);
+    let (tokens, body_trimmed) = tauri::async_runtime::spawn_blocking(move || {
+        measure_context_meter(state, thread_id, draft, web_search, Some(source_id))
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    Ok(LlmFileGrainMeter {
+        tokens,
+        body_trimmed,
+    })
+}
+
+struct FileGrainReading {
+    tokens: usize,
+    body_trimmed: bool,
+}
+
+/// Same extra user row `meter_usage_tokens` appends. Kept in step with
+/// `history_including_draft` so this count is the meter numerator.
+fn history_with_meter_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMessageRow> {
+    let mut history = history.to_vec();
+    history.push(LlmMessageRow {
+        id: "meter-draft".into(),
+        thread_id: history
+            .last()
+            .map(|row| row.thread_id.clone())
+            .unwrap_or_default(),
+        role: "user".into(),
+        content: meter_question(draft).to_string(),
+        created_at: 0,
+        reasoning: String::new(),
+        tool_calls: String::new(),
+        tool_call_id: String::new(),
+        tool_name: String::new(),
+        kind: String::new(),
+    });
+    history
+}
+
+fn file_grain_reading(
+    system: &str,
+    sources: &[LlmSourceRow],
+    history: &[LlmMessageRow],
+    draft: &str,
+    schema_tokens: usize,
+    message_budget: usize,
+    source_id: &str,
+) -> FileGrainReading {
+    let history = history_with_meter_draft(history, draft);
+    let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
+    let sent: usize = turns
+        .iter()
+        .filter(|turn| turn.role != "system")
+        .map(crate::llm::context::turn_tokens)
+        .sum();
+    let full = sources
+        .iter()
+        .find(|source| source.id == source_id)
+        .map(|source| source.body.trim().to_string())
+        .unwrap_or_default();
+    let latest = turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == "user")
+        .map(|turn| turn.content.as_str())
+        .unwrap_or("");
+    FileGrainReading {
+        tokens: sent + schema_tokens,
+        body_trimmed: !full.is_empty() && !latest.contains(full.as_str()),
+    }
+}
+
+/// Pending rows of the same path are dropped, matching `llm_set_source_grain`.
+fn sources_with_file_body(
+    mut sources: Vec<LlmSourceRow>,
+    id: &str,
+    file_body: String,
+) -> Result<Vec<LlmSourceRow>, String> {
+    let idx = sources
+        .iter()
+        .position(|source| source.id == id)
+        .ok_or_else(|| "出典が見つかりません".to_string())?;
+    let path = sources[idx].path.trim().to_string();
+    sources[idx].body = file_body;
+    sources[idx].grain = "file".into();
+    if !path.is_empty() {
+        sources.retain(|source| {
+            source.id == id || !source.is_pending() || !source.path.eq_ignore_ascii_case(&path)
+        });
+    }
+    Ok(sources)
+}
+
+fn reject_file_grain(row: &LlmSourceRow) -> Result<(), String> {
+    if row.is_image() {
+        return Err("画像出典は段落／全文を切り替えられません。".into());
+    }
+    if row.is_web() {
+        return Err("ウェブ出典は段落／全文を切り替えられません。".into());
+    }
+    if row.is_remote() {
+        return Err("リモート出典は段落／全文を切り替えられません。".into());
+    }
+    if !row.is_pending() {
+        return Err("読み込み済みの出典は段落／全文を切り替えられません。".into());
+    }
+    if row.path.trim().is_empty() {
+        return Err("パスが無い出典はファイル全体にできません。".into());
+    }
+    Ok(())
+}
+
+fn expand_pending_file(
+    state: &AppState,
+    sources: Vec<LlmSourceRow>,
+    id: &str,
+) -> Result<Vec<LlmSourceRow>, String> {
+    let path = {
+        let row = sources
+            .iter()
+            .find(|source| source.id == id)
+            .ok_or_else(|| "出典が見つかりません".to_string())?;
+        reject_file_grain(row)?;
+        row.path.trim().to_string()
+    };
+    let (body, _) = load_file_body(state, &path)?;
+    sources_with_file_body(sources, id, body)
 }
 
 fn measure_context_meter(
@@ -1614,10 +1764,11 @@ fn measure_context_meter(
     thread_id: String,
     draft: String,
     web_search: bool,
-) -> Result<usize, String> {
+    expand_source_id: Option<String>,
+) -> Result<(usize, bool), String> {
     let question = meter_question(&draft).to_string();
     let settings = state.settings.read().clone();
-    let (thread, history, sources) = if thread_id.trim().is_empty() {
+    let (thread, history, mut sources) = if thread_id.trim().is_empty() {
         (blank_llm_thread(), Vec::new(), Vec::new())
     } else {
         let thread = state
@@ -1635,6 +1786,14 @@ fn measure_context_meter(
             .map_err(|e| e.to_string())?;
         (thread, history, sources)
     };
+    let expand_id = expand_source_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if let Some(id) = expand_id.as_deref() {
+        sources = expand_pending_file(&state, sources, id)?;
+    }
     let plan = plan_chat_request(
         &state,
         &settings,
@@ -1646,13 +1805,28 @@ fn measure_context_meter(
     );
     let history =
         summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
-    Ok(meter_usage_tokens(
-        &plan.system,
-        &sources,
-        &history,
-        &draft,
-        plan.schema_tokens,
-        plan.prompt_budget,
+    if let Some(id) = expand_id.as_deref() {
+        let reading = file_grain_reading(
+            &plan.system,
+            &sources,
+            &history,
+            &draft,
+            plan.schema_tokens,
+            plan.prompt_budget,
+            id,
+        );
+        return Ok((reading.tokens, reading.body_trimmed));
+    }
+    Ok((
+        meter_usage_tokens(
+            &plan.system,
+            &sources,
+            &history,
+            &draft,
+            plan.schema_tokens,
+            plan.prompt_budget,
+        ),
+        false,
     ))
 }
 
@@ -3330,5 +3504,137 @@ mod tests {
             .unwrap();
         assert_eq!(second.cite_no, 7);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pending_contract(body: &str) -> LlmSourceRow {
+        LlmSourceRow {
+            id: "f1".into(),
+            thread_id: "t".into(),
+            sort_order: 0,
+            origin: "attach".into(),
+            path: r"C:\docs\契約.txt".into(),
+            title: String::new(),
+            paragraph_id: "f1".into(),
+            body: body.into(),
+            query: String::new(),
+            created_at: 0,
+            grain: "unit".into(),
+            unit_body: String::new(),
+            injected_user_message_id: String::new(),
+            cited_assistant_message_id: String::new(),
+            cite_no: 0,
+            kind: "text".into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
+        }
+    }
+
+    fn chat_message(id: &str, role: &str, content: &str) -> LlmMessageRow {
+        LlmMessageRow {
+            id: id.into(),
+            thread_id: "t".into(),
+            role: role.into(),
+            content: content.into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+        }
+    }
+
+    #[test]
+    fn file_grain_meter_counts_the_pending_attachment_on_the_meter_basis() {
+        let budget = 200_000;
+        let expanded = sources_with_file_body(
+            vec![pending_contract("段落")],
+            "f1",
+            "あ".repeat(100_000),
+        )
+        .unwrap();
+        assert_eq!(expanded[0].grain, "file");
+        let reading = file_grain_reading("役割", &expanded, &[], "", 2_410, budget, "f1");
+        assert!(!reading.body_trimmed);
+        assert_eq!(
+            reading.tokens, 64_932,
+            "same count as the chat meter for a pending attachment"
+        );
+        assert_eq!(
+            reading.tokens,
+            meter_usage_tokens("役割", &expanded, &[], "", 2_410, budget)
+        );
+
+        let mut sibling = pending_contract("別段落");
+        sibling.id = "f2".into();
+        sibling.path = r"c:\docs\契約.txt".into();
+        let mut other = pending_contract("他のファイル");
+        other.id = "other".into();
+        other.path = r"C:\docs\other.txt".into();
+        let mut consumed = pending_contract("既読");
+        consumed.id = "kept".into();
+        consumed.injected_user_message_id = "u1".into();
+        let kept = sources_with_file_body(
+            vec![pending_contract("段落"), sibling, other, consumed],
+            "f1",
+            "本文".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.iter().map(|source| source.id.as_str()).collect::<Vec<_>>(),
+            ["f1", "other", "kept"]
+        );
+        assert_eq!(kept[0].body, "本文");
+        assert_eq!(kept[0].grain, "file");
+
+    }
+
+    #[test]
+    fn file_grain_confirm_asks_only_when_the_file_body_is_cut() {
+        let budget = 40_000usize;
+        let exchange = "あ".repeat(2_000);
+        let mut history = Vec::new();
+        for i in 0..80 {
+            history.push(chat_message(&format!("u{i}"), "user", &exchange));
+            history.push(chat_message(&format!("a{i}"), "assistant", &exchange));
+        }
+
+        let small = sources_with_file_body(
+            vec![pending_contract("段落")],
+            "f1",
+            "あ".repeat(3_000),
+        )
+        .unwrap();
+        let small_reading = file_grain_reading("役割", &small, &history, "", 2_410, budget, "f1");
+        assert!(
+            !small_reading.body_trimmed,
+            "a short file stays whole after old exchanges are dropped"
+        );
+        assert_eq!(
+            small_reading.tokens,
+            meter_usage_tokens("役割", &small, &history, "", 2_410, budget)
+        );
+        let whole_history = meter_usage_tokens("役割", &small, &history, "", 2_410, 8_000_000);
+        assert!(
+            whole_history > small_reading.tokens,
+            "the untrimmed history is larger than the send: {whole_history} vs {}",
+            small_reading.tokens
+        );
+
+        let large = sources_with_file_body(
+            vec![pending_contract("段落")],
+            "f1",
+            "あ".repeat(100_000),
+        )
+        .unwrap();
+        let large_reading = file_grain_reading("役割", &large, &history, "", 2_410, budget, "f1");
+        assert!(
+            large_reading.body_trimmed,
+            "a file that does not fit is cut"
+        );
+        assert_eq!(
+            large_reading.tokens,
+            meter_usage_tokens("役割", &large, &history, "", 2_410, budget)
+        );
     }
 }
