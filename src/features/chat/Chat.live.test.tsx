@@ -831,6 +831,57 @@ describe("scroll follow during generation", () => {
     expect(log.scrollTop).toBe(parked);
   });
 
+  it("does not resume when closing earlier thinking clamps onto the bottom", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-old",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "前の回答",
+        reasoning: "前の思考",
+        createdAt: 2,
+      },
+    ];
+    const { log, box } = await startPinnedLog();
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(false);
+    fireEvent.click(screen.getByText("思考"));
+    box.resize({ scrollHeight: 1200 });
+    await act(async () => {});
+    expect(jump()).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "↓最新へ" }));
+    await act(async () => {});
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(false);
+
+    fireEvent.click(screen.getByText("思考"));
+    box.resize({ scrollHeight: 800 });
+    expect(800 - log.scrollTop - 120).toBe(0);
+    expect(jump()).toBeTruthy();
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(true);
+    const parked = log.scrollTop;
+    box.setScrollHeight(box.scrollHeight() + 180);
+    await emitDelta("thread-a", "次の段落");
+    expect(log.scrollTop).toBe(parked);
+    expect(jump()).toBeTruthy();
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    expect(jump()).toBeTruthy();
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(true);
+
+    fireEvent.wheel(log, { deltaY: 40 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    await act(async () => {});
+    expect(jump()).toBeNull();
+    expect(log.classList.contains("chat-log-no-anchor")).toBe(false);
+    box.setScrollHeight(box.scrollHeight() + 40);
+    await emitDelta("thread-a", "再開");
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+  });
+
   it("resumes following when enlarging the window clamps onto the bottom", async () => {
     const { log, box } = await startPinnedLog();
     log.scrollTop = 500;

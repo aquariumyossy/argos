@@ -4,9 +4,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type SyntheticEvent as ReactSyntheticEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -45,6 +47,19 @@ import {
   openableCitesFromGroups,
 } from "./sourceGroups";
 import "./chat.css";
+
+const USER_SCROLL_TAIL_MS = 300;
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 
 type LlmThreadRow = {
   id: string;
@@ -547,6 +562,7 @@ export default function Chat() {
   const [dropActive, setDropActive] = useState(false);
   const [live, setLive] = useState<LiveGeneration | null>(null);
   const [followBottom, setFollowBottom] = useState(true);
+  const [detailsHold, setDetailsHold] = useState(false);
   const [noteReviews, setNoteReviews] = useState<NoteReview[]>([]);
   const [appendUndo, setAppendUndo] = useState<{
     noteId: string;
@@ -584,6 +600,9 @@ export default function Chat() {
   const programmaticScroll = useRef(false);
   const scrollAnchor = useRef(0);
   const wasAtBottomRef = useRef(true);
+  const detailsHoldRef = useRef(false);
+  const userScrollUntilRef = useRef(0);
+  const scrollbarPointerRef = useRef(false);
   const liveMessageRef = useRef<HTMLElement | null>(null);
   const liveHeightRef = useRef(0);
   const logObserverRef = useRef<ResizeObserver | null>(null);
@@ -897,10 +916,21 @@ export default function Chat() {
     wasAtBottomRef.current = true;
   }, [noteProgrammaticScroll]);
 
+  const releaseDetailsHold = useCallback(() => {
+    if (!detailsHoldRef.current) return;
+    detailsHoldRef.current = false;
+    listRef.current?.classList.remove("chat-log-no-anchor");
+    setDetailsHold(false);
+  }, []);
+
   const pauseFollow = useCallback(() => {
     if (!followRef.current) return;
     followRef.current = false;
     wasAtBottomRef.current = false;
+    // Class is applied before the browser clamps or anchors this frame.
+    detailsHoldRef.current = true;
+    listRef.current?.classList.add("chat-log-no-anchor");
+    setDetailsHold(true);
     setFollowBottom(false);
   }, []);
 
@@ -1034,9 +1064,41 @@ export default function Chat() {
     };
   }, [pauseFollow, pinLogToBottom, scrollLog]);
 
+  const userScrollActive = useCallback(() => {
+    return scrollbarPointerRef.current || performance.now() < userScrollUntilRef.current;
+  }, []);
+
+  const noteUserScroll = useCallback((event: ReactSyntheticEvent) => {
+    if (event.type === "pointerdown") {
+      if (event.target !== event.currentTarget) return;
+      scrollbarPointerRef.current = true;
+    } else if (event.type === "pointerup" || event.type === "pointercancel") {
+      const wasScrollbar = scrollbarPointerRef.current;
+      scrollbarPointerRef.current = false;
+      if (!wasScrollbar) return;
+    } else if (event.type === "pointermove") {
+      if (!scrollbarPointerRef.current) return;
+    } else if (event.type === "touchmove") {
+      const target = event.target;
+      if (target instanceof Element && target.closest("summary")) return;
+    } else if (event.type === "keydown") {
+      const key = (event as ReactKeyboardEvent).key;
+      if (!SCROLL_KEYS.has(key)) return;
+    }
+    userScrollUntilRef.current = performance.now() + USER_SCROLL_TAIL_MS;
+  }, []);
+
   const onLogScroll = useCallback(() => {
     const el = listRef.current;
     if (!el || programmaticScroll.current) return;
+    const atBottom = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    // A details close clamps onto the bottom, and later growth can anchor there.
+    // Neither is a user scroll, so they must not resume following.
+    if (detailsHoldRef.current && !(userScrollActive() && atBottom)) {
+      scrollAnchor.current = el.scrollTop;
+      wasAtBottomRef.current = false;
+      return;
+    }
     const next = followAfterUserScroll({
       follow: followRef.current,
       scrollTop: el.scrollTop,
@@ -1045,14 +1107,16 @@ export default function Chat() {
       clientHeight: el.clientHeight,
     });
     scrollAnchor.current = next.anchor;
-    wasAtBottomRef.current = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    wasAtBottomRef.current = atBottom;
+    if (next.follow) releaseDetailsHold();
     if (followRef.current === next.follow) return;
     followRef.current = next.follow;
     setFollowBottom(next.follow);
-  }, []);
+  }, [releaseDetailsHold, userScrollActive]);
 
   function pinFollow() {
     followRef.current = true;
+    releaseDetailsHold();
     setFollowBottom(true);
   }
 
@@ -1974,7 +2038,18 @@ export default function Chat() {
 
       <main className="chat-main">
         <div className="chat-log-wrap">
-        <div className="chat-log" ref={listRef} onScroll={onLogScroll}>
+        <div
+          className={detailsHold ? "chat-log chat-log-no-anchor" : "chat-log"}
+          ref={listRef}
+          onScroll={onLogScroll}
+          onWheel={noteUserScroll}
+          onPointerDown={noteUserScroll}
+          onPointerMove={noteUserScroll}
+          onPointerUp={noteUserScroll}
+          onPointerCancel={noteUserScroll}
+          onTouchMove={noteUserScroll}
+          onKeyDown={noteUserScroll}
+        >
           <div className="chat-log-content" ref={logContentRef}>
           {messages.length === 0 && !showLive ? (
             <p className="chat-muted chat-empty">

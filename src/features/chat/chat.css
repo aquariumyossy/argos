@@ -319,6 +319,10 @@
   flex-direction: column;
 }
 
+.chat-log.chat-log-no-anchor {
+  overflow-anchor: none;
+}
+
 .chat-log-content {
   display: flex;
   flex-direction: column;
