@@ -869,6 +869,8 @@ pub async fn llm_send(
     let mut cut_hold = llm::thinking::CutHold::default();
     // First answer kept when a phantom retry (hint or source-block) comes back empty.
     let mut phantom_fallback: Option<PhantomOriginal> = None;
+    // Cut answer kept when a later phantom or citation retry fails.
+    let mut recovered_cut: Option<RecoveredCut> = None;
     let mut kept_source_ids: Option<std::collections::HashSet<String>> = None;
     let result_text;
 
@@ -1008,6 +1010,13 @@ pub async fn llm_send(
                     note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
                 });
             }
+            Err(_) if recovered_cut_to_keep(&recovered_cut).is_some() => {
+                // A later phantom or citation retry failed. Keep the cut answer.
+                let kept = recovered_cut.take().expect("cut answer");
+                final_reasoning = kept.reasoning;
+                result_text = kept.content;
+                break;
+            }
             Err(e) if round_limit_final => {
                 let finished = tools::round_limit_failure(max_rounds, &e);
                 result_text = finished.text;
@@ -1064,6 +1073,12 @@ pub async fn llm_send(
                 });
             }
             Ok(out) => {
+                remember_recovered_cut(
+                    &mut recovered_cut,
+                    cut_hold.thinking_off,
+                    &out.content,
+                    &out.reasoning,
+                );
                 if round_limit_final {
                     let finished = tools::round_limit_answer(Some(&out.content), max_rounds);
                     if finished.notice.is_some() {
@@ -1284,9 +1299,14 @@ pub async fn llm_send(
                         kept_source_ids = Some(original.source_ids);
                     }
                     PhantomRetryAnswer::EmptyNotice => {
-                        empty_reply = true;
-                        final_reasoning = out.reasoning;
-                        result_text = silent_end_notice(&out.finish_reason);
+                        if let Some(kept) = recovered_cut_to_keep(&recovered_cut) {
+                            final_reasoning = kept.reasoning.clone();
+                            result_text = kept.content.clone();
+                        } else {
+                            empty_reply = true;
+                            final_reasoning = out.reasoning;
+                            result_text = silent_end_notice(&out.finish_reason);
+                        }
                     }
                     PhantomRetryAnswer::Retry => {
                         final_reasoning = out.reasoning;
@@ -2667,6 +2687,30 @@ struct PhantomOriginal {
     source_ids: std::collections::HashSet<String>,
 }
 
+struct RecoveredCut {
+    content: String,
+    reasoning: String,
+}
+
+/// The cut already answered. A later retry must not replace this with a failure.
+fn remember_recovered_cut(
+    slot: &mut Option<RecoveredCut>,
+    thinking_was_cut: bool,
+    content: &str,
+    reasoning: &str,
+) {
+    if thinking_was_cut && !content.trim().is_empty() {
+        *slot = Some(RecoveredCut {
+            content: content.to_string(),
+            reasoning: reasoning.to_string(),
+        });
+    }
+}
+
+fn recovered_cut_to_keep(slot: &Option<RecoveredCut>) -> Option<&RecoveredCut> {
+    slot.as_ref().filter(|row| !row.content.trim().is_empty())
+}
+
 /// Remember the first phantom answer and the source ids that existed then.
 /// A later retry must not replace it, and must not bind a newly fetched row to it.
 fn remember_phantom_answer(
@@ -3758,6 +3802,106 @@ mod tests {
         assert_eq!(
             large_reading.tokens,
             meter_usage_tokens("役割", &large, &history, "", 2_410, budget)
+        );
+    }
+
+    fn cut_then_answer(tools: bool, body: &str) -> (llm::thinking::CutHold, Option<RecoveredCut>) {
+        let mut turn = llm::thinking::ThinkingCut::start(true, tools);
+        assert!(matches!(
+            turn.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(_)
+        ));
+        let llm::thinking::CutStep::Answer { tools: still } =
+            turn.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the thinking-off resend should answer");
+        };
+        let mut hold = llm::thinking::CutHold::default();
+        hold.observe_answer(still);
+        let mut recovered = None;
+        remember_recovered_cut(&mut recovered, hold.thinking_off, body, "");
+        (hold, recovered)
+    }
+
+    #[test]
+    fn phantom_retry_http_500_keeps_the_cut_answer() {
+        let body = "根拠は [9] です。";
+        let (hold, recovered) = cut_then_answer(true, body);
+        let err = crate::llm::http_error::chat_failure(500, "internal");
+        assert!(!llm::is_cancelled_error(&err));
+        let kept = recovered_cut_to_keep(&recovered).expect("the cut answer is saved");
+        assert_eq!(kept.content, body);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+        let mut phantom = None;
+        remember_phantom_answer(&mut phantom, body, "", &[]);
+        assert!(phantom.is_some());
+        assert!(matches!(
+            answer_after_phantom_retry(true, true),
+            PhantomRetryAnswer::Original
+        ));
+    }
+
+    #[test]
+    fn second_cap_on_the_phantom_retry_keeps_the_cut_answer() {
+        let body = "根拠は [9] です。";
+        let (hold, recovered) = cut_then_answer(false, body);
+        assert!(hold.thinking_off);
+        let tools_on = phantom_retry_tools_on(false, 0, 8, hold.tools_off, true);
+        assert!(!tools_on, "a tools-rejecting server does not resend tools");
+        let mut retry = llm::thinking::ThinkingCut::held(tools_on);
+        assert_eq!(
+            retry.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Stop { over_cap: true }
+        );
+        let err = llm::thinking::finish_runaway("thinking-runaway:32768");
+        assert!(!llm::is_cancelled_error(&err));
+        let kept = recovered_cut_to_keep(&recovered).expect("the cut answer survives the second cap");
+        assert_eq!(kept.content, body);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+
+        let mut first = llm::thinking::ThinkingCut::start(true, true);
+        assert!(matches!(
+            first.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(_)
+        ));
+        assert_eq!(
+            first.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Stop { over_cap: true }
+        );
+        let mut none = None;
+        remember_recovered_cut(&mut none, false, body, "");
+        assert!(
+            recovered_cut_to_keep(&none).is_none(),
+            "the first thinking-off resend still fails when it hits the cap"
+        );
+    }
+
+    #[test]
+    fn citation_rerequest_cap_keeps_the_uncited_cut_body() {
+        let body = "三か月以内です。";
+        let (hold, recovered) = cut_then_answer(true, body);
+        let mut phantom = None;
+        remember_phantom_answer(&mut phantom, body, "", &[]);
+        assert!(
+            phantom.is_none(),
+            "this body has no [n], so the phantom slot does not keep it"
+        );
+        let mut retry = llm::thinking::ThinkingCut::held(false);
+        assert_eq!(
+            retry.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Stop { over_cap: true }
+        );
+        let kept = recovered_cut_to_keep(&recovered).expect("the uncited body is saved");
+        assert_eq!(kept.content, body);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
         );
     }
 }
