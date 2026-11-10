@@ -64,12 +64,16 @@ export function toolSchemaTokenCount(opts: {
   return TOOL_SCHEMA_TOKENS.base;
 }
 
+/**
+ * Tokens this thread would actually send: messages, tool calls, attachments,
+ * the draft, and the tool list. Reply headroom and the tool-result allowance
+ * are reserved by the server and are not usage. Compare with `contextMeterLimit`.
+ */
 export function contextUsageTokens(parts: {
   messages: { content?: string; toolCalls?: string; kind?: string }[];
   sources: { body?: string; title?: string }[];
   draft: string;
   schemaTokens?: number;
-  limit?: number;
 }): number {
   let total = 0;
   for (const message of parts.messages) {
@@ -83,10 +87,27 @@ export function contextUsageTokens(parts: {
   if (parts.schemaTokens && parts.schemaTokens > 0) {
     total += parts.schemaTokens;
   }
-  if (parts.limit && parts.limit > 0) {
-    total += replyHeadroomTokens(parts.limit) + toolResultAllowanceTokens(parts.limit);
-  }
   return total;
+}
+
+/** Configured limit minus the reply and tool-result reserves. */
+export function contextMeterLimit(limit: number): number {
+  if (!(limit > 0)) return 0;
+  return Math.max(0, limit - replyHeadroomTokens(limit) - toolResultAllowanceTokens(limit));
+}
+
+/** Actual use against the room left after reply and tool-result reserves. */
+export function contextMeter(parts: {
+  messages: { content?: string; toolCalls?: string; kind?: string }[];
+  sources: { body?: string; title?: string }[];
+  draft: string;
+  schemaTokens?: number;
+  limit: number;
+}): { used: number; limit: number } {
+  return {
+    used: contextUsageTokens(parts),
+    limit: contextMeterLimit(parts.limit),
+  };
 }
 
 export function contextIsNearLimit(tokens: number, limit: number): boolean {

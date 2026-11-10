@@ -20,8 +20,8 @@ import { AssistantBody } from "./AssistantBody";
 import {
   CHARS_PER_TOKEN,
   contextIsNearLimit,
+  contextMeter,
   contextMeterLabel,
-  contextUsageTokens,
   toolSchemaTokenCount,
 } from "./contextEstimate";
 import { shouldRestoreDraft } from "./refusedSend";
@@ -819,9 +819,9 @@ export default function Chat() {
     });
   }, [active?.pathPrefix, searchMode, searxngUrl, webSearch]);
 
-  const estimatedTokens = useMemo(
+  const meter = useMemo(
     () =>
-      contextUsageTokens({
+      contextMeter({
         messages: messages.map((m) => ({
           content: m.content,
           toolCalls: m.toolCalls,
@@ -861,7 +861,7 @@ export default function Chat() {
     [liveCiteGroups],
   );
 
-  const nearBudget = contextIsNearLimit(estimatedTokens, maxContextTokens);
+  const nearBudget = contextIsNearLimit(meter.used, meter.limit);
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
@@ -2037,7 +2037,7 @@ export default function Chat() {
                 className={nearBudget ? "chat-char-meter warn" : "chat-char-meter"}
                 title="この会話を送るときの目安です。上限を超えると古いやり取りから落ちます。"
               >
-                {contextMeterLabel(estimatedTokens, maxContextTokens)}
+                {contextMeterLabel(meter.used, meter.limit)}
               </span>
               {nearBudget ? (
                 <span className="chat-char-meter warn">
