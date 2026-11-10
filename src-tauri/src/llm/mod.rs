@@ -773,12 +773,39 @@ fn ingest_payload(
     for (kind, text) in pieces_from_payload(&v) {
         if kind == "content" {
             parse.content.push_str(&text);
+            on_delta(kind, &text);
         } else if kind == "reasoning" {
-            parse.reasoning.push_str(&text);
+            push_reasoning(parse, &text, runaway_chars, on_delta)?;
         }
-        on_delta(kind, &text);
     }
     guard_stream(parse, runaway_chars)
+}
+
+/// Keep reasoning up to the cap. The character that would pass it stops the stream.
+fn push_reasoning(
+    parse: &mut StreamParse,
+    text: &str,
+    runaway_chars: usize,
+    on_delta: &mut impl FnMut(&str, &str),
+) -> Result<(), String> {
+    let incoming = text.chars().count();
+    let have = parse.reasoning.chars().count();
+    if runaway_chars == 0 || have.saturating_add(incoming) <= runaway_chars {
+        parse.reasoning.push_str(text);
+        on_delta("reasoning", text);
+        return Ok(());
+    }
+    let room = runaway_chars.saturating_sub(have);
+    if room > 0 {
+        let clipped: String = text.chars().take(room).collect();
+        parse.reasoning.push_str(&clipped);
+        on_delta("reasoning", &clipped);
+    }
+    Err(format!(
+        "{}{}",
+        thinking::THINKING_RUNAWAY_PREFIX,
+        parse.reasoning.chars().count()
+    ))
 }
 
 fn value_text(v: Option<&Value>) -> String {
@@ -1215,6 +1242,39 @@ mod tests {
         .unwrap();
         assert_eq!(parse.content, "あ");
         assert_eq!(got, "あ");
+    }
+
+    #[test]
+    fn reasoning_stream_stops_at_the_cap_and_does_not_emit_the_rest() {
+        let first = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "あいう" } }]
+        });
+        let second = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "えおか", "content": "答え" } }]
+        });
+        let mut buf = format!("data: {first}\ndata: {second}\n");
+        let mut parse = StreamParse::default();
+        let mut seen = String::new();
+        let err = drain_sse_lines(&mut buf, &mut parse, 4, &mut |kind, delta| {
+            assert_eq!(kind, "reasoning");
+            seen.push_str(delta);
+        })
+        .expect_err("the fifth character stops the stream");
+        assert_eq!(seen, "あいうえ");
+        assert_eq!(parse.reasoning, "あいうえ");
+        assert!(parse.content.is_empty(), "{}", parse.content);
+        assert_eq!(err, format!("{}4", thinking::THINKING_RUNAWAY_PREFIX));
+    }
+
+    #[test]
+    fn reasoning_exactly_at_the_cap_stays_open() {
+        let payload = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "あいうえ" } }]
+        });
+        let mut buf = format!("data: {payload}\n");
+        let mut parse = StreamParse::default();
+        drain_sse_lines(&mut buf, &mut parse, 4, &mut |_, _| {}).unwrap();
+        assert_eq!(parse.reasoning.chars().count(), 4);
     }
 
     #[test]

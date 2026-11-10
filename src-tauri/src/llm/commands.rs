@@ -865,6 +865,8 @@ pub async fn llm_send(
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
     let mut empty_reply = false;
+    // Set only when the thinking-cap retry actually answered.
+    let mut thinking_was_cut = false;
     // First answer kept when a phantom retry (hint or source-block) comes back empty.
     let mut phantom_fallback: Option<PhantomOriginal> = None;
     let mut kept_source_ids: Option<std::collections::HashSet<String>> = None;
@@ -893,15 +895,30 @@ pub async fn llm_send(
         }
         let turns_now = current_turns.clone();
         let mut bridge_retried = false;
+        let mut cut = llm::thinking::ThinkingCut::start(
+            llm::thinking::thinking_enabled(&settings),
+            with_tools,
+        );
+        let mut thinking_off_settings = None;
         let outcome = loop {
             let app2 = app.clone();
             let req = request_id.clone();
             let tid = thread.id.clone();
+            let request = cut.request();
+            let call_settings: &crate::db::Settings = if request.thinking_off {
+                thinking_off_settings.get_or_insert_with(|| {
+                    let mut off = settings.clone();
+                    off.llm_thinking = "off".into();
+                    off
+                })
+            } else {
+                &settings
+            };
             let streamed = llm::stream_chat(
-                &settings,
+                call_settings,
                 &turns_now,
                 cancel.clone(),
-                if with_tools {
+                if request.tools {
                     Some(&tools_schema)
                 } else {
                     None
@@ -920,7 +937,7 @@ pub async fn llm_send(
                 },
             )
             .await;
-            match streamed {
+            match &streamed {
                 Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR && !bridge_retried => {
                     bridge_retried = true;
                     emit_chat_reset(&app, &request_id, &thread.id);
@@ -929,14 +946,36 @@ pub async fn llm_send(
                 Err(e) if e == llm::thinking::THINKING_BRIDGE_ERROR => {
                     break Err(llm::thinking::thinking_bridge_error());
                 }
-                Err(e) if e.starts_with(llm::thinking::THINKING_RUNAWAY_PREFIX) => {
-                    let chars = e
-                        .strip_prefix(llm::thinking::THINKING_RUNAWAY_PREFIX)
-                        .unwrap_or("");
-                    let n: usize = chars.parse().unwrap_or(0);
-                    break Err(llm::thinking::runaway_thinking_error(n));
+                _ => {}
+            }
+            let reply = cut_reply(&streamed);
+            let step = if cut.in_recovery() || matches!(reply, llm::thinking::CutReply::OverCap) {
+                cut.observe(reply)
+            } else {
+                llm::thinking::CutStep::Pass
+            };
+            match step {
+                llm::thinking::CutStep::Pass => break streamed,
+                llm::thinking::CutStep::Again(_) => {
+                    // The cap stopped this thinking stream. Ask again from the
+                    // materials already in the turn. This is not a tool round.
+                    emit_chat_reset(&app, &request_id, &thread.id);
+                    continue;
                 }
-                other => break other,
+                llm::thinking::CutStep::Answer { tools } => {
+                    if !tools {
+                        use_tools = false;
+                    }
+                    if streamed.is_ok() {
+                        thinking_was_cut = true;
+                    }
+                    break streamed;
+                }
+                llm::thinking::CutStep::Stop { over_cap: true } => {
+                    let err = streamed.as_ref().err().map(String::as_str).unwrap_or("");
+                    break Err(llm::thinking::finish_runaway(err));
+                }
+                llm::thinking::CutStep::Stop { over_cap: false } => break streamed,
             }
         };
 
@@ -1270,6 +1309,11 @@ pub async fn llm_send(
     };
     if let Some(notice) = round_limit_aside.as_deref() {
         let _ = state.db.insert_llm_notice(&thread.id, notice);
+    }
+    if thinking_was_cut {
+        let _ = state
+            .db
+            .insert_llm_notice(&thread.id, llm::thinking::THINKING_CUT_NOTICE);
     }
     let unset_notice = llm::thinking::thinking_budget_unset_notice();
     let already_told = history.iter().any(|message| {
@@ -2374,6 +2418,20 @@ pub fn llm_attached_file_path(
     Err("ファイルが見つかりません。".into())
 }
 
+fn cut_reply(result: &Result<llm::StreamOutcome, String>) -> llm::thinking::CutReply {
+    match result {
+        Err(e) if e.starts_with(llm::thinking::THINKING_RUNAWAY_PREFIX) => {
+            llm::thinking::CutReply::OverCap
+        }
+        Err(e) if llm::is_tools_unsupported_error(e) => llm::thinking::CutReply::ToolsRejected,
+        Err(_) => llm::thinking::CutReply::Other,
+        Ok(out) if !out.tool_calls.is_empty() || out.finish_reason == "tool_calls" => {
+            llm::thinking::CutReply::NeedsTools
+        }
+        Ok(_) => llm::thinking::CutReply::Answer,
+    }
+}
+
 /// A phantom [n] may call tools again only while rounds remain.
 /// At the cap the retry stays tool-free, so it is not the round-limit final answer.
 fn phantom_retry_enables_tools(unlimited_rounds: bool, rounds: usize, max_rounds: usize) -> bool {
@@ -3201,6 +3259,57 @@ mod tests {
             .insert_llm_source(&thread.id, "attach", "later.txt", "later", "p2", "続き", "")
             .unwrap();
         assert_eq!(second.cite_no, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cut_reply_notices_a_cap_a_tool_call_and_a_tools_rejection() {
+        let runaway = Err(format!("{}12", llm::thinking::THINKING_RUNAWAY_PREFIX));
+        assert_eq!(cut_reply(&runaway), llm::thinking::CutReply::OverCap);
+        let rejected = Err(crate::llm::http_error::TOOLS_UNSUPPORTED_ERROR.to_string());
+        assert_eq!(cut_reply(&rejected), llm::thinking::CutReply::ToolsRejected);
+        assert_eq!(
+            cut_reply(&Err("cancelled".into())),
+            llm::thinking::CutReply::Other
+        );
+        let answer = llm::StreamOutcome {
+            content: "答え".into(),
+            ..llm::StreamOutcome::default()
+        };
+        assert_eq!(cut_reply(&Ok(answer)), llm::thinking::CutReply::Answer);
+        let tools = llm::StreamOutcome {
+            content: String::new(),
+            tool_calls: vec![llm::ToolCall {
+                id: "c".into(),
+                name: "search_index".into(),
+                arguments: "{}".into(),
+            }],
+            ..llm::StreamOutcome::default()
+        };
+        assert_eq!(cut_reply(&Ok(tools)), llm::thinking::CutReply::NeedsTools);
+        let finish = llm::StreamOutcome {
+            finish_reason: "tool_calls".into(),
+            ..llm::StreamOutcome::default()
+        };
+        assert_eq!(cut_reply(&Ok(finish)), llm::thinking::CutReply::NeedsTools);
+    }
+
+    #[test]
+    fn thinking_cut_notice_is_stored_as_a_chat_notice() {
+        let (dir, db) = temp_db("think-cut");
+        let thread = db.create_llm_thread("会話", true).unwrap();
+        let row = db
+            .insert_llm_notice(&thread.id, llm::thinking::THINKING_CUT_NOTICE)
+            .unwrap();
+        assert_eq!(row.kind, crate::db::LLM_MESSAGE_NOTICE);
+        assert_eq!(row.role, "assistant");
+        assert_eq!(
+            row.content,
+            "考えが長くなったため途中で打ち切り、集めた資料から答えています"
+        );
+        let history = db.list_llm_messages(&thread.id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind, "notice");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
