@@ -560,6 +560,7 @@ export default function Chat() {
   const [listQuery, setListQuery] = useState("");
   const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const logContentRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const bootstrappingRef = useRef(false);
   const activeIdRef = useRef<string | null>(null);
@@ -877,6 +878,19 @@ export default function Chat() {
     el.scrollTop = el.scrollHeight;
     scrollAnchor.current = el.scrollTop;
   }, [noteProgrammaticScroll]);
+
+  useEffect(() => {
+    const content = logContentRef.current;
+    if (!content || typeof ResizeObserver === "undefined") return;
+    let lastHeight = content.offsetHeight;
+    const observer = new ResizeObserver(() => {
+      const next = content.offsetHeight;
+      if (next > lastHeight) scrollLog();
+      lastHeight = next;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [scrollLog]);
 
   const onLogScroll = useCallback(() => {
     const el = listRef.current;
@@ -1811,6 +1825,7 @@ export default function Chat() {
       <main className="chat-main">
         <div className="chat-log-wrap">
         <div className="chat-log" ref={listRef} onScroll={onLogScroll}>
+          <div className="chat-log-content" ref={logContentRef}>
           {messages.length === 0 && !showLive ? (
             <p className="chat-muted chat-empty">
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
@@ -1980,6 +1995,7 @@ export default function Chat() {
           {ocrBusy && !busy ? (
             <p className="chat-tool-hint">画像を読み取っています…</p>
           ) : null}
+          </div>
         </div>
         {!followBottom ? (
           <button type="button" className="chat-jump-latest" onClick={jumpToLatest}>

@@ -103,6 +103,30 @@ async function emitDelta(threadId: string, text: string, kind = "content") {
   });
 }
 
+const contentObservers: ResizeObserverCallback[] = [];
+
+class ContentResizeObserver {
+  constructor(private readonly callback: ResizeObserverCallback) {}
+  observe() {
+    contentObservers.push(this.callback);
+  }
+  unobserve() {}
+  disconnect() {
+    const index = contentObservers.indexOf(this.callback);
+    if (index >= 0) contentObservers.splice(index, 1);
+  }
+}
+
+function notifyContentResize(content: HTMLElement, height: number) {
+  Object.defineProperty(content, "offsetHeight", {
+    configurable: true,
+    get: () => height,
+  });
+  const callback = contentObservers[contentObservers.length - 1];
+  if (!callback) throw new Error("content ResizeObserver is not attached");
+  callback([], {} as ResizeObserver);
+}
+
 /** jsdom does not clamp scrollTop. A real log cannot scroll past scrollHeight - clientHeight. */
 function installLogGeometry(
   log: HTMLElement,
@@ -129,6 +153,10 @@ function installLogGeometry(
   });
   return {
     maxTop,
+    scrollHeight: () => scrollHeight,
+    setScrollHeight(next: number) {
+      scrollHeight = next;
+    },
     resize(next: { scrollHeight?: number; clientHeight?: number }) {
       if (next.scrollHeight != null) scrollHeight = next.scrollHeight;
       if (next.clientHeight != null) clientHeight = next.clientHeight;
@@ -147,6 +175,8 @@ async function renderChat() {
 }
 
 beforeEach(() => {
+  contentObservers.length = 0;
+  vi.stubGlobal("ResizeObserver", ContentResizeObserver);
   messagesA = [originalUser];
   releaseSend = () => {};
   listeners.clear();
@@ -216,6 +246,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
 });
 
@@ -441,5 +472,35 @@ describe("scroll follow during generation", () => {
     expect(jump()).toBeTruthy();
     await emitDelta("thread-a", "矢印");
     expect(log.scrollTop).toBe(box.maxTop() - 16);
+  });
+
+  it("pins after streamed text grows late, and stays put when follow is off", async () => {
+    const { log, box } = await startPinnedLog();
+    const content = log.querySelector(".chat-log-content");
+    if (!(content instanceof HTMLElement)) throw new Error("log content missing");
+    const oldBottom = log.scrollTop;
+    vi.useFakeTimers();
+    await emitDelta("thread-a", `${"新しい行\n".repeat(12)}末尾`);
+    expect(log.scrollTop).toBe(oldBottom);
+    await act(async () => {
+      vi.advanceTimersByTime(50);
+    });
+    box.setScrollHeight(box.scrollHeight() + 285);
+    notifyContentResize(content, box.scrollHeight());
+    expect(log.scrollTop).toBe(box.maxTop());
+    expect(jump()).toBeNull();
+    await act(async () => {});
+
+    log.scrollTop = box.maxTop() - 40;
+    fireEvent.scroll(log);
+    const parked = log.scrollTop;
+    expect(jump()).toBeTruthy();
+    await emitDelta("thread-a", `${"さらに\n".repeat(25)}下`);
+    await act(async () => {
+      vi.advanceTimersByTime(50);
+    });
+    box.setScrollHeight(box.scrollHeight() + 621);
+    notifyContentResize(content, box.scrollHeight());
+    expect(log.scrollTop).toBe(parked);
   });
 });
