@@ -6,7 +6,7 @@ import {
   WARN_RATIO,
   contextIsNearLimit,
   contextMeterLabel,
-  contextUsageTokens,
+  contextMeterLimit,
   estimateTokens,
   messageTokens,
   replyHeadroomTokens,
@@ -29,21 +29,6 @@ describe("context tokens", () => {
     );
   });
 
-  it("sums messages, sources, and the draft", () => {
-    const total = contextUsageTokens({
-      messages: [{ content: "質問" }, { content: "答え", toolCalls: "[]" }],
-      sources: [{ title: "民法", body: "第一条" }],
-      draft: "続き",
-    });
-    expect(total).toBe(
-      messageTokens({ content: "質問" }) +
-        messageTokens({ content: "答え", toolCalls: "[]" }) +
-        estimateTokens("民法") +
-        estimateTokens("第一条") +
-        estimateTokens("続き"),
-    );
-  });
-
   it("warns from 80 percent of the limit", () => {
     expect(WARN_RATIO).toBe(0.8);
     expect(contextIsNearLimit(79, 100)).toBe(false);
@@ -53,9 +38,10 @@ describe("context tokens", () => {
 
   it("labels the meter in tokens", () => {
     expect(contextMeterLabel(12345, 131072)).toBe("12,345 / 131,072 トークン");
+    expect(contextMeterLabel(null, 78000)).toBe("— / 78,000 トークン");
   });
 
-  it("counts schema text the same way as other text and reserves reply and tool room", () => {
+  it("counts schema text the same way as other text", () => {
     expect(REPLY_HEADROOM_RATIO).toBe(0.1);
     expect(toolSchemaTokens("あ".repeat(16))).toBe(10);
     expect(toolSchemaTokens("")).toBe(0);
@@ -65,40 +51,20 @@ describe("context tokens", () => {
       remoteIndex: false,
       remoteOnly: false,
     });
-    const total = contextUsageTokens({
-      messages: [{ content: "質問" }],
-      sources: [],
-      draft: "",
-      schemaTokens: schema,
-      limit,
-    });
-    expect(total).toBe(
-      messageTokens({ content: "質問" }) +
-        schema +
-        replyHeadroomTokens(limit) +
-        toolResultAllowanceTokens(limit),
-    );
     expect(replyHeadroomTokens(limit)).toBe(26_000);
     expect(toolResultAllowanceTokens(limit)).toBe(65_000);
     expect(toolResultAllowanceTokens(limit)).toBe(Math.floor(limit * TOOL_RESULT_BUDGET_RATIO));
     expect(schema).toBeGreaterThan(0);
   });
 
-  it("leaves app notices out of the estimate", () => {
-    const withNotice = contextUsageTokens({
-      messages: [
-        { content: "質問" },
-        { content: "ツール往復が上限の 8 回に達したため、続きの操作はせず、ここまでの資料で答えています。", kind: "notice" },
-        { content: "答え" },
-      ],
-      sources: [],
-      draft: "",
-    });
-    const without = contextUsageTokens({
-      messages: [{ content: "質問" }, { content: "答え" }],
-      sources: [],
-      draft: "",
-    });
-    expect(withNotice).toBe(without);
+  it("sets the denominator to the limit minus unused reserves", () => {
+    const limit = 120_000;
+    expect(replyHeadroomTokens(limit)).toBe(12_000);
+    expect(toolResultAllowanceTokens(limit)).toBe(30_000);
+    expect(contextMeterLimit(limit)).toBe(78_000);
+    expect(contextMeterLimit(0)).toBe(0);
+    expect(contextMeterLabel(2_410, contextMeterLimit(limit))).toBe("2,410 / 78,000 トークン");
+    expect(contextIsNearLimit(62_400, contextMeterLimit(limit))).toBe(true);
+    expect(contextIsNearLimit(62_399, contextMeterLimit(limit))).toBe(false);
   });
 });

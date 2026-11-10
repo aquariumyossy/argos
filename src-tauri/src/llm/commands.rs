@@ -8,9 +8,11 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
-    estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn,
+    estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
+    meter_usage_tokens,
     parse_cited_nos, silent_end_notice, sources_for_consumed, tool_schema_tokens, ChatTurn,
-    PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
+    ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
+    STOP_TOOLS_HINT,
 };
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
@@ -606,6 +608,115 @@ pub fn llm_cancel(app: AppHandle, state: State<'_, Arc<AppState>>) {
     }
 }
 
+struct ChatRequestPlan {
+    system: String,
+    web_search: bool,
+    tools_schema: serde_json::Value,
+    schema_tokens: usize,
+    split: Option<ContextBudget>,
+    prompt_budget: usize,
+    tool_budget: usize,
+}
+
+/// System text, tool schema, and the message budget `llm_send` passes to `assemble_turns`.
+fn plan_chat_request(
+    state: &AppState,
+    settings: &crate::db::Settings,
+    thread: &LlmThreadRow,
+    content: &str,
+    web_search: bool,
+    sources: &[LlmSourceRow],
+    extra_system: Option<&str>,
+) -> ChatRequestPlan {
+    let mut system = llm::system_for_request(settings);
+    llm::append_diagram_hint(&mut system, content);
+    // Without this the model reads an empty result as "nothing exists" and keeps
+    // rephrasing, instead of reporting that the folder does not contain the answer.
+    if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
+        system.push_str(&line);
+    }
+    let bound_note = {
+        let nid = thread.note_id.trim();
+        if nid.is_empty() {
+            None
+        } else {
+            state.db.get_note(nid).ok().flatten()
+        }
+    };
+    if let Some(note) = &bound_note {
+        system.push_str(&tools::format_note_target_system_line(
+            &note.title,
+            &note.memo,
+        ));
+    }
+    system.push_str(&tools::format_search_date_system_line(
+        settings.mail_days_back,
+    ));
+    system.push_str(&tools::format_calendar_system_line());
+    let web_search = web_search && !settings.searxng_url.trim().is_empty();
+    if web_search {
+        system.push_str(&tools::format_web_search_system_line());
+    }
+    let remote_index =
+        tools::include_hybrid_remote_system_line(&settings.search_mode, &thread.path_prefix);
+    if remote_index {
+        system.push_str(&tools::format_remote_index_system_line());
+    }
+    if let Some(line) = extra_system {
+        system.push_str(line);
+    }
+    let remote_only = tools::is_remote_only_thread(&thread.path_prefix);
+    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only);
+    let schema_tokens = tool_schema_tokens(&tools_schema);
+    let full_limit = settings.llm_max_context_tokens as usize;
+    let required = required_prompt_tokens(&system, content, sources);
+    let Some(split) = context_budget(full_limit, schema_tokens, required) else {
+        return ChatRequestPlan {
+            system,
+            web_search,
+            tools_schema,
+            schema_tokens,
+            split: None,
+            prompt_budget: full_limit.max(1),
+            tool_budget: 0,
+        };
+    };
+    // Reserves shrink when this question needs the room. The schema stays counted.
+    let mut prompt_budget = split.messages;
+    let mut tool_budget = split.tool_allowance;
+    let excerpt = crate::llm::context::pending_attachment_borrow(
+        &system,
+        content,
+        sources,
+        prompt_budget,
+    )
+    .min(tool_budget);
+    prompt_budget = prompt_budget.saturating_add(excerpt);
+    tool_budget = tool_budget.saturating_sub(excerpt);
+    ChatRequestPlan {
+        system,
+        web_search,
+        tools_schema,
+        schema_tokens,
+        split: Some(split),
+        prompt_budget,
+        tool_budget,
+    }
+}
+
+fn blank_llm_thread() -> LlmThreadRow {
+    LlmThreadRow {
+        id: String::new(),
+        title: String::new(),
+        search_enabled: true,
+        path_prefix: String::new(),
+        note_id: String::new(),
+        sort_order: 0,
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
 #[tauri::command]
 pub async fn llm_send(
     app: AppHandle,
@@ -679,48 +790,21 @@ pub async fn llm_send(
         .list_llm_sources(&thread.id)
         .map_err(|e| e.to_string())?;
     let settings = state.settings.read().clone();
-    let max_tokens = settings.llm_max_context_tokens as usize;
     let thread_scope = Some(thread.path_prefix.trim().to_string()).filter(|s| !s.is_empty());
-    let mut system = llm::system_for_request(&settings);
-    llm::append_diagram_hint(&mut system, &content);
-    // Without this the model reads an empty result as "nothing exists" and keeps
-    // rephrasing, instead of reporting that the folder does not contain the answer.
-    if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
-        system.push_str(&line);
-    }
-    let bound_note = {
-        let nid = thread.note_id.trim();
-        if nid.is_empty() {
-            None
-        } else {
-            state.db.get_note(nid).ok().flatten()
-        }
-    };
-    if let Some(n) = &bound_note {
-        system.push_str(&tools::format_note_target_system_line(&n.title, &n.memo));
-    }
-    system.push_str(&tools::format_search_date_system_line(
-        settings.mail_days_back,
-    ));
-    system.push_str(&tools::format_calendar_system_line());
-    let web_search = web_search && !settings.searxng_url.trim().is_empty();
-    if web_search {
-        system.push_str(&tools::format_web_search_system_line());
-    }
-    let remote_index =
-        tools::include_hybrid_remote_system_line(&settings.search_mode, &thread.path_prefix);
-    if remote_index {
-        system.push_str(&tools::format_remote_index_system_line());
-    }
-    if let Some(line) = paste.system_line() {
-        system.push_str(&line);
-    }
-    let remote_only_scope = tools::is_remote_only_thread(&thread.path_prefix);
-    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only_scope);
-    let schema_tokens = tool_schema_tokens(&tools_schema);
-    let full_limit = max_tokens;
-    let required = required_prompt_tokens(&system, &content, &sources);
-    let Some(split) = context_budget(full_limit, schema_tokens, required) else {
+    let paste_line = paste.system_line();
+    let plan = plan_chat_request(
+        &state,
+        &settings,
+        &thread,
+        &content,
+        web_search,
+        &sources,
+        paste_line.as_deref(),
+    );
+    let system = plan.system;
+    let web_search = plan.web_search;
+    let tools_schema = plan.tools_schema;
+    let Some(split) = plan.split else {
         discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
             thread,
@@ -729,18 +813,8 @@ pub async fn llm_send(
             crate::llm::http_error::QUESTION_DOES_NOT_FIT_ERROR,
         ));
     };
-    // Reserves shrink when this question needs the room. The schema stays counted.
-    let mut prompt_budget = split.messages;
-    let mut tool_budget = split.tool_allowance;
-    let excerpt = crate::llm::context::pending_attachment_borrow(
-        &system,
-        &content,
-        &sources,
-        prompt_budget,
-    )
-    .min(tool_budget);
-    prompt_budget = prompt_budget.saturating_add(excerpt);
-    tool_budget = tool_budget.saturating_sub(excerpt);
+    let prompt_budget = plan.prompt_budget;
+    let tool_budget = plan.tool_budget;
     // Messages plus the tool allowance leave the reply reserve untouched.
     let inject_budget = split.messages.saturating_add(split.tool_allowance).max(1);
     let (assembled, stats) = assemble_turns(&system, &sources, &history, prompt_budget);
@@ -1388,6 +1462,70 @@ fn attach_thread_title(explicit: Option<&str>, items: &[LlmAttachItem]) -> Strin
         }
     }
     "新しい会話".into()
+}
+
+/// Size of the next request: assembled turns, without the system prompt, plus the tool schema.
+/// Runs off the UI thread. An empty draft is measured as one new question.
+#[tauri::command]
+pub async fn llm_context_meter(
+    state: State<'_, Arc<AppState>>,
+    thread_id: Option<String>,
+    draft: String,
+    web_search: Option<bool>,
+) -> Result<usize, String> {
+    let state = state.inner().clone();
+    let thread_id = thread_id.unwrap_or_default();
+    let web_search = web_search.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        measure_context_meter(state, thread_id, draft, web_search)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn measure_context_meter(
+    state: Arc<AppState>,
+    thread_id: String,
+    draft: String,
+    web_search: bool,
+) -> Result<usize, String> {
+    let question = meter_question(&draft).to_string();
+    let settings = state.settings.read().clone();
+    let (thread, history, sources) = if thread_id.trim().is_empty() {
+        (blank_llm_thread(), Vec::new(), Vec::new())
+    } else {
+        let thread = state
+            .db
+            .get_llm_thread(thread_id.trim())
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "会話が見つかりません".to_string())?;
+        let history = state
+            .db
+            .list_llm_messages(&thread.id)
+            .map_err(|e| e.to_string())?;
+        let sources = state
+            .db
+            .list_llm_sources(&thread.id)
+            .map_err(|e| e.to_string())?;
+        (thread, history, sources)
+    };
+    let plan = plan_chat_request(
+        &state,
+        &settings,
+        &thread,
+        &question,
+        web_search,
+        &sources,
+        None,
+    );
+    Ok(meter_usage_tokens(
+        &plan.system,
+        &sources,
+        &history,
+        &draft,
+        plan.schema_tokens,
+        plan.prompt_budget,
+    ))
 }
 
 #[tauri::command]

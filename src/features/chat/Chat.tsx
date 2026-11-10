@@ -17,13 +17,8 @@ import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
-import {
-  CHARS_PER_TOKEN,
-  contextIsNearLimit,
-  contextMeterLabel,
-  contextUsageTokens,
-  toolSchemaTokenCount,
-} from "./contextEstimate";
+import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
+import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
@@ -806,34 +801,17 @@ export default function Chat() {
     scrollLog();
   }, [messages, stream, thinking, toolHint, busy, scrollLog]);
 
-  const schemaTokens = useMemo(() => {
-    const remoteOnly = (active?.pathPrefix ?? "")
-      .split(/\r?\n/)
-      .some((line) => line.trim() === "source:remote");
-    const remoteIndex =
-      (searchMode === "hybrid" || searchMode === "remote") && !remoteOnly;
-    return toolSchemaTokenCount({
-      webSearch: webSearch && !!searxngUrl,
-      remoteIndex,
-      remoteOnly,
-    });
-  }, [active?.pathPrefix, searchMode, searxngUrl, webSearch]);
-
-  const estimatedTokens = useMemo(
-    () =>
-      contextUsageTokens({
-        messages: messages.map((m) => ({
-          content: m.content,
-          toolCalls: m.toolCalls,
-          kind: m.kind,
-        })),
-        sources: sources.map((s) => ({ body: s.body, title: s.title })),
-        draft,
-        schemaTokens,
-        limit: maxContextTokens,
-      }),
-    [sources, messages, draft, schemaTokens, maxContextTokens],
-  );
+  const meter = useChatContextMeter({
+    threadId: active?.id ?? "",
+    noteId: active?.noteId ?? "",
+    pathPrefix: active?.pathPrefix ?? "",
+    draft,
+    webSearch: webSearch && !!searxngUrl,
+    maxContextTokens,
+    searchMode,
+    messages,
+    sources,
+  });
 
   const pendingSources = useMemo(
     () => sources.filter(isPendingSource),
@@ -861,7 +839,7 @@ export default function Chat() {
     [liveCiteGroups],
   );
 
-  const nearBudget = contextIsNearLimit(estimatedTokens, maxContextTokens);
+  const nearBudget = meter.warn;
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
@@ -2037,7 +2015,7 @@ export default function Chat() {
                 className={nearBudget ? "chat-char-meter warn" : "chat-char-meter"}
                 title="この会話を送るときの目安です。上限を超えると古いやり取りから落ちます。"
               >
-                {contextMeterLabel(estimatedTokens, maxContextTokens)}
+                {contextMeterLabel(meter.used, meter.limit)}
               </span>
               {nearBudget ? (
                 <span className="chat-char-meter warn">

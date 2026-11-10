@@ -462,6 +462,7 @@ pub fn run() {
             llm::commands::llm_set_active_thread,
             llm::commands::llm_list_messages,
             llm::commands::llm_list_sources,
+            llm::commands::llm_context_meter,
             llm::commands::llm_attach_sources,
             llm::commands::llm_attach_files,
             llm::commands::llm_retry_ocr,

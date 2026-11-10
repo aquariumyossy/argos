@@ -64,36 +64,22 @@ export function toolSchemaTokenCount(opts: {
   return TOOL_SCHEMA_TOKENS.base;
 }
 
-export function contextUsageTokens(parts: {
-  messages: { content?: string; toolCalls?: string; kind?: string }[];
-  sources: { body?: string; title?: string }[];
-  draft: string;
-  schemaTokens?: number;
-  limit?: number;
-}): number {
-  let total = 0;
-  for (const message of parts.messages) {
-    if (message.kind === "notice") continue;
-    total += messageTokens(message);
-  }
-  for (const source of parts.sources) {
-    total += estimateTokens(source.body || "") + estimateTokens(source.title || "");
-  }
-  total += estimateTokens(parts.draft);
-  if (parts.schemaTokens && parts.schemaTokens > 0) {
-    total += parts.schemaTokens;
-  }
-  if (parts.limit && parts.limit > 0) {
-    total += replyHeadroomTokens(parts.limit) + toolResultAllowanceTokens(parts.limit);
-  }
-  return total;
+/**
+ * Denominator of the chat meter: the configured limit minus the reply headroom
+ * and the tool-result allowance. The numerator is the next request's size from
+ * `llm_context_meter`, which measures `assemble_turns`.
+ */
+export function contextMeterLimit(limit: number): number {
+  if (!(limit > 0)) return 0;
+  return Math.max(0, limit - replyHeadroomTokens(limit) - toolResultAllowanceTokens(limit));
 }
 
 export function contextIsNearLimit(tokens: number, limit: number): boolean {
   return limit > 0 && tokens / limit >= WARN_RATIO;
 }
 
-export function contextMeterLabel(tokens: number, limit: number): string {
+export function contextMeterLabel(tokens: number | null, limit: number): string {
   const jp = (n: number) => n.toLocaleString("ja-JP");
-  return `${jp(tokens)} / ${jp(limit)} トークン`;
+  const used = tokens == null ? "—" : jp(tokens);
+  return `${used} / ${jp(limit)} トークン`;
 }
