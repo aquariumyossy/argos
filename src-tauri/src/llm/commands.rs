@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
@@ -147,7 +147,7 @@ async fn execute_tool_off_runtime(
     }
 }
 
-fn emit_chat_reset(app: &AppHandle, request_id: &str, thread_id: &str) {
+fn emit_chat_reset<R: Runtime>(app: &AppHandle<R>, request_id: &str, thread_id: &str) {
     let _ = app.emit(
         "llm-chat-delta",
         LlmChatDelta {
@@ -391,7 +391,7 @@ pub struct NoteReviewEvent {
     pub note_id: String,
 }
 
-fn emit_note_review(app: &AppHandle, thread_id: &str, note_id: &str) {
+fn emit_note_review<R: Runtime>(app: &AppHandle<R>, thread_id: &str, note_id: &str) {
     let _ = app.emit(
         "llm-note-review",
         NoteReviewEvent {
@@ -401,7 +401,12 @@ fn emit_note_review(app: &AppHandle, thread_id: &str, note_id: &str) {
     );
 }
 
-fn after_llm_note_write(app: &AppHandle, state: &AppState, thread_id: &str, note_id: &str) {
+fn after_llm_note_write<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    thread_id: &str,
+    note_id: &str,
+) {
     crate::commands::emit_note_updated_from(app, note_id, "memo", "llm");
     emit_note_review(app, thread_id, note_id);
     if !crate::notes_window_visible(app) {
@@ -725,6 +730,16 @@ pub async fn llm_send(
     content: String,
     web_search: Option<bool>,
 ) -> Result<LlmSendResult, String> {
+    llm_send_inner(&app, state.inner(), thread_id, content, web_search).await
+}
+
+async fn llm_send_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &Arc<AppState>,
+    thread_id: Option<String>,
+    content: String,
+    web_search: Option<bool>,
+) -> Result<LlmSendResult, String> {
     let web_search = web_search.unwrap_or(false);
     let content = content.trim().to_string();
     if content.is_empty() {
@@ -765,7 +780,7 @@ pub async fn llm_send(
         .map_err(|e| e.to_string())?;
 
     let paste = if crate::llm::fetch_url::message_may_contain_url(&content) {
-        let state_for_fetch = state.inner().clone();
+        let state_for_fetch = Arc::clone(state);
         let tid = thread.id.clone();
         let msg = content.clone();
         tokio::task::spawn_blocking(move || {
@@ -838,7 +853,7 @@ pub async fn llm_send(
     persist_image_group_cites(&state.db, &sources, &consumed);
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
-    let state_arc = state.inner().clone();
+    let state_arc = Arc::clone(state);
     if !state.start_llm(
         request_id.clone(),
         thread.id.clone(),
@@ -1007,14 +1022,26 @@ pub async fn llm_send(
                     thinking_budget_state: budget_fields(&settings.llm_base_url).0,
                     thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
-                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+                    note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
                 });
             }
-            Err(_) if recovered_cut_to_keep(&recovered_cut).is_some() => {
-                // A later phantom or citation retry failed. Keep the cut answer.
-                let kept = recovered_cut.take().expect("cut answer");
-                final_reasoning = kept.reasoning;
-                result_text = kept.content;
+            Err(_)
+                if recovered_cut_to_keep(&recovered_cut).is_some() || phantom_fallback.is_some() =>
+            {
+                // A later phantom or citation retry failed. Keep the cut answer,
+                // and only the sources that existed when it was written.
+                if let Some(original) = phantom_fallback.take() {
+                    final_reasoning = original.reasoning;
+                    result_text = original.content;
+                    kept_source_ids = Some(original.source_ids);
+                } else if let Some(kept) = recovered_cut.take() {
+                    final_reasoning = kept.reasoning;
+                    result_text = kept.content;
+                    kept_source_ids = Some(kept.source_ids);
+                } else {
+                    final_reasoning = String::new();
+                    result_text = String::new();
+                }
                 break;
             }
             Err(e) if round_limit_final => {
@@ -1069,15 +1096,24 @@ pub async fn llm_send(
                     thinking_budget_state: budget_fields(&settings.llm_base_url).0,
                     thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
                     warning,
-                    note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+                    note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
                 });
             }
             Ok(out) => {
+                let source_ids = state
+                    .db
+                    .list_llm_sources(&thread.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect();
                 remember_recovered_cut(
                     &mut recovered_cut,
                     cut_hold.thinking_off,
                     &out.content,
                     &out.reasoning,
+                    !out.tool_calls.is_empty(),
+                    source_ids,
                 );
                 if round_limit_final {
                     let finished = tools::round_limit_answer(Some(&out.content), max_rounds);
@@ -1182,7 +1218,7 @@ pub async fn llm_send(
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
                         if let Some(nid) = exec.wrote_note_id.clone() {
-                            after_llm_note_write(&app, state.inner().as_ref(), &thread.id, &nid);
+                            after_llm_note_write(&app, state.as_ref(), &thread.id, &nid);
                             if !wrote_note_ids.iter().any(|x| x == &nid) {
                                 wrote_note_ids.push(nid);
                             }
@@ -1299,9 +1335,14 @@ pub async fn llm_send(
                         kept_source_ids = Some(original.source_ids);
                     }
                     PhantomRetryAnswer::EmptyNotice => {
-                        if let Some(kept) = recovered_cut_to_keep(&recovered_cut) {
+                        if let Some(original) = phantom_fallback.take() {
+                            final_reasoning = original.reasoning;
+                            result_text = original.content;
+                            kept_source_ids = Some(original.source_ids);
+                        } else if let Some(kept) = recovered_cut_to_keep(&recovered_cut) {
                             final_reasoning = kept.reasoning.clone();
                             result_text = kept.content.clone();
+                            kept_source_ids = Some(kept.source_ids.clone());
                         } else {
                             empty_reply = true;
                             final_reasoning = out.reasoning;
@@ -1381,7 +1422,7 @@ pub async fn llm_send(
         thinking_budget_state: budget_fields(&settings.llm_base_url).0,
         thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
         warning,
-        note_writes: note_write_notices(state.inner().as_ref(), &wrote_note_ids),
+        note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
     })
 }
 
@@ -1412,7 +1453,7 @@ pub struct LlmAttachResult {
     pub created_thread: bool,
 }
 
-fn emit_sources_updated(app: &AppHandle, thread_id: &str) {
+fn emit_sources_updated<R: Runtime>(app: &AppHandle<R>, thread_id: &str) {
     let _ = app.emit(
         "llm-sources-updated",
         LlmSourcesUpdated {
@@ -1421,7 +1462,7 @@ fn emit_sources_updated(app: &AppHandle, thread_id: &str) {
     );
 }
 
-fn emit_ocr_status(app: &AppHandle, thread_id: &str, active: bool) {
+fn emit_ocr_status<R: Runtime>(app: &AppHandle<R>, thread_id: &str, active: bool) {
     let _ = app.emit(
         "llm-ocr-status",
         LlmOcrStatus {
@@ -1431,14 +1472,14 @@ fn emit_ocr_status(app: &AppHandle, thread_id: &str, active: bool) {
     );
 }
 
-fn kick_pending_ocr(app: &AppHandle, state: Arc<AppState>) {
+fn kick_pending_ocr<R: Runtime>(app: &AppHandle<R>, state: Arc<AppState>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         run_ocr_queue(app, state).await;
     });
 }
 
-async fn run_ocr_queue(app: AppHandle, state: Arc<AppState>) {
+async fn run_ocr_queue<R: Runtime>(app: AppHandle<R>, state: Arc<AppState>) {
     loop {
         if state.is_llm_busy() {
             return;
@@ -1454,7 +1495,11 @@ async fn run_ocr_queue(app: AppHandle, state: Arc<AppState>) {
     }
 }
 
-async fn run_ocr_for_thread(app: &AppHandle, state: Arc<AppState>, thread_id: String) {
+async fn run_ocr_for_thread<R: Runtime>(
+    app: &AppHandle<R>,
+    state: Arc<AppState>,
+    thread_id: String,
+) {
     let request_id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     if !state.start_llm(request_id.clone(), thread_id.clone(), "ocr", cancel.clone()) {
@@ -2690,19 +2735,25 @@ struct PhantomOriginal {
 struct RecoveredCut {
     content: String,
     reasoning: String,
+    /// Sources that already existed when this answer was produced.
+    source_ids: std::collections::HashSet<String>,
 }
 
 /// The cut already answered. A later retry must not replace this with a failure.
+/// Text that rides along with a tool call is a preamble, not a new answer.
 fn remember_recovered_cut(
     slot: &mut Option<RecoveredCut>,
     thinking_was_cut: bool,
     content: &str,
     reasoning: &str,
+    has_tool_calls: bool,
+    source_ids: std::collections::HashSet<String>,
 ) {
-    if thinking_was_cut && !content.trim().is_empty() {
+    if thinking_was_cut && !has_tool_calls && !content.trim().is_empty() {
         *slot = Some(RecoveredCut {
             content: content.to_string(),
             reasoning: reasoning.to_string(),
+            source_ids,
         });
     }
 }
@@ -3819,7 +3870,14 @@ mod tests {
         let mut hold = llm::thinking::CutHold::default();
         hold.observe_answer(still);
         let mut recovered = None;
-        remember_recovered_cut(&mut recovered, hold.thinking_off, body, "");
+        remember_recovered_cut(
+            &mut recovered,
+            hold.thinking_off,
+            body,
+            "",
+            false,
+            std::collections::HashSet::new(),
+        );
         (hold, recovered)
     }
 
@@ -3875,7 +3933,14 @@ mod tests {
             llm::thinking::CutStep::Stop { over_cap: true }
         );
         let mut none = None;
-        remember_recovered_cut(&mut none, false, body, "");
+        remember_recovered_cut(
+            &mut none,
+            false,
+            body,
+            "",
+            false,
+            std::collections::HashSet::new(),
+        );
         assert!(
             recovered_cut_to_keep(&none).is_none(),
             "the first thinking-off resend still fails when it hits the cap"
@@ -3903,5 +3968,306 @@ mod tests {
             hold.notice(false, &kept.content),
             Some(llm::thinking::THINKING_CUT_NOTICE)
         );
+    }
+
+    #[test]
+    fn tool_call_preamble_does_not_overwrite_the_recovered_answer() {
+        let mut slot = None;
+        remember_recovered_cut(
+            &mut slot,
+            true,
+            "根拠は [9] です。",
+            "",
+            false,
+            std::collections::HashSet::new(),
+        );
+        remember_recovered_cut(
+            &mut slot,
+            true,
+            "確認します。",
+            "",
+            true,
+            std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            recovered_cut_to_keep(&slot).unwrap().content,
+            "根拠は [9] です。"
+        );
+    }
+
+    fn sse_message(payload: serde_json::Value) -> Vec<u8> {
+        let data = format!("data: {payload}\n\ndata: [DONE]\n\n");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{data}"
+        )
+        .into_bytes()
+    }
+
+    fn http_status(code: u16, reason: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn serve_script(script: Vec<Vec<u8>>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for response in script {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut sock, &mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let len = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        if name.eq_ignore_ascii_case("content-length") {
+                                            value.trim().parse::<usize>().ok()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() - (header_end + 4) >= len {
+                                    break;
+                                }
+                            }
+                            if buf.len() > 4_000_000 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = std::io::Write::write_all(&mut sock, &response);
+                let _ = std::io::Write::flush(&mut sock);
+            }
+        });
+        port
+    }
+
+    fn reasoning_over_cap() -> Vec<u8> {
+        let payload = serde_json::json!({
+            "choices": [{ "delta": { "reasoning_content": "あ".repeat(100_000) } }]
+        });
+        sse_message(payload)
+    }
+
+    fn content_stop(text: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{ "delta": { "content": text }, "finish_reason": "stop" }]
+        }))
+    }
+
+    fn content_and_search(text: &str, query: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": text,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "c1",
+                        "function": {
+                            "name": "search_index",
+                            "arguments": serde_json::json!({ "query": query }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+
+    fn test_state(dir: &std::path::Path, port: u16, max_rounds: u32) -> std::sync::Arc<crate::state::AppState> {
+        let db = std::sync::Arc::new(crate::db::Db::open(&dir.join("argos.db")).unwrap());
+        let mut settings = crate::db::Settings::default();
+        settings.llm_base_url = format!("http://127.0.0.1:{port}/v1");
+        settings.llm_model = "test-model".into();
+        settings.llm_timeout_ms = 20_000;
+        settings.llm_thinking = "on".into();
+        settings.llm_max_tool_rounds = max_rounds;
+        settings.search_mode = "local".into();
+        let backend = std::sync::Arc::new(
+            crate::search::tantivy_backend::TantivyBackend::open(&dir.join("index"))
+                .unwrap()
+                .backend,
+        );
+        let mail_backend = std::sync::Arc::new(
+            crate::search::tantivy_backend::TantivyBackend::open_mail(&dir.join("index-mail"))
+                .unwrap()
+                .backend,
+        );
+        let indexer = std::sync::Arc::new(crate::indexer::Indexer::new(
+            db.clone(),
+            backend.clone(),
+        ));
+        let mail = crate::mail::MailStaHandle::start(db.clone(), mail_backend.clone()).unwrap();
+        std::sync::Arc::new(crate::state::AppState {
+            db,
+            settings: std::sync::Arc::new(parking_lot::RwLock::new(settings)),
+            data_dir: dir.to_path_buf(),
+            backend,
+            mail_backend,
+            indexer,
+            remote_server: crate::remote_server::RemoteServerHandle::new(),
+            watcher: parking_lot::RwLock::new(None),
+            user_dict: std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::search::UserDictMatcher::from_words(std::iter::empty::<String>()),
+            )),
+            mail,
+            calendar_sync: parking_lot::Mutex::new(()),
+            llm_job: parking_lot::RwLock::new(None),
+            preview_target: parking_lot::RwLock::new(None),
+        })
+    }
+
+    fn final_answer(messages: &[crate::db::LlmMessageRow]) -> &crate::db::LlmMessageRow {
+        messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == "assistant"
+                    && message.tool_calls.trim().is_empty()
+                    && message.kind != crate::db::LLM_MESSAGE_NOTICE
+            })
+            .expect("a final assistant answer")
+    }
+
+    async fn send_script(
+        label: &str,
+        max_rounds: u32,
+        script: Vec<Vec<u8>>,
+        index: bool,
+    ) -> (
+        std::path::PathBuf,
+        crate::db::Db,
+        crate::db::LlmThreadRow,
+        LlmSendResult,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-send-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = serve_script(script);
+        let state = test_state(&dir, port, max_rounds);
+        if index {
+            let path = dir.join("contract.txt");
+            std::fs::write(&path, "OrionContract の期間は三か月です。").unwrap();
+            state
+                .backend
+                .index_file(
+                    &path,
+                    &path.to_string_lossy(),
+                    "",
+                    1,
+                    20,
+                    &crate::extractor::ExtractedDoc {
+                        title: "contract.txt".into(),
+                        pages: vec!["OrionContract の期間は三か月です。".into()],
+                    },
+                )
+                .unwrap();
+        }
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            None,
+            "調べて".into(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db, result.thread.clone(), result)
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_cut_answer_when_a_tool_preamble_then_fails() {
+        let (dir, db, thread, result) = send_script(
+            "preamble",
+            1,
+            vec![
+                reasoning_over_cap(),
+                content_stop("根拠は [9] です。"),
+                content_and_search("調べます。", "OrionContract"),
+                http_status(500, "Internal Server Error", r#"{"error":"failed"}"#),
+            ],
+            false,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, "根拠は [9] です。");
+        assert!(messages.iter().any(|message| {
+            message.kind == crate::db::LLM_MESSAGE_NOTICE
+                && message.content == llm::thinking::THINKING_CUT_NOTICE
+        }));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == "調べます。")
+                .count(),
+            1,
+            "the preamble stays on the tool-call row only"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_does_not_bind_a_source_fetched_after_the_cut_answer() {
+        let (dir, db, thread, result) = send_script(
+            "bind",
+            8,
+            vec![
+                reasoning_over_cap(),
+                content_stop("根拠は [1] です。"),
+                content_and_search("確認します。", "OrionContract"),
+                http_status(500, "Internal Server Error", r#"{"error":"failed"}"#),
+            ],
+            true,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, "根拠は [1] です。");
+        let tool = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("search_index ran");
+        assert!(
+            tool.content.contains("OrionContract"),
+            "the retry must have registered a hit: {}",
+            tool.content
+        );
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert!(
+            sources
+                .iter()
+                .all(|source| source.cited_assistant_message_id != answer.id),
+            "a source fetched during the retry must not bind to the kept answer: {sources:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

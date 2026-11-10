@@ -625,7 +625,7 @@ fn ensure_notes_window(app: &AppHandle) -> Option<WebviewWindow> {
     create_notes_window(app)
 }
 
-pub fn notes_window_visible(app: &AppHandle) -> bool {
+pub fn notes_window_visible<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
     app.get_webview_window("notes")
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false)
