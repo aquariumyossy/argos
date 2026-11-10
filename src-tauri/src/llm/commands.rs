@@ -3318,4 +3318,45 @@ mod tests {
         assert_eq!(history[0].kind, "notice");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn phantom_tools_after(answer_tools: bool, rounds: usize, max_rounds: usize) -> bool {
+        let mut hold = llm::thinking::CutHold::default();
+        hold.observe_answer(answer_tools);
+        phantom_retry_enables_tools(false, rounds, max_rounds) && !hold.tools_off
+    }
+
+    #[test]
+    fn tool_less_cut_keeps_the_phantom_tools_hint_while_rounds_remain() {
+        let mut cut = llm::thinking::ThinkingCut::start(true, false);
+        assert!(matches!(
+            cut.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(_)
+        ));
+        let llm::thinking::CutStep::Answer { tools } =
+            cut.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the tool-less re-request should answer");
+        };
+        assert!(tools);
+        assert!(
+            phantom_tools_after(tools, 1, 8),
+            "rounds remain, so the phantom retry still has tools"
+        );
+        assert_eq!(phantom_cite_hint(true), PHANTOM_CITE_HINT);
+
+        let mut stripped = llm::thinking::ThinkingCut::start(true, true);
+        stripped.observe(llm::thinking::CutReply::OverCap);
+        stripped.observe(llm::thinking::CutReply::ToolsRejected);
+        let llm::thinking::CutStep::Answer { tools: kept } =
+            stripped.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the tools-off fallback should answer");
+        };
+        assert!(!kept);
+        assert!(
+            !phantom_tools_after(kept, 1, 8),
+            "recovery that stripped tools keeps the phantom retry tool-free"
+        );
+        assert_eq!(phantom_cite_hint(false), PHANTOM_CITE_HINT_NO_TOOLS);
+    }
 }

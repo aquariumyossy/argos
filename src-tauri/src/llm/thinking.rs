@@ -139,7 +139,9 @@ pub enum CutReply {
 pub enum CutStep {
     /// Ask again. The session's [`ThinkingCut::request`] matches this.
     Again(CutRequest),
-    /// The retry produced an answer. `tools` is false when tool calls must not run.
+    /// The retry produced an answer. `tools` is false only when this recovery
+    /// stripped tools (stage 2). A call that was already tool-less stays `true`,
+    /// so a later phantom retry can turn tools back on while rounds remain.
     Answer { tools: bool },
     /// Give up. `over_cap` selects the existing runaway error.
     Stop { over_cap: bool },
@@ -218,10 +220,9 @@ impl ThinkingCut {
                     self.request.tools = false;
                     CutStep::Again(self.request)
                 }
-                CutReply::Answer => CutStep::Answer {
-                    tools: self.request.tools,
-                },
-                CutReply::NeedsTools => CutStep::Answer { tools: false },
+                // Already tool-less for this one call. That is not the recovery
+                // removing tools, so later passes may enable them again.
+                CutReply::Answer | CutReply::NeedsTools => CutStep::Answer { tools: true },
                 CutReply::ToolsRejected | CutReply::Other => CutStep::Stop { over_cap: false },
             };
         }
@@ -237,7 +238,8 @@ impl ThinkingCut {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CutHold {
     pub thinking_off: bool,
-    /// Set when the cut itself answered with tools disabled.
+    /// Set only when cut recovery itself stripped tools, not when the one
+    /// call was already tool-less.
     pub tools_off: bool,
 }
 
@@ -529,6 +531,19 @@ mod tests {
 
     #[test]
     fn tools_forced_off_by_a_cut_stay_off_when_a_phantom_retry_asks() {
+        let mut cut = ThinkingCut::start(true, true);
+        assert!(matches!(cut.observe(CutReply::OverCap), CutStep::Again(_)));
+        assert_eq!(
+            cut.observe(CutReply::NeedsTools),
+            CutStep::Again(CutRequest {
+                thinking_off: true,
+                tools: false
+            })
+        );
+        assert_eq!(
+            cut.observe(CutReply::Answer),
+            CutStep::Answer { tools: false }
+        );
         let mut hold = CutHold::default();
         hold.observe_answer(false);
         let (thinking, tools) = hold.allow(true, true);
@@ -541,6 +556,35 @@ mod tests {
                 tools: false
             }
         );
+    }
+
+    #[test]
+    fn cut_on_a_tool_less_rerequest_leaves_phantom_tools_on() {
+        // The source-block re-request, and the final call after the tool-round
+        // budget, are sent without tools for that one call.
+        let mut cut = ThinkingCut::start(true, false);
+        assert_eq!(
+            cut.observe(CutReply::OverCap),
+            CutStep::Again(CutRequest {
+                thinking_off: true,
+                tools: false
+            })
+        );
+        assert_eq!(cut.observe(CutReply::Answer), CutStep::Answer { tools: true });
+        let mut hold = CutHold::default();
+        hold.observe_answer(true);
+        // Rounds remain, so the phantom retry asks for tools again.
+        let (thinking, tools) = hold.allow(true, true);
+        assert!(!thinking, "thinking stays off for the rest of the turn");
+        assert!(tools, "the phantom retry keeps tools");
+        assert_eq!(
+            ThinkingCut::held(tools).request(),
+            CutRequest {
+                thinking_off: true,
+                tools: true
+            }
+        );
+        assert!(hold.notice(false, "出典 [9] は未確認です").is_some());
     }
 
     #[test]
