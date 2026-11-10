@@ -1522,6 +1522,180 @@ mod tests {
         assert_eq!(summary_saved_after_request(&stored, ""), stored.trim());
     }
 
+    fn repeated(blob: &str, ch: char) -> usize {
+        blob.chars().filter(|c| *c == ch).count()
+    }
+
+    fn message_budget(limit: usize, question: &str) -> usize {
+        let required = turn_tokens(&ChatTurn::text("system", "役割"))
+            + turn_tokens(&ChatTurn::text("user", question));
+        context_budget(limit, 0, required).expect("question fits").messages
+    }
+
+    #[test]
+    fn summary_does_not_stub_a_recent_attachment_that_almost_fits() {
+        let summary = format!("{}\n{SUMMARY_DISCLAIMER}", "要".repeat(tokens_to_chars(1_000)));
+        let question = "短い質問";
+        for (limit, chars) in [(16_384usize, 15_500usize), (32_768, 33_000), (131_072, 136_000)] {
+            let body = "添".repeat(chars);
+            let mut host = source("host", "u1", 2, &body);
+            host.grain = "file".into();
+            host.paragraph_id.clear();
+            host.path = r"C:\docs\ホスト添付.txt".into();
+            host.title = "ホスト添付".into();
+            let history = vec![
+                msg("u0", "user", "古い"),
+                msg("a0", "assistant", "読んだ"),
+                msg("u1", "user", "ホストの質問"),
+                msg("u2", "user", question),
+            ];
+            let budget = message_budget(limit, question);
+            let (without, _) = assemble_turns("役割", std::slice::from_ref(&host), &history, budget);
+            let without_blob = without.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+            let without_chars = repeated(&without_blob, '添');
+            assert!(
+                without_chars >= chars && without_chars < chars + 80,
+                "limit {limit} without {without_chars}"
+            );
+            let prepared = prepare_model_history(&history, &summary, "a0");
+            let (with, stats) = assemble_turns("役割", std::slice::from_ref(&host), &prepared, budget);
+            assert!(stats.total_tokens <= budget, "{limit} {}", stats.total_tokens);
+            let with_blob = with.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+            let with_chars = repeated(&with_blob, '添');
+            assert!(
+                with_chars + 2_500 > without_chars && with_chars > without_chars / 2,
+                "limit {limit} budget {budget} without {without_chars} with {with_chars}"
+            );
+        }
+        let paragraph_body = "段".repeat(15_500);
+        let mut paragraph = source("para", "u1", 3, &paragraph_body);
+        paragraph.grain = "unit".into();
+        paragraph.paragraph_id = "p1".into();
+        paragraph.origin = "tool".into();
+        let mut url = source("url", "u1", 4, &"頁".repeat(15_500));
+        url.kind = "web".into();
+        url.origin = "tool".into();
+        url.path = "https://example.com/case".into();
+        url.title = "判例".into();
+        url.paragraph_id.clear();
+        let question = "短い質問";
+        let budget = message_budget(16_384, question);
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a0", "assistant", "読んだ"),
+            msg("u1", "user", "ホストの質問"),
+            msg("u2", "user", question),
+        ];
+        let summary = format!("{}\n{SUMMARY_DISCLAIMER}", "要".repeat(tokens_to_chars(1_000)));
+        for (label, row, ch) in [
+            ("paragraph", paragraph, '段'),
+            ("url", url, '頁'),
+        ] {
+            let prepared = prepare_model_history(&history, &summary, "a0");
+            let (with, _) = assemble_turns("役割", std::slice::from_ref(&row), &prepared, budget);
+            let blob = with.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+            let sent = repeated(&blob, ch);
+            assert!(
+                sent > 15_500 / 2,
+                "{label} collapsed to {sent} chars"
+            );
+        }
+    }
+
+    #[test]
+    fn current_attachment_shrinks_only_by_the_summary_block() {
+        let summary = format!("{}\n{SUMMARY_DISCLAIMER}", "要".repeat(tokens_to_chars(40)));
+        let question = "今回の質問";
+        for limit in [16_384usize, 32_768, 131_072] {
+            let body = "添".repeat(20_000);
+            let mut file = source("cur", "", 1, &body);
+            file.grain = "file".into();
+            file.paragraph_id.clear();
+            file.injected_user_message_id.clear();
+            let history = vec![
+                msg("u0", "user", "古い"),
+                msg("a0", "assistant", "読んだ"),
+                msg("u1", "user", question),
+            ];
+            let budget = message_budget(limit, question);
+            let (without, _) = assemble_turns("役割", std::slice::from_ref(&file), &history, budget);
+            let without_chars = repeated(
+                &without.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n"),
+                '添',
+            );
+            let prepared = prepare_model_history(&history, &summary, "a0");
+            let (with, stats) = assemble_turns("役割", std::slice::from_ref(&file), &prepared, budget);
+            assert!(stats.total_tokens <= budget, "{limit} {}", stats.total_tokens);
+            let with_chars = repeated(
+                &with.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n"),
+                '添',
+            );
+            let summary_chars = summary.chars().count() + 80;
+            assert!(
+                with_chars + summary_chars >= without_chars && with_chars > without_chars / 2,
+                "limit {limit} without {without_chars} with {with_chars}"
+            );
+        }
+    }
+
+    #[test]
+    fn minimum_summary_is_reserved_before_a_large_attachment() {
+        let summary = format!("{}\n{SUMMARY_DISCLAIMER}", "要".repeat(tokens_to_chars(400)));
+        let question = "今回の質問";
+        for limit in [16_384usize, 32_768, 131_072] {
+            let body = "添".repeat(200_000);
+            let mut file = source("cur", "", 1, &body);
+            file.grain = "file".into();
+            file.paragraph_id.clear();
+            file.injected_user_message_id.clear();
+            let history = vec![
+                msg("u0", "user", "古い"),
+                msg("a0", "assistant", "読んだ"),
+                msg("u1", "user", "ホストの質問"),
+                msg("a1", "assistant", "途中"),
+                msg("u2", "user", "その次"),
+                msg("a2", "assistant", "了解"),
+                msg("u3", "user", question),
+            ];
+            let budget = message_budget(limit, question);
+            let prepared = prepare_model_history(&history, &summary, "a0");
+            let (turns, stats) = assemble_turns("役割", std::slice::from_ref(&file), &prepared, budget);
+            assert!(stats.total_tokens <= budget, "{limit} {}", stats.total_tokens);
+            let blob = turns.iter().map(|t| t.content.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(blob.contains(SUMMARY_PREFIX), "{limit} {blob}");
+            assert!(blob.contains(SUMMARY_DISCLAIMER), "{limit} {blob}");
+        }
+    }
+
+    #[test]
+    fn quoting_the_summary_heading_is_not_wiped_when_the_summary_is_dropped() {
+        let quote = "上の【ここまでの要約】にあるとおり、期限は3月末です。";
+        let summary = format!("{}\n{SUMMARY_DISCLAIMER}", "要".repeat(tokens_to_chars(800)));
+        let question = "問".repeat(8_000);
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a0", "assistant", "読んだ"),
+            msg("u-host", "user", "ホストの質問"),
+            msg("u-prev", "user", "前の質問"),
+            msg("a-quote", "assistant", quote),
+            msg("u3", "user", &question),
+        ];
+        let kept = vec![
+            msg("u-prev", "user", "前の質問"),
+            msg("a-quote", "assistant", quote),
+            msg("u3", "user", &question),
+        ];
+        let (_, bare) = assemble_turns("役割", &[], &kept, 80_000);
+        let budget = bare.total_tokens;
+        let prepared = prepare_model_history(&history, &summary, "a0");
+        let (turns, _) = assemble_turns("役割", &[], &prepared, budget);
+        let quoted = turns
+            .iter()
+            .find(|turn| turn.content.contains("期限は3月末"))
+            .expect("the quoting answer was removed");
+        assert_eq!(quoted.content, quote);
+    }
+
     fn assert_no_orphan_tool(turns: &[ChatTurn]) {
         let mut open = false;
         for turn in turns {

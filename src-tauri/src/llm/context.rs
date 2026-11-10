@@ -819,6 +819,7 @@ fn select_sources(
     budget: usize,
     pending_ids: &HashSet<String>,
     ledger: &[LlmSourceRow],
+    precise: bool,
 ) -> (Vec<LlmSourceRow>, usize, bool) {
     let original = sources.len();
     let mut rows: Vec<LlmSourceRow> = sources
@@ -837,7 +838,7 @@ fn select_sources(
     let over = |rows: &[LlmSourceRow]| char_len(&format_sources_with_pool(rows, pool)) > budget;
     let is_protected = |s: &LlmSourceRow| pending_ids.contains(&s.id) && s.origin == "attach";
 
-    while over(&rows) {
+    while !precise && over(&rows) {
         if let Some(idx) = rows
             .iter()
             .enumerate()
@@ -871,7 +872,7 @@ fn select_sources(
         let next = char_len(&rows[idx].body) / 2;
         let pending_attach =
             pending_ids.contains(&rows[idx].id) && rows[idx].origin == "attach";
-        if pending_attach {
+        if precise || pending_attach {
             let before = rows[idx].body.clone();
             fit_pending_prefix(&mut rows, idx, pool, budget, ledger);
             if rows[idx].body == before {
@@ -1242,7 +1243,7 @@ pub fn assemble_turns(
     // Keep the last two user turns while they fit. If a recent source is what
     // overflows, shorten it before dropping the previous question and answer.
     trim_keeping(&mut built, max_tokens, RECENT_USER_TURNS, &mut truncated);
-    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources)
+    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources, carried_summary.as_ref())
     {
         truncated = true;
     }
@@ -1252,7 +1253,7 @@ pub fn assemble_turns(
     if tokens_of(&built) > max_tokens {
         trim_keeping(&mut built, max_tokens, 1, &mut truncated);
     }
-    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources)
+    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources, carried_summary.as_ref())
     {
         truncated = true;
     }
@@ -1264,7 +1265,7 @@ pub fn assemble_turns(
     }
     // The first refit can drop a pending attachment while an older exchange is
     // still protected. Put the original sources back into the room that trim freed.
-    if refit_freed_budget(&mut built, pool, max_tokens, &pending_ids, sources) {
+    if refit_freed_budget(&mut built, pool, max_tokens, &pending_ids, sources, carried_summary.as_ref()) {
         truncated = true;
     }
     if restore_recent_rereads(&mut built, max_tokens) {
@@ -1939,6 +1940,7 @@ fn refit_freed_budget(
     max_tokens: usize,
     pending_ids: &HashSet<String>,
     ledger: &[LlmSourceRow],
+    carried: Option<&CarriedSummary>,
 ) -> bool {
     let recent = recent_user_ids(built);
     let mut changed = false;
@@ -1965,7 +1967,7 @@ fn refit_freed_budget(
     if !changed {
         return false;
     }
-    let fitted = refit_sources(built, pool, max_tokens, pending_ids, ledger);
+    let fitted = refit_sources(built, pool, max_tokens, pending_ids, ledger, carried);
     if tokens_of(built) > max_tokens {
         shrink_recent_sources(built, pool, max_tokens, ledger);
     }
@@ -2103,26 +2105,73 @@ fn drop_empty_image_pages(rows: &mut Vec<LlmSourceRow>) {
     });
 }
 
-fn source_char_room(built: &[BuiltTurn], max_tokens: usize) -> usize {
+fn source_char_room(
+    built: &[BuiltTurn],
+    max_tokens: usize,
+    carried: Option<&CarriedSummary>,
+) -> usize {
     let recent = recent_user_ids(built);
-    let base: usize = built
+    let mut base: usize = built
         .iter()
         .map(|row| {
             // Source bodies are fitted separately. Count the wrapper that render adds
-            // around them, not the question text alone.
+            // around them, not the question text alone. A summary merged into this
+            // turn is fixed text, so it has to come out of the same budget.
             if row.turn.role == "user"
                 && !row.sources.is_empty()
                 && recent.contains(&row.message_id)
             {
                 let shell = wrap_user("【出典】\n", &row.question);
                 turn_tokens(&ChatTurn::text("user", shell))
+                    + summary_overhead_tokens(&row.turn.content)
             } else {
                 turn_tokens(&row.turn)
             }
         })
         .sum();
+    let summary_in_turns = built
+        .iter()
+        .any(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX));
+    if !summary_in_turns {
+        if let Some(carried) = carried {
+            // The host turn was dropped. Keep room for the disclaimer and 既読 lines
+            // so the attachment does not take the space the summary needs.
+            base += estimate_tokens(&minimum_summary_text(carried));
+        }
+    }
     // A few tokens of slack, so omission notes and rounding cannot stub the attachment.
     tokens_to_chars(max_tokens.saturating_sub(base).saturating_sub(16))
+}
+
+fn summary_overhead_tokens(content: &str) -> usize {
+    if !content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+        return 0;
+    }
+    let (block, rest) = crate::llm::summary::split_merged_user(content);
+    let stubs: Vec<&str> = rest
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("既読 "))
+        .collect();
+    let extra = if stubs.is_empty() {
+        format!("{block}\n\n")
+    } else {
+        format!("{block}\n\n{}\n\n", stubs.join("\n"))
+    };
+    estimate_tokens(&extra)
+}
+
+fn minimum_summary_text(carried: &CarriedSummary) -> String {
+    let mut text = format!(
+        "{}\n{}\n\n",
+        crate::llm::summary::SUMMARY_PREFIX,
+        crate::llm::summary::SUMMARY_DISCLAIMER
+    );
+    if !carried.stubs.is_empty() {
+        text.push_str(&carried.stubs.join("\n"));
+        text.push_str("\n\n");
+    }
+    text
 }
 
 /// Drop source bodies that still do not fit. Attachments are removed last, matching
@@ -2133,6 +2182,7 @@ fn refit_sources(
     max_tokens: usize,
     pending_ids: &HashSet<String>,
     ledger: &[LlmSourceRow],
+    carried: Option<&CarriedSummary>,
 ) -> bool {
     let recent = recent_user_ids(built);
     let current = full_sources_on_recent_turns(built);
@@ -2142,9 +2192,10 @@ fn refit_sources(
     let (kept, dropped, shortened) = select_sources(
         &current,
         pool,
-        source_char_room(built, max_tokens),
+        source_char_room(built, max_tokens, carried),
         pending_ids,
         ledger,
+        carried.is_some(),
     );
     if dropped == 0 && !shortened {
         return false;
@@ -2498,7 +2549,7 @@ fn drop_summary_if_over_budget(built: &mut Vec<BuiltTurn>, max_tokens: usize, st
     }
     let mut changed = false;
     for row in built.iter_mut() {
-        if !row.turn.content.contains(crate::llm::summary::SUMMARY_PREFIX) {
+        if !row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
             continue;
         }
         let next = strip_summary_and_stubs(&row.turn.content, stubs);
@@ -2514,6 +2565,9 @@ fn drop_summary_if_over_budget(built: &mut Vec<BuiltTurn>, max_tokens: usize, st
 }
 
 fn strip_summary_and_stubs(content: &str, stubs: &[String]) -> String {
+    if !content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+        return content.to_string();
+    }
     let Some(pos) = content.find(crate::llm::summary::SUMMARY_PREFIX) else {
         return content.to_string();
     };
