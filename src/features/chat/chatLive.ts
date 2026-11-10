@@ -30,7 +30,7 @@ export function applyChatDelta(live: LiveGeneration, delta: ChatDelta): LiveGene
   return { ...live, stream: live.stream + delta.text };
 }
 
-/** Treat a few pixels of slack as the bottom so subpixel layout does not unpin. */
+/** Slack used only when deciding that the user has returned to the bottom. */
 export const SCROLL_FOLLOW_SLACK_PX = 48;
 
 export function isNearBottom(
@@ -40,4 +40,26 @@ export function isNearBottom(
   slack = SCROLL_FOLLOW_SLACK_PX,
 ): boolean {
   return scrollHeight - scrollTop - clientHeight <= slack;
+}
+
+/**
+ * Any upward movement stops following, including a step inside the bottom slack.
+ * Moving downward resumes only once the viewport is back at the bottom.
+ */
+export function followAfterUserScroll(input: {
+  follow: boolean;
+  scrollTop: number;
+  anchor: number;
+  scrollHeight: number;
+  clientHeight: number;
+}): { follow: boolean; anchor: number } {
+  const { scrollTop, anchor } = input;
+  if (scrollTop < anchor) return { follow: false, anchor: scrollTop };
+  if (
+    scrollTop > anchor &&
+    isNearBottom(scrollTop, input.scrollHeight, input.clientHeight)
+  ) {
+    return { follow: true, anchor: scrollTop };
+  }
+  return { follow: input.follow, anchor: scrollTop };
 }

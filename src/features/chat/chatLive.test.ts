@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { applyChatDelta, isNearBottom, type LiveGeneration } from "./chatLive";
+import {
+  applyChatDelta,
+  followAfterUserScroll,
+  isNearBottom,
+  type LiveGeneration,
+} from "./chatLive";
 
 const live = (threadId: string, stream = ""): LiveGeneration => ({
   threadId,
@@ -48,9 +53,30 @@ describe("stream routing", () => {
 });
 
 describe("scroll follow", () => {
-  it("treats the bottom slack as still following", () => {
+  it("treats the bottom slack as the bottom when resuming", () => {
     expect(isNearBottom(0, 800, 120)).toBe(false);
     expect(isNearBottom(632, 800, 120)).toBe(true);
     expect(isNearBottom(800, 800, 120)).toBe(true);
+  });
+
+  it("stops following on an upward step that is still inside the bottom slack", () => {
+    const pinned = followAfterUserScroll({
+      follow: true,
+      scrollTop: 790,
+      anchor: 800,
+      scrollHeight: 800,
+      clientHeight: 120,
+    });
+    expect(isNearBottom(790, 800, 120)).toBe(true);
+    expect(pinned).toEqual({ follow: false, anchor: 790 });
+
+    const resumed = followAfterUserScroll({
+      follow: false,
+      scrollTop: 800,
+      anchor: 790,
+      scrollHeight: 800,
+      clientHeight: 120,
+    });
+    expect(resumed.follow).toBe(true);
   });
 });

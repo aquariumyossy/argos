@@ -7,6 +7,8 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type TouchEvent as ReactTouchEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -19,7 +21,11 @@ import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
 import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
-import { applyChatDelta, isNearBottom, type LiveGeneration } from "./chatLive";
+import {
+  applyChatDelta,
+  followAfterUserScroll,
+  type LiveGeneration,
+} from "./chatLive";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -568,6 +574,8 @@ export default function Chat() {
   const heldBanners = useRef(new Map<string, ThreadBanner>());
   const followRef = useRef(true);
   const programmaticScroll = useRef(false);
+  const scrollAnchor = useRef(0);
+  const touchYRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
   const threadDragRef = useRef<ThreadDragSession | null>(null);
@@ -805,8 +813,13 @@ export default function Chat() {
       if (busyRef.current || ocrBusyRef.current || attachingRef.current) {
         if (tid === activeIdRef.current) {
           void invoke<LlmSourceRow[]>("llm_list_sources", { threadId: tid })
-            .then(setSources)
-            .catch((e) => setError(formatInvokeError(e)));
+            .then((rows) => {
+              if (activeIdRef.current !== tid) return;
+              setSources(rows);
+            })
+            .catch((e) => {
+              if (activeIdRef.current === tid) setError(formatInvokeError(e));
+            });
         }
         return;
       }
@@ -860,21 +873,62 @@ export default function Chat() {
     });
   }, []);
 
+  const stopFollow = useCallback(() => {
+    if (!followRef.current) return;
+    followRef.current = false;
+    setFollowBottom(false);
+  }, []);
+
   const scrollLog = useCallback(() => {
     const el = listRef.current;
     if (!el || !followRef.current) return;
     noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
+    scrollAnchor.current = el.scrollTop;
   }, [noteProgrammaticScroll]);
 
   const onLogScroll = useCallback(() => {
     const el = listRef.current;
     if (!el || programmaticScroll.current) return;
-    const near = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
-    if (followRef.current === near) return;
-    followRef.current = near;
-    setFollowBottom(near);
+    const next = followAfterUserScroll({
+      follow: followRef.current,
+      scrollTop: el.scrollTop,
+      anchor: scrollAnchor.current,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+    });
+    scrollAnchor.current = next.anchor;
+    if (followRef.current === next.follow) return;
+    followRef.current = next.follow;
+    setFollowBottom(next.follow);
   }, []);
+
+  const onLogWheel = useCallback((event: ReactWheelEvent) => {
+    if (event.deltaY < 0) stopFollow();
+  }, [stopFollow]);
+
+  const onLogTouchStart = useCallback((event: ReactTouchEvent) => {
+    touchYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const onLogTouchMove = useCallback((event: ReactTouchEvent) => {
+    const y = event.touches[0]?.clientY;
+    if (y == null || touchYRef.current == null) return;
+    const movedUp = y > touchYRef.current;
+    touchYRef.current = y;
+    if (movedUp) stopFollow();
+  }, [stopFollow]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "ArrowUp" && event.key !== "PageUp" && event.key !== "Home") return;
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("input, textarea, select")) return;
+      stopFollow();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [stopFollow]);
 
   function pinFollow() {
     followRef.current = true;
@@ -887,6 +941,7 @@ export default function Chat() {
     if (!el) return;
     noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
+    scrollAnchor.current = el.scrollTop;
   }
 
   useEffect(() => {
@@ -935,8 +990,8 @@ export default function Chat() {
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
-    // A running reply stays on its own thread. Attaching still mutates the open one.
-    if (attaching || !id || id === activeIdRef.current) return;
+    // Generation keeps running. OCR and attach still belong to the open thread.
+    if (ocrBusy || attaching || !id || id === activeIdRef.current) return;
     const prev = activeIdRef.current;
     pendingThreadId.current = id;
     activeIdRef.current = id;
@@ -1394,8 +1449,10 @@ export default function Chat() {
           const msgs = await invoke<LlmMessageRow[]>("llm_list_messages", {
             threadId: originId,
           });
-          contentEpoch.current += 1;
-          setMessages(msgs);
+          if (activeIdRef.current === originId) {
+            contentEpoch.current += 1;
+            setMessages(msgs);
+          }
         } catch {
           /* keep optimistic */
         }
@@ -1789,7 +1846,14 @@ export default function Chat() {
 
       <main className="chat-main">
         <div className="chat-log-wrap">
-        <div className="chat-log" ref={listRef} onScroll={onLogScroll}>
+        <div
+          className="chat-log"
+          ref={listRef}
+          onScroll={onLogScroll}
+          onWheel={onLogWheel}
+          onTouchStart={onLogTouchStart}
+          onTouchMove={onLogTouchMove}
+        >
           {messages.length === 0 && !showLive ? (
             <p className="chat-muted chat-empty">
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。

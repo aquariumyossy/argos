@@ -279,7 +279,7 @@ describe("background generation", () => {
 });
 
 describe("scroll follow during generation", () => {
-  it("stops following when scrolled up, resumes at the bottom, and the button jumps back", async () => {
+  async function startPinnedLog(): Promise<HTMLElement> {
     await renderChat();
     fireEvent.click(screen.getByRole("button", { name: "再送" }));
     await screen.findByText("生成中…");
@@ -287,9 +287,14 @@ describe("scroll follow during generation", () => {
     if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
     Object.defineProperty(log, "clientHeight", { configurable: true, value: 120 });
     Object.defineProperty(log, "scrollHeight", { configurable: true, value: 800 });
-    expect(log.clientHeight).toBe(120);
-    expect(log.scrollHeight).toBe(800);
+    await emitDelta("thread-a", "底");
+    expect(log.scrollTop).toBe(800);
     expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+    return log;
+  }
+
+  it("stops following when scrolled up, resumes at the bottom, and the button jumps back", async () => {
+    const log = await startPinnedLog();
 
     log.scrollTop = 0;
     fireEvent.scroll(log);
@@ -310,5 +315,43 @@ describe("scroll follow during generation", () => {
     expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
     await emitDelta("thread-a", "さらに");
     expect(log.scrollTop).toBe(800);
+  });
+
+  it("stops following on an upward step smaller than the bottom slack", async () => {
+    const log = await startPinnedLog();
+    log.scrollTop = 790;
+    fireEvent.scroll(log);
+    expect(screen.getByRole("button", { name: "↓最新へ" })).toBeTruthy();
+    await emitDelta("thread-a", "少し上");
+    expect(log.scrollTop).toBe(790);
+
+    log.scrollTop = 800;
+    fireEvent.scroll(log);
+    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+    await emitDelta("thread-a", "戻った");
+    expect(log.scrollTop).toBe(800);
+  });
+
+  it("stops following on wheel, arrow key, and touch before the next delta", async () => {
+    const log = await startPinnedLog();
+
+    fireEvent.wheel(log, { deltaY: -4 });
+    log.scrollTop = 796;
+    await emitDelta("thread-a", "ホイール");
+    expect(log.scrollTop).toBe(796);
+    fireEvent.click(screen.getByRole("button", { name: "↓最新へ" }));
+    expect(log.scrollTop).toBe(800);
+
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    log.scrollTop = 794;
+    await emitDelta("thread-a", "キー");
+    expect(log.scrollTop).toBe(794);
+    fireEvent.click(screen.getByRole("button", { name: "↓最新へ" }));
+
+    fireEvent.touchStart(log, { touches: [{ clientY: 100 }] });
+    fireEvent.touchMove(log, { touches: [{ clientY: 128 }] });
+    log.scrollTop = 792;
+    await emitDelta("thread-a", "タッチ");
+    expect(log.scrollTop).toBe(792);
   });
 });
