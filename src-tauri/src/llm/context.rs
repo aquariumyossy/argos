@@ -982,6 +982,52 @@ struct BuiltTurn {
     tool_backup: Option<String>,
 }
 
+/// Tokens the next request spends on replayed turns, plus the tool schema.
+/// `assemble_turns` applies age stubs, cited-body dedupe, tool-call name and
+/// arguments, and trimming at `message_budget`. The system prompt is not
+/// included. Reply headroom and the tool-result allowance are not included.
+pub fn meter_usage_tokens(
+    system: &str,
+    sources: &[LlmSourceRow],
+    history: &[LlmMessageRow],
+    draft: &str,
+    schema_tokens: usize,
+    message_budget: usize,
+) -> usize {
+    let history = history_including_draft(history, draft);
+    let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
+    let sent: usize = turns
+        .iter()
+        .filter(|turn| turn.role != "system")
+        .map(turn_tokens)
+        .sum();
+    sent + schema_tokens
+}
+
+fn history_including_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMessageRow> {
+    let text = draft.trim();
+    if text.is_empty() {
+        return history.to_vec();
+    }
+    let mut history = history.to_vec();
+    history.push(LlmMessageRow {
+        id: "meter-draft".into(),
+        thread_id: history
+            .last()
+            .map(|row| row.thread_id.clone())
+            .unwrap_or_default(),
+        role: "user".into(),
+        content: text.to_string(),
+        created_at: 0,
+        reasoning: String::new(),
+        tool_calls: String::new(),
+        tool_call_id: String::new(),
+        tool_name: String::new(),
+        kind: String::new(),
+    });
+    history
+}
+
 /// Build the message list sent to the model.
 /// Pending sources (empty `injected_user_message_id`) attach to the latest user turn.
 /// Already-consumed sources attach only to the user message that first read them.
@@ -4240,5 +4286,138 @@ mod tests {
         assert!(turns[3].content.contains("…（長いので省略しました）"));
         assert_ne!(turns[2].content, TOOL_RESULT_OMITTED);
         assert_ne!(turns[3].content, TOOL_RESULT_OMITTED);
+    }
+
+    fn conversation_tokens(turns: &[ChatTurn]) -> usize {
+        turns
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .map(turn_tokens)
+            .sum()
+    }
+
+    /// The pre-fix meter: every message, the full tool-call JSON, and every source
+    /// body, with no age stub and no cite dedupe.
+    fn naive_meter_tokens(
+        messages: &[LlmMessageRow],
+        sources: &[LlmSourceRow],
+        schema: usize,
+    ) -> usize {
+        let mut total = schema;
+        for message in messages {
+            if message.kind == crate::db::LLM_MESSAGE_NOTICE {
+                continue;
+            }
+            total += estimate_tokens(&message.content) + estimate_tokens(&message.tool_calls) + 4;
+        }
+        for source in sources {
+            total += estimate_tokens(&source.body) + estimate_tokens(&source.title);
+        }
+        total
+    }
+
+    #[test]
+    fn meter_matches_assembled_size_for_an_aged_attachment() {
+        let body = "あ".repeat(100_000);
+        let mut file = src_file("f1", "attach", 0, &body);
+        file.title.clear();
+        file.path = r"C:\docs\契約.txt".into();
+        file.injected_user_message_id = "u1".into();
+        file.cite_no = 1;
+        let history = vec![
+            msg("u1", "user", "見て"),
+            msg("a1", "assistant", "はい"),
+            msg("u2", "user", "次へ"),
+            msg("a2", "assistant", "了解"),
+            msg("u3", "user", "その"),
+            msg("a3", "assistant", "承知"),
+            msg("u4", "user", "最後"),
+        ];
+        let schema = 2_410;
+        let budget = 200_000;
+        let system = "役割";
+        let sources = [file];
+        let used = meter_usage_tokens(system, &sources, &history, "", schema, budget);
+        let (turns, _) = assemble_turns(system, &sources, &history, budget);
+        let assembled = conversation_tokens(&turns) + schema;
+        let naive = naive_meter_tokens(&history, &sources, schema);
+        assert_eq!(naive, 64_952, "the old meter counted the full attachment");
+        assert_eq!(used, 2_507);
+        assert_eq!(used, assembled);
+        assert!(
+            turns
+                .iter()
+                .filter(|turn| turn.role != "system")
+                .all(|turn| !turn.content.contains(&body)),
+            "an attachment three questions ago is a stub"
+        );
+        assert!(used < 62_400, "warning stays off: {used} / 78,000");
+        assert!(naive > 62_400, "the old number warned: {naive}");
+    }
+
+    #[test]
+    fn meter_matches_assembled_size_for_a_search_with_duplicated_bodies() {
+        let body = "あ".repeat(36_000);
+        let mut hit_a = consumed("a", "tool", 0, &body, "u1", 1);
+        hit_a.title = "甲.txt".into();
+        hit_a.path = r"C:\law\甲.txt".into();
+        hit_a.paragraph_id = "a".into();
+        let mut hit_b = consumed("b", "tool", 1, &body, "u1", 2);
+        hit_b.title = "乙.txt".into();
+        hit_b.path = r"C:\law\乙.txt".into();
+        hit_b.paragraph_id = "b".into();
+        let sources = vec![hit_a.clone(), hit_b.clone()];
+        let calls = r#"[{"id":"c1","type":"function","function":{"name":"search_index","arguments":"{\"query\":\"民法\"}"}}]"#;
+        let mut assistant = msg("a1", "assistant", "");
+        assistant.tool_calls = calls.into();
+        let mut tool = msg("t1", "tool", &format_sources(&sources));
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "search_index".into();
+        let history = vec![
+            msg("u1", "user", "調べて"),
+            assistant,
+            tool,
+            msg("u2", "user", "続き"),
+        ];
+        let schema = 2_410;
+        let budget = 200_000;
+        let system = "役割";
+        let used = meter_usage_tokens(system, &sources, &history, "", schema, budget);
+        let (turns, _) = assemble_turns(system, &sources, &history, budget);
+        let assembled = conversation_tokens(&turns) + schema;
+        let naive = naive_meter_tokens(&history, &sources, schema);
+        let blob = turns
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(blob.matches(body.as_str()).count(), 2, "each hit is sent once");
+        let assistant_turn = turns.iter().find(|turn| turn.role == "assistant").unwrap();
+        assert!(turn_tokens(assistant_turn) < estimate_tokens(calls) + 4);
+        assert_eq!(used, 47_567);
+        assert_eq!(naive, 92_560);
+        assert_eq!(used, assembled);
+        assert!(used < 62_400, "warning stays off: {used} / 78,000");
+        assert!(naive > 62_400, "the old number warned: {naive}");
+    }
+
+    #[test]
+    fn meter_matches_assembled_size_for_a_fresh_thread() {
+        let schema = 2_410;
+        let budget = 200_000;
+        let system = "役割";
+        let empty = meter_usage_tokens(system, &[], &[], "  ", schema, budget);
+        let (turns, _) = assemble_turns(system, &[], &[], budget);
+        assert_eq!(empty, conversation_tokens(&turns) + schema);
+        assert_eq!(empty, schema);
+        assert_eq!(empty, 2_410);
+
+        let draft = " 質問です ";
+        let used = meter_usage_tokens(system, &[], &[], draft, schema, budget);
+        let history = vec![msg("meter-draft", "user", draft.trim())];
+        let (turns, _) = assemble_turns(system, &[], &history, budget);
+        assert_eq!(used, conversation_tokens(&turns) + schema);
+        assert_eq!(used, 2_417);
     }
 }

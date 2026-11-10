@@ -65,49 +65,13 @@ export function toolSchemaTokenCount(opts: {
 }
 
 /**
- * Tokens this thread would actually send: messages, tool calls, attachments,
- * the draft, and the tool list. Reply headroom and the tool-result allowance
- * are reserved by the server and are not usage. Compare with `contextMeterLimit`.
+ * Denominator of the chat meter: the configured limit minus the reply headroom
+ * and the tool-result allowance. The numerator is the next request's size from
+ * `llm_context_meter`, which measures `assemble_turns`.
  */
-export function contextUsageTokens(parts: {
-  messages: { content?: string; toolCalls?: string; kind?: string }[];
-  sources: { body?: string; title?: string }[];
-  draft: string;
-  schemaTokens?: number;
-}): number {
-  let total = 0;
-  for (const message of parts.messages) {
-    if (message.kind === "notice") continue;
-    total += messageTokens(message);
-  }
-  for (const source of parts.sources) {
-    total += estimateTokens(source.body || "") + estimateTokens(source.title || "");
-  }
-  total += estimateTokens(parts.draft);
-  if (parts.schemaTokens && parts.schemaTokens > 0) {
-    total += parts.schemaTokens;
-  }
-  return total;
-}
-
-/** Configured limit minus the reply and tool-result reserves. */
 export function contextMeterLimit(limit: number): number {
   if (!(limit > 0)) return 0;
   return Math.max(0, limit - replyHeadroomTokens(limit) - toolResultAllowanceTokens(limit));
-}
-
-/** Actual use against the room left after reply and tool-result reserves. */
-export function contextMeter(parts: {
-  messages: { content?: string; toolCalls?: string; kind?: string }[];
-  sources: { body?: string; title?: string }[];
-  draft: string;
-  schemaTokens?: number;
-  limit: number;
-}): { used: number; limit: number } {
-  return {
-    used: contextUsageTokens(parts),
-    limit: contextMeterLimit(parts.limit),
-  };
 }
 
 export function contextIsNearLimit(tokens: number, limit: number): boolean {
