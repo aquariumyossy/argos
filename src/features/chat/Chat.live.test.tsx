@@ -149,10 +149,11 @@ function notifyContentResize(content: HTMLElement, height: number) {
 /** jsdom does not clamp scrollTop. A real log cannot scroll past scrollHeight - clientHeight. */
 function installLogGeometry(
   log: HTMLElement,
-  initial: { scrollHeight: number; clientHeight: number },
+  initial: { scrollHeight: number; clientHeight: number; clientWidth?: number },
 ) {
   let scrollHeight = initial.scrollHeight;
   let clientHeight = initial.clientHeight;
+  let clientWidth = initial.clientWidth ?? 0;
   let scrollTop = 0;
   const maxTop = () => Math.max(0, scrollHeight - clientHeight);
   Object.defineProperty(log, "scrollHeight", {
@@ -162,6 +163,10 @@ function installLogGeometry(
   Object.defineProperty(log, "clientHeight", {
     configurable: true,
     get: () => clientHeight,
+  });
+  Object.defineProperty(log, "clientWidth", {
+    configurable: true,
+    get: () => clientWidth,
   });
   Object.defineProperty(log, "scrollTop", {
     configurable: true,
@@ -175,6 +180,9 @@ function installLogGeometry(
     scrollHeight: () => scrollHeight,
     setScrollHeight(next: number) {
       scrollHeight = next;
+    },
+    setClientWidth(next: number) {
+      clientWidth = next;
     },
     resize(next: { scrollHeight?: number; clientHeight?: number }) {
       if (next.scrollHeight != null) scrollHeight = next.scrollHeight;
@@ -524,6 +532,12 @@ describe("scroll follow during generation", () => {
       vi.advanceTimersByTime(50);
     });
     box.setScrollHeight(box.scrollHeight() + 285);
+    const live = log.querySelector(".chat-msg.assistant.streaming");
+    if (!(live instanceof HTMLElement)) throw new Error("streaming message missing");
+    Object.defineProperty(live, "offsetHeight", {
+      configurable: true,
+      get: () => box.scrollHeight(),
+    });
     notifyContentResize(content, box.scrollHeight());
     expect(log.scrollTop).toBe(box.maxTop());
     expect(jump()).toBeNull();
@@ -649,6 +663,33 @@ describe("scroll follow during generation", () => {
     expect(1200 - log.scrollTop - 240).toBe(0);
   });
 
+  it("keeps an earlier heading in place when its thinking is opened during generation", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "m-old",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "前の回答",
+        reasoning: "前の思考",
+        createdAt: 2,
+      },
+    ];
+    const { log, box } = await startPinnedLog();
+    const parked = log.scrollTop;
+    notifyLogResize();
+    fireEvent.click(screen.getByText("思考"));
+    box.setScrollHeight(box.scrollHeight() + 426);
+    const content = log.querySelector(".chat-log-content");
+    if (!(content instanceof HTMLElement)) throw new Error("log content missing");
+    notifyContentResize(content, box.scrollHeight());
+    await act(async () => {});
+    expect(log.scrollTop).toBe(parked);
+    expect(jump()).toBeTruthy();
+    await emitDelta("thread-a", "次のトークン");
+    expect(log.scrollTop).toBe(parked);
+  });
+
   it("resumes following when enlarging the window clamps onto the bottom", async () => {
     const { log, box } = await startPinnedLog();
     log.scrollTop = 500;
@@ -753,6 +794,48 @@ describe("finished answer stays put", () => {
     });
     await pending;
     expect(log.scrollTop).toBe(parked);
+  });
+
+  it("pins when a diagram grows after the log was at the bottom", async () => {
+    messagesA = [originalUser, finishedAnswer];
+    render(<Chat />);
+    await screen.findByRole("button", { name: "図" });
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, { scrollHeight: 800, clientHeight: 120 });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    box.setScrollHeight(box.scrollHeight() + 58);
+    fireEvent.click(screen.getByRole("button", { name: "ソース" }));
+    fireEvent.click(screen.getByRole("button", { name: "図" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(800 + 58 - log.scrollTop - 120).toBe(0);
+    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
+  });
+
+  it("pins when a narrower log reflows a finished thread that was at the bottom", async () => {
+    messagesA = [originalUser, finishedAnswer];
+    render(<Chat />);
+    await screen.findByText("回答です");
+    const log = document.querySelector(".chat-log");
+    if (!(log instanceof HTMLElement)) throw new Error("chat log missing");
+    const box = installLogGeometry(log, {
+      scrollHeight: 914,
+      clientHeight: 616,
+      clientWidth: 800,
+    });
+    log.scrollTop = box.maxTop();
+    fireEvent.scroll(log);
+    notifyLogResize();
+    expect(914 - log.scrollTop - 616).toBe(0);
+    box.setClientWidth(560);
+    box.setScrollHeight(1277);
+    notifyLogResize();
+    expect(1277 - log.scrollTop - 616).toBe(0);
+    expect(screen.queryByRole("button", { name: "↓最新へ" })).toBeNull();
   });
 
   it("does not jump when a diagram lays out away from the bottom", async () => {

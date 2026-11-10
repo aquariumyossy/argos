@@ -583,6 +583,8 @@ export default function Chat() {
   const showLiveRef = useRef(false);
   const programmaticScroll = useRef(false);
   const scrollAnchor = useRef(0);
+  const wasAtBottomRef = useRef(true);
+  const liveMessageRef = useRef<HTMLElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const threadsRef = useRef(threads);
   const messagesRef = useRef(messages);
@@ -890,18 +892,29 @@ export default function Chat() {
     noteProgrammaticScroll();
     el.scrollTop = el.scrollHeight;
     scrollAnchor.current = el.scrollTop;
+    wasAtBottomRef.current = true;
   }, [noteProgrammaticScroll]);
 
-  const scrollLog = useCallback(() => {
+  const pauseFollow = useCallback(() => {
+    if (!followRef.current) return;
+    followRef.current = false;
+    wasAtBottomRef.current = false;
+    setFollowBottom(false);
+  }, []);
+
+  const scrollLog = useCallback((layout = false) => {
     const el = listRef.current;
     const key = messageListKey(messagesRef.current.map((m) => m.id));
     const listChanged = key !== seenMessageKeyRef.current;
     seenMessageKeyRef.current = key;
     if (!el || !followRef.current) return;
-    const atBottom = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
+    // Layout runs after the DOM has already grown, so the pre-growth flag is the one that matters.
+    const atBottom = layout
+      ? wasAtBottomRef.current
+      : isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
     if (
       !shouldFollowScrollToBottom({
-        live: showLiveRef.current,
+        live: showLiveRef.current && !layout,
         listChanged,
         atBottom,
       })
@@ -911,33 +924,64 @@ export default function Chat() {
     pinLogToBottom();
   }, [pinLogToBottom]);
 
+  const scrollAfterLayout = useCallback(() => {
+    scrollLog(true);
+  }, [scrollLog]);
+
   useEffect(() => {
     const content = logContentRef.current;
     const log = listRef.current;
     if (!content || !log || typeof ResizeObserver === "undefined") return;
     let lastContentHeight = content.offsetHeight;
     let lastClientHeight = log.clientHeight;
+    let lastClientWidth = log.clientWidth;
     let lastScrollHeight = log.scrollHeight;
+    let lastLiveHeight = liveMessageRef.current?.offsetHeight ?? 0;
     const observer = new ResizeObserver(() => {
       const contentHeight = content.offsetHeight;
       const clientHeight = log.clientHeight;
+      const clientWidth = log.clientWidth;
+      const scrollHeight = log.scrollHeight;
       const contentGrew = contentHeight > lastContentHeight;
+      const scrollGrew = scrollHeight > lastScrollHeight;
+      const widthChanged = clientWidth !== lastClientWidth;
+      const viewportChanged = clientHeight !== lastClientHeight;
       const viewportShrank = clientHeight < lastClientHeight;
-      const wasAtBottom = isAtBottom(log.scrollTop, lastScrollHeight, lastClientHeight);
+      const wasGeoBottom = isAtBottom(log.scrollTop, lastScrollHeight, lastClientHeight);
+      const liveEl = liveMessageRef.current;
+      const liveHeight = liveEl?.offsetHeight ?? 0;
+      const liveGrew = liveEl != null && liveHeight > lastLiveHeight;
       lastContentHeight = contentHeight;
       lastClientHeight = clientHeight;
-      lastScrollHeight = log.scrollHeight;
+      lastClientWidth = clientWidth;
+      lastScrollHeight = scrollHeight;
+      lastLiveHeight = liveHeight;
+      if (showLiveRef.current) {
+        if (!followRef.current) return;
+        if (liveGrew && wasAtBottomRef.current) {
+          pinLogToBottom();
+          return;
+        }
+        if (contentGrew && !liveGrew && wasAtBottomRef.current) {
+          pauseFollow();
+          return;
+        }
+        if (viewportShrank && wasGeoBottom) pinLogToBottom();
+        return;
+      }
       if (!followRef.current) return;
-      if (viewportShrank && wasAtBottom) {
+      if (wasGeoBottom && (widthChanged || viewportChanged)) {
         pinLogToBottom();
         return;
       }
-      if (contentGrew && showLiveRef.current) scrollLog();
+      if (contentGrew || scrollGrew) {
+        wasAtBottomRef.current = isAtBottom(log.scrollTop, scrollHeight, clientHeight);
+      }
     });
     observer.observe(content);
     observer.observe(log);
     return () => observer.disconnect();
-  }, [pinLogToBottom, scrollLog]);
+  }, [pauseFollow, pinLogToBottom, scrollLog]);
 
   const onLogScroll = useCallback(() => {
     const el = listRef.current;
@@ -950,6 +994,7 @@ export default function Chat() {
       clientHeight: el.clientHeight,
     });
     scrollAnchor.current = next.anchor;
+    wasAtBottomRef.current = isAtBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
     if (followRef.current === next.follow) return;
     followRef.current = next.follow;
     setFollowBottom(next.follow);
@@ -1927,7 +1972,7 @@ export default function Chat() {
                           }}
                           onChoice={applyTemplate}
                           choicesDisabled={blocked}
-                          onLayout={scrollLog}
+                          onLayout={scrollAfterLayout}
                         />
                       ) : null}
                     </>
@@ -1996,7 +2041,7 @@ export default function Chat() {
             })
           )}
           {showLive ? (
-            <article className="chat-msg assistant streaming">
+            <article className="chat-msg assistant streaming" ref={liveMessageRef}>
               {toolHint ? <p className="chat-tool-hint">{toolHint}</p> : null}
               {thinking ? (
                 <details className="chat-thinking">
@@ -2015,7 +2060,7 @@ export default function Chat() {
                 choicesDisabled
                 streaming={!!stream}
                 showCaret={!!stream || (!thinking && !toolHint)}
-                onLayout={scrollLog}
+                onLayout={scrollAfterLayout}
               />
               {liveCiteGroups.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
