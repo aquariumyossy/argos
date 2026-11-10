@@ -1422,6 +1422,63 @@ mod tests {
     }
 
     #[test]
+    fn recent_host_citation_block_omits_the_covered_file() {
+        let mut covered = source("s0", "u0", 1, "カバー本文SECRET");
+        covered.grain = "file".into();
+        covered.paragraph_id.clear();
+        let mut host_file = source("s1", "u1", 2, &"添".repeat(40_000));
+        host_file.grain = "file".into();
+        host_file.paragraph_id.clear();
+        host_file.path = r"C:\docs\ホスト添付.txt".into();
+        host_file.title = "ホスト添付".into();
+        let stored = format!("要点です。\n{SUMMARY_DISCLAIMER}");
+        let history = vec![
+            msg("u0", "user", "古い添付"),
+            msg("a0", "assistant", "読んだ"),
+            msg("u1", "user", "ホストの質問"),
+            msg("u2", "user", "短い質問"),
+        ];
+        let prepared = prepare_model_history(&history, &stored, "a0");
+        let sources = [covered, host_file];
+        let system = "役割";
+        let question = "短い質問";
+        for limit in [16_384usize, 32_768] {
+            let required = turn_tokens(&ChatTurn::text("system", system))
+                + turn_tokens(&ChatTurn::text("user", question));
+            let budget = context_budget(limit, 0, required).expect("question fits").messages;
+            let (turns, _) = assemble_turns(system, &sources, &prepared, budget);
+            let blob = turns
+                .iter()
+                .map(|turn| turn.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(blob.contains(SUMMARY_PREFIX), "{limit} {blob}");
+            assert!(
+                !blob.contains(&"添".repeat(40_000)),
+                "{limit} kept the host body whole, so the recent-source render did not run"
+            );
+            assert_eq!(
+                blob.matches("既読 [1] 契約書.docx").count(),
+                1,
+                "{limit} budget {budget} {blob}"
+            );
+            assert!(!blob.contains(r"C:\docs\契約書.docx"), "{limit} {blob}");
+            assert!(!blob.contains("カバー本文SECRET"), "{limit} {blob}");
+            for section in blob.split("【出典】").skip(1) {
+                let body = section.split("【質問】").next().unwrap_or(section);
+                assert!(
+                    body.lines().any(|line| !line.trim().is_empty()),
+                    "empty 出典 at {limit}: {blob}"
+                );
+                assert!(
+                    !body.contains("契約書"),
+                    "host 出典 includes the covered file at {limit}: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stub_line_inside_the_summary_body_survives_halving() {
         let filler = "要".repeat(tokens_to_chars(1_800));
         let stored = format!("{filler}\n既読 [1] 契約書.docx\n{SUMMARY_DISCLAIMER}");

@@ -1957,7 +1957,8 @@ fn refit_freed_budget(
             continue;
         }
         row.sources = row.original_sources.clone();
-        let rendered = render_user_content(&row.question, &row.sources, pool, false);
+        let own = sources_for_user_render(row);
+        let rendered = render_user_content(&row.question, &own, pool, false);
         assign_user_content(row, rendered);
         changed = true;
     }
@@ -1996,7 +1997,8 @@ fn shrink_recent_sources(
         if latest.as_deref() == Some(row.message_id.as_str()) && has_unsent_attachment(row) {
             continue;
         }
-        let next = render_user_content(&row.question, &row.sources, pool, true);
+        let own = sources_for_user_render(row);
+        let next = render_user_content(&row.question, &own, pool, true);
         let current = if row
             .turn
             .content
@@ -2067,7 +2069,7 @@ fn shrink_unsent_attachment(
         };
         drop_empty_image_pages(&mut built[turn_idx].sources);
         let question = built[turn_idx].question.clone();
-        let sources = built[turn_idx].sources.clone();
+        let sources = sources_for_user_render(&built[turn_idx]);
         let rendered = render_user_content(&question, &sources, pool, false);
         assign_user_content(&mut built[turn_idx], rendered);
         changed = true;
@@ -2158,7 +2160,8 @@ fn refit_sources(
             .iter()
             .filter_map(|source| kept_by_id.get(&source.id).cloned())
             .collect();
-        let rendered = render_user_content(&row.question, &row.sources, pool, false);
+        let own = sources_for_user_render(row);
+        let rendered = render_user_content(&row.question, &own, pool, false);
         assign_user_content(row, rendered);
     }
     true
