@@ -215,6 +215,12 @@ pub struct LlmThreadRow {
     pub sort_order: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// One summary for this thread. Empty until the conversation is summarized.
+    #[serde(default)]
+    pub summary: String,
+    /// Last message covered by `summary`. The original messages stay in the thread.
+    #[serde(default)]
+    pub summary_through_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +244,9 @@ pub struct LlmMessageRow {
     /// Empty for a normal turn. "notice" is an app message: shown in the chat, not sent to the model.
     #[serde(default)]
     pub kind: String,
+    /// Set by `prepare_model_history` on the injected summary. Not stored.
+    #[serde(skip, default)]
+    pub carries_summary: bool,
 }
 
 /// App-generated chat row. Saved and shown, but left out of later model context.
@@ -329,7 +338,7 @@ const LLM_SOURCE_COLS: &str =
     "id, thread_id, sort_order, origin, path, title, paragraph_id, body, query, created_at, grain, unit_body, injected_user_message_id, cited_assistant_message_id, cite_no, kind, stored_relpath, ocr_status";
 
 const LLM_THREAD_COLS: &str =
-    "id, title, search_enabled, path_prefix, note_id, sort_order, created_at, updated_at";
+    "id, title, search_enabled, path_prefix, note_id, sort_order, created_at, updated_at, summary, summary_through_id";
 
 fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
     Ok(LlmThreadRow {
@@ -341,6 +350,8 @@ fn map_llm_thread(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmThreadRow> {
         sort_order: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+        summary: row.get(8)?,
+        summary_through_id: row.get(9)?,
     })
 }
 
@@ -953,6 +964,8 @@ impl Db {
               path_prefix TEXT NOT NULL DEFAULT '',
               sort_order INTEGER NOT NULL DEFAULT 0,
               cite_counter INTEGER NOT NULL DEFAULT 0,
+              summary TEXT NOT NULL DEFAULT '',
+              summary_through_id TEXT NOT NULL DEFAULT '',
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL
             );
@@ -1200,6 +1213,14 @@ impl Db {
             }
         }
         conn.execute_batch("COMMIT;")?;
+        let _ = conn.execute(
+            "ALTER TABLE llm_threads ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_threads ADD COLUMN summary_through_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN llm_review_base TEXT", []);
         let _ = conn.execute(
             "UPDATE llm_note_proposals SET status='dismissed' WHERE status='pending'",
@@ -3588,7 +3609,24 @@ impl Db {
             sort_order,
             created_at: now,
             updated_at: now,
+            summary: String::new(),
+            summary_through_id: String::new(),
         })
+    }
+
+    /// Replace this thread's summary. The messages it covers are not deleted.
+    pub fn set_llm_thread_summary(
+        &self,
+        id: &str,
+        summary: &str,
+        through_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE llm_threads SET summary=?1, summary_through_id=?2 WHERE id=?3",
+            rusqlite::params![summary, through_id, id],
+        )?;
+        Ok(())
     }
 
     pub fn rename_llm_thread(
@@ -3689,6 +3727,7 @@ impl Db {
                 tool_call_id: row.get(7)?,
                 tool_name: row.get(8)?,
                 kind: row.get(9)?,
+                carries_summary: false,
             })
         })?;
         Ok(rows.flatten().collect())
@@ -3772,6 +3811,7 @@ impl Db {
             tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             kind: kind.to_string(),
+            carries_summary: false,
         })
     }
 
@@ -6285,6 +6325,52 @@ mod folder_index_status_tests {
             .insert_llm_source(&thread.id, "attach", "memo.txt", "memo", "p", "本文", "")
             .unwrap();
         assert_eq!(row.cite_no, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summary_columns_migrate_and_keep_messages() {
+        let dir = temp_dir();
+        let path = dir.join("argos.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE llm_threads (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL DEFAULT '',
+                  search_enabled INTEGER NOT NULL DEFAULT 1,
+                  path_prefix TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_threads(id, title, search_enabled, path_prefix, created_at, updated_at)
+                  VALUES ('t1', '会話', 1, '', 10, 20);
+                CREATE TABLE llm_messages (
+                  id TEXT PRIMARY KEY,
+                  thread_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL DEFAULT '',
+                  created_at INTEGER NOT NULL
+                );
+                INSERT INTO llm_messages(id, thread_id, role, content, created_at)
+                  VALUES ('m1', 't1', 'user', '元の質問', 11);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let thread = db.get_llm_thread("t1").unwrap().unwrap();
+        assert_eq!(thread.summary, "");
+        assert_eq!(thread.summary_through_id, "");
+        let messages = db.list_llm_messages("t1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "元の質問");
+        db.set_llm_thread_summary("t1", "要約本文", "m1").unwrap();
+        let thread = db.get_llm_thread("t1").unwrap().unwrap();
+        assert_eq!(thread.summary, "要約本文");
+        assert_eq!(thread.summary_through_id, "m1");
+        assert_eq!(db.list_llm_messages("t1").unwrap()[0].content, "元の質問");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

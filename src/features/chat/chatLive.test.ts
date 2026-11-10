@@ -13,6 +13,7 @@ const live = (threadId: string, stream = ""): LiveGeneration => ({
   stream,
   thinking: "",
   toolHint: "",
+  status: "",
 });
 
 describe("stream routing", () => {
@@ -51,6 +52,22 @@ describe("stream routing", () => {
       text: "",
     });
     expect(reset).toEqual(live("thread-a"));
+  });
+
+  it("keeps a summary status out of the answer stream", () => {
+    const status = applyChatDelta(live("thread-a", "途中"), {
+      threadId: "thread-a",
+      kind: "status",
+      text: "会話が長くなったため、古いやり取りを要約しています…",
+    });
+    expect(status.stream).toBe("途中");
+    expect(status.status).toContain("要約しています");
+    const answer = applyChatDelta(status, {
+      threadId: "thread-a",
+      text: "続き",
+    });
+    expect(answer.status).toBe("");
+    expect(answer.stream).toBe("途中続き");
   });
 });
 

@@ -3,6 +3,7 @@ export type LiveGeneration = {
   stream: string;
   thinking: string;
   toolHint: string;
+  status: string;
 };
 
 export type ChatDelta = {
@@ -16,18 +17,22 @@ export function applyChatDelta(live: LiveGeneration, delta: ChatDelta): LiveGene
   if (delta.threadId !== live.threadId) return live;
   const kind = delta.kind ?? "content";
   if (kind === "reset") {
-    return { ...live, stream: "", thinking: "", toolHint: "" };
+    return { ...live, stream: "", thinking: "", toolHint: "", status: "" };
   }
   if (kind === "reasoning") {
-    return { ...live, thinking: live.thinking + delta.text };
+    return { ...live, status: "", thinking: live.thinking + delta.text };
   }
   if (kind === "tool") {
     return {
       ...live,
+      status: "",
       toolHint: delta.text || "インデックスを検索しています…",
     };
   }
-  return { ...live, stream: live.stream + delta.text };
+  if (kind === "status") {
+    return { ...live, status: delta.text };
+  }
+  return { ...live, status: "", stream: live.stream + delta.text };
 }
 
 /** Subpixel rounding still counts as the bottom. Anything larger is scrolled up. */

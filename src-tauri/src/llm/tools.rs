@@ -3441,6 +3441,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }];
         let (turns, stats) = crate::llm::context::assemble_turns(
             "役割",
@@ -3746,6 +3747,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }];
         let mut saw = false;
         for budget in [500usize, 700, 900, 1_100, 1_400] {
@@ -3925,6 +3927,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }];
         let mut saw = false;
         for budget in [400usize, 600, 800, 1_000, 1_400] {
@@ -4091,6 +4094,7 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            carries_summary: false,
         }
     }
 

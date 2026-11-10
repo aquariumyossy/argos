@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -29,6 +30,7 @@ import {
   shouldFollowScrollToBottom,
   type LiveGeneration,
 } from "./chatLive";
+import { noticeFromSend, SummaryAfterMessage } from "./conversationSummary";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -70,6 +72,8 @@ type LlmThreadRow = {
   sortOrder?: number;
   createdAt: number;
   updatedAt: number;
+  summary?: string;
+  summaryThroughId?: string;
 };
 
 type LlmMessageRow = {
@@ -189,16 +193,8 @@ function bannerFromResult(
       restoreDraft: source === "draft" && shouldRestoreDraft(result.error) ? text : null,
     };
   }
-  if (result.warning) {
-    return { error: "", notice: result.warning, restoreDraft: null };
-  }
-  if (result.truncated) {
-    return {
-      error: "",
-      notice: "トークン上限のため、古いやり取りや出典から切り詰めて送りました。",
-      restoreDraft: null,
-    };
-  }
+  const note = noticeFromSend(result.warning, !!result.truncated);
+  if (note) return { error: "", notice: note, restoreDraft: null };
   return { error: "", notice: "", restoreDraft: null };
 }
 
@@ -894,8 +890,14 @@ export default function Chat() {
   const stream = viewingLive?.stream ?? "";
   const thinking = viewingLive?.thinking ?? "";
   const toolHint = viewingLive?.toolHint ?? "";
+  const status = viewingLive?.status ?? "";
   const showLive =
-    !!viewingLive && (busy || stream.length > 0 || thinking.length > 0 || toolHint.length > 0);
+    !!viewingLive &&
+    (busy ||
+      stream.length > 0 ||
+      thinking.length > 0 ||
+      toolHint.length > 0 ||
+      status.length > 0);
   showLiveRef.current = showLive;
   useEffect(() => {
     if (showLive) return;
@@ -1582,6 +1584,7 @@ export default function Chat() {
       stream: "",
       thinking: "",
       toolHint: "",
+      status: "",
     };
     liveRef.current = started;
     setLive(started);
@@ -2076,7 +2079,8 @@ export default function Chat() {
                       ? "chat-msg assistant notice"
                       : "chat-msg assistant";
               return (
-                <article key={m.id} className={roleClass}>
+                <Fragment key={m.id}>
+                <article className={roleClass}>
                   {m.role === "assistant" && (m.reasoning ?? "").trim() ? (
                     <details className="chat-thinking">
                       <summary>思考</summary>
@@ -2168,11 +2172,18 @@ export default function Chat() {
                     </div>
                   ) : null}
                 </article>
+                <SummaryAfterMessage
+                  messageId={m.id}
+                  throughId={active?.summaryThroughId ?? ""}
+                  summary={active?.summary ?? ""}
+                />
+                </Fragment>
               );
             })
           )}
           {showLive ? (
             <article className="chat-msg assistant streaming" ref={setLiveMessageEl}>
+              {status ? <p className="chat-tool-hint">{status}</p> : null}
               {toolHint ? <p className="chat-tool-hint">{toolHint}</p> : null}
               {thinking ? (
                 <details className="chat-thinking">
@@ -2181,7 +2192,7 @@ export default function Chat() {
                 </details>
               ) : null}
               <AssistantBody
-                text={stream || (!thinking && !toolHint ? "生成中…" : "")}
+                text={stream || (!thinking && !toolHint && !status ? "生成中…" : "")}
                 citeNos={liveCiteInfo.nos}
                 onCite={(n) => {
                   const s = liveCiteInfo.byNo.get(n);
@@ -2190,7 +2201,7 @@ export default function Chat() {
                 onChoice={applyTemplate}
                 choicesDisabled
                 streaming={!!stream}
-                showCaret={!!stream || (!thinking && !toolHint)}
+                showCaret={!!stream || (!thinking && !toolHint && !status)}
                 onLayout={scrollAfterLayout}
               />
               {liveCiteGroups.length > 0 ? (
