@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -18,6 +19,12 @@ import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
 import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
+import {
+  applyChatDelta,
+  emptyChatLive,
+  noticeFromSend,
+  SummaryAfterMessage,
+} from "./conversationSummary";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -46,6 +53,8 @@ type LlmThreadRow = {
   sortOrder?: number;
   createdAt: number;
   updatedAt: number;
+  summary?: string;
+  summaryThroughId?: string;
 };
 
 type LlmMessageRow = {
@@ -497,9 +506,8 @@ export default function Chat() {
   const [ocrBusy, setOcrBusy] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [dropActive, setDropActive] = useState(false);
-  const [stream, setStream] = useState("");
-  const [thinking, setThinking] = useState("");
-  const [toolHint, setToolHint] = useState("");
+  const [live, setLive] = useState(emptyChatLive);
+  const { stream, thinking, toolHint, status } = live;
   const [noteReviews, setNoteReviews] = useState<NoteReview[]>([]);
   const [appendUndo, setAppendUndo] = useState<{
     noteId: string;
@@ -726,17 +734,7 @@ export default function Chat() {
     void listen<LlmChatDelta>("llm-chat-delta", (event) => {
       if (event.payload.threadId !== activeIdRef.current) return;
       const kind = event.payload.kind ?? "content";
-      if (kind === "reset") {
-        setStream("");
-        setThinking("");
-        setToolHint("");
-      } else if (kind === "reasoning") {
-        setThinking((prev) => prev + event.payload.text);
-      } else if (kind === "tool") {
-        setToolHint(event.payload.text || "インデックスを検索しています…");
-      } else {
-        setStream((prev) => prev + event.payload.text);
-      }
+      setLive((prev) => applyChatDelta(prev, kind, event.payload.text));
     }).then((fn) => {
       unlistenDelta = fn;
     });
@@ -761,9 +759,7 @@ export default function Chat() {
         .then(() => {
           if (tid !== prev) {
             setDraft("");
-            setStream("");
-            setThinking("");
-            setToolHint("");
+            setLive(emptyChatLive);
             setError("");
           }
         })
@@ -799,7 +795,7 @@ export default function Chat() {
 
   useEffect(() => {
     scrollLog();
-  }, [messages, stream, thinking, toolHint, busy, scrollLog]);
+  }, [messages, stream, thinking, toolHint, status, busy, scrollLog]);
 
   const meter = useChatContextMeter({
     threadId: active?.id ?? "",
@@ -848,9 +844,7 @@ export default function Chat() {
       const t = await invoke<LlmThreadRow>("llm_set_active_thread", { id });
       setActive(t);
       await loadThreadContent(t);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      setLive(emptyChatLive);
       setError("");
       setNotice("");
     } catch (e) {
@@ -866,9 +860,7 @@ export default function Chat() {
       setActive(t);
       setMessages([]);
       setSources([]);
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      setLive(emptyChatLive);
       setError("");
       setNotice("");
       textareaRef.current?.focus();
@@ -882,8 +874,7 @@ export default function Chat() {
     try {
       await invoke("llm_delete_thread", { id });
       await loadThreads();
-      setStream("");
-      setThinking("");
+      setLive(emptyChatLive);
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1163,9 +1154,7 @@ export default function Chat() {
     setError("");
     setNotice("");
     setDraft("");
-    setStream("");
-    setThinking("");
-    setToolHint("");
+    setLive(emptyChatLive);
     let thread: LlmThreadRow;
     try {
       thread =
@@ -1208,13 +1197,11 @@ export default function Chat() {
       });
       setMessages(msgs);
       setSources(srcs);
+      setLive(emptyChatLive);
       for (const w of result.noteWrites ?? []) {
         if (w.noteId) await loadNoteReview(w.noteId);
       }
       if (result.thread.noteId) await loadNoteReview(result.thread.noteId);
-      setStream("");
-      setThinking("");
-      setToolHint("");
       if (result.thinkingBudgetState) {
         setThinkingBudget({
           state: result.thinkingBudgetState,
@@ -1228,15 +1215,12 @@ export default function Chat() {
         if (shouldRestoreDraft(result.error)) {
           setDraft(text);
         }
-      } else if (result.warning) {
-        setNotice(result.warning);
-      } else if (result.truncated) {
-        setNotice("トークン上限のため、古いやり取りや出典から切り詰めて送りました。");
+      } else {
+        const note = noticeFromSend(result.warning, !!result.truncated);
+        if (note) setNotice(note);
       }
     } catch (e) {
-      setStream("");
-      setThinking("");
-      setToolHint("");
+      setLive(emptyChatLive);
       const msg = formatInvokeError(e);
       if (msg.includes("生成中です")) {
         try {
@@ -1639,7 +1623,7 @@ export default function Chat() {
 
       <main className="chat-main">
         <div className="chat-log" ref={listRef}>
-          {messages.length === 0 && !stream && !thinking && !toolHint && !busy ? (
+          {messages.length === 0 && !stream && !thinking && !toolHint && !status && !busy ? (
             <p className="chat-muted chat-empty">
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
             </p>
@@ -1660,7 +1644,8 @@ export default function Chat() {
                       ? "chat-msg assistant notice"
                       : "chat-msg assistant";
               return (
-                <article key={m.id} className={roleClass}>
+                <Fragment key={m.id}>
+                <article className={roleClass}>
                   {m.role === "assistant" && (m.reasoning ?? "").trim() ? (
                     <details className="chat-thinking">
                       <summary>思考</summary>
@@ -1733,11 +1718,18 @@ export default function Chat() {
                     </div>
                   ) : null}
                 </article>
+                <SummaryAfterMessage
+                  messageId={m.id}
+                  throughId={active?.summaryThroughId ?? ""}
+                  summary={active?.summary ?? ""}
+                />
+                </Fragment>
               );
             })
           )}
-          {busy || stream || thinking || toolHint ? (
+          {busy || stream || thinking || toolHint || status ? (
             <article className="chat-msg assistant streaming">
+              {status ? <p className="chat-tool-hint">{status}</p> : null}
               {toolHint ? <p className="chat-tool-hint">{toolHint}</p> : null}
               {thinking ? (
                 <details className="chat-thinking">
@@ -1746,7 +1738,7 @@ export default function Chat() {
                 </details>
               ) : null}
               <AssistantBody
-                text={stream || (!thinking && !toolHint ? "生成中…" : "")}
+                text={stream || (!thinking && !toolHint && !status ? "生成中…" : "")}
                 citeNos={liveCiteInfo.nos}
                 onCite={(n) => {
                   const s = liveCiteInfo.byNo.get(n);
@@ -1755,7 +1747,7 @@ export default function Chat() {
                 onChoice={applyTemplate}
                 choicesDisabled
                 streaming={!!stream}
-                showCaret={!!stream || (!thinking && !toolHint)}
+                showCaret={!!stream || (!thinking && !toolHint && !status)}
                 onLayout={scrollLog}
               />
               {liveCiteGroups.length > 0 ? (

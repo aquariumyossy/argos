@@ -9,11 +9,12 @@ use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
     estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
-    meter_usage_tokens,
+    meter_usage_tokens, sent_usage_tokens, summary_trigger_reached,
     parse_cited_nos, silent_end_notice, sources_for_consumed, tool_schema_tokens, ChatTurn,
     ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
     STOP_TOOLS_HINT,
 };
+use crate::llm::summary::{self, SummaryAttempt};
 use crate::llm::tools::{self, ToolExec};
 use crate::llm::{self, files, LlmModelInfo};
 use crate::state::AppState;
@@ -714,7 +715,16 @@ fn blank_llm_thread() -> LlmThreadRow {
         sort_order: 0,
         created_at: 0,
         updated_at: 0,
+        summary: String::new(),
+        summary_through_id: String::new(),
     }
+}
+
+fn push_warning(warning: &mut Option<String>, line: &str) {
+    *warning = Some(match warning.take() {
+        Some(prev) if !prev.is_empty() => format!("{prev} {line}"),
+        _ => line.to_string(),
+    });
 }
 
 #[tauri::command]
@@ -734,7 +744,7 @@ pub async fn llm_send(
         return Err("生成中です。停止してから送信してください。".into());
     }
 
-    let thread = match thread_id.filter(|s| !s.trim().is_empty()) {
+    let mut thread = match thread_id.filter(|s| !s.trim().is_empty()) {
         Some(id) => state
             .db
             .get_llm_thread(&id)
@@ -815,9 +825,110 @@ pub async fn llm_send(
     };
     let prompt_budget = plan.prompt_budget;
     let tool_budget = plan.tool_budget;
+    let schema_tokens = plan.schema_tokens;
     // Messages plus the tool allowance leave the reply reserve untouched.
     let inject_budget = split.messages.saturating_add(split.tool_allowance).max(1);
-    let (assembled, stats) = assemble_turns(&system, &sources, &history, prompt_budget);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let state_arc = state.inner().clone();
+    let mut busy: Option<LlmBusyGuard> = None;
+    // Same numerator the meter reports, against 80% of the meter denominator.
+    let baseline =
+        summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
+    let usage = sent_usage_tokens(&system, &sources, &baseline, schema_tokens, prompt_budget);
+    let mut attempt = SummaryAttempt::NotRun;
+    if summary_trigger_reached(usage, settings.llm_max_context_tokens as usize) {
+        if let Some(job) = summary::summary_job(
+            &history,
+            &sources,
+            &thread.summary,
+            &thread.summary_through_id,
+        ) {
+            if !state.start_llm(request_id.clone(), thread.id.clone(), "send", cancel.clone()) {
+                return Err("生成中です。停止してから送信してください。".into());
+            }
+            busy = Some(LlmBusyGuard::new(state_arc.clone(), request_id.clone()));
+            let _ = app.emit(
+                "llm-chat-delta",
+                LlmChatDelta {
+                    request_id: request_id.clone(),
+                    thread_id: thread.id.clone(),
+                    text: summary::SUMMARY_STATUS_TEXT.into(),
+                    kind: "status".into(),
+                },
+            );
+            // Thinking off and tools off. The closure drops summary tokens.
+            let call = summary::summary_call(&job.transcript);
+            let summarized = llm::stream_chat(
+                &settings,
+                &call.turns,
+                cancel.clone(),
+                None,
+                llm::runaway_chars_for(&settings.llm_base_url),
+                call.thinking,
+                |_, _| {},
+            )
+            .await;
+            match summarized {
+                Err(e) if llm::is_cancelled_error(&e) => {
+                    if let Some(guard) = busy.as_mut() {
+                        guard.finish();
+                    }
+                    kick_pending_ocr(&app, state_arc.clone());
+                    let _ = state.db.delete_uncited_tool_sources(&thread.id);
+                    emit_sources_updated(&app, &thread.id);
+                    let thread = state
+                        .db
+                        .get_llm_thread(&thread.id)
+                        .map_err(|err| err.to_string())?
+                        .unwrap_or(thread);
+                    return Ok(LlmSendResult {
+                        thread,
+                        user_message,
+                        assistant_message: None,
+                        cancelled: true,
+                        error: None,
+                        truncated: false,
+                        context_tokens: 0,
+                        thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                        thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
+                        warning,
+                        note_writes: Vec::new(),
+                    });
+                }
+                Ok(out) => match summary::finalize_summary(&out.content) {
+                    Ok(text) => {
+                        if state
+                            .db
+                            .set_llm_thread_summary(&thread.id, &text, &job.through_id)
+                            .is_ok()
+                        {
+                            attempt = SummaryAttempt::Saved {
+                                summary: text,
+                                through_id: job.through_id,
+                            };
+                        } else {
+                            attempt = SummaryAttempt::Failed;
+                        }
+                    }
+                    Err(_) => attempt = SummaryAttempt::Failed,
+                },
+                Err(_) => attempt = SummaryAttempt::Failed,
+            }
+        }
+    }
+    let folded = summary::fold_summary(
+        &history,
+        &thread.summary,
+        &thread.summary_through_id,
+        attempt,
+    );
+    if folded.failed {
+        push_warning(&mut warning, summary::SUMMARY_FAILURE_WARNING);
+    }
+    thread.summary = folded.summary;
+    thread.summary_through_id = folded.through_id;
+    let (assembled, stats) = assemble_turns(&system, &sources, &folded.messages, prompt_budget);
     if stats.question_exceeds {
         discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
@@ -836,18 +947,13 @@ pub async fn llm_send(
         .map(|c| (c.id.clone(), c.cite_no))
         .collect();
     persist_image_group_cites(&state.db, &sources, &consumed);
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let state_arc = state.inner().clone();
-    if !state.start_llm(
-        request_id.clone(),
-        thread.id.clone(),
-        "send",
-        cancel.clone(),
-    ) {
-        return Err("生成中です。停止してから送信してください。".into());
+    if busy.is_none() {
+        if !state.start_llm(request_id.clone(), thread.id.clone(), "send", cancel.clone()) {
+            return Err("生成中です。停止してから送信してください。".into());
+        }
+        busy = Some(LlmBusyGuard::new(state_arc.clone(), request_id.clone()));
     }
-    let mut busy = LlmBusyGuard::new(state_arc.clone(), request_id.clone());
+    let mut busy = busy.expect("llm send owns the busy guard");
 
     let mut use_tools = true;
     let mut retried_without_tools = false;
@@ -907,6 +1013,7 @@ pub async fn llm_send(
                     None
                 },
                 llm::runaway_chars_for(&settings.llm_base_url),
+                None,
                 move |kind, delta| {
                     let _ = app2.emit(
                         "llm-chat-delta",
@@ -1518,6 +1625,8 @@ fn measure_context_meter(
         &sources,
         None,
     );
+    let history =
+        summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
     Ok(meter_usage_tokens(
         &plan.system,
         &sources,

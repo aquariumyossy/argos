@@ -19,6 +19,10 @@ pub const TOOL_RESULT_BUDGET_RATIO: f64 = 0.25;
 pub const REPLY_HEADROOM_RATIO: f64 = 0.10;
 /// User turns, counting back from the latest, whose source bodies stay in full.
 pub const RECENT_USER_TURNS: usize = 2;
+/// Synthetic user turn that stands in for messages a stored summary already covers.
+pub const SUMMARY_TURN_ID: &str = "argos:summary";
+/// The summary runs once a send reaches this share of the meter denominator.
+pub const SUMMARY_TRIGGER_RATIO: f64 = 0.8;
 /// Oldest exchanges removed together so the next sends keep the same prefix.
 pub const TRIM_EXCHANGE_BATCH: usize = 4;
 /// Old tool output that is not itself a cited source.
@@ -42,6 +46,20 @@ pub fn reply_headroom_tokens(limit_tokens: usize) -> usize {
 
 pub fn tool_result_allowance_tokens(limit_tokens: usize) -> usize {
     ((limit_tokens as f64) * TOOL_RESULT_BUDGET_RATIO).floor() as usize
+}
+
+/// Denominator of the chat meter: the context limit minus the reply reserve and the
+/// tool reserve. Not the raw limit. At 120_000 this is 78_000, so 80% is 62_400.
+pub fn meter_denominator(limit_tokens: usize) -> usize {
+    limit_tokens
+        .saturating_sub(reply_headroom_tokens(limit_tokens))
+        .saturating_sub(tool_result_allowance_tokens(limit_tokens))
+}
+
+/// True when `usage_tokens` reaches 80% of [`meter_denominator`], the same line the meter draws.
+pub fn summary_trigger_reached(usage_tokens: usize, limit_tokens: usize) -> bool {
+    let denom = meter_denominator(limit_tokens);
+    denom > 0 && (usage_tokens as f64) / (denom as f64) >= SUMMARY_TRIGGER_RATIO
 }
 
 /// Tokens of the compact JSON tool schema sent beside the messages.
@@ -102,6 +120,16 @@ pub fn source_stub_line(row: &LlmSourceRow) -> String {
         }
     }
     base
+}
+
+/// Stub kept in a conversation summary. Citation number and file name only.
+pub fn summary_stub_line(row: &LlmSourceRow) -> String {
+    let name = stub_file_name(row);
+    if row.cite_no > 0 {
+        format!("既読 [{}] {name}", row.cite_no)
+    } else {
+        format!("既読 {name}")
+    }
 }
 
 pub fn format_source_stubs(sources: &[LlmSourceRow]) -> String {
@@ -969,6 +997,7 @@ fn prompt_tokens_with_sources(system: &str, question: &str, sources: &[LlmSource
     sys_tokens + turn_tokens(&ChatTurn::text("user", user))
 }
 
+#[derive(Clone)]
 struct BuiltTurn {
     turn: ChatTurn,
     /// Sources rendered on this turn right now. Refit may drop or shorten them.
@@ -980,6 +1009,8 @@ struct BuiltTurn {
     message_id: String,
     /// Tool text before cite-dedupe. Restored when the user excerpt no longer has it.
     tool_backup: Option<String>,
+    /// Stored conversation summary. Not a real user turn.
+    summary: bool,
 }
 
 /// Stand-in used only by the meter when the composer is empty.
@@ -1001,7 +1032,8 @@ pub fn meter_question(draft: &str) -> &str {
 /// arguments, and trimming at `message_budget`. An empty draft still appends
 /// [`METER_PLACEHOLDER_QUESTION`], so the recent window matches a real send.
 /// The system prompt is not included. Reply headroom and the tool-result
-/// allowance are not included.
+/// allowance are not included. Callers that have a stored summary pass history
+/// already folded by `prepare_model_history`.
 pub fn meter_usage_tokens(
     system: &str,
     sources: &[LlmSourceRow],
@@ -1011,7 +1043,18 @@ pub fn meter_usage_tokens(
     message_budget: usize,
 ) -> usize {
     let history = history_including_draft(history, draft);
-    let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
+    sent_usage_tokens(system, sources, &history, schema_tokens, message_budget)
+}
+
+/// Same numerator as [`meter_usage_tokens`], for a history that already contains the question.
+pub fn sent_usage_tokens(
+    system: &str,
+    sources: &[LlmSourceRow],
+    history: &[LlmMessageRow],
+    schema_tokens: usize,
+    message_budget: usize,
+) -> usize {
+    let (turns, _) = assemble_turns(system, sources, history, message_budget.max(1));
     let sent: usize = turns
         .iter()
         .filter(|turn| turn.role != "system")
@@ -1047,6 +1090,10 @@ fn history_including_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMes
 /// When the request is over budget, old exchanges are dropped before source bodies.
 /// Sources outside the recent window are then sent as stubs. A body that is already
 /// on a user turn is removed from earlier tool results.
+///
+/// A turn with [`SUMMARY_TURN_ID`] replaces the messages the summary covers. It is
+/// not a user turn for the recent window, for dropping old exchanges, or for the
+/// must-fit check. Sources that belonged to the covered messages are stub lines.
 pub fn assemble_turns(
     system: &str,
     sources: &[LlmSourceRow],
@@ -1090,7 +1137,7 @@ pub fn assemble_turns(
     let latest_user_id = hist
         .iter()
         .rev()
-        .find(|m| m.role == "user")
+        .find(|m| m.role == "user" && m.id != SUMMARY_TURN_ID)
         .map(|m| m.id.as_str());
 
     let mut built: Vec<BuiltTurn> = Vec::new();
@@ -1102,17 +1149,21 @@ pub fn assemble_turns(
             question: String::new(),
             message_id: String::new(),
             tool_backup: None,
+            summary: false,
         });
     }
 
     for m in &hist {
+        let summary = m.id == SUMMARY_TURN_ID;
         let mut turn = history_turn(m);
-        let question = if m.role == "user" {
-            m.content.clone()
-        } else {
+        let question = if summary || m.role != "user" {
             String::new()
+        } else {
+            m.content.clone()
         };
-        let attached = if m.role == "user" {
+        let mut attached = if summary {
+            covered_sources(&kept, &hist)
+        } else if m.role == "user" {
             kept.iter()
                 .filter(|s| {
                     if pending_ids.contains(&s.id) {
@@ -1126,7 +1177,13 @@ pub fn assemble_turns(
         } else {
             Vec::new()
         };
-        if !attached.is_empty() {
+        if summary {
+            // The stub line is what is sent. Drop the body so a later refit cannot put it back.
+            for source in &mut attached {
+                source.body.clear();
+            }
+            append_summary_stubs(&mut turn.content, &attached);
+        } else if !attached.is_empty() {
             turn.content = render_user_content(&question, &attached, pool, false);
         }
         let tool_backup = if m.role == "tool" {
@@ -1136,11 +1193,12 @@ pub fn assemble_turns(
         };
         built.push(BuiltTurn {
             turn,
-            original_sources: attached.clone(),
+            original_sources: if summary { Vec::new() } else { attached.clone() },
             sources: attached,
             question,
             message_id: m.id.clone(),
             tool_backup,
+            summary,
         });
     }
 
@@ -1203,12 +1261,21 @@ pub fn assemble_turns(
             });
         }
     }
+    let summary_source_ids: HashSet<String> = built
+        .iter()
+        .filter(|row| row.summary)
+        .flat_map(|row| row.sources.iter().map(|s| s.id.clone()))
+        .collect();
     let shown: Vec<LlmSourceRow> = built
         .iter()
+        .filter(|row| !row.summary)
         .flat_map(|row| row.sources.iter().cloned())
         .collect();
     let source_chars = char_len(&format_sources_with_pool(&shown, pool));
     let shortened = shown.iter().any(|s| {
+        if summary_source_ids.contains(&s.id) {
+            return false;
+        }
         pool.iter()
             .find(|o| o.id == s.id)
             .is_some_and(|o| char_len(o.body.trim()) > char_len(&s.body))
@@ -1614,10 +1681,86 @@ fn dedupe_tool_bodies(built: &mut [BuiltTurn], rendered: &[LlmSourceRow]) {
     }
 }
 
+fn is_real_user(row: &BuiltTurn) -> bool {
+    row.turn.role == "user" && !row.summary
+}
+
+/// Sources whose user turn was replaced by the summary. Pending rows stay on the latest question.
+fn covered_sources(kept: &[LlmSourceRow], hist: &[&LlmMessageRow]) -> Vec<LlmSourceRow> {
+    let live: HashSet<&str> = hist
+        .iter()
+        .filter(|message| message.role == "user" && message.id != SUMMARY_TURN_ID)
+        .map(|message| message.id.as_str())
+        .collect();
+    kept.iter()
+        .filter(|source| {
+            let id = source.injected_user_message_id.trim();
+            !id.is_empty() && !live.contains(id)
+        })
+        .cloned()
+        .collect()
+}
+
+fn append_summary_stubs(content: &mut String, sources: &[LlmSourceRow]) {
+    let mut extra = Vec::new();
+    for source in sources {
+        let line = summary_stub_line(source);
+        if content.lines().any(|existing| existing.trim() == line) || extra.iter().any(|have| have == &line)
+        {
+            continue;
+        }
+        extra.push(line);
+    }
+    if extra.is_empty() {
+        return;
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+    content.push_str(&extra.join("\n"));
+}
+
+/// Cite stubs for a tool result. Note bodies and other non-source tools are left out.
+pub(crate) fn summary_stubs_for_tool(
+    content: &str,
+    sources: &[LlmSourceRow],
+    tool_name: Option<&str>,
+) -> Vec<String> {
+    if let Some(name) = tool_name.map(str::trim).filter(|name| !name.is_empty()) {
+        if !tool_result_lists_sources(Some(name)) {
+            return Vec::new();
+        }
+    }
+    let spans = emitted_header_spans(content, sources);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut ledger: HashMap<i64, &LlmSourceRow> = HashMap::new();
+    for source in sources {
+        if source.cite_no > 0 {
+            ledger.entry(source.cite_no).or_insert(source);
+        }
+    }
+    let mut lines = Vec::new();
+    let mut seen = HashSet::new();
+    for (cite, _, _) in spans {
+        if !seen.insert(cite) {
+            continue;
+        }
+        if let Some(row) = ledger.get(&cite) {
+            lines.push(summary_stub_line(row));
+        }
+    }
+    lines
+}
+
 fn recent_user_ids(built: &[BuiltTurn]) -> HashSet<String> {
     let ids: Vec<&str> = built
         .iter()
-        .filter(|row| row.turn.role == "user" && !row.message_id.is_empty())
+        .filter(|row| is_real_user(row) && !row.message_id.is_empty())
         .map(|row| row.message_id.as_str())
         .collect();
     let start = ids.len().saturating_sub(RECENT_USER_TURNS);
@@ -1628,7 +1771,7 @@ fn first_recent_index(built: &[BuiltTurn]) -> usize {
     let users: Vec<usize> = built
         .iter()
         .enumerate()
-        .filter(|(_, row)| row.turn.role == "user")
+        .filter(|(_, row)| is_real_user(row))
         .map(|(index, _)| index)
         .collect();
     if users.is_empty() {
@@ -1642,6 +1785,9 @@ fn apply_age_stubs(built: &mut [BuiltTurn], pool: &[LlmSourceRow]) {
     let recent = recent_user_ids(built);
     let recent_from = first_recent_index(built);
     for (index, row) in built.iter_mut().enumerate() {
+        if row.summary {
+            continue;
+        }
         if row.turn.role == "user" && !row.sources.is_empty() && !recent.contains(&row.message_id) {
             row.turn.content = render_user_content(&row.question, &row.sources, pool, true);
         } else if row.turn.role == "tool" && index < recent_from {
@@ -1737,7 +1883,7 @@ fn shrink_recent_sources(
     let latest = built
         .iter()
         .rev()
-        .find(|row| row.turn.role == "user")
+        .find(|row| is_real_user(row))
         .map(|row| row.message_id.clone());
     let mut changed = false;
     for row in built.iter_mut() {
@@ -1772,7 +1918,7 @@ fn shrink_unsent_attachment(
     let mut guard = 0;
     while tokens_of(built) > max_tokens && guard < 24 {
         guard += 1;
-        let Some(turn_idx) = built.iter().rposition(|row| row.turn.role == "user") else {
+        let Some(turn_idx) = built.iter().rposition(is_real_user) else {
             break;
         };
         if !has_unsent_attachment(&built[turn_idx]) {
@@ -1909,7 +2055,7 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
     let mut guard = 0;
     while tokens_of(built) > max_tokens && guard < 24 {
         guard += 1;
-        let latest = built.iter().rposition(|row| row.turn.role == "user");
+        let latest = built.iter().rposition(is_real_user);
         let idx = built
             .iter()
             .enumerate()
@@ -1945,7 +2091,7 @@ pub fn is_synthetic_user_turn(content: &str) -> bool {
 
 /// Past turns keep tool calls and tool results, and drop the reasoning channel.
 /// A tool message with an empty body is still a reply the server expects.
-fn message_is_replayed(message: &LlmMessageRow) -> bool {
+pub(crate) fn message_is_replayed(message: &LlmMessageRow) -> bool {
     if message.kind == crate::db::LLM_MESSAGE_NOTICE {
         return false;
     }
@@ -2007,7 +2153,7 @@ fn oldest_protected_user(built: &[BuiltTurn], keep_users: usize) -> Option<usize
     let users: Vec<usize> = built
         .iter()
         .enumerate()
-        .filter(|(_, row)| row.turn.role == "user")
+        .filter(|(_, row)| is_real_user(row))
         .map(|(index, _)| index)
         .collect();
     if users.is_empty() {
@@ -2017,8 +2163,16 @@ fn oldest_protected_user(built: &[BuiltTurn], keep_users: usize) -> Option<usize
     Some(users[start])
 }
 
+fn exchange_drop_start(built: &[BuiltTurn]) -> usize {
+    let mut index = usize::from(built.first().is_some_and(|row| row.turn.role == "system"));
+    while index < built.len() && built[index].summary {
+        index += 1;
+    }
+    index
+}
+
 fn drop_oldest_exchange(built: &mut Vec<BuiltTurn>, keep_users: usize) -> bool {
-    let start = usize::from(built.first().is_some_and(|row| row.turn.role == "system"));
+    let start = exchange_drop_start(built);
     let Some(protected) = oldest_protected_user(built, keep_users) else {
         return false;
     };
@@ -2026,7 +2180,7 @@ fn drop_oldest_exchange(built: &mut Vec<BuiltTurn>, keep_users: usize) -> bool {
         return false;
     }
     let mut remove_until = start + 1;
-    while remove_until < protected && built[remove_until].turn.role != "user" {
+    while remove_until < protected && !is_real_user(&built[remove_until]) {
         remove_until += 1;
     }
     if remove_until > protected {
@@ -2035,18 +2189,25 @@ fn drop_oldest_exchange(built: &mut Vec<BuiltTurn>, keep_users: usize) -> bool {
     if start >= remove_until {
         return false;
     }
-    built.drain(start..remove_until);
-    true
+    let mut removed = false;
+    for index in (start..remove_until).rev() {
+        if built[index].summary {
+            continue;
+        }
+        built.remove(index);
+        removed = true;
+    }
+    removed
 }
 
-/// System prompt plus the typed question. Source bodies are not part of this.
+/// System prompt plus the typed question. The summary turn and source bodies are not part of this.
 fn must_fit_tokens(built: &[BuiltTurn]) -> usize {
     let system = built
         .iter()
         .find(|row| row.turn.role == "system")
         .map(|row| turn_tokens(&row.turn))
         .unwrap_or(0);
-    let Some(latest) = built.iter().rev().find(|row| row.turn.role == "user") else {
+    let Some(latest) = built.iter().rev().find(|row| is_real_user(row)) else {
         return system;
     };
     let text = if !latest.sources.is_empty() {
@@ -4566,5 +4727,67 @@ mod tests {
             let expected = if chars == 20_000 { 14_932 } else { 64_932 };
             assert_eq!(used, expected, "{chars} chars");
         }
+    }
+
+    fn built_user(id: &str, content: &str, summary: bool) -> BuiltTurn {
+        BuiltTurn {
+            turn: ChatTurn::text("user", content),
+            sources: Vec::new(),
+            original_sources: Vec::new(),
+            question: if summary { String::new() } else { content.into() },
+            message_id: id.into(),
+            tool_backup: None,
+            summary,
+        }
+    }
+
+    #[test]
+    fn summary_trigger_is_eighty_percent_of_the_meter_denominator() {
+        let limit = 120_000;
+        assert_eq!(reply_headroom_tokens(limit), 12_000);
+        assert_eq!(tool_result_allowance_tokens(limit), 30_000);
+        assert_eq!(meter_denominator(limit), 78_000);
+        assert!(summary_trigger_reached(62_400, limit));
+        assert!(!summary_trigger_reached(62_399, limit));
+        let raw_eighty = ((limit as f64) * SUMMARY_TRIGGER_RATIO) as usize;
+        assert_eq!(raw_eighty, 96_000);
+        assert!(70_000 < raw_eighty);
+        assert!(summary_trigger_reached(70_000, limit));
+    }
+
+    #[test]
+    fn summary_turn_is_excluded_from_recent_ids_drop_and_must_fit() {
+        let summary = built_user(SUMMARY_TURN_ID, &"要".repeat(4_000), true);
+        let older = built_user("u1", "消える", false);
+        let latest = built_user("u2", "残る", false);
+        let system = BuiltTurn {
+            turn: ChatTurn::text("system", "役割"),
+            sources: Vec::new(),
+            original_sources: Vec::new(),
+            question: String::new(),
+            message_id: String::new(),
+            tool_backup: None,
+            summary: false,
+        };
+        let mut built = vec![system.clone(), summary.clone(), older, latest.clone()];
+        let ids = recent_user_ids(&built);
+        assert!(ids.contains("u1"));
+        assert!(ids.contains("u2"));
+        assert!(!ids.contains(SUMMARY_TURN_ID));
+        let only = recent_user_ids(&[summary.clone(), latest.clone()]);
+        assert!(only.contains("u2"));
+        assert!(!only.contains(SUMMARY_TURN_ID));
+        assert_eq!(only.len(), 1);
+
+        assert!(drop_oldest_exchange(&mut built, 1));
+        assert!(built.iter().any(|row| row.summary));
+        assert!(built.iter().any(|row| row.message_id == "u2"));
+        assert!(built.iter().all(|row| row.message_id != "u1"));
+
+        let huge = built_user(SUMMARY_TURN_ID, &"要".repeat(20_000), true);
+        let question = built_user("u9", "質問", false);
+        let fit = must_fit_tokens(&[system, question, huge]);
+        assert!(fit < 100, "{fit}");
+        assert!(estimate_tokens(&"要".repeat(20_000)) > fit);
     }
 }

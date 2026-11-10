@@ -9,6 +9,7 @@ pub mod grain;
 pub mod http_error;
 pub mod pdf_win;
 pub mod searxng;
+pub mod summary;
 pub mod thinking;
 pub mod tools;
 pub mod transcript;
@@ -533,12 +534,17 @@ fn pull_embedded_tool_calls(text: &str) -> (String, Vec<ToolCallAcc>) {
     (stripped, calls)
 }
 
+fn requested_thinking(settings: &Settings, thinking: Option<bool>) -> bool {
+    thinking.unwrap_or_else(|| thinking::thinking_enabled(settings))
+}
+
 pub async fn stream_chat(
     settings: &Settings,
     turns: &[ChatTurn],
     cancel: Arc<AtomicBool>,
     tools: Option<&Value>,
     runaway_chars: usize,
+    thinking: Option<bool>,
     mut on_delta: impl FnMut(&str, &str),
 ) -> Result<StreamOutcome, String> {
     let base = normalize_base_url(&settings.llm_base_url);
@@ -559,7 +565,7 @@ pub async fn stream_chat(
 
     let url = join_url(&base, "chat/completions");
     let client = client_for_stream()?;
-    let thinking_on = thinking::thinking_enabled(settings);
+    let thinking_on = requested_thinking(settings, thinking);
     let mut include_thinking = true;
     let resp = loop {
         let thinking = if include_thinking {
@@ -1333,6 +1339,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             if tools { Some(&schema) } else { None },
             0,
+            None,
             |_, _| {},
         )
         .await
@@ -1494,6 +1501,19 @@ mod tests {
         let without = build_chat_body("m", &[], None, None);
         assert!(without.get("chat_template_kwargs").is_none());
         assert!(without.get("thinking_budget").is_none());
+        let off = build_chat_body("m", &[], None, Some(false));
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn summary_call_can_force_thinking_off() {
+        let mut on = Settings::default();
+        on.llm_thinking = "on".into();
+        assert!(requested_thinking(&on, None));
+        assert!(!requested_thinking(&on, Some(false)));
+        let mut off = Settings::default();
+        off.llm_thinking = "off".into();
+        assert!(!requested_thinking(&off, None));
     }
 
     #[test]

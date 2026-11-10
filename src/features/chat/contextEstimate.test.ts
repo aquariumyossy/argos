@@ -66,5 +66,7 @@ describe("context tokens", () => {
     expect(contextMeterLabel(2_410, contextMeterLimit(limit))).toBe("2,410 / 78,000 トークン");
     expect(contextIsNearLimit(62_400, contextMeterLimit(limit))).toBe(true);
     expect(contextIsNearLimit(62_399, contextMeterLimit(limit))).toBe(false);
+    expect(limit * 0.8).toBe(96_000);
+    expect(contextIsNearLimit(62_400, limit)).toBe(false);
   });
 });
