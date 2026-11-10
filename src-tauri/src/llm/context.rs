@@ -1236,6 +1236,7 @@ pub fn assemble_turns(
     let full = full_sources_on_recent_turns(&built);
     dedupe_tool_bodies(&mut built, &full);
 
+    let carried_summary = carried_summary_block(&built);
     let mut truncated = false;
     // Keep the last two user turns while they fit. If a recent source is what
     // overflows, shorten it before dropping the previous question and answer.
@@ -1266,6 +1267,13 @@ pub fn assemble_turns(
         truncated = true;
     }
     if restore_recent_rereads(&mut built, max_tokens) {
+        truncated = true;
+    }
+    // Drops can remove the user turn the summary was merged into, and a skipped
+    // notice can leave two user turns in a row. Put the summary back on the first
+    // kept user, merge adjacent users, and shrink only the summary if it still
+    // does not fit. The stored summary is not replaced by this clip.
+    if normalize_summary_placement(&mut built, carried_summary.as_deref(), max_tokens) {
         truncated = true;
     }
     // Only the system prompt and the typed question (plus the 【質問】 wrapper) can
@@ -2293,6 +2301,166 @@ fn drop_oldest_exchange(built: &mut Vec<BuiltTurn>, keep_users: usize) -> bool {
         removed = true;
     }
     removed
+}
+
+fn carried_summary_block(built: &[BuiltTurn]) -> Option<String> {
+    built.iter().find_map(|row| {
+        if row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+            Some(crate::llm::summary::split_merged_user(&row.turn.content).0)
+        } else {
+            None
+        }
+    })
+}
+
+fn combine_user_text(left: &str, right: &str) -> String {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() {
+        return right.to_string();
+    }
+    if right.is_empty() {
+        return left.to_string();
+    }
+    if left.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+        let (block, user) = crate::llm::summary::split_merged_user(left);
+        let rest = if user.is_empty() {
+            right.to_string()
+        } else {
+            format!("{user}\n\n{right}")
+        };
+        return join_summary_and_user(&block, &rest);
+    }
+    if right.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+        let (block, user) = crate::llm::summary::split_merged_user(right);
+        let rest = if user.is_empty() {
+            left.to_string()
+        } else {
+            format!("{left}\n\n{user}")
+        };
+        return join_summary_and_user(&block, &rest);
+    }
+    format!("{left}\n\n{right}")
+}
+
+fn join_summary_and_user(block: &str, user: &str) -> String {
+    let block = block.trim();
+    let user = user.trim();
+    if user.is_empty() {
+        block.to_string()
+    } else {
+        format!("{block}\n\n{user}")
+    }
+}
+
+fn user_text_beside_summary(row: &BuiltTurn) -> String {
+    let content = row.turn.content.trim();
+    if !content.starts_with(crate::llm::summary::SUMMARY_PREFIX) {
+        return content.to_string();
+    }
+    let (_, user) = crate::llm::summary::split_merged_user(content);
+    if content.contains(crate::llm::summary::SUMMARY_DISCLAIMER) {
+        return user;
+    }
+    if !row.question.trim().is_empty() && row.sources.is_empty() {
+        return row.question.clone();
+    }
+    user
+}
+
+/// After drops, the summary belongs on the first user that is still sent.
+/// A summary turn sitting next to another user is merged into that user.
+fn normalize_summary_placement(
+    built: &mut Vec<BuiltTurn>,
+    summary_block: Option<&str>,
+    max_tokens: usize,
+) -> bool {
+    merge_adjacent_user_turns(built);
+    if let Some(block) = summary_block {
+        ensure_summary_on_first_user(built, block);
+    }
+    shrink_carried_summary(built, max_tokens)
+}
+
+fn merge_adjacent_user_turns(built: &mut Vec<BuiltTurn>) {
+    let mut index = 0;
+    while index + 1 < built.len() {
+        let carries = built[index].summary
+            || built[index + 1].summary
+            || built[index]
+                .turn
+                .content
+                .starts_with(crate::llm::summary::SUMMARY_PREFIX)
+            || built[index + 1]
+                .turn
+                .content
+                .starts_with(crate::llm::summary::SUMMARY_PREFIX);
+        if built[index].turn.role != "user" || built[index + 1].turn.role != "user" || !carries {
+            index += 1;
+            continue;
+        }
+        let left_content = built[index].turn.content.clone();
+        let left_sources = built[index].sources.clone();
+        let left_original = built[index].original_sources.clone();
+        let left_question = built[index].question.clone();
+        let right_content = built[index + 1].turn.content.clone();
+        built[index + 1].turn.content = combine_user_text(&left_content, &right_content);
+        for source in left_sources {
+            if !built[index + 1].sources.iter().any(|have| have.id == source.id) {
+                built[index + 1].sources.push(source);
+            }
+        }
+        for source in left_original {
+            if !built[index + 1]
+                .original_sources
+                .iter()
+                .any(|have| have.id == source.id)
+            {
+                built[index + 1].original_sources.push(source);
+            }
+        }
+        if built[index + 1].question.trim().is_empty() && !left_question.trim().is_empty() {
+            built[index + 1].question = left_question;
+        }
+        built.remove(index);
+    }
+}
+
+fn ensure_summary_on_first_user(built: &mut [BuiltTurn], block: &str) {
+    let Some(index) = built.iter().position(|row| row.turn.role == "user") else {
+        return;
+    };
+    let user = user_text_beside_summary(&built[index]);
+    let next = join_summary_and_user(block, &user);
+    if built[index].turn.content != next {
+        built[index].turn.content = next;
+    }
+}
+
+/// Same halving as [`force_under_budget`] uses for a standalone summary turn.
+/// The disclaimer stays, and the user's own text is not the part that is cut.
+fn shrink_carried_summary(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
+    let mut changed = false;
+    let mut guard = 0;
+    while tokens_of(built) > max_tokens && guard < 24 {
+        guard += 1;
+        let Some(index) = built
+            .iter()
+            .position(|row| row.turn.content.starts_with(crate::llm::summary::SUMMARY_PREFIX))
+        else {
+            break;
+        };
+        let (block, user) = crate::llm::summary::split_merged_user(&built[index].turn.content);
+        let len = char_len(&block);
+        let next = (len / 2).max(40);
+        let clipped = crate::llm::summary::clip_injected_summary(&block, next);
+        if char_len(&clipped) >= len {
+            break;
+        }
+        built[index].turn.content = join_summary_and_user(&clipped, &user);
+        changed = true;
+    }
+    changed
 }
 
 /// System prompt plus the typed question. The summary turn and source bodies are not part of this.

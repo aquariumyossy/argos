@@ -208,11 +208,12 @@ pub fn next_summary_chunk(
         let rendered = render_summary_input(group, sources);
         let group_through = fresh[end].id.clone();
         if rendered.trim().is_empty() {
-            // An empty tool result still moves the cursor, so the next request
-            // does not open on an orphan role:tool turn.
-            if fresh[index].role == "tool"
-                || (fresh[index].role == "assistant" && !fresh[index].tool_calls.trim().is_empty())
-            {
+            // Empty tool results and notice rows still move the cursor. A notice is
+            // not replayed, so leaving `through_id` in front of it stalls the next chunk.
+            let tool_tail = fresh[index].role == "tool"
+                || (fresh[index].role == "assistant" && !fresh[index].tool_calls.trim().is_empty());
+            let skipped = group.iter().any(|message| !message_is_replayed(message));
+            if tool_tail || skipped {
                 through_id = Some(group_through);
             }
             index = end + 1;
@@ -445,35 +446,48 @@ pub fn prepare_model_history(
         return history.to_vec();
     };
     let mut rest: Vec<LlmMessageRow> = history[pos + 1..].to_vec();
-    // Tool rows whose assistant was already summarized cannot open the request.
-    while rest.first().is_some_and(|message| message.role == "tool") {
-        rest.remove(0);
-    }
+    // Tool rows whose assistant was already summarized cannot open the request,
+    // even when a notice sits in front of them. Notices stay; they are not replayed.
+    let mut seen_anchor = false;
+    rest.retain(|message| {
+        if !seen_anchor && message.role == "tool" {
+            return false;
+        }
+        if message_is_replayed(message) && message.role != "tool" {
+            seen_anchor = true;
+        }
+        true
+    });
     let block = summary_turn_content(summary);
-    if rest.first().is_some_and(|message| message.role == "user") {
-        let user_text = rest[0].content.trim().to_string();
-        rest[0].content = if user_text.is_empty() {
-            block
-        } else {
-            format!("{block}\n\n{user_text}")
-        };
-        return rest;
-    }
-    let mut out = Vec::with_capacity(rest.len() + 1);
-    out.push(LlmMessageRow {
+    let summary_row = LlmMessageRow {
         id: SUMMARY_TURN_ID.into(),
         thread_id: history[pos].thread_id.clone(),
         role: "user".into(),
-        content: block,
+        content: block.clone(),
         created_at: history[pos].created_at,
         reasoning: String::new(),
         tool_calls: String::new(),
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
-    });
-    out.extend(rest);
-    out
+    };
+    // Notices are not replayed. The next row that is actually sent decides merge vs standalone.
+    let Some(index) = rest.iter().position(message_is_replayed) else {
+        let mut out = vec![summary_row];
+        out.extend(rest);
+        return out;
+    };
+    if rest[index].role == "user" {
+        let user_text = rest[index].content.trim().to_string();
+        rest[index].content = if user_text.is_empty() {
+            block
+        } else {
+            format!("{block}\n\n{user_text}")
+        };
+        return rest;
+    }
+    rest.insert(index, summary_row);
+    rest
 }
 
 /// Injection clipping stays in the request. The stored summary is the canonical text.
@@ -529,6 +543,7 @@ pub fn fold_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::LLM_MESSAGE_NOTICE;
     use crate::llm::context::{
         assemble_turns, context_budget, estimate_tokens, meter_denominator, meter_usage_tokens,
         reply_headroom_tokens, summary_trigger_reached, turn_tokens, SUMMARY_TRIGGER_RATIO,
@@ -1045,6 +1060,134 @@ mod tests {
             .expect("the cursor moves past the tool result");
         assert_eq!(again.through_id, "a-long");
         assert!(!again.transcript.contains("ノート本文SECRET"));
+    }
+
+    #[test]
+    fn long_question_keeps_a_shrunk_summary_in_the_spare_room() {
+        let body = "要".repeat(tokens_to_chars(1_924));
+        assert_eq!(estimate_tokens(&body), 1_924);
+        let stored = format!("{body}\n{SUMMARY_DISCLAIMER}");
+        let question = "問".repeat(32_000);
+        let history = vec![
+            msg("u0", "user", "古い質問"),
+            msg("a1", "assistant", "古い答え"),
+            msg("u-mid", "user", "残す質問"),
+            msg("a-mid", "assistant", "途中の答え"),
+            msg("q", "user", &question),
+        ];
+        let system = "役割";
+        let required = turn_tokens(&ChatTurn::text("system", system))
+            + turn_tokens(&ChatTurn::text("user", &question));
+        let split = context_budget(32_768, 0, required).expect("question fits");
+        let spare = split.messages.saturating_sub(required);
+        assert_eq!(spare, 1_290, "message budget {}", split.messages);
+        let prepared = prepare_model_history(&history, &stored, "a1");
+        assert!(prepared[0].content.contains("残す質問"));
+        let (turns, stats) = assemble_turns(system, &[], &prepared, split.messages);
+        assert!(!stats.question_exceeds);
+        assert!(stats.total_tokens <= split.messages, "{}", stats.total_tokens);
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains(SUMMARY_PREFIX), "{blob}");
+        assert!(blob.contains(SUMMARY_DISCLAIMER), "{blob}");
+        assert!(blob.contains(&"要".repeat(100)), "{blob}");
+        assert!(blob.contains(&"問".repeat(100)), "{blob}");
+        let request = turns
+            .iter()
+            .find(|turn| turn.content.starts_with(SUMMARY_PREFIX))
+            .expect("summary stays on the kept user");
+        assert_eq!(summary_saved_after_request(&stored, &request.content), stored.trim());
+        let roles: Vec<&str> = turns
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .map(|turn| turn.role.as_str())
+            .collect();
+        assert!(roles.windows(2).all(|pair| pair[0] != pair[1]), "{roles:?}");
+
+        let folded = fold_summary(&history, &stored, "a1", SummaryAttempt::Failed);
+        assert!(folded.failed);
+        let (again, again_stats) = assemble_turns(system, &[], &folded.messages, split.messages);
+        assert!(!again_stats.question_exceeds);
+        assert!(again_stats.total_tokens <= split.messages);
+        let failed_blob = again
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(failed_blob.contains(SUMMARY_PREFIX), "{failed_blob}");
+        assert!(failed_blob.contains(SUMMARY_DISCLAIMER), "{failed_blob}");
+        assert!(failed_blob.contains(&"要".repeat(100)), "{failed_blob}");
+        assert_eq!(folded.summary, stored);
+    }
+
+    #[test]
+    fn notice_between_summary_and_user_does_not_stack_users_and_the_cursor_advances() {
+        let mut empty = msg(
+            "n-empty",
+            "assistant",
+            "モデルが本文も操作も返さずに終わりました（終了理由: stop）。",
+        );
+        empty.kind = LLM_MESSAGE_NOTICE.into();
+        let mut limited = msg(
+            "n-limit",
+            "assistant",
+            "ツール往復が上限の 8 回に達したため、残りの操作はしていません。",
+        );
+        limited.kind = LLM_MESSAGE_NOTICE.into();
+        let history = vec![
+            msg("u0", "user", "古い"),
+            msg("a1", "assistant", "答え"),
+            empty.clone(),
+            limited.clone(),
+            msg("u1", "user", "次の質問"),
+            msg("a2", "assistant", "次の答え"),
+            msg("u2", "user", "今の質問"),
+        ];
+        let summary = format!("要点です。\n{SUMMARY_DISCLAIMER}");
+        let prepared = prepare_model_history(&history, &summary, "a1");
+        let replayed: Vec<&LlmMessageRow> = prepared.iter().filter(|message| message_is_replayed(message)).collect();
+        assert!(replayed[0].content.starts_with(SUMMARY_PREFIX));
+        assert!(replayed[0].content.contains("次の質問"));
+        assert!(replayed.windows(2).all(|pair| {
+            !(pair[0].role == "user" && pair[1].role == "user")
+        }));
+        let (turns, _) = assemble_turns("役割", &[], &prepared, 80_000);
+        let roles: Vec<&str> = turns
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .map(|turn| turn.role.as_str())
+            .collect();
+        assert!(roles.windows(2).all(|pair| pair[0] != pair[1]), "{roles:?}");
+        let blob = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(blob.contains("要点です"), "{blob}");
+        assert!(!blob.contains("終わりました"), "{blob}");
+        assert!(!blob.contains("ツール往復"), "{blob}");
+
+        let covered = vec![
+            msg("u0", "user", "最初"),
+            empty,
+            limited,
+            msg("a-long", "assistant", &"あ".repeat(20_000)),
+            msg("u-recent", "user", "残す"),
+            msg("u-now", "user", "今"),
+        ];
+        let head = "ユーザー:\n最初\n\n";
+        let budget = summary_request_tokens(head) + 40;
+        let chunk = next_summary_chunk(&covered, &[], "", "", budget).unwrap();
+        assert_eq!(chunk.through_id, "n-limit");
+        assert!(chunk.transcript.contains("最初"), "{}", chunk.transcript);
+        assert!(!chunk.transcript.contains("終わりました"), "{}", chunk.transcript);
+        assert!(!chunk.transcript.contains("ツール往復"), "{}", chunk.transcript);
+        assert!(!chunk.transcript.contains(&"あ".repeat(80)), "{}", chunk.transcript);
+        let next = next_summary_chunk(&covered, &[], "要点", &chunk.through_id, budget);
+        assert!(next.is_none() || next.unwrap().through_id != "n-empty");
     }
 
     fn assert_no_orphan_tool(turns: &[ChatTurn]) {
