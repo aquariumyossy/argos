@@ -2060,9 +2060,17 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
             .iter()
             .enumerate()
             .filter(|(index, row)| {
-                row.turn.role != "system"
-                    && Some(*index) != latest
-                    && char_len(&row.turn.content) > 40
+                if row.turn.role == "system" || Some(*index) == latest {
+                    return false;
+                }
+                let len = char_len(&row.turn.content);
+                if row.summary {
+                    let next = (len / 2).max(40);
+                    let clipped =
+                        crate::llm::summary::clip_injected_summary(&row.turn.content, next);
+                    return char_len(&clipped) < len;
+                }
+                len > 40 && (len / 2).max(40) < len
             })
             .max_by_key(|(_, row)| char_len(&row.turn.content))
             .map(|(index, _)| index);
@@ -2071,6 +2079,15 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
         };
         let len = char_len(&built[idx].turn.content);
         let next = (len / 2).max(40);
+        if built[idx].summary {
+            let clipped = crate::llm::summary::clip_injected_summary(&built[idx].turn.content, next);
+            if char_len(&clipped) >= len {
+                break;
+            }
+            built[idx].turn.content = clipped;
+            changed = true;
+            continue;
+        }
         if next >= len {
             break;
         }

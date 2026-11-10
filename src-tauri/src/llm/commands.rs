@@ -836,29 +836,41 @@ pub async fn llm_send(
     let baseline =
         summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
     let usage = sent_usage_tokens(&system, &sources, &baseline, schema_tokens, prompt_budget);
+    let mut summary_now = thread.summary.clone();
+    let mut through_now = thread.summary_through_id.clone();
     let mut attempt = SummaryAttempt::NotRun;
     if summary_trigger_reached(usage, settings.llm_max_context_tokens as usize) {
-        if let Some(job) = summary::summary_job(
-            &history,
-            &sources,
-            &thread.summary,
-            &thread.summary_through_id,
-        ) {
-            if !state.start_llm(request_id.clone(), thread.id.clone(), "send", cancel.clone()) {
-                return Err("生成中です。停止してから送信してください。".into());
+        let chunk_budget = summary::summary_request_budget(settings.llm_max_context_tokens as usize);
+        let mut announced = false;
+        for _ in 0..summary::SUMMARY_CHUNKS_PER_SEND {
+            let Some(chunk) = summary::next_summary_chunk(
+                &history,
+                &sources,
+                &summary_now,
+                &through_now,
+                chunk_budget,
+            ) else {
+                break;
+            };
+            if !announced {
+                if !state.start_llm(request_id.clone(), thread.id.clone(), "send", cancel.clone())
+                {
+                    return Err("生成中です。停止してから送信してください。".into());
+                }
+                busy = Some(LlmBusyGuard::new(state_arc.clone(), request_id.clone()));
+                let _ = app.emit(
+                    "llm-chat-delta",
+                    LlmChatDelta {
+                        request_id: request_id.clone(),
+                        thread_id: thread.id.clone(),
+                        text: summary::SUMMARY_STATUS_TEXT.into(),
+                        kind: "status".into(),
+                    },
+                );
+                announced = true;
             }
-            busy = Some(LlmBusyGuard::new(state_arc.clone(), request_id.clone()));
-            let _ = app.emit(
-                "llm-chat-delta",
-                LlmChatDelta {
-                    request_id: request_id.clone(),
-                    thread_id: thread.id.clone(),
-                    text: summary::SUMMARY_STATUS_TEXT.into(),
-                    kind: "status".into(),
-                },
-            );
             // Thinking off and tools off. The closure drops summary tokens.
-            let call = summary::summary_call(&job.transcript);
+            let call = summary::summary_call(&chunk.transcript);
             let summarized = llm::stream_chat(
                 &settings,
                 &call.turns,
@@ -866,6 +878,7 @@ pub async fn llm_send(
                 None,
                 llm::runaway_chars_for(&settings.llm_base_url),
                 call.thinking,
+                Some(call.max_tokens),
                 |_, _| {},
             )
             .await;
@@ -900,35 +913,53 @@ pub async fn llm_send(
                     Ok(text) => {
                         if state
                             .db
-                            .set_llm_thread_summary(&thread.id, &text, &job.through_id)
+                            .set_llm_thread_summary(&thread.id, &text, &chunk.through_id)
                             .is_ok()
                         {
+                            summary_now = text;
+                            through_now = chunk.through_id;
                             attempt = SummaryAttempt::Saved {
-                                summary: text,
-                                through_id: job.through_id,
+                                summary: summary_now.clone(),
+                                through_id: through_now.clone(),
                             };
                         } else {
                             attempt = SummaryAttempt::Failed;
+                            break;
                         }
                     }
-                    Err(_) => attempt = SummaryAttempt::Failed,
+                    Err(_) => {
+                        attempt = SummaryAttempt::Failed;
+                        break;
+                    }
                 },
-                Err(_) => attempt = SummaryAttempt::Failed,
+                Err(_) => {
+                    attempt = SummaryAttempt::Failed;
+                    break;
+                }
             }
         }
     }
-    let folded = summary::fold_summary(
-        &history,
-        &thread.summary,
-        &thread.summary_through_id,
-        attempt,
-    );
+    let folded = summary::fold_summary(&history, &summary_now, &through_now, attempt);
     if folded.failed {
         push_warning(&mut warning, summary::SUMMARY_FAILURE_WARNING);
     }
     thread.summary = folded.summary;
     thread.summary_through_id = folded.through_id;
     let (assembled, stats) = assemble_turns(&system, &sources, &folded.messages, prompt_budget);
+    if let Some(turn) = assembled.iter().find(|turn| {
+        turn.role == "user" && turn.content.starts_with(summary::SUMMARY_PREFIX)
+    }) {
+        let injected = summary::stored_text_from_turn(&turn.content);
+        if !injected.is_empty() && injected != thread.summary.trim() {
+            if state
+                .db
+                .set_llm_thread_summary(&thread.id, &injected, &thread.summary_through_id)
+                .is_ok()
+            {
+                thread.summary = injected;
+            }
+        }
+    }
     if stats.question_exceeds {
         discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
@@ -1013,6 +1044,7 @@ pub async fn llm_send(
                     None
                 },
                 llm::runaway_chars_for(&settings.llm_base_url),
+                None,
                 None,
                 move |kind, delta| {
                     let _ = app2.emit(

@@ -213,6 +213,7 @@ pub(crate) fn build_chat_body(
     messages: &[Value],
     tools: Option<&Value>,
     thinking: Option<bool>,
+    max_tokens: Option<u32>,
 ) -> Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -225,6 +226,9 @@ pub(crate) fn build_chat_body(
     }
     if let Some(enabled) = thinking {
         body["chat_template_kwargs"] = json!({ "enable_thinking": enabled });
+    }
+    if let Some(max_tokens) = max_tokens {
+        body["max_tokens"] = json!(max_tokens);
     }
     body
 }
@@ -545,6 +549,7 @@ pub async fn stream_chat(
     tools: Option<&Value>,
     runaway_chars: usize,
     thinking: Option<bool>,
+    max_tokens: Option<u32>,
     mut on_delta: impl FnMut(&str, &str),
 ) -> Result<StreamOutcome, String> {
     let base = normalize_base_url(&settings.llm_base_url);
@@ -573,7 +578,7 @@ pub async fn stream_chat(
         } else {
             None
         };
-        let body = build_chat_body(model, &messages, tools, thinking);
+        let body = build_chat_body(model, &messages, tools, thinking, max_tokens);
         let req = apply_auth(
             client
                 .post(&url)
@@ -1340,6 +1345,7 @@ mod tests {
             if tools { Some(&schema) } else { None },
             0,
             None,
+            None,
             |_, _| {},
         )
         .await
@@ -1496,13 +1502,15 @@ mod tests {
 
     #[test]
     fn chat_body_can_omit_thinking_fields() {
-        let with = build_chat_body("m", &[], None, Some(true));
+        let with = build_chat_body("m", &[], None, Some(true), None);
         assert_eq!(with["chat_template_kwargs"]["enable_thinking"], true);
-        let without = build_chat_body("m", &[], None, None);
+        let without = build_chat_body("m", &[], None, None, None);
         assert!(without.get("chat_template_kwargs").is_none());
         assert!(without.get("thinking_budget").is_none());
-        let off = build_chat_body("m", &[], None, Some(false));
+        assert!(without.get("max_tokens").is_none());
+        let off = build_chat_body("m", &[], None, Some(false), Some(2_000));
         assert_eq!(off["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(off["max_tokens"], 2_000);
     }
 
     #[test]
