@@ -17,12 +17,8 @@ import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { AssistantBody } from "./AssistantBody";
-import {
-  CHARS_PER_TOKEN,
-  contextIsNearLimit,
-  contextMeterLabel,
-  contextMeterLimit,
-} from "./contextEstimate";
+import { CHARS_PER_TOKEN, contextMeterLabel } from "./contextEstimate";
+import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
@@ -805,36 +801,17 @@ export default function Chat() {
     scrollLog();
   }, [messages, stream, thinking, toolHint, busy, scrollLog]);
 
-  const meterLimit = contextMeterLimit(maxContextTokens);
-  const [usedTokens, setUsedTokens] = useState(0);
-  // Numerator is the next request from assemble_turns, not a second estimate.
-  useEffect(() => {
-    let cancelled = false;
-    void invoke<number>("llm_context_meter", {
-      threadId: active?.id ?? "",
-      draft,
-      webSearch: webSearch && !!searxngUrl,
-    })
-      .then((used) => {
-        if (!cancelled && Number.isFinite(used)) setUsedTokens(used);
-      })
-      .catch(() => {
-        /* keep the last reading */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    active?.id,
-    active?.noteId,
-    active?.pathPrefix,
+  const meter = useChatContextMeter({
+    threadId: active?.id ?? "",
+    noteId: active?.noteId ?? "",
+    pathPrefix: active?.pathPrefix ?? "",
     draft,
-    messages,
+    webSearch: webSearch && !!searxngUrl,
+    maxContextTokens,
     searchMode,
-    searxngUrl,
+    messages,
     sources,
-    webSearch,
-  ]);
+  });
 
   const pendingSources = useMemo(
     () => sources.filter(isPendingSource),
@@ -862,7 +839,7 @@ export default function Chat() {
     [liveCiteGroups],
   );
 
-  const nearBudget = contextIsNearLimit(usedTokens, meterLimit);
+  const nearBudget = meter.warn;
   const blocked = busy || ocrBusy || attaching;
 
   async function selectThread(id: string) {
@@ -2038,7 +2015,7 @@ export default function Chat() {
                 className={nearBudget ? "chat-char-meter warn" : "chat-char-meter"}
                 title="この会話を送るときの目安です。上限を超えると古いやり取りから落ちます。"
               >
-                {contextMeterLabel(usedTokens, meterLimit)}
+                {contextMeterLabel(meter.used, meter.limit)}
               </span>
               {nearBudget ? (
                 <span className="chat-char-meter warn">

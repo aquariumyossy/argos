@@ -38,6 +38,7 @@ describe("context tokens", () => {
 
   it("labels the meter in tokens", () => {
     expect(contextMeterLabel(12345, 131072)).toBe("12,345 / 131,072 トークン");
+    expect(contextMeterLabel(null, 78000)).toBe("— / 78,000 トークン");
   });
 
   it("counts schema text the same way as other text", () => {

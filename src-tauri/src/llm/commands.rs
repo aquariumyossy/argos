@@ -8,7 +8,8 @@ use tauri::{AppHandle, Emitter, State};
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
-    estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_usage_tokens,
+    estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
+    meter_usage_tokens,
     parse_cited_nos, silent_end_notice, sources_for_consumed, tool_schema_tokens, ChatTurn,
     ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
     STOP_TOOLS_HINT,
@@ -1464,17 +1465,32 @@ fn attach_thread_title(explicit: Option<&str>, items: &[LlmAttachItem]) -> Strin
 }
 
 /// Size of the next request: assembled turns, without the system prompt, plus the tool schema.
+/// Runs off the UI thread. An empty draft is measured as one new question.
 #[tauri::command]
-pub fn llm_context_meter(
+pub async fn llm_context_meter(
     state: State<'_, Arc<AppState>>,
     thread_id: Option<String>,
     draft: String,
     web_search: Option<bool>,
 ) -> Result<usize, String> {
-    let draft = draft.trim().to_string();
-    let web_search = web_search.unwrap_or(false);
-    let settings = state.settings.read().clone();
+    let state = state.inner().clone();
     let thread_id = thread_id.unwrap_or_default();
+    let web_search = web_search.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        measure_context_meter(state, thread_id, draft, web_search)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+fn measure_context_meter(
+    state: Arc<AppState>,
+    thread_id: String,
+    draft: String,
+    web_search: bool,
+) -> Result<usize, String> {
+    let question = meter_question(&draft).to_string();
+    let settings = state.settings.read().clone();
     let (thread, history, sources) = if thread_id.trim().is_empty() {
         (blank_llm_thread(), Vec::new(), Vec::new())
     } else {
@@ -1497,7 +1513,7 @@ pub fn llm_context_meter(
         &state,
         &settings,
         &thread,
-        &draft,
+        &question,
         web_search,
         &sources,
         None,

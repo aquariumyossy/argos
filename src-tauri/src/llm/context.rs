@@ -982,10 +982,26 @@ struct BuiltTurn {
     tool_backup: Option<String>,
 }
 
+/// Stand-in used only by the meter when the composer is empty.
+/// One character, so the recent-turn window matches a real send.
+pub const METER_PLACEHOLDER_QUESTION: &str = "。";
+
+/// Question the meter pretends will be sent. An empty composer still counts as one new turn.
+pub fn meter_question(draft: &str) -> &str {
+    let text = draft.trim();
+    if text.is_empty() {
+        METER_PLACEHOLDER_QUESTION
+    } else {
+        text
+    }
+}
+
 /// Tokens the next request spends on replayed turns, plus the tool schema.
 /// `assemble_turns` applies age stubs, cited-body dedupe, tool-call name and
-/// arguments, and trimming at `message_budget`. The system prompt is not
-/// included. Reply headroom and the tool-result allowance are not included.
+/// arguments, and trimming at `message_budget`. An empty draft still appends
+/// [`METER_PLACEHOLDER_QUESTION`], so the recent window matches a real send.
+/// The system prompt is not included. Reply headroom and the tool-result
+/// allowance are not included.
 pub fn meter_usage_tokens(
     system: &str,
     sources: &[LlmSourceRow],
@@ -1005,10 +1021,6 @@ pub fn meter_usage_tokens(
 }
 
 fn history_including_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMessageRow> {
-    let text = draft.trim();
-    if text.is_empty() {
-        return history.to_vec();
-    }
     let mut history = history.to_vec();
     history.push(LlmMessageRow {
         id: "meter-draft".into(),
@@ -1017,7 +1029,7 @@ fn history_including_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMes
             .map(|row| row.thread_id.clone())
             .unwrap_or_default(),
         role: "user".into(),
-        content: text.to_string(),
+        content: meter_question(draft).to_string(),
         created_at: 0,
         reasoning: String::new(),
         tool_calls: String::new(),
@@ -4338,11 +4350,10 @@ mod tests {
         let system = "役割";
         let sources = [file];
         let used = meter_usage_tokens(system, &sources, &history, "", schema, budget);
-        let (turns, _) = assemble_turns(system, &sources, &history, budget);
+        let (turns, _) = assemble_turns(system, &sources, &history_with_question(&history, ""), budget);
         let assembled = conversation_tokens(&turns) + schema;
         let naive = naive_meter_tokens(&history, &sources, schema);
         assert_eq!(naive, 64_952, "the old meter counted the full attachment");
-        assert_eq!(used, 2_507);
         assert_eq!(used, assembled);
         assert!(
             turns
@@ -4382,8 +4393,11 @@ mod tests {
         let schema = 2_410;
         let budget = 200_000;
         let system = "役割";
+        let before = conversation_tokens(
+            &assemble_turns(system, &sources, &history, budget).0,
+        ) + schema;
         let used = meter_usage_tokens(system, &sources, &history, "", schema, budget);
-        let (turns, _) = assemble_turns(system, &sources, &history, budget);
+        let (turns, _) = assemble_turns(system, &sources, &history_with_question(&history, ""), budget);
         let assembled = conversation_tokens(&turns) + schema;
         let naive = naive_meter_tokens(&history, &sources, schema);
         let blob = turns
@@ -4392,14 +4406,14 @@ mod tests {
             .map(|turn| turn.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(blob.matches(body.as_str()).count(), 2, "each hit is sent once");
+        assert_eq!(blob.matches(body.as_str()).count(), 0, "the next send stubs the old hits");
         let assistant_turn = turns.iter().find(|turn| turn.role == "assistant").unwrap();
         assert!(turn_tokens(assistant_turn) < estimate_tokens(calls) + 4);
-        assert_eq!(used, 47_567);
+        assert_eq!(before, 47_567);
+        assert_eq!(used, 2_502);
         assert_eq!(naive, 92_560);
         assert_eq!(used, assembled);
         assert!(used < 62_400, "warning stays off: {used} / 78,000");
-        assert!(naive > 62_400, "the old number warned: {naive}");
     }
 
     #[test]
@@ -4408,16 +4422,149 @@ mod tests {
         let budget = 200_000;
         let system = "役割";
         let empty = meter_usage_tokens(system, &[], &[], "  ", schema, budget);
-        let (turns, _) = assemble_turns(system, &[], &[], budget);
+        let (turns, _) = assemble_turns(
+            system,
+            &[],
+            &history_with_question(&[], ""),
+            budget,
+        );
         assert_eq!(empty, conversation_tokens(&turns) + schema);
-        assert_eq!(empty, schema);
-        assert_eq!(empty, 2_410);
+        assert_eq!(empty, 2_415);
 
         let draft = " 質問です ";
         let used = meter_usage_tokens(system, &[], &[], draft, schema, budget);
-        let history = vec![msg("meter-draft", "user", draft.trim())];
+        let history = history_with_question(&[], draft);
         let (turns, _) = assemble_turns(system, &[], &history, budget);
         assert_eq!(used, conversation_tokens(&turns) + schema);
         assert_eq!(used, 2_417);
+    }
+
+    fn history_with_question(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMessageRow> {
+        let mut history = history.to_vec();
+        history.push(msg("meter-draft", "user", meter_question(draft)));
+        history
+    }
+
+    fn empty_draft_matches_next_send(
+        system: &str,
+        sources: &[LlmSourceRow],
+        history: &[LlmMessageRow],
+        schema: usize,
+        budget: usize,
+    ) -> (usize, usize) {
+        let before = conversation_tokens(&assemble_turns(system, sources, history, budget).0) + schema;
+        let used = meter_usage_tokens(system, sources, history, "", schema, budget);
+        let next = history_with_question(history, "");
+        let assembled =
+            conversation_tokens(&assemble_turns(system, sources, &next, budget).0) + schema;
+        assert_eq!(used, assembled);
+        (before, used)
+    }
+
+    #[test]
+    fn empty_draft_matches_the_next_send_for_a_cancelled_attachment() {
+        let body = "あ".repeat(100_000);
+        let mut file = src_file("f1", "attach", 0, &body);
+        file.title.clear();
+        file.path = r"C:\docs\契約.txt".into();
+        file.injected_user_message_id = "u1".into();
+        file.cite_no = 1;
+        let history = vec![
+            msg("u1", "user", "見て"),
+            msg("a1", "assistant", "はい"),
+            msg("u2", "user", "次へ"),
+        ];
+        let (before, used) =
+            empty_draft_matches_next_send("役割", std::slice::from_ref(&file), &history, 2_410, 200_000);
+        let next = history_with_question(&history, "");
+        let (turns, _) = assemble_turns("役割", std::slice::from_ref(&file), &next, 200_000);
+        assert!(
+            turns
+                .iter()
+                .filter(|turn| turn.role != "system")
+                .all(|turn| !turn.content.contains(&body))
+        );
+        assert_eq!(before, 64_947);
+        assert_eq!(used, 2_488);
+        assert!(before > 62_400, "empty meter without the extra turn warned: {before}");
+        assert!(used < 62_400, "the next send does not warn: {used}");
+    }
+
+    #[test]
+    fn empty_draft_matches_the_next_send_for_read_unit() {
+        let body = "あ".repeat(40_000);
+        let mut hit = consumed("p", "tool", 0, &body, "u1", 3);
+        hit.title = "条文.txt".into();
+        hit.path = r"C:\law\条文.txt".into();
+        hit.paragraph_id = "p".into();
+        let mut tool = msg("t1", "tool", &format_sources(std::slice::from_ref(&hit)));
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "read_unit".into();
+        let mut assistant = msg("a1", "assistant", "");
+        assistant.tool_calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{\"cite_no\":3}"}}]"#
+                .into();
+        let history = vec![
+            msg("u1", "user", "読んで"),
+            assistant,
+            tool,
+            msg("u2", "user", "次へ"),
+        ];
+        let (before, used) =
+            empty_draft_matches_next_send("役割", std::slice::from_ref(&hit), &history, 2_410, 200_000);
+        let next = history_with_question(&history, "");
+        let (turns, _) = assemble_turns("役割", std::slice::from_ref(&hit), &next, 200_000);
+        assert!(turns.iter().all(|turn| !turn.content.contains(&body)));
+        assert_eq!(before, 27_513);
+        assert_eq!(used, 2_479);
+    }
+
+    #[test]
+    fn empty_draft_matches_the_next_send_for_read_note() {
+        let note = "め".repeat(12_000);
+        let mut tool = msg("t1", "tool", &note);
+        tool.tool_call_id = "c1".into();
+        tool.tool_name = "read_note".into();
+        let mut assistant = msg("a1", "assistant", "");
+        assistant.tool_calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"read_note","arguments":"{}"}}]"#
+                .into();
+        let history = vec![
+            msg("u1", "user", "ノート"),
+            assistant,
+            tool,
+            msg("u2", "user", "次へ"),
+        ];
+        let (before, used) = empty_draft_matches_next_send("役割", &[], &history, 2_410, 200_000);
+        let next = history_with_question(&history, "");
+        let (turns, _) = assemble_turns("役割", &[], &next, 200_000);
+        assert!(turns.iter().all(|turn| !turn.content.contains(&note)));
+        assert!(turns.iter().any(|turn| turn.content.contains(OLD_TOOL_STUB)));
+        assert_eq!(before, 9_938);
+        assert_eq!(used, 2_456);
+    }
+
+    #[test]
+    fn empty_draft_counts_a_pending_attachment_on_a_new_thread() {
+        let small = "あ".repeat(20_000);
+        let large = "あ".repeat(100_000);
+        for body in [small, large] {
+            let mut file = src_file("f1", "attach", 0, &body);
+            file.title.clear();
+            file.path = r"C:\docs\契約.txt".into();
+            let sources = [file];
+            let (before, used) =
+                empty_draft_matches_next_send("役割", &sources, &[], 2_410, 200_000);
+            let next = history_with_question(&[], "");
+            let (turns, _) = assemble_turns("役割", &sources, &next, 200_000);
+            assert!(
+                turns.iter().any(|turn| turn.content.contains(&body)),
+                "the unsent attachment is part of the next request"
+            );
+            assert_eq!(before, 2_410);
+            let chars = body.chars().count();
+            let expected = if chars == 20_000 { 14_932 } else { 64_932 };
+            assert_eq!(used, expected, "{chars} chars");
+        }
     }
 }
