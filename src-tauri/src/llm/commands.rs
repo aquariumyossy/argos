@@ -1251,11 +1251,14 @@ pub async fn llm_send(
                         phantom_retried = true;
                         // At the cap, turning tools back on makes the next pass the
                         // round-limit final answer (notice and stream reset).
-                        let tools_on = phantom_retry_enables_tools(
+                        // A server that already rejected tools stays tool-less too.
+                        let tools_on = phantom_retry_tools_on(
                             unlimited_rounds,
                             rounds,
                             max_rounds,
-                        ) && !cut_hold.tools_off;
+                            cut_hold.tools_off,
+                            retried_without_tools,
+                        );
                         current_turns.push(ChatTurn::text("user", phantom_cite_hint(tools_on)));
                         use_tools = tools_on;
                         remember_phantom_answer(
@@ -2444,6 +2447,21 @@ fn phantom_retry_enables_tools(unlimited_rounds: bool, rounds: usize, max_rounds
     unlimited_rounds || rounds < max_rounds
 }
 
+/// Tools stay off when this turn already learned the server rejects them, and
+/// when cut recovery itself removed them. A tool-less citation re-request on a
+/// tool-capable server does not set `tools_locked_off`, so rounds may restore tools.
+fn phantom_retry_tools_on(
+    unlimited_rounds: bool,
+    rounds: usize,
+    max_rounds: usize,
+    tools_locked_off: bool,
+    retried_without_tools: bool,
+) -> bool {
+    phantom_retry_enables_tools(unlimited_rounds, rounds, max_rounds)
+        && !tools_locked_off
+        && !retried_without_tools
+}
+
 fn phantom_cite_hint(tools_on: bool) -> &'static str {
     if tools_on {
         PHANTOM_CITE_HINT
@@ -3322,7 +3340,7 @@ mod tests {
     fn phantom_tools_after(answer_tools: bool, rounds: usize, max_rounds: usize) -> bool {
         let mut hold = llm::thinking::CutHold::default();
         hold.observe_answer(answer_tools);
-        phantom_retry_enables_tools(false, rounds, max_rounds) && !hold.tools_off
+        phantom_retry_tools_on(false, rounds, max_rounds, hold.tools_off, false)
     }
 
     #[test]
@@ -3358,5 +3376,82 @@ mod tests {
             "recovery that stripped tools keeps the phantom retry tool-free"
         );
         assert_eq!(phantom_cite_hint(false), PHANTOM_CITE_HINT_NO_TOOLS);
+    }
+
+    /// A vLLM-style 400 (`"auto" tool choice requires`) falls back once. The
+    /// phantom-cite retry must not send tools again, or the second rejection
+    /// discards the answer because `retried_without_tools` is already set.
+    #[test]
+    fn tools_rejecting_server_keeps_the_phantom_answer_without_resending_tools() {
+        let rejected = crate::llm::http_error::chat_failure(
+            400,
+            r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice"}}"#,
+        );
+        assert_eq!(rejected, crate::llm::http_error::TOOLS_UNSUPPORTED_ERROR);
+        assert!(llm::is_tools_unsupported_error(&rejected));
+
+        let mut use_tools = true;
+        let mut retried_without_tools = false;
+        assert!(use_tools && !retried_without_tools);
+        use_tools = false;
+        retried_without_tools = true;
+
+        let answer = "根拠は [9] です。";
+        assert!(answer_has_phantom_cites(answer, &[]));
+
+        // Plain call after the fallback hits the cap, then answers with [9].
+        let mut cut = llm::thinking::ThinkingCut::start(true, use_tools);
+        assert!(matches!(
+            cut.observe(llm::thinking::CutReply::OverCap),
+            llm::thinking::CutStep::Again(req) if req.thinking_off && !req.tools
+        ));
+        let llm::thinking::CutStep::Answer { tools } = cut.observe(llm::thinking::CutReply::Answer)
+        else {
+            panic!("the thinking-off resend should answer");
+        };
+        assert!(
+            tools,
+            "a tool-capable citation re-request must still be allowed to restore tools"
+        );
+        let mut hold = llm::thinking::CutHold::default();
+        hold.observe_answer(tools);
+        assert!(!hold.tools_off);
+        let tools_on = phantom_retry_tools_on(false, 0, 8, hold.tools_off, retried_without_tools);
+        assert!(!tools_on, "do not re-send tools after the server rejected them");
+        assert_eq!(phantom_cite_hint(tools_on), PHANTOM_CITE_HINT_NO_TOOLS);
+        use_tools = tools_on;
+        assert!(
+            !(use_tools && !retried_without_tools && llm::is_tools_unsupported_error(&rejected)),
+            "a second rejection is not the one-time fallback, so it would drop the answer"
+        );
+        let mut kept = None;
+        remember_phantom_answer(&mut kept, answer, "", &[]);
+        assert!(matches!(
+            answer_after_phantom_retry(true, kept.is_some()),
+            PhantomRetryAnswer::Original
+        ));
+        let kept = kept.expect("the phantom answer is kept");
+        assert_eq!(kept.content, answer);
+        assert_eq!(
+            hold.notice(false, &kept.content),
+            Some(llm::thinking::THINKING_CUT_NOTICE)
+        );
+
+        // The same gate without a cut: a short phantom answer stays tool-less
+        // and does not store the cut notice.
+        let mut plain = llm::thinking::ThinkingCut::start(true, false);
+        assert_eq!(
+            plain.observe(llm::thinking::CutReply::Answer),
+            llm::thinking::CutStep::Pass
+        );
+        let hold_plain = llm::thinking::CutHold::default();
+        let tools_plain = phantom_retry_tools_on(false, 0, 8, hold_plain.tools_off, true);
+        assert!(!tools_plain);
+        assert_eq!(phantom_cite_hint(tools_plain), PHANTOM_CITE_HINT_NO_TOOLS);
+        assert!(hold_plain.notice(false, answer).is_none());
+        assert!(matches!(
+            answer_after_phantom_retry(true, true),
+            PhantomRetryAnswer::Original
+        ));
     }
 }
