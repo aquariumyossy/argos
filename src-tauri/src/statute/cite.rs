@@ -465,6 +465,20 @@ mod tests {
         assert!(suppl.contains("附則第1条（要確認）"), "{suppl}");
         let suppl_named = mark_unverified("民法附則第1条。", &[verified_cite(&["民法"], "s1")]);
         assert!(suppl_named.contains("要確認"), "{suppl_named}");
+        let main = vec![verified_cite(&["民法"], "1")];
+        for sample in [
+            "民法附則第1条",
+            "附則3条",
+            "民法附則（平成二十九年法律第四十四号）第1条",
+            "附則（平成29年法律第44号）第1条",
+            "民法附則の第1条",
+        ] {
+            let marked = mark_unverified(sample, &main);
+            assert!(
+                marked.contains("（要確認）"),
+                "{sample} -> {marked}"
+            );
+        }
         let bare = mark_unverified("民法555条は売買です。民法1条は別です。", &verified);
         assert!(bare.contains("555条（要確認）"), "{bare}");
         assert!(bare.contains("民法1条は"), "{bare}");

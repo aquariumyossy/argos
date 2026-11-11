@@ -725,11 +725,51 @@ fn take_numeral(chars: &[char], start: usize) -> Option<(u32, usize)> {
     None
 }
 
-fn suppl_prefix(chars: &[char], dai: usize) -> Option<usize> {
-    let mut i = dai;
+/// 附則 may be separated from the article by an amendment reference in
+/// parentheses and/or の: `附則（平成29年法律第44号）の第1条`.
+fn suppl_prefix(chars: &[char], article_at: usize) -> Option<usize> {
+    let mut i = skip_ws_back(chars, article_at);
+    for _ in 0..2 {
+        if i > 0 && chars[i - 1] == 'の' {
+            i = skip_ws_back(chars, i - 1);
+            continue;
+        }
+        if let Some(next) = skip_parens_back(chars, i) {
+            i = skip_ws_back(chars, next);
+            continue;
+        }
+        break;
+    }
+    suppl_word(chars, i)
+}
+
+fn skip_ws_back(chars: &[char], mut i: usize) -> usize {
     while i > 0 && chars[i - 1].is_whitespace() {
         i -= 1;
     }
+    i
+}
+
+fn skip_parens_back(chars: &[char], i: usize) -> Option<usize> {
+    if i == 0 {
+        return None;
+    }
+    let open = match chars[i - 1] {
+        '）' => '（',
+        ')' => '(',
+        _ => return None,
+    };
+    let mut j = i - 1;
+    while j > 0 && chars[j - 1] != open {
+        j -= 1;
+    }
+    if j == 0 || chars[j - 1] != open {
+        return None;
+    }
+    Some(j - 1)
+}
+
+fn suppl_word(chars: &[char], i: usize) -> Option<usize> {
     if i >= 2 && chars[i - 2] == '附' && chars[i - 1] == '則' {
         return Some(i - 2);
     }
@@ -888,6 +928,20 @@ mod tests {
         let suppl = article_spans("附則3条");
         assert_eq!(suppl[0].key, "s3");
         assert!(suppl[0].suppl);
+        for sample in [
+            "民法附則第1条",
+            "民法附則（平成二十九年法律第四十四号）第1条",
+            "附則（平成29年法律第44号）第1条",
+            "附則(平成29年法律第44号)第1条",
+            "民法附則の第1条",
+            "附則（平成29年法律第44号）の第1条",
+        ] {
+            let spans = article_spans(sample);
+            assert_eq!(spans.len(), 1, "{sample} -> {spans:?}");
+            assert!(spans[0].suppl, "{sample}");
+            assert_eq!(spans[0].key, "s1", "{sample}");
+            assert!(spans[0].end <= sample.chars().count(), "{sample}");
+        }
         assert!(parse_article_query("").is_none());
         assert!(parse_article_query("条なし").is_none());
     }

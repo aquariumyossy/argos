@@ -466,16 +466,37 @@ fn resolve_law(
     db.resolve_name(name).map_err(EgovFailure::Bad)
 }
 
+/// Today's list is published during the day. A 404 or an empty body before that
+/// must not count as "today is done". Re-check at most once per hour.
+const TODAY_LIST_INTERVAL_SECS: i64 = 60 * 60;
+const UPDATES_TODAY_CHECKED: &str = "updates_today_checked";
+
 fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
-    let through = db.meta("updates_through").unwrap_or_default();
-    let Some(mut day) = walk_start(&through, today) else {
-        return false;
-    };
     let Some(today_d) = parse_ymd(today) else {
         return false;
     };
+    let stored_through = db.meta("updates_through").unwrap_or_default();
+    let through = if parse_ymd(&stored_through) == Some(today_d) {
+        today_d
+            .pred_opt()
+            .map(format_ymd)
+            .unwrap_or_else(|| stored_through.clone())
+    } else {
+        stored_through
+    };
+    let Some(mut day) = walk_start(&through, today) else {
+        return false;
+    };
+    if day == today_d && today_list_is_fresh(db) {
+        return false;
+    }
     let mut fetched = 0i64;
+    let mut finished_today = false;
     while day <= today_d && fetched < UPDATE_WALK_DAYS {
+        if day == today_d && today_list_is_fresh(db) {
+            break;
+        }
+        let is_today = day == today_d;
         let url = update_list_url(&compact_ymd(day));
         match client.fetch(&url) {
             Ok(xml) => match xmlparse::parse_update_list(&xml) {
@@ -486,12 +507,20 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
                     {
                         return true;
                     }
+                    if is_today {
+                        note_today_checked(db);
+                        finished_today = true;
+                    }
                 }
                 Err(_) => return true,
             },
             Err(EgovFailure::NotFound) => {
                 if db.store_updates(&format_ymd(day), today, &[]).is_err() {
                     return true;
+                }
+                if is_today {
+                    note_today_checked(db);
+                    finished_today = true;
                 }
             }
             Err(_) => return true,
@@ -502,14 +531,38 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
             None => break,
         };
     }
-    if day > today_d {
-        let _ = db.set_meta("updates_through", today);
+    let settled = if finished_today {
+        today_d.pred_opt()
     } else if fetched > 0 {
-        if let Some(last) = day.pred_opt() {
-            let _ = db.set_meta("updates_through", &format_ymd(last));
-        }
+        day.pred_opt()
+    } else {
+        None
+    };
+    if let Some(settled) = settled {
+        let settled = if settled >= today_d {
+            today_d.pred_opt().unwrap_or(settled)
+        } else {
+            settled
+        };
+        let _ = db.set_meta("updates_through", &format_ymd(settled));
     }
     false
+}
+
+fn today_list_is_fresh(db: &StatuteDb) -> bool {
+    let raw = db.meta(UPDATES_TODAY_CHECKED).unwrap_or_default();
+    let Ok(checked) = raw.parse::<i64>() else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    now.saturating_sub(checked) < TODAY_LIST_INTERVAL_SECS
+}
+
+fn note_today_checked(db: &StatuteDb) {
+    let _ = db.set_meta(
+        UPDATES_TODAY_CHECKED,
+        &chrono::Utc::now().timestamp().to_string(),
+    );
 }
 
 #[cfg(test)]
@@ -517,6 +570,14 @@ mod tests {
     use super::*;
     use crate::statute::egov::{MapEgov, OfflineEgov};
     use crate::statute::xmlparse::ParsedArticle;
+
+    fn skip_today_list(db: &StatuteDb) {
+        db.set_meta(
+            UPDATES_TODAY_CHECKED,
+            &chrono::Utc::now().timestamp().to_string(),
+        )
+        .unwrap();
+    }
 
     fn temp_db() -> StatuteDb {
         let path = std::env::temp_dir().join(format!(
@@ -580,6 +641,7 @@ mod tests {
     fn missing_article_is_fetched_and_cached() {
         let db = temp_db();
         db.set_meta("updates_through", "2026-11-11").unwrap();
+        skip_today_list(&db);
         let xml = include_str!("fixtures/article_555.xml").to_string();
         let client = MapEgov::new(vec![("articles;lawId=129AC0000000089".into(), Ok(xml))]);
         db.ensure_law(
@@ -664,6 +726,7 @@ mod tests {
         let body = "売買は、当事者の一方がある財産権を相手方に移転することを約し、相手方がこれに対してその代金を支払うことを約することによって、その効力を生ずる。";
         seed_minpo(&db, body, "2026-11-11");
         db.set_meta("updates_through", "2026-11-11").unwrap();
+        skip_today_list(&db);
         let hits = resolve_articles(
             &db,
             &OfflineEgov,
@@ -684,6 +747,7 @@ mod tests {
     fn fetching_one_article_does_not_mark_the_whole_law_current() {
         let db = temp_db();
         db.set_meta("updates_through", "2026-11-11").unwrap();
+        skip_today_list(&db);
         db.ensure_law("129AC0000000089", "民法", "", "bundle")
             .unwrap();
         let client = MapEgov::new(vec![(
@@ -765,6 +829,7 @@ mod tests {
     fn a_pending_amendment_is_refetched_once_it_is_in_force() {
         let db = temp_db();
         db.set_meta("updates_through", "2027-04-02").unwrap();
+        skip_today_list(&db);
         db.replace_law(
             "129AC0000000089",
             "民法",
@@ -858,5 +923,105 @@ mod tests {
             .unwrap()
             .body
             .contains("新しい第一条"));
+    }
+
+    #[test]
+    fn a_missing_today_list_is_fetched_again_later() {
+        let db = temp_db();
+        seed_minpo(&db, "古い本文", "2020-04-01");
+        db.set_meta("updates_through", "2026-11-10").unwrap();
+        let first = MapEgov::new(vec![(
+            "updatelawlists/20261111".into(),
+            Err(EgovFailure::NotFound),
+        )]);
+        let before = resolve_articles(
+            &db,
+            &first,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert_eq!(before[0].body, "古い本文");
+        assert_eq!(db.meta("updates_through").unwrap(), "2026-11-10");
+        assert!(db.remote_as_of("129AC0000000089").unwrap().is_none());
+        assert!(!db.pending_due("129AC0000000089", "2026-11-12").unwrap());
+
+        let again = MapEgov::new(vec![(
+            "updatelawlists/20261111".into(),
+            Ok(r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot><Result><Code>0</Code></Result><ApplData>
+<LawNameListInfo>
+<LawId>129AC0000000089</LawId>
+<EnforcementDate>20261111</EnforcementDate>
+<EnforcementFlg>0</EnforcementFlg>
+</LawNameListInfo>
+</ApplData></DataRoot>"#
+                .to_string()),
+        )]);
+        let throttled = resolve_articles(
+            &db,
+            &again,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert_eq!(throttled[0].body, "古い本文");
+        assert!(!db.pending_due("129AC0000000089", "2026-11-12").unwrap());
+
+        db.set_meta(UPDATES_TODAY_CHECKED, "0").unwrap();
+        let later = resolve_articles(
+            &db,
+            &again,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert_eq!(later[0].body, "古い本文");
+        assert_eq!(db.meta("updates_through").unwrap(), "2026-11-10");
+        assert!(db.remote_as_of("129AC0000000089").unwrap().is_none());
+        assert!(!db.pending_due("129AC0000000089", "2026-11-11").unwrap());
+        assert!(db.pending_due("129AC0000000089", "2026-11-12").unwrap());
+    }
+
+    #[test]
+    fn a_parenthetical_suppl_request_is_not_verified() {
+        let db = temp_db();
+        skip_today_list(&db);
+        db.set_meta("updates_through", "2026-11-11").unwrap();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["民法".into()],
+            &[ParsedArticle {
+                key: "1".into(),
+                num: "第1条".into(),
+                heading: "本則".into(),
+                body: "本則の本文".into(),
+                suppl: false,
+            }],
+        )
+        .unwrap();
+        let hits = resolve_articles(
+            &db,
+            &OfflineEgov,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "附則（平成29年法律第44号）第1条".into(),
+            }],
+            "2026-11-11",
+        );
+        assert!(!hits[0].verified, "{:?}", hits[0].note);
+        assert!(hits[0].note.contains("附則"), "{}", hits[0].note);
+        assert!(!hits[0].body.contains("本則の本文"));
     }
 }
