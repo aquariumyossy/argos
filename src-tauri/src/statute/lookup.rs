@@ -523,7 +523,16 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
                     finished_today = true;
                 }
             }
-            Err(_) => return true,
+            Err(_) => {
+                // A down or 5xx list for today is one attempt. It must not block
+                // fetching an article, and it must not be retried for an hour.
+                if is_today {
+                    note_today_checked(db);
+                    finished_today = true;
+                    break;
+                }
+                return true;
+            }
         }
         fetched += 1;
         day = match day.succ_opt() {
@@ -987,6 +996,70 @@ mod tests {
         assert!(db.remote_as_of("129AC0000000089").unwrap().is_none());
         assert!(!db.pending_due("129AC0000000089", "2026-11-11").unwrap());
         assert!(db.pending_due("129AC0000000089", "2026-11-12").unwrap());
+    }
+
+    struct CountingList {
+        list_hits: std::sync::Mutex<usize>,
+        article: String,
+    }
+
+    impl EgovSource for CountingList {
+        fn fetch(&self, url: &str) -> Result<String, EgovFailure> {
+            if url.contains("updatelawlists/") {
+                *self.list_hits.lock().unwrap() += 1;
+                return Err(EgovFailure::Offline);
+            }
+            if url.contains("articles;") {
+                return Ok(self.article.clone());
+            }
+            Err(EgovFailure::Offline)
+        }
+    }
+
+    #[test]
+    fn a_failed_today_list_is_not_retried_within_the_hour() {
+        let db = temp_db();
+        db.set_meta("updates_through", "2026-11-10").unwrap();
+        db.ensure_law(
+            "129AC0000000089",
+            "民法",
+            "明治二十九年法律第八十九号",
+            "bundle",
+        )
+        .unwrap();
+        let client = CountingList {
+            list_hits: std::sync::Mutex::new(0),
+            article: include_str!("fixtures/article_555.xml").to_string(),
+        };
+        let first = resolve_articles(
+            &db,
+            &client,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "第555条".into(),
+            }],
+            "2026-11-11",
+        );
+        assert!(first[0].verified, "{:?}", first[0].note);
+        assert!(!first[0].offline);
+        assert!(first[0].body.contains("財産権"), "{}", first[0].body);
+        assert_eq!(*client.list_hits.lock().unwrap(), 1);
+        assert_eq!(db.meta("updates_through").unwrap(), "2026-11-10");
+        assert!(!db.meta(UPDATES_TODAY_CHECKED).unwrap().is_empty());
+
+        let second = resolve_articles(
+            &db,
+            &client,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "第555条".into(),
+            }],
+            "2026-11-11",
+        );
+        assert!(second[0].verified, "{:?}", second[0].note);
+        assert!(!second[0].offline);
+        assert_eq!(*client.list_hits.lock().unwrap(), 1);
+        assert_ne!(db.meta("updates_through").unwrap(), "2026-11-11");
     }
 
     #[test]
