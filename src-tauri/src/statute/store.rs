@@ -661,37 +661,28 @@ impl StatuteDb {
             }
             let enforce = parse_ymd(&row.enforce_on);
             let as_of_date = parse_ymd(&row.as_of);
-            let future = row.pending
+            // Today still counts as outstanding: refetch on the following day.
+            let outstanding = row.pending
                 || enforce
                     .zip(today_d)
-                    .is_some_and(|(date, today)| date > today)
+                    .is_some_and(|(date, today)| date >= today)
                 || as_of_date
                     .zip(today_d)
-                    .is_some_and(|(date, today)| date > today);
-            if future {
+                    .is_some_and(|(date, today)| date >= today);
+            if outstanding {
                 let when = if !row.enforce_on.is_empty() {
                     row.enforce_on.as_str()
                 } else {
                     row.as_of.as_str()
                 };
                 if !when.is_empty() {
-                    tx.execute(
-                        "INSERT INTO pending_revision (law_id, enforce_on) VALUES (?1, ?2)
-                         ON CONFLICT(law_id) DO UPDATE SET enforce_on = excluded.enforce_on",
-                        params![row.law_id, when],
-                    )
-                    .map_err(|e| e.to_string())?;
+                    remember_pending(&tx, &row.law_id, when)?;
                 }
                 continue;
             }
             if row.as_of.is_empty() {
                 continue;
             }
-            tx.execute(
-                "DELETE FROM pending_revision WHERE law_id = ?1",
-                [&row.law_id],
-            )
-            .map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT INTO law_update (law_id, as_of) VALUES (?1, ?2)
                  ON CONFLICT(law_id) DO UPDATE SET
@@ -717,9 +708,11 @@ impl StatuteDb {
         let Some(when) = when else {
             return Ok(false);
         };
+        // The enforcement day itself is too early: the published text can still
+        // be the pre-amendment one. Recheck from the next day.
         Ok(parse_ymd(&when)
             .zip(parse_ymd(today))
-            .is_some_and(|(due, today)| due <= today))
+            .is_some_and(|(due, today)| due < today))
     }
 
     pub fn clear_pending(&self, law_id: &str) -> Result<(), String> {
@@ -929,6 +922,20 @@ fn import_attached(conn: &Connection, path: &Path) -> Result<(), String> {
         let _ = conn.execute("DETACH DATABASE seed", []);
     }
     import
+}
+
+fn remember_pending(conn: &Connection, law_id: &str, enforce_on: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO pending_revision (law_id, enforce_on) VALUES (?1, ?2)
+         ON CONFLICT(law_id) DO UPDATE SET
+           enforce_on = CASE
+             WHEN excluded.enforce_on < pending_revision.enforce_on THEN excluded.enforce_on
+             ELSE pending_revision.enforce_on
+           END",
+        params![law_id, enforce_on],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 fn bump_rev_locked(conn: &Connection) -> Result<(), String> {
@@ -1214,6 +1221,51 @@ mod tests {
         .unwrap();
         assert!(db.remote_as_of("129AC0000000089").unwrap().is_none());
         assert!(!db.pending_due("129AC0000000089", "2026-11-11").unwrap());
-        assert!(db.pending_due("129AC0000000089", "2027-04-01").unwrap());
+        assert!(!db.pending_due("129AC0000000089", "2027-04-01").unwrap());
+        assert!(db.pending_due("129AC0000000089", "2027-04-02").unwrap());
+    }
+
+    #[test]
+    fn pending_dates_keep_the_earliest_and_a_today_row_is_not_dropped() {
+        let (_dir, db) = temp_db();
+        let row = |enforce: &str, pending: bool| ListedUpdate {
+            law_id: "129AC0000000089".into(),
+            as_of: if pending {
+                String::new()
+            } else {
+                enforce.into()
+            },
+            enforce_on: enforce.into(),
+            pending,
+        };
+        db.store_updates("2026-11-01", "2026-11-11", &[row("2027-06-01", true)])
+            .unwrap();
+        db.store_updates("2026-11-02", "2026-11-11", &[row("2027-04-01", true)])
+            .unwrap();
+        assert!(!db.pending_due("129AC0000000089", "2027-04-01").unwrap());
+        assert!(
+            db.pending_due("129AC0000000089", "2027-04-02").unwrap(),
+            "a later pending date must not replace the earlier one"
+        );
+        db.store_updates(
+            "2026-11-11",
+            "2026-11-11",
+            &[ListedUpdate {
+                law_id: "129AC0000000089".into(),
+                as_of: "2024-04-01".into(),
+                enforce_on: "2024-04-01".into(),
+                pending: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            db.remote_as_of("129AC0000000089").unwrap().as_deref(),
+            Some("2024-04-01")
+        );
+        assert!(db.pending_due("129AC0000000089", "2027-04-02").unwrap());
+        db.store_updates("2026-11-11", "2026-11-11", &[row("2026-11-11", false)])
+            .unwrap();
+        assert!(!db.pending_due("129AC0000000089", "2026-11-11").unwrap());
+        assert!(db.pending_due("129AC0000000089", "2026-11-12").unwrap());
     }
 }

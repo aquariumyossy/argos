@@ -567,63 +567,26 @@ pub struct ArticleSpan {
     pub suppl: bool,
 }
 
-/// Every 第N条 in `text`, including 附則 and branch numbers of any depth.
-/// `start`/`end` are char indexes. A following 項 or 号 is not part of the span.
+/// Every article citation in `text`, including forms without 第 (`555条`) or without
+/// 条 (`第548の2`). `start`/`end` are char indexes into `text` itself.
+/// A following 項 or 号 is not part of the span.
 pub fn article_spans(text: &str) -> Vec<ArticleSpan> {
-    let prepared = ensure_article_mark(text);
-    let chars: Vec<char> = prepared.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
-        if chars[i] != '第' {
-            i += 1;
-            continue;
-        }
-        let Some((main, mut j)) = take_numeral(&chars, i + 1) else {
+        let Some(span) = citation_at(&chars, i) else {
             i += 1;
             continue;
         };
-        if chars.get(j) != Some(&'条') {
-            i += 1;
-            continue;
-        }
-        j += 1;
-        let mut parts = vec![main];
-        while chars.get(j) == Some(&'の') {
-            let Some((branch, next)) = take_numeral(&chars, j + 1) else {
-                break;
-            };
-            if chars.get(next) == Some(&'条') {
-                break;
-            }
-            parts.push(branch);
-            j = next;
-        }
-        let suppl_at = suppl_prefix(&chars, i);
-        let suppl = suppl_at.is_some();
-        let start = suppl_at.unwrap_or(i);
-        let attr = parts
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join("_");
-        let Some((key, display)) = article_identity(&attr, suppl) else {
-            i = j;
-            continue;
-        };
-        out.push(ArticleSpan {
-            start,
-            end: j,
-            key,
-            display,
-            suppl,
-        });
-        i = j;
+        let next = span.end.max(i + 1);
+        out.push(span);
+        i = next;
     }
     out
 }
 
-/// `555`, `第555条`, `第五百五十五条`, `548の2`, `第32条の4の2`, `附則第1条`.
+/// `555`, `555条`, `第555条`, `第五百五十五条`, `548の2`, `第548の2`, `附則3条`.
 pub fn parse_article_query(raw: &str) -> Option<(String, String)> {
     let text = raw.trim();
     if text.is_empty() {
@@ -631,6 +594,7 @@ pub fn parse_article_query(raw: &str) -> Option<(String, String)> {
     }
     if !text.contains('第')
         && !text.contains('条')
+        && !text.contains('附')
         && text
             .chars()
             .all(|c| c.is_ascii_digit() || ('０'..='９').contains(&c) || c == '_')
@@ -647,14 +611,84 @@ pub fn parse_article_query(raw: &str) -> Option<(String, String)> {
             .collect();
         return article_identity(&ascii, false);
     }
-    let span = article_spans(text).into_iter().next()?;
+    if let Some(span) = article_spans(text).into_iter().next() {
+        return Some((span.key, span.display));
+    }
+    // `548の2` has neither 第 nor 条. Only the query parser may rewrite it.
+    if text.contains('条') {
+        return None;
+    }
+    let span = article_spans(&ensure_article_mark(text))
+        .into_iter()
+        .next()?;
     Some((span.key, span.display))
 }
 
-fn ensure_article_mark(text: &str) -> String {
-    if text.contains('条') {
-        return text.to_string();
+fn citation_at(chars: &[char], i: usize) -> Option<ArticleSpan> {
+    let with_dai = chars.get(i) == Some(&'第');
+    let digit_start = chars
+        .get(i)
+        .is_some_and(|c| c.is_ascii_digit() || ('０'..='９').contains(c));
+    if !with_dai && !digit_start {
+        return None;
     }
+    if !with_dai && i > 0 && (chars[i - 1] == '第' || crate::search::legal_ref::is_numeral_char(chars[i - 1]))
+    {
+        return None;
+    }
+    let num_start = if with_dai { i + 1 } else { i };
+    let (main, num_end) = take_numeral(chars, num_start)?;
+    let mut parts = vec![main];
+    let mut end = num_end;
+    if chars.get(num_end) == Some(&'条') {
+        end = num_end + 1;
+        end = take_branches(chars, end, &mut parts);
+    } else if with_dai && chars.get(num_end) == Some(&'の') {
+        end = take_branches(chars, end, &mut parts);
+        if parts.len() < 2 {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    let suppl_at = suppl_prefix(chars, i);
+    let suppl = suppl_at.is_some();
+    let start = suppl_at.unwrap_or(i);
+    if start > end || end > chars.len() {
+        return None;
+    }
+    let attr = parts
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("_");
+    let (key, display) = article_identity(&attr, suppl)?;
+    Some(ArticleSpan {
+        start,
+        end,
+        key,
+        display,
+        suppl,
+    })
+}
+
+fn take_branches(chars: &[char], mut end: usize, parts: &mut Vec<u32>) -> usize {
+    while chars.get(end) == Some(&'の') {
+        let Some((branch, next)) = take_numeral(chars, end + 1) else {
+            break;
+        };
+        if chars.get(next) == Some(&'条') {
+            break;
+        }
+        parts.push(branch);
+        end = next;
+    }
+    end
+}
+
+/// Used only for a bare query such as `548の2`. Indexes into this string are not
+/// applied to the caller's text.
+fn ensure_article_mark(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     if !text.contains('第') {
@@ -835,10 +869,25 @@ mod tests {
         assert_eq!(parse_article_query("３２の４の２").unwrap().0, "32_4_2");
         assert_eq!(parse_article_query("附則第1条").unwrap().0, "s1");
         assert_eq!(parse_article_query("附則第1条").unwrap().1, "附則第1条");
+        assert_eq!(parse_article_query("附則3条").unwrap().0, "s3");
+        assert_eq!(parse_article_query("555条").unwrap().0, "555");
+        assert_eq!(parse_article_query("第548の2").unwrap().0, "548_2");
+        assert_eq!(parse_article_query("第548の2").unwrap().1, "第548条の2");
         assert_eq!(parse_article_query("第1条").unwrap().0, "1");
         let spans = article_spans("民法第1条及び第2条");
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[1].key, "2");
+        let bare = article_spans("民法555条と民法1条");
+        assert_eq!(bare.len(), 2);
+        assert_eq!(bare[0].key, "555");
+        assert_eq!(bare[1].key, "1");
+        let omitted = article_spans("根拠は民法第548の2");
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].key, "548_2");
+        assert!(omitted[0].end <= "根拠は民法第548の2".chars().count());
+        let suppl = article_spans("附則3条");
+        assert_eq!(suppl[0].key, "s3");
+        assert!(suppl[0].suppl);
         assert!(parse_article_query("").is_none());
         assert!(parse_article_query("条なし").is_none());
     }

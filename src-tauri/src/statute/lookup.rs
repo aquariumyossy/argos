@@ -58,6 +58,13 @@ fn resolve_one(
     let Some((key, display)) = parse_article_query(&article_query) else {
         return miss(&law_query, &article_query, "条番号を読めませんでした。");
     };
+    if key.starts_with('s') || article_query.contains("附則") {
+        return miss(
+            &law_query,
+            &article_query,
+            "附則は改正ごとに本文が分かれるため、確認済みにはしません。",
+        );
+    }
     let law = match resolve_law(db, client, &law_query, fetched_catalog) {
         Ok(Some(law)) => law,
         Ok(None) => return miss(&law_query, &article_query, "法令名を特定できませんでした。"),
@@ -745,16 +752,19 @@ mod tests {
             ],
             "2026-11-11",
         );
-        assert!(hits[0].verified, "{:?}", hits[0].note);
-        assert!(hits[0].body.contains("附則の本文"), "{}", hits[0].body);
+        assert!(!hits[0].verified, "{:?}", hits[0].note);
+        assert!(hits[0].note.contains("附則"), "{}", hits[0].note);
         assert!(!hits[0].body.contains("本則の本文"));
-        assert!(hits[1].body.contains("附則の本文"), "{:?}", hits[1].note);
+        assert!(!hits[0].body.contains("附則の本文"));
+        assert!(!hits[1].verified, "{:?}", hits[1].note);
+        assert!(hits[1].note.contains("附則"));
+        assert!(!hits[1].body.contains("本則の本文"));
     }
 
     #[test]
     fn a_pending_amendment_is_refetched_once_it_is_in_force() {
         let db = temp_db();
-        db.set_meta("updates_through", "2027-04-01").unwrap();
+        db.set_meta("updates_through", "2027-04-02").unwrap();
         db.replace_law(
             "129AC0000000089",
             "民法",
@@ -819,7 +829,7 @@ mod tests {
             "lawdata/129AC0000000089".into(),
             Ok(fresh.to_string()),
         )]);
-        let after = resolve_articles(
+        let on_the_day = resolve_articles(
             &db,
             &client,
             &[ArticleQuery {
@@ -828,10 +838,20 @@ mod tests {
             }],
             "2027-04-01",
         );
+        assert_eq!(on_the_day[0].body, "古い本文");
+        let after = resolve_articles(
+            &db,
+            &client,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2027-04-02",
+        );
         assert!(after[0].body.contains("新しい本文"), "{:?}", after[0].note);
         let stored = db.resolve_name("民法").unwrap().unwrap();
-        assert_eq!(stored.as_of, "2027-04-01");
-        assert!(!db.pending_due("129AC0000000089", "2027-04-01").unwrap());
+        assert_eq!(stored.as_of, "2027-04-02");
+        assert!(!db.pending_due("129AC0000000089", "2027-04-02").unwrap());
         assert!(db
             .lookup_article("129AC0000000089", "1")
             .unwrap()
