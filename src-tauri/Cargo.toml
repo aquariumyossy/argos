@@ -5,6 +5,7 @@ description = "Argos  Elocal desktop instant search"
 authors = ["Shuhei Yoshida"]
 license = "Apache-2.0"
 edition = "2021"
+default-run = "argos"
 
 [lib]
 name = "argos_lib"
@@ -62,6 +63,10 @@ flate2 = "1.1"
 serde_json = "1"
 tower = { version = "0.5", features = ["util"] }
 tauri = { version = "2", features = ["test"] }
+
+[[bin]]
+name = "argos"
+path = "src/main.rs"
 
 [[bin]]
 name = "statute-bundle"
