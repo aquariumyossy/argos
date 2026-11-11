@@ -37,24 +37,54 @@ pub struct ListedLaw {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedUpdate {
     pub law_id: String,
-    /// `YYYY-MM-DD`. Empty when the row has no usable date.
+    /// In-force text date, `YYYY-MM-DD`. Empty when this row is not yet in force.
     pub as_of: String,
+    /// Enforcement date when the API marks the amendment as not yet in force.
+    pub enforce_on: String,
+    pub pending: bool,
 }
 
 pub fn parse_law_xml(xml: &str) -> Result<ParsedLaw, String> {
     let mut parser = LawParser::default();
     parser.feed(xml)?;
-    if parser.law_id.is_empty() && parser.articles.is_empty() {
-        return Err("法令XMLに本文がありません".into());
+    let code = parser.result_code.trim();
+    if !code.is_empty() && code != "0" {
+        return Err(format!(
+            "e-Gov 法令APIの結果コードが成功ではありません ({code})"
+        ));
+    }
+    if parser.articles.is_empty() {
+        return Err("法令XMLに条文がありません".into());
     }
     dedupe_article_keys(&mut parser.articles);
+    let law_num = squash(&parser.law_num);
     Ok(ParsedLaw {
         law_id: parser.law_id,
-        law_num: squash(&parser.law_num),
-        name: squash(&parser.law_name),
+        name: display_law_name(&law_num, &parser.law_name),
+        law_num,
         abbrev: squash(&parser.abbrev),
         articles: parser.articles,
     })
+}
+
+/// e-Gov puts the law number inside `LawTitle` for some acts
+/// (`昭和二十二年法律第五十四号（私的独占の…）`). Store the name in the parentheses.
+fn display_law_name(law_num: &str, law_name: &str) -> String {
+    let name = squash(law_name);
+    let num = squash(law_num);
+    if num.is_empty() || !name.starts_with(&num) {
+        return name;
+    }
+    let rest = name[num.len()..].trim();
+    let rest = rest
+        .trim_start_matches(['（', '('])
+        .trim_end_matches(['）', ')'])
+        .trim();
+    if rest.is_empty() {
+        name
+    } else {
+        rest.to_string()
+    }
 }
 
 pub fn parse_law_list(xml: &str) -> Result<Vec<ListedLaw>, String> {
@@ -121,6 +151,7 @@ pub fn parse_update_list(xml: &str) -> Result<Vec<ListedUpdate>, String> {
     let mut law_id = String::new();
     let mut enforcement = String::new();
     let mut amend = String::new();
+    let mut flag = String::new();
     let mut in_row = false;
     let mut field = Field::None;
     loop {
@@ -132,12 +163,14 @@ pub fn parse_update_list(xml: &str) -> Result<Vec<ListedUpdate>, String> {
                     law_id.clear();
                     enforcement.clear();
                     amend.clear();
+                    flag.clear();
                     field = Field::None;
                 } else if in_row {
                     field = match name.as_str() {
                         "LawId" => Field::Id,
                         "EnforcementDate" => Field::Enforcement,
                         "AmendPromulgationDate" => Field::Amend,
+                        "EnforcementFlg" => Field::Flag,
                         _ => Field::None,
                     };
                 }
@@ -149,16 +182,30 @@ pub fn parse_update_list(xml: &str) -> Result<Vec<ListedUpdate>, String> {
                         Field::Id => law_id.push_str(&text),
                         Field::Enforcement => enforcement.push_str(&text),
                         Field::Amend => amend.push_str(&text),
+                        Field::Flag => flag.push_str(&text),
                         _ => {}
                     }
                 }
             }
             Ok(Event::End(e)) => {
                 if local(e.name().as_ref()) == "LawNameListInfo" && in_row {
-                    let as_of = revision_date(&enforcement, &amend);
+                    let pending = flag.trim() == "1";
+                    let enforce_on = crate::statute::refresh::parse_ymd(&enforcement)
+                        .map(format_ymd)
+                        .unwrap_or_default();
+                    let as_of = if pending {
+                        String::new()
+                    } else {
+                        revision_date(&enforcement, &amend)
+                    };
                     let id = law_id.trim().to_string();
                     if !id.is_empty() {
-                        out.push(ListedUpdate { law_id: id, as_of });
+                        out.push(ListedUpdate {
+                            law_id: id,
+                            as_of,
+                            enforce_on,
+                            pending,
+                        });
                     }
                     in_row = false;
                 }
@@ -190,6 +237,7 @@ enum Field {
     Num,
     Enforcement,
     Amend,
+    Flag,
 }
 
 fn push_field(row: &mut ListedLaw, field: Field, text: &str) {
@@ -223,6 +271,9 @@ struct LawParser {
     capture_id: bool,
     capture_num: bool,
     capture_name: bool,
+    capture_code: bool,
+    in_result: u32,
+    result_code: String,
     article: Option<ArticleBuf>,
     skip_article: u32,
 }
@@ -288,6 +339,8 @@ impl LawParser {
             "TOC" => self.toc = self.toc.saturating_add(1),
             "Rt" => self.rt = self.rt.saturating_add(1),
             "SupplProvision" => self.suppl = self.suppl.saturating_add(1),
+            "Result" => self.in_result = self.in_result.saturating_add(1),
+            "Code" => self.capture_code = self.in_result > 0 && self.result_code.is_empty(),
             "LawId" => self.capture_id = self.article.is_none() && self.skip_article == 0,
             "LawNum" => self.capture_num = self.article.is_none() && self.law_num.is_empty(),
             "LawTitle" => {
@@ -356,13 +409,17 @@ impl LawParser {
         if text.is_empty() || text.trim().is_empty() {
             return;
         }
+        if self.capture_code {
+            self.result_code.push_str(text.trim());
+        }
         if self.capture_id {
             self.law_id.push_str(text);
         }
         if self.capture_num {
             self.law_num.push_str(text);
         }
-        if self.capture_name && self.rt == 0 {
+        // LawNum nested in LawTitle must not become part of the stored name.
+        if self.capture_name && self.rt == 0 && !self.capture_num {
             self.law_name.push_str(text);
         }
         let Some(article) = self.article.as_mut() else {
@@ -388,6 +445,8 @@ impl LawParser {
             "TOC" => self.toc = self.toc.saturating_sub(1),
             "Rt" => self.rt = self.rt.saturating_sub(1),
             "SupplProvision" => self.suppl = self.suppl.saturating_sub(1),
+            "Result" => self.in_result = self.in_result.saturating_sub(1),
+            "Code" => self.capture_code = false,
             "LawId" => self.capture_id = false,
             "LawNum" => self.capture_num = false,
             "LawTitle" => self.capture_name = false,
@@ -461,19 +520,25 @@ pub fn article_identity(num: &str, suppl: bool) -> Option<(String, String)> {
     if num.is_empty() {
         return None;
     }
-    let (main, branch) = match num.split_once('_') {
-        Some((main, branch)) => (main, Some(branch)),
-        None => (num, None),
-    };
-    let main_n: u32 = main.parse().ok()?;
-    let branch_n = match branch {
-        Some(branch) if !branch.is_empty() => Some(branch.parse::<u32>().ok()?),
-        _ => None,
-    };
-    let key_body = match branch_n {
-        Some(branch) => format!("{main_n}_{branch}"),
-        None => main_n.to_string(),
-    };
+    let mut parts = Vec::new();
+    for part in num.split('_') {
+        if part.is_empty() {
+            return None;
+        }
+        let n: u32 = part.parse().ok()?;
+        if n == 0 || n > 999_999 {
+            return None;
+        }
+        parts.push(n);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let key_body = parts
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("_");
     let key = if suppl {
         format!("s{key_body}")
     } else {
@@ -484,66 +549,158 @@ pub fn article_identity(num: &str, suppl: bool) -> Option<(String, String)> {
         display.push_str("附則");
     }
     display.push('第');
-    display.push_str(&main_n.to_string());
+    display.push_str(&parts[0].to_string());
     display.push('条');
-    if let Some(branch) = branch_n {
+    for branch in parts.iter().skip(1) {
         display.push('の');
         display.push_str(&branch.to_string());
     }
     Some((key, display))
 }
 
-/// `555`, `第555条`, `第五百五十五条`, `548の2`.
-pub fn parse_article_query(raw: &str) -> Option<(String, String)> {
-    let text = raw.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let prepared = if text.contains('条') {
-        text.to_string()
-    } else if let Some((main, branch)) = text.split_once('の') {
-        format!("第{main}条の{branch}")
-    } else {
-        format!("第{text}条")
-    };
-    let normalized = crate::search::legal_ref::normalize_legal_refs(&prepared);
-    let chars: Vec<char> = normalized.chars().collect();
-    let mut i = 0;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleSpan {
+    pub start: usize,
+    pub end: usize,
+    pub key: String,
+    pub display: String,
+    pub suppl: bool,
+}
+
+/// Every 第N条 in `text`, including 附則 and branch numbers of any depth.
+/// `start`/`end` are char indexes. A following 項 or 号 is not part of the span.
+pub fn article_spans(text: &str) -> Vec<ArticleSpan> {
+    let prepared = ensure_article_mark(text);
+    let chars: Vec<char> = prepared.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
     while i < chars.len() {
         if chars[i] != '第' {
             i += 1;
             continue;
         }
-        let start = i + 1;
-        let mut j = start;
-        while j < chars.len() && chars[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j == start || j >= chars.len() || chars[j] != '条' {
+        let Some((main, mut j)) = take_numeral(&chars, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if chars.get(j) != Some(&'条') {
             i += 1;
             continue;
         }
-        let main: String = chars[start..j].iter().collect();
-        let mut k = j + 1;
-        let branch = if k < chars.len() && chars[k] == 'の' {
-            k += 1;
-            let bstart = k;
-            while k < chars.len() && chars[k].is_ascii_digit() {
-                k += 1;
+        j += 1;
+        let mut parts = vec![main];
+        while chars.get(j) == Some(&'の') {
+            let Some((branch, next)) = take_numeral(&chars, j + 1) else {
+                break;
+            };
+            if chars.get(next) == Some(&'条') {
+                break;
             }
-            if k > bstart {
-                Some(chars[bstart..k].iter().collect::<String>())
-            } else {
-                None
+            parts.push(branch);
+            j = next;
+        }
+        let suppl_at = suppl_prefix(&chars, i);
+        let suppl = suppl_at.is_some();
+        let start = suppl_at.unwrap_or(i);
+        let attr = parts
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("_");
+        let Some((key, display)) = article_identity(&attr, suppl) else {
+            i = j;
+            continue;
+        };
+        out.push(ArticleSpan {
+            start,
+            end: j,
+            key,
+            display,
+            suppl,
+        });
+        i = j;
+    }
+    out
+}
+
+/// `555`, `第555条`, `第五百五十五条`, `548の2`, `第32条の4の2`, `附則第1条`.
+pub fn parse_article_query(raw: &str) -> Option<(String, String)> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if !text.contains('第')
+        && !text.contains('条')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('０'..='９').contains(&c) || c == '_')
+    {
+        let ascii: String = text
+            .chars()
+            .map(|c| {
+                if ('０'..='９').contains(&c) {
+                    char::from(b'0' + (c as u32 - '０' as u32) as u8)
+                } else {
+                    c
+                }
+            })
+            .collect();
+        return article_identity(&ascii, false);
+    }
+    let span = article_spans(text).into_iter().next()?;
+    Some((span.key, span.display))
+}
+
+fn ensure_article_mark(text: &str) -> String {
+    if text.contains('条') {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    if !text.contains('第') {
+        out.push('第');
+    }
+    let mut inserted = false;
+    for c in chars {
+        if !inserted && c == 'の' {
+            out.push('条');
+            inserted = true;
+        }
+        out.push(c);
+    }
+    if !inserted {
+        out.push('条');
+    }
+    out
+}
+
+fn take_numeral(chars: &[char], start: usize) -> Option<(u32, usize)> {
+    let mut end = start;
+    while end < chars.len() && crate::search::legal_ref::is_numeral_char(chars[end]) {
+        end += 1;
+    }
+    while end > start {
+        let token: String = chars[start..end].iter().collect();
+        if let Some(n) = crate::search::legal_ref::parse_legal_numeral(&token) {
+            if n > 0 && n <= 999_999 {
+                return Some((n, end));
             }
-        } else {
-            None
-        };
-        let attr = match &branch {
-            Some(branch) => format!("{main}_{branch}"),
-            None => main,
-        };
-        return article_identity(&attr, false);
+        }
+        end -= 1;
+    }
+    None
+}
+
+fn suppl_prefix(chars: &[char], dai: usize) -> Option<usize> {
+    let mut i = dai;
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    if i >= 2 && chars[i - 2] == '附' && chars[i - 1] == '則' {
+        return Some(i - 2);
+    }
+    if i >= 3 && chars[i - 3] == '附' && chars[i - 1] == '則' && chars[i - 2].is_whitespace() {
+        return Some(i - 3);
     }
     None
 }
@@ -605,7 +762,7 @@ mod tests {
         assert_eq!(law.abbrev, "試法");
         assert_eq!(law.law_num, "令和八年法律第一号");
         let keys: Vec<&str> = law.articles.iter().map(|a| a.key.as_str()).collect();
-        assert_eq!(keys, vec!["1", "3_2", "s1"]);
+        assert_eq!(keys, vec!["1", "3_2", "32_4_2", "s1"]);
         let first = &law.articles[0];
         assert_eq!(first.num, "第1条");
         assert_eq!(first.heading, "趣旨");
@@ -618,8 +775,11 @@ mod tests {
         assert!(branch.body.contains("一　号の本文"));
         assert!(branch.body.contains("売主"));
         assert!(!branch.body.contains("うりぬし"));
-        assert_eq!(law.articles[2].num, "附則第1条");
-        assert!(law.articles[2].body.contains("附則の本文"));
+        assert_eq!(law.articles[2].key, "32_4_2");
+        assert_eq!(law.articles[2].num, "第32条の4の2");
+        assert!(law.articles[2].body.contains("二重枝番の本文"));
+        assert_eq!(law.articles[3].num, "附則第1条");
+        assert!(law.articles[3].body.contains("附則の本文"));
         assert!(law.articles.iter().all(|a| !a.body.contains("改正規定")));
         assert!(law.articles.iter().all(|a| !a.body.contains("削除条文")));
     }
@@ -649,6 +809,11 @@ mod tests {
         assert_eq!(updates[1].law_id, "140AC0000000045");
         assert_eq!(updates[1].as_of, "2024-01-15");
         assert_eq!(updates[2].as_of, "");
+        assert!(!updates[0].pending);
+        assert!(updates[3].pending);
+        assert_eq!(updates[3].as_of, "");
+        assert_eq!(updates[3].enforce_on, "2027-04-01");
+        assert_eq!(updates[3].law_id, "417AC0000000086");
         let names = parse_law_list(NAMES).unwrap();
         assert_eq!(names[0].law_id, "129AC0000000089");
         assert_eq!(names[0].name, "民法");
@@ -662,7 +827,43 @@ mod tests {
         assert_eq!(parse_article_query("第五百五十五条").unwrap().0, "555");
         assert_eq!(parse_article_query("548の2").unwrap().1, "第548条の2");
         assert_eq!(parse_article_query("第548条の2").unwrap().0, "548_2");
+        assert_eq!(parse_article_query("第32条の4の2").unwrap().0, "32_4_2");
+        assert_eq!(
+            parse_article_query("第三十二条の四の二").unwrap().1,
+            "第32条の4の2"
+        );
+        assert_eq!(parse_article_query("３２の４の２").unwrap().0, "32_4_2");
+        assert_eq!(parse_article_query("附則第1条").unwrap().0, "s1");
+        assert_eq!(parse_article_query("附則第1条").unwrap().1, "附則第1条");
+        assert_eq!(parse_article_query("第1条").unwrap().0, "1");
+        let spans = article_spans("民法第1条及び第2条");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[1].key, "2");
         assert!(parse_article_query("").is_none());
         assert!(parse_article_query("条なし").is_none());
+    }
+
+    #[test]
+    fn rejects_an_egov_error_body_and_strips_the_law_number_from_the_title() {
+        let error = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot><Result><Code>1</Code><Message>該当なし</Message></Result>
+<ApplData><LawId>129AC0000000089</LawId></ApplData></DataRoot>"#;
+        let err = parse_law_xml(error).unwrap_err();
+        assert!(err.contains("結果コード"), "{err}");
+        let empty = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot><Result><Code>0</Code></Result>
+<ApplData><LawId>129AC0000000089</LawId><LawFullText></LawFullText></ApplData></DataRoot>"#;
+        assert!(parse_law_xml(empty).unwrap_err().contains("条文がありません"));
+        let titled = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot><Result><Code>0</Code></Result><ApplData><LawFullText><Law>
+<LawNum>昭和二十二年法律第五十四号</LawNum>
+<LawBody><LawTitle Abbrev="独禁法">昭和二十二年法律第五十四号（私的独占の禁止及び公正取引の確保に関する法律）</LawTitle>
+<MainProvision><Article Num="1"><ArticleTitle>第一条</ArticleTitle>
+<Paragraph><ParagraphSentence><Sentence>本文。</Sentence></ParagraphSentence></Paragraph>
+</Article></MainProvision></LawBody></Law></LawFullText></ApplData></DataRoot>"#;
+        let law = parse_law_xml(titled).unwrap();
+        assert_eq!(law.name, "私的独占の禁止及び公正取引の確保に関する法律");
+        assert_eq!(law.law_num, "昭和二十二年法律第五十四号");
+        assert!(!law.name.contains("昭和二十二年"));
     }
 }

@@ -999,6 +999,7 @@ async fn llm_send_inner<R: Runtime>(
     let mut retried_without_tools = false;
     let mut phantom_retried = false;
     let mut rounds = 0usize;
+    let mut model_rounds = 0usize;
     let mut law_calls = 0usize;
     let mut verified_cites: Vec<crate::statute::VerifiedCite> = Vec::new();
     let max_rounds = tools::max_tool_rounds(settings.llm_max_tool_rounds);
@@ -1048,7 +1049,7 @@ async fn llm_send_inner<R: Runtime>(
             continue;
         }
         let with_tools = use_tools;
-        if rounds > 0 {
+        if model_rounds > 0 {
             crate::llm::context::fit_followup_request(&mut current_turns, inject_budget);
         }
         let turns_now = current_turns.clone();
@@ -1321,9 +1322,12 @@ async fn llm_send_inner<R: Runtime>(
                         .iter()
                         .map(|call| call.name.as_str())
                         .collect();
+                    model_rounds += 1;
                     if tools::counts_toward_tool_round(&names) {
                         rounds += 1;
                     }
+                    let law_only = !names.is_empty()
+                        && names.iter().all(|name| *name == tools::TOOL_LAW);
                     let tool_calls_json = serde_json::json!(out
                         .tool_calls
                         .iter()
@@ -1437,10 +1441,6 @@ async fn llm_send_inner<R: Runtime>(
                                 wrote_note_ids.push(nid);
                             }
                         }
-                        if tc.name == tools::TOOL_LAW {
-                            verified_cites
-                                .extend(crate::statute::verified_from_tool_output(&exec.content));
-                        }
                         let mut content = exec.content;
                         if tc.name == tools::TOOL_WRITE_NOTE && !read_note_called {
                             content.push_str(
@@ -1452,6 +1452,10 @@ async fn llm_send_inner<R: Runtime>(
                         } else {
                             fit_tool_text(content, tool_budget, tool_used)
                         };
+                        if tc.name == tools::TOOL_LAW {
+                            verified_cites
+                                .extend(crate::statute::verified_from_delivered(&content));
+                        }
                         tool_used += estimate_tokens(&content);
                         let tool_turn = ChatTurn {
                             role: "tool".into(),
@@ -1463,6 +1467,11 @@ async fn llm_send_inner<R: Runtime>(
                         };
                         store_turn(&state.db, &thread.id, &tool_turn)?;
                         current_turns.push(tool_turn);
+                    }
+                    // A law-only round does not spend the web-search budget, but it must
+                    // not keep requesting the model after law_article is exhausted.
+                    if law_only && law_calls >= tools::MAX_LAW_CALLS {
+                        use_tools = false;
                     }
                     // The reserve is spent; answer from what the rounds already produced.
                     if tool_used >= tool_budget {
@@ -4450,6 +4459,47 @@ mod tests {
             .expect("llm_send");
         let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
         (dir, db, result.thread.clone(), result)
+    }
+
+    fn content_and_law() -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "law1",
+                        "function": {
+                            "name": "law_article",
+                            "arguments": serde_json::json!({ "law": "民法", "article": "1" }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn law_article_only_rounds_stop_after_the_call_cap() {
+        let mut script = Vec::new();
+        for _ in 0..16 {
+            script.push(content_and_law());
+        }
+        script.push(content_stop("確認できた範囲で答えます。"));
+        let (dir, db, thread, result) = send_script("law-cap", 8, script, false).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let law_rows = messages
+            .iter()
+            .filter(|message| message.tool_name == "law_article")
+            .count();
+        assert!(
+            (10..=11).contains(&law_rows),
+            "law_article rounds did not stop at the cap: {law_rows}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn seven_searches() -> Vec<Vec<u8>> {

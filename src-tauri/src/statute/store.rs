@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::statute::xmlparse::ParsedArticle;
+use crate::statute::refresh::parse_ymd;
+use crate::statute::xmlparse::{article_spans, ListedUpdate, ParsedArticle};
 
-pub const BUNDLE_VERSION: &str = "2026-11-11";
+pub const BUNDLE_VERSION: &str = "2026-11-11b";
 const BUNDLE_VERSION_KEY: &str = "bundle_version";
 
 const SCHEMA: &str = "
@@ -53,6 +54,10 @@ CREATE TABLE IF NOT EXISTS law_update (
 CREATE TABLE IF NOT EXISTS update_day (
   day TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS pending_revision (
+  law_id TEXT PRIMARY KEY,
+  enforce_on TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_law_alias_id ON law_alias(law_id);
 CREATE INDEX IF NOT EXISTS idx_law_name_name ON law_name(name);
 ";
@@ -85,9 +90,16 @@ struct AliasHit {
     name: String,
 }
 
+#[derive(Default)]
+pub struct IndexDirty {
+    pub laws: Vec<String>,
+    pub removed: Vec<(String, String)>,
+}
+
 pub struct StatuteDb {
     conn: Mutex<Connection>,
     aliases: Mutex<Option<Vec<AliasHit>>>,
+    dirty: Mutex<IndexDirty>,
 }
 
 impl StatuteDb {
@@ -108,6 +120,17 @@ impl StatuteDb {
         Ok(Self {
             conn: Mutex::new(conn),
             aliases: Mutex::new(None),
+            dirty: Mutex::new(IndexDirty::default()),
+        })
+    }
+
+    pub fn open_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            aliases: Mutex::new(None),
+            dirty: Mutex::new(IndexDirty::default()),
         })
     }
 
@@ -118,70 +141,30 @@ impl StatuteDb {
             return Ok(());
         }
         let temp = seed_temp_path();
-        {
+        let decoded = (|| -> Result<(), String> {
             let mut file = File::create(&temp).map_err(|e| e.to_string())?;
             let mut decoder = flate2::read::GzDecoder::new(SEED);
             std::io::copy(&mut decoder, &mut file).map_err(|e| e.to_string())?;
             file.flush().map_err(|e| e.to_string())?;
-        }
-        let attached = temp.to_string_lossy().to_string();
-        let import = (|| -> Result<(), String> {
-            conn.execute("ATTACH DATABASE ?1 AS seed", [&attached])
-                .map_err(|e| e.to_string())?;
-            conn.execute_batch(
-                "
-                BEGIN;
-                INSERT INTO law_name (law_id, name, law_num)
-                SELECT law_id, name, law_num FROM seed.law_name
-                WHERE 1
-                ON CONFLICT(law_id) DO UPDATE SET
-                  name = excluded.name,
-                  law_num = excluded.law_num;
-                INSERT INTO law_alias (alias, law_id)
-                SELECT alias, law_id FROM seed.law_alias
-                WHERE 1
-                ON CONFLICT(alias) DO UPDATE SET law_id = excluded.law_id;
-                DELETE FROM article WHERE law_id IN (
-                  SELECT s.law_id FROM seed.law s
-                  LEFT JOIN law l ON l.law_id = s.law_id
-                  WHERE l.law_id IS NULL OR s.as_of >= COALESCE(l.as_of, '')
-                );
-                INSERT INTO article (
-                  law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
-                )
-                SELECT law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
-                FROM seed.article
-                WHERE law_id IN (
-                  SELECT s.law_id FROM seed.law s
-                  LEFT JOIN law l ON l.law_id = s.law_id
-                  WHERE l.law_id IS NULL OR s.as_of >= COALESCE(l.as_of, '')
-                );
-                INSERT INTO law (law_id, name, law_num, as_of, checked_on, source)
-                SELECT law_id, name, law_num, as_of, checked_on, source FROM seed.law
-                WHERE 1
-                ON CONFLICT(law_id) DO UPDATE SET
-                  name = excluded.name,
-                  law_num = excluded.law_num,
-                  as_of = CASE WHEN excluded.as_of >= law.as_of THEN excluded.as_of ELSE law.as_of END,
-                  checked_on = CASE WHEN excluded.as_of >= law.as_of THEN excluded.checked_on ELSE law.checked_on END,
-                  source = CASE
-                    WHEN law.source = 'egov' AND excluded.as_of < law.as_of THEN law.source
-                    ELSE excluded.source
-                  END;
-                COMMIT;
-                ",
-            )
-            .map_err(|e| e.to_string())?;
-            conn.execute("DETACH DATABASE seed", [])
-                .map_err(|e| e.to_string())?;
             Ok(())
         })();
+        if let Err(err) = decoded {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err);
+        }
+        let import = import_attached(&conn, &temp);
         let _ = std::fs::remove_file(&temp);
         import?;
         set_meta_locked(&conn, BUNDLE_VERSION_KEY, BUNDLE_VERSION)?;
         drop(conn);
         self.invalidate_aliases();
         Ok(())
+    }
+
+    /// Attach `path` and copy seed tables. Rolls the transaction back and detaches on failure.
+    pub fn import_attached_db(&self, path: &Path) -> Result<(), String> {
+        let conn = self.conn.lock();
+        import_attached(&conn, path)
     }
 
     pub fn meta(&self, key: &str) -> Result<String, String> {
@@ -217,7 +200,20 @@ impl StatuteDb {
     pub fn index_token(&self) -> Result<String, String> {
         let version = self.meta(BUNDLE_VERSION_KEY)?;
         let count = self.article_count()?;
-        Ok(format!("{version}:{count}"))
+        let rev = self.meta("content_rev")?;
+        Ok(format!("{version}:{count}:{rev}"))
+    }
+
+    pub fn take_index_dirty(&self) -> IndexDirty {
+        std::mem::take(&mut *self.dirty.lock())
+    }
+
+    fn note_dirty(&self, law_id: &str, removed: Vec<(String, String)>) {
+        let mut dirty = self.dirty.lock();
+        if !dirty.laws.iter().any(|id| id == law_id) {
+            dirty.laws.push(law_id.to_string());
+        }
+        dirty.removed.extend(removed);
     }
 
     pub fn upsert_names(&self, names: &[(String, String, String)]) -> Result<(), String> {
@@ -255,8 +251,24 @@ impl StatuteDb {
         aliases: &[String],
         articles: &[ParsedArticle],
     ) -> Result<(), String> {
+        if articles.is_empty() {
+            return Err("空の法令で既存の条文を置き換えません".into());
+        }
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let old_keys = {
+            let mut stmt = tx
+                .prepare("SELECT article_key FROM article WHERE law_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([law_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            let mut keys = Vec::new();
+            for row in rows {
+                keys.push(row.map_err(|e| e.to_string())?);
+            }
+            keys
+        };
         tx.execute("DELETE FROM article WHERE law_id = ?1", [law_id])
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM law_alias WHERE law_id = ?1", [law_id])
@@ -295,8 +307,17 @@ impl StatuteDb {
         )
         .map_err(|e| e.to_string())?;
         insert_aliases(&tx, law_id, name, aliases)?;
+        bump_rev_locked(&tx)?;
         tx.commit().map_err(|e| e.to_string())?;
         drop(conn);
+        let new_keys: std::collections::HashSet<&str> =
+            articles.iter().map(|article| article.key.as_str()).collect();
+        let removed = old_keys
+            .into_iter()
+            .filter(|key| !new_keys.contains(key.as_str()))
+            .map(|key| (law_id.to_string(), key))
+            .collect();
+        self.note_dirty(law_id, removed);
         self.invalidate_aliases();
         Ok(())
     }
@@ -360,6 +381,9 @@ impl StatuteDb {
             ],
         )
         .map_err(|e| e.to_string())?;
+        bump_rev_locked(&conn)?;
+        drop(conn);
+        self.note_dirty(law_id, Vec::new());
         Ok(())
     }
 
@@ -398,6 +422,24 @@ impl StatuteDb {
         )
         .optional()
         .map_err(|e| e.to_string())
+    }
+
+    pub fn articles_for(&self, law_id: &str) -> Result<Vec<ArticleRow>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
+                 FROM article WHERE law_id = ?1 ORDER BY article_key",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([law_id], read_article)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     }
 
     pub fn article_count_for(&self, law_id: &str) -> Result<usize, String> {
@@ -470,6 +512,41 @@ impl StatuteDb {
     }
 
     pub fn match_law_in_text(&self, text: &str) -> Result<Option<LawRef>, String> {
+        if let Some(span) = article_spans(text).into_iter().next() {
+            let chars: Vec<char> = text.chars().collect();
+            let mut end = span.start;
+            while end > 0 && chars[end - 1].is_whitespace() {
+                end -= 1;
+            }
+            let before: String = chars[..end].iter().collect();
+            return self.alias_ending(&before);
+        }
+        self.alias_contained(text)
+    }
+
+    fn alias_ending(&self, text: &str) -> Result<Option<LawRef>, String> {
+        let norm = normalize_alias(text);
+        if norm.chars().count() < 2 {
+            return Ok(None);
+        }
+        self.ensure_alias_cache()?;
+        let cache = self.aliases.lock();
+        let Some(entries) = cache.as_ref() else {
+            return Ok(None);
+        };
+        let found = entries.iter().find(|hit| {
+            hit.alias.chars().count() >= 2 && norm.ends_with(hit.alias.as_str())
+        });
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        let law_id = found.law_id.clone();
+        let fallback_name = found.name.clone();
+        drop(cache);
+        self.law_with_fallback(&law_id, &fallback_name)
+    }
+
+    fn alias_contained(&self, text: &str) -> Result<Option<LawRef>, String> {
         let norm = normalize_alias(text);
         if norm.chars().count() < 2 {
             return Ok(None);
@@ -481,17 +558,21 @@ impl StatuteDb {
         };
         let found = entries
             .iter()
-            .find(|hit| hit.alias.chars().count() >= 2 && norm.contains(&hit.alias));
+            .find(|hit| hit.alias.chars().count() >= 2 && norm.contains(hit.alias.as_str()));
         let Some(found) = found else {
             return Ok(None);
         };
         let law_id = found.law_id.clone();
         let fallback_name = found.name.clone();
         drop(cache);
-        let mut law = self.law_ref(&law_id)?;
+        self.law_with_fallback(&law_id, &fallback_name)
+    }
+
+    fn law_with_fallback(&self, law_id: &str, fallback_name: &str) -> Result<Option<LawRef>, String> {
+        let mut law = self.law_ref(law_id)?;
         if let Some(law) = law.as_mut() {
             if law.name.is_empty() {
-                law.name = fallback_name;
+                law.name = fallback_name.to_string();
             }
         }
         Ok(law)
@@ -568,24 +649,83 @@ impl StatuteDb {
         Ok(out)
     }
 
-    pub fn store_updates(&self, day: &str, rows: &[(String, String)]) -> Result<(), String> {
+    pub fn store_updates(&self, day: &str, today: &str, rows: &[ListedUpdate]) -> Result<(), String> {
+        let today_d = parse_ymd(today);
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         tx.execute("INSERT OR IGNORE INTO update_day (day) VALUES (?1)", [day])
             .map_err(|e| e.to_string())?;
-        for (law_id, as_of) in rows {
-            if law_id.is_empty() || as_of.is_empty() {
+        for row in rows {
+            if row.law_id.is_empty() {
                 continue;
             }
+            let enforce = parse_ymd(&row.enforce_on);
+            let as_of_date = parse_ymd(&row.as_of);
+            let future = row.pending
+                || enforce
+                    .zip(today_d)
+                    .is_some_and(|(date, today)| date > today)
+                || as_of_date
+                    .zip(today_d)
+                    .is_some_and(|(date, today)| date > today);
+            if future {
+                let when = if !row.enforce_on.is_empty() {
+                    row.enforce_on.as_str()
+                } else {
+                    row.as_of.as_str()
+                };
+                if !when.is_empty() {
+                    tx.execute(
+                        "INSERT INTO pending_revision (law_id, enforce_on) VALUES (?1, ?2)
+                         ON CONFLICT(law_id) DO UPDATE SET enforce_on = excluded.enforce_on",
+                        params![row.law_id, when],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                continue;
+            }
+            if row.as_of.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM pending_revision WHERE law_id = ?1",
+                [&row.law_id],
+            )
+            .map_err(|e| e.to_string())?;
             tx.execute(
                 "INSERT INTO law_update (law_id, as_of) VALUES (?1, ?2)
                  ON CONFLICT(law_id) DO UPDATE SET
                    as_of = CASE WHEN excluded.as_of > law_update.as_of THEN excluded.as_of ELSE law_update.as_of END",
-                params![law_id, as_of],
+                params![row.law_id, row.as_of],
             )
             .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn pending_due(&self, law_id: &str, today: &str) -> Result<bool, String> {
+        let conn = self.conn.lock();
+        let when: Option<String> = conn
+            .query_row(
+                "SELECT enforce_on FROM pending_revision WHERE law_id = ?1",
+                [law_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(when) = when else {
+            return Ok(false);
+        };
+        Ok(parse_ymd(&when)
+            .zip(parse_ymd(today))
+            .is_some_and(|(due, today)| due <= today))
+    }
+
+    pub fn clear_pending(&self, law_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM pending_revision WHERE law_id = ?1", [law_id])
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -729,6 +869,74 @@ pub fn normalize_alias(text: &str) -> String {
         .collect()
 }
 
+const SEED_IMPORT_SQL: &str = "
+BEGIN;
+INSERT INTO law_name (law_id, name, law_num)
+SELECT law_id, name, law_num FROM seed.law_name
+WHERE 1
+ON CONFLICT(law_id) DO UPDATE SET
+  name = excluded.name,
+  law_num = excluded.law_num;
+INSERT INTO law_alias (alias, law_id)
+SELECT alias, law_id FROM seed.law_alias
+WHERE 1
+ON CONFLICT(alias) DO UPDATE SET law_id = excluded.law_id;
+DELETE FROM article WHERE law_id IN (
+  SELECT s.law_id FROM seed.law s
+  LEFT JOIN law l ON l.law_id = s.law_id
+  WHERE l.law_id IS NULL OR s.as_of >= COALESCE(l.as_of, '')
+);
+INSERT INTO article (
+  law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
+)
+SELECT law_id, article_key, article_num, heading, body, as_of, probed_on, suppl
+FROM seed.article
+WHERE law_id IN (
+  SELECT s.law_id FROM seed.law s
+  LEFT JOIN law l ON l.law_id = s.law_id
+  WHERE l.law_id IS NULL OR s.as_of >= COALESCE(l.as_of, '')
+);
+INSERT INTO law (law_id, name, law_num, as_of, checked_on, source)
+SELECT law_id, name, law_num, as_of, checked_on, source FROM seed.law
+WHERE 1
+ON CONFLICT(law_id) DO UPDATE SET
+  name = excluded.name,
+  law_num = excluded.law_num,
+  as_of = CASE WHEN excluded.as_of >= law.as_of THEN excluded.as_of ELSE law.as_of END,
+  checked_on = CASE WHEN excluded.as_of >= law.as_of THEN excluded.checked_on ELSE law.checked_on END,
+  source = CASE
+    WHEN law.source = 'egov' AND excluded.as_of < law.as_of THEN law.source
+    ELSE excluded.source
+  END;
+COMMIT;
+";
+
+fn import_attached(conn: &Connection, path: &Path) -> Result<(), String> {
+    let attached = path.to_string_lossy().to_string();
+    let mut did_attach = false;
+    let import = (|| -> Result<(), String> {
+        conn.execute("ATTACH DATABASE ?1 AS seed", [&attached])
+            .map_err(|e| e.to_string())?;
+        did_attach = true;
+        conn.execute_batch(SEED_IMPORT_SQL)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if import.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    if did_attach {
+        let _ = conn.execute("DETACH DATABASE seed", []);
+    }
+    import
+}
+
+fn bump_rev_locked(conn: &Connection) -> Result<(), String> {
+    let current = meta_locked(conn, "content_rev")?.unwrap_or_default();
+    let next = current.parse::<u64>().unwrap_or(0).saturating_add(1);
+    set_meta_locked(conn, "content_rev", &next.to_string())
+}
+
 fn seed_temp_path() -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -870,21 +1078,18 @@ mod tests {
     #[test]
     fn update_list_keeps_the_newest_revision_date() {
         let (_dir, db) = temp_db();
-        db.store_updates(
-            "2026-11-10",
-            &[("129AC0000000089".into(), "2024-04-01".into())],
-        )
-        .unwrap();
-        db.store_updates(
-            "2026-11-11",
-            &[("129AC0000000089".into(), "2026-04-01".into())],
-        )
-        .unwrap();
-        db.store_updates(
-            "2026-11-09",
-            &[("129AC0000000089".into(), "2020-01-01".into())],
-        )
-        .unwrap();
+        let row = |as_of: &str| ListedUpdate {
+            law_id: "129AC0000000089".into(),
+            as_of: as_of.into(),
+            enforce_on: as_of.into(),
+            pending: false,
+        };
+        db.store_updates("2026-11-10", "2026-11-11", &[row("2024-04-01")])
+            .unwrap();
+        db.store_updates("2026-11-11", "2026-11-11", &[row("2026-04-01")])
+            .unwrap();
+        db.store_updates("2026-11-09", "2026-11-11", &[row("2020-01-01")])
+            .unwrap();
         assert_eq!(
             db.remote_as_of("129AC0000000089").unwrap().as_deref(),
             Some("2026-04-01")
@@ -893,5 +1098,122 @@ mod tests {
         assert_eq!(from.as_deref(), Some("2026-11-09"));
         assert_eq!(through.as_deref(), Some("2026-11-11"));
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn article_number_binds_to_the_law_name_before_it() {
+        let (_dir, db) = temp_db();
+        let article = ParsedArticle {
+            key: "555".into(),
+            num: "第555条".into(),
+            heading: "売買".into(),
+            body: "本文".into(),
+            suppl: false,
+        };
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-04-01",
+            "2026-04-01",
+            "bundle",
+            &["民法".into()],
+            &[article.clone()],
+        )
+        .unwrap();
+        db.replace_law(
+            "417AC0000000086",
+            "会社法",
+            "",
+            "2026-04-01",
+            "2026-04-01",
+            "bundle",
+            &["会社法".into()],
+            &[article],
+        )
+        .unwrap();
+        let law = db
+            .match_law_in_text("民法第555条と会社法")
+            .unwrap()
+            .unwrap();
+        assert_eq!(law.law_id, "129AC0000000089");
+        assert!(db.match_law_in_text("第555条と会社法").unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_replacement_does_not_delete_articles() {
+        let (_dir, db) = temp_db();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-04-01",
+            "2026-04-01",
+            "bundle",
+            &["民法".into()],
+            &[ParsedArticle {
+                key: "1".into(),
+                num: "第1条".into(),
+                heading: String::new(),
+                body: "本文".into(),
+                suppl: false,
+            }],
+        )
+        .unwrap();
+        let err = db
+            .replace_law(
+                "129AC0000000089",
+                "民法",
+                "",
+                "2026-11-11",
+                "2026-11-11",
+                "egov",
+                &["民法".into()],
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("置き換えません"), "{err}");
+        assert!(db
+            .lookup_article("129AC0000000089", "1")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn failed_attach_rolls_back_and_detaches() {
+        let (dir, db) = temp_db();
+        let bad = dir.path().join("bad.db");
+        let raw = Connection::open(&bad).unwrap();
+        raw.execute_batch("CREATE TABLE dummy (id INTEGER);")
+            .unwrap();
+        drop(raw);
+        let err = db.import_attached_db(&bad).unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(db.article_count().unwrap(), 0);
+        let again = db.import_attached_db(&bad).unwrap_err();
+        assert!(
+            !again.contains("already in use"),
+            "seed stayed attached: {again}"
+        );
+        assert!(bad.exists(), "the caller's file is not the temp seed");
+    }
+
+    #[test]
+    fn a_future_update_is_pending_until_it_is_in_force() {
+        let (_dir, db) = temp_db();
+        db.store_updates(
+            "2026-11-11",
+            "2026-11-11",
+            &[ListedUpdate {
+                law_id: "129AC0000000089".into(),
+                as_of: String::new(),
+                enforce_on: "2027-04-01".into(),
+                pending: true,
+            }],
+        )
+        .unwrap();
+        assert!(db.remote_as_of("129AC0000000089").unwrap().is_none());
+        assert!(!db.pending_due("129AC0000000089", "2026-11-11").unwrap());
+        assert!(db.pending_due("129AC0000000089", "2027-04-01").unwrap());
     }
 }

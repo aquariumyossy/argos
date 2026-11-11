@@ -110,14 +110,36 @@ pub struct RevisionInput<'a> {
     pub offline: bool,
     pub cached_articles: usize,
     pub probed_on: &'a str,
+    /// A saved amendment whose enforcement date has arrived.
+    pub pending_due: bool,
 }
 
 pub fn revision_action(input: &RevisionInput<'_>) -> RevisionAction {
     if input.offline {
         return RevisionAction::Keep { offline: true };
     }
+    // A future date is not the text we stored. Recheck once it can be in force.
+    if let (Some(stored), Some(today)) = (parse_ymd(input.stored_as_of), parse_ymd(input.today)) {
+        if stored > today {
+            return reload_or_probe(input.cached_articles, input.today);
+        }
+    }
+    if input.pending_due {
+        return reload_or_probe(input.cached_articles, input.today);
+    }
     if let Some(remote) = input.remote_as_of {
-        if revision_is_newer(remote, input.stored_as_of) {
+        if let (Some(remote_date), Some(today)) = (parse_ymd(remote), parse_ymd(input.today)) {
+            if remote_date > today {
+                // Not in force yet. Do not treat the law as updated.
+            } else if revision_is_newer(remote, input.stored_as_of) {
+                if input.cached_articles > 1 {
+                    return RevisionAction::ReloadLaw {
+                        as_of: format_ymd(remote_date),
+                    };
+                }
+                return RevisionAction::ProbeArticle;
+            }
+        } else if revision_is_newer(remote, input.stored_as_of) {
             if input.cached_articles > 1 {
                 if let Some(date) = parse_ymd(remote) {
                     return RevisionAction::ReloadLaw {
@@ -132,6 +154,16 @@ pub fn revision_action(input: &RevisionInput<'_>) -> RevisionAction {
         return RevisionAction::ProbeArticle;
     }
     RevisionAction::Keep { offline: false }
+}
+
+fn reload_or_probe(cached_articles: usize, today: &str) -> RevisionAction {
+    if cached_articles > 1 {
+        RevisionAction::ReloadLaw {
+            as_of: today.to_string(),
+        }
+    } else {
+        RevisionAction::ProbeArticle
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +244,7 @@ mod tests {
             offline,
             cached_articles: count,
             probed_on: probed,
+            pending_due: false,
         }
     }
 
@@ -256,6 +289,42 @@ mod tests {
         assert_eq!(
             revision_action(&input("2024-04-01", None, false, false, 40, "2026-11-11")),
             RevisionAction::Keep { offline: false }
+        );
+    }
+
+    #[test]
+    fn a_future_enforcement_date_is_not_treated_as_current_text() {
+        assert_eq!(
+            revision_action(&input(
+                "2020-04-01",
+                Some("2027-04-01"),
+                true,
+                false,
+                40,
+                ""
+            )),
+            RevisionAction::Keep { offline: false }
+        );
+        let mut due = input("2020-04-01", None, true, false, 40, "2026-11-11");
+        due.pending_due = true;
+        assert_eq!(
+            revision_action(&due),
+            RevisionAction::ReloadLaw {
+                as_of: "2026-11-11".into()
+            }
+        );
+        assert_eq!(
+            revision_action(&input(
+                "2027-04-01",
+                None,
+                true,
+                false,
+                40,
+                "2026-11-11"
+            )),
+            RevisionAction::ReloadLaw {
+                as_of: "2026-11-11".into()
+            }
         );
     }
 }

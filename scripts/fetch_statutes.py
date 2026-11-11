@@ -24,7 +24,7 @@ UA = "Argos/1.18 (statute bundle; e-Gov law API v1)"
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "src-tauri" / "src" / "statute" / "catalog.rs"
 OUT = ROOT / "src-tauri" / "resources" / "statutes.db.gz"
-BUNDLE_VERSION = "2026-11-11"
+BUNDLE_VERSION = "2026-11-11b"
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -94,22 +94,31 @@ def article_identity(num: str, suppl: bool) -> tuple[str, str] | None:
     num = num.strip()
     if not num:
         return None
-    if "_" in num:
-        main, branch = num.split("_", 1)
-    else:
-        main, branch = num, None
-    if not main.isdigit():
+    parts: list[int] = []
+    for part in num.split("_"):
+        if not part.isdigit():
+            return None
+        value = int(part)
+        if value <= 0 or value > 999_999:
+            return None
+        parts.append(value)
+    if not parts:
         return None
-    main_n = int(main)
-    branch_n = int(branch) if branch and branch.isdigit() else None
-    if branch and branch_n is None:
-        return None
-    key_body = f"{main_n}_{branch_n}" if branch_n is not None else str(main_n)
+    key_body = "_".join(str(value) for value in parts)
     key = f"s{key_body}" if suppl else key_body
-    display = ("附則" if suppl else "") + f"第{main_n}条"
-    if branch_n is not None:
-        display += f"の{branch_n}"
+    display = ("附則" if suppl else "") + f"第{parts[0]}条"
+    for branch in parts[1:]:
+        display += f"の{branch}"
     return key, display
+
+
+def display_law_name(law_num: str, law_name: str) -> str:
+    name = squash(law_name)
+    num = squash(law_num)
+    if not num or not name.startswith(num):
+        return name
+    rest = name[len(num) :].strip().strip("（()）").strip()
+    return rest or name
 
 
 def cleanup_heading(raw: str) -> str:
@@ -142,7 +151,7 @@ def parse_law(xml: str) -> dict:
         elif name_l == "LawNum" and not law_num:
             law_num = squash(text_of(node, skip_rt=False))
         elif name_l == "LawTitle" and not name:
-            name = squash(text_of(node))
+            name = display_law_name(law_num, text_of(node))
             if not abbrev:
                 abbrev = (node.attrib.get("Abbrev") or "").strip()
         elif name_l == "Article" and amend == 0 and toc == 0:
@@ -307,6 +316,8 @@ def main() -> None:
         print(f"fetch {law_id}", flush=True)
         time.sleep(0.35)
         parsed = parse_law(fetch(f"{ORIGIN}/lawdata/{law_id}"))
+        if not parsed["articles"]:
+            raise SystemExit(f"{law_id}: e-Gov response had no articles")
         use_id = parsed["law_id"] or law_id
         name = parsed["name"] or (aliases[0] if aliases else use_id)
         all_aliases = list(dict.fromkeys([*aliases, parsed["abbrev"], parsed["name"], name]))

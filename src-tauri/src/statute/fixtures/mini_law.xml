@@ -50,6 +50,15 @@
                 </Item>
               </Paragraph>
             </Article>
+            <Article Num="32_4_2">
+              <ArticleCaption>（二重枝番）</ArticleCaption>
+              <ArticleTitle>第三十二条の四の二</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>二重枝番の本文。</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+            </Article>
           </MainProvision>
           <SupplProvision>
             <Article Num="1">

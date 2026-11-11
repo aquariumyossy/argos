@@ -91,26 +91,21 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
     let backend = state.backend.clone();
     let mail_backend = state.mail_backend.clone();
     let user_dict = state.user_dict.read().clone();
-    let owned = Arc::clone(&state);
     let q = query.clone();
     let pos_filter = settings.pos_filter_enabled;
     let search_result = tauri::async_runtime::spawn_blocking(move || {
-        let statute = owned.statute.index.get().ok();
         let found = search::run_search(
             &settings,
             backend.as_ref(),
             Some(mail_backend.as_ref()),
-            statute.as_deref(),
+            None,
             &q,
             limit,
             None,
             None,
             &user_dict,
         );
-        let result = found.map(|hits| {
-            let cites = crate::statute::citation_hits(&owned.statute.db, &q);
-            crate::statute::merge_citation_hits(hits, cites, limit)
-        });
+        let result = found;
         let terms = search::extract_search_terms(&q, |text| {
             backend.morph_content_surfaces(text, pos_filter)
         })
@@ -562,12 +557,11 @@ pub async fn search_query(
         }
         let filter =
             search::build_search_filter(&state.db, date, None, prefix, exts.as_deref(), false)?;
-        let statute = state.statute.index.get().ok();
         let hits = search::run_search_with_mail_options(
             &settings,
             state.backend.as_ref(),
             Some(state.mail_backend.as_ref()),
-            statute.as_deref(),
+            None,
             &query,
             limit,
             prefix,
@@ -575,10 +569,6 @@ pub async fn search_query(
             &user_dict,
             &filter,
         )?;
-        if search::include_builtin_statutes(prefix, exts.as_deref(), &filter) {
-            let cites = crate::statute::citation_hits(&state.statute.db, &query);
-            return Ok(crate::statute::merge_citation_hits(hits, cites, limit));
-        }
         Ok(hits)
     })
     .await

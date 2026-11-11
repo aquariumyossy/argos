@@ -10,8 +10,6 @@ use parking_lot::Mutex;
 use crate::search::legal_ref::has_legal_ref;
 use crate::search::{SearchHit, TantivyBackend};
 use crate::statute::store::{ArticleRow, StatuteDb};
-use crate::statute::xmlparse::parse_article_query;
-
 pub const PATH_PREFIX: &str = "statute:";
 
 pub struct StatuteIndex {
@@ -81,47 +79,47 @@ pub fn ensure_index(db: &StatuteDb, index: &StatuteIndex) -> Result<(), String> 
 pub fn index_verified(
     db: &StatuteDb,
     index: &StatuteIndex,
-    articles: &[crate::statute::cite::ToolArticle],
+    _articles: &[crate::statute::cite::ToolArticle],
 ) {
-    for article in articles.iter().filter(|article| article.verified) {
-        let Some(name) = article.names.first() else {
-            continue;
-        };
-        let Ok(Some(law)) = db.resolve_name(name) else {
-            continue;
-        };
-        let Some((key, _)) = parse_article_query(&article.article_num) else {
-            continue;
-        };
-        let Ok(Some(row)) = db.lookup_article(&law.law_id, &key) else {
-            continue;
-        };
-        let name = if law.name.is_empty() {
-            name.clone()
-        } else {
-            law.name
-        };
-        let _ = index_article(db, index, &name, &row);
-    }
+    let _ = sync_dirty(db, index);
 }
 
-pub fn index_article(
-    db: &StatuteDb,
-    index: &StatuteIndex,
-    name: &str,
-    row: &ArticleRow,
-) -> Result<(), String> {
+/// Rewrite every article of a law that just changed, and drop keys that are gone.
+/// The freshness token is written only when the index document count matches SQLite.
+pub fn sync_dirty(db: &StatuteDb, index: &StatuteIndex) -> Result<(), String> {
+    let note = db.take_index_dirty();
+    if note.laws.is_empty() && note.removed.is_empty() {
+        return Ok(());
+    }
     let _gate = index.gate.lock();
     let backend = index.get()?;
-    backend.stage_plain_unit(
-        &hit_title(name, row),
-        &hit_body(name, row),
-        &statute_path(&row.law_id, &row.key),
-        &hit_label(row),
-    )?;
+    for (law_id, key) in &note.removed {
+        backend.stage_delete_path(&statute_path(law_id, key))?;
+    }
+    for law_id in &note.laws {
+        let name = db
+            .law_ref(law_id)?
+            .map(|law| law.name)
+            .unwrap_or_default();
+        for row in db.articles_for(law_id)? {
+            backend.stage_plain_unit(
+                &hit_title(&name, &row),
+                &hit_body(&name, &row),
+                &statute_path(&row.law_id, &row.key),
+                &hit_label(&row),
+            )?;
+        }
+    }
     backend.publish_staged()?;
-    let want = db.index_token()?;
-    let _ = std::fs::write(index.token_path(), want);
+    let count = db.article_count()?;
+    if backend.num_docs() == count as u64 {
+        if let Some(parent) = index.token_path().parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(index.token_path(), db.index_token()?).map_err(|e| e.to_string())?;
+    } else {
+        let _ = std::fs::remove_file(index.token_path());
+    }
     Ok(())
 }
 
@@ -167,8 +165,10 @@ pub fn merge_citation_hits(
 }
 
 fn first_article(query: &str) -> Option<(String, String)> {
-    let normalized = crate::search::legal_ref::normalize_legal_refs(query);
-    parse_article_query(&normalized)
+    let span = crate::statute::xmlparse::article_spans(query)
+        .into_iter()
+        .next()?;
+    Some((span.key, span.display))
 }
 
 fn hit_title(name: &str, row: &ArticleRow) -> String {
@@ -220,6 +220,7 @@ fn to_hit(name: &str, row: &ArticleRow, score: f32) -> SearchHit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::SearchBackend;
     use crate::statute::xmlparse::ParsedArticle;
 
     #[test]
@@ -286,5 +287,92 @@ mod tests {
         assert_eq!(merged[0].doc_kind, "statute");
         assert_eq!(merged.len(), 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replacing_a_law_refreshes_the_index_even_when_the_count_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-statute-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = StatuteDb::open_empty(&dir.join("statutes.db")).unwrap();
+        let index = StatuteIndex::new(dir.join("index-statute"));
+        let article = |body: &str| ParsedArticle {
+            key: "555".into(),
+            num: "第555条".into(),
+            heading: "売買".into(),
+            body: body.into(),
+            suppl: false,
+        };
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-04-01",
+            "2026-04-01",
+            "bundle",
+            &["民法".into()],
+            &[article("OLDBODYTOKEN")],
+        )
+        .unwrap();
+        sync_dirty(&db, &index).unwrap();
+        let token = std::fs::read_to_string(index.token_path()).unwrap();
+        assert_eq!(index.get().unwrap().num_docs(), 1);
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-04-01",
+            "2026-04-01",
+            "egov",
+            &["民法".into()],
+            &[article("NEWBODYTOKEN")],
+        )
+        .unwrap();
+        assert_eq!(db.article_count().unwrap(), 1);
+        sync_dirty(&db, &index).unwrap();
+        let token2 = std::fs::read_to_string(index.token_path()).unwrap();
+        assert_ne!(token, token2, "same count must still change the index token");
+        let backend = index.get().unwrap();
+        assert_eq!(backend.num_docs(), 1);
+        let fresh = backend
+            .search_opts(
+                "NEWBODYTOKEN",
+                5,
+                None,
+                None,
+                false,
+                crate::search::SearchOpts::default(),
+            )
+            .unwrap();
+        assert!(
+            fresh.iter().any(|hit| {
+                hit.preview_text.contains("NEWBODYTOKEN") || hit.snippet.contains("NEWBODYTOKEN")
+            }),
+            "{fresh:?}"
+        );
+        let stale = backend
+            .search_opts(
+                "OLDBODYTOKEN",
+                5,
+                None,
+                None,
+                false,
+                crate::search::SearchOpts::default(),
+            )
+            .unwrap();
+        assert!(
+            stale
+                .iter()
+                .all(|hit| !hit.preview_text.contains("OLDBODYTOKEN")),
+            "{stale:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

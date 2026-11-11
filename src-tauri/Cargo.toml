@@ -68,6 +68,6 @@ tauri = { version = "2", features = ["test"] }
 name = "argos"
 path = "src/main.rs"
 
-[[bin]]
+[[example]]
 name = "statute-bundle"
-path = "src/bin/statute_bundle.rs"
+path = "examples/statute_bundle.rs"

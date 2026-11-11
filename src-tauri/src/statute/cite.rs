@@ -1,7 +1,9 @@
 //! Mark statute citations the chat did not verify.
 
-use crate::search::legal_ref::legal_ref_spans;
-use crate::statute::xmlparse::parse_article_query;
+use crate::statute::xmlparse::{article_spans, parse_article_query};
+
+const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
+const TOOL_RESULT_TRUNCATION_NOTE: &str = "…（長いので省略しました）";
 
 pub const LLM_STATUTE_HINT: &str = "\
 条文を回答に書く前に law_article で、その条の本文を取得してください。1回に10条まで、1つの回答で10回までです。この回数はウェブ検索や他のツール往復には数えません。返ってきた見出しと本文だけを根拠にし、本文にない効果は書かないでください。取得できなかった条番号には「要確認」と付けてください。";
@@ -118,6 +120,59 @@ pub fn verified_from_tool_output(content: &str) -> Vec<VerifiedCite> {
     out
 }
 
+/// Verified cites from the tool text the model actually received.
+/// A result replaced by the context-limit stub, or an article whose body was
+/// cut, does not count.
+pub fn verified_from_delivered(content: &str) -> Vec<VerifiedCite> {
+    if content.contains(TOOL_RESULT_OMITTED) {
+        return Vec::new();
+    }
+    let header = verified_from_tool_output(content);
+    let Some(cut) = content.find(TOOL_RESULT_TRUNCATION_NOTE) else {
+        return header;
+    };
+    let complete = complete_section_keys(content, cut);
+    header
+        .into_iter()
+        .filter(|cite| complete.iter().any(|key| key == &cite.key))
+        .collect()
+}
+
+fn complete_section_keys(content: &str, cut: usize) -> Vec<String> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut byte_at = Vec::with_capacity(chars.len() + 1);
+    let mut n = 0usize;
+    byte_at.push(0);
+    for ch in &chars {
+        n += ch.len_utf8();
+        byte_at.push(n);
+    }
+    let cut_chars = byte_at.iter().position(|b| *b >= cut).unwrap_or(chars.len());
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '【' {
+            starts.push(i);
+        }
+        i += 1;
+    }
+    let mut keys = Vec::new();
+    for (idx, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(idx + 1).copied().unwrap_or(chars.len());
+        if cut_chars < end {
+            continue;
+        }
+        let heading: String = chars[start..end.min(chars.len())]
+            .iter()
+            .take_while(|c| **c != '】')
+            .collect();
+        if let Some(span) = article_spans(&heading).into_iter().next() {
+            keys.push(span.key);
+        }
+    }
+    keys
+}
+
 pub fn summary_lines(content: &str) -> Vec<String> {
     content
         .lines()
@@ -128,34 +183,86 @@ pub fn summary_lines(content: &str) -> Vec<String> {
 
 pub fn mark_unverified(answer: &str, verified: &[VerifiedCite]) -> String {
     let chars: Vec<char> = answer.chars().collect();
+    let spans = article_spans(answer);
     let mut inserts = Vec::new();
-    for (start, end) in legal_ref_spans(answer) {
-        if end <= start || end > chars.len() {
-            continue;
-        }
-        let cite: String = chars[start..end].iter().collect();
-        if !cite.contains('条') {
-            continue;
-        }
-        let Some((key, _)) = parse_article_query(&cite) else {
+    let mut current_law: Option<String> = None;
+    let mut current_suppl = false;
+    let mut previous_end = 0usize;
+    for span in &spans {
+        let between: String = chars[previous_end..span.start].iter().collect();
+        let inherit = current_law.is_some()
+            && (is_connector(&between) || between.trim() == "同法" || between.ends_with("同法"));
+        let window = law_window(&chars, span.start);
+        let dou = window.as_deref() == Some("同法");
+        let name = if dou && current_law.is_none() {
+            verified
+                .iter()
+                .find(|item| item.key == span.key || item.key == format!("s{}", span.key))
+                .and_then(|item| item.names.first().cloned())
+        } else if inherit || dou {
+            current_law.clone()
+        } else if let Some(window) = window.as_deref() {
+            if DENY_LAW_NAME.iter().any(|deny| window.ends_with(deny)) {
+                current_law = None;
+                previous_end = span.end;
+                continue;
+            }
+            match longest_verified_suffix(window, verified) {
+                Some(found) => {
+                    current_law = Some(found.clone());
+                    current_suppl = span.suppl;
+                    Some(found)
+                }
+                None => {
+                    if window.ends_with("憲法") || window.ends_with('法') {
+                        current_law = Some(window.to_string());
+                        current_suppl = span.suppl;
+                        Some(window.to_string())
+                    } else {
+                        current_law = None;
+                        previous_end = span.end;
+                        continue;
+                    }
+                }
+            }
+        } else {
+            current_law = None;
+            previous_end = span.end;
             continue;
         };
-        let Some(name) = law_name_before(&chars, start) else {
+        let Some(name) = name else {
+            previous_end = span.end;
             continue;
         };
         if DENY_LAW_NAME.contains(&name.as_str()) {
+            previous_end = span.end;
             continue;
         }
-        if verified
-            .iter()
-            .any(|item| item.key == key && item.names.iter().any(|n| n == &name))
-        {
-            continue;
+        let suppl = if span.suppl {
+            true
+        } else if inherit || dou {
+            current_suppl
+        } else {
+            false
+        };
+        current_suppl = suppl;
+        if !inherit && !dou {
+            current_law = Some(name.clone());
         }
-        if already_marked(&chars, end) {
-            continue;
+        let key = if suppl && !span.key.starts_with('s') {
+            format!("s{}", span.key)
+        } else if !suppl && span.key.starts_with('s') && !span.suppl {
+            span.key.clone()
+        } else {
+            span.key.clone()
+        };
+        let ok = verified.iter().any(|item| {
+            item.key == key && item.names.iter().any(|candidate| candidate == &name)
+        });
+        if !ok && !already_marked(&chars, span.end) {
+            inserts.push(span.end);
         }
-        inserts.push(end);
+        previous_end = span.end;
     }
     if inserts.is_empty() {
         return answer.to_string();
@@ -173,7 +280,24 @@ pub fn mark_unverified(answer: &str, verified: &[VerifiedCite]) -> String {
     out
 }
 
-fn law_name_before(chars: &[char], cite_start: usize) -> Option<String> {
+fn longest_verified_suffix(window: &str, verified: &[VerifiedCite]) -> Option<String> {
+    let mut best: Option<String> = None;
+    for item in verified {
+        for name in &item.names {
+            if name.chars().count() < 2 {
+                continue;
+            }
+            if window == name || window.ends_with(name.as_str()) {
+                if best.as_ref().map(|b| name.chars().count() > b.chars().count()).unwrap_or(true) {
+                    best = Some(name.clone());
+                }
+            }
+        }
+    }
+    best
+}
+
+fn law_window(chars: &[char], cite_start: usize) -> Option<String> {
     let mut end = cite_start;
     while end > 0 && chars[end - 1].is_whitespace() {
         end -= 1;
@@ -187,17 +311,31 @@ fn law_name_before(chars: &[char], cite_start: usize) -> Option<String> {
     }
     let name: String = chars[start..end].iter().collect();
     if name.chars().count() < 2 {
-        return None;
-    }
-    if name.ends_with("憲法") || name.ends_with('法') {
-        Some(name)
-    } else {
         None
+    } else {
+        Some(name)
     }
 }
 
 fn is_law_char(c: char) -> bool {
-    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{30A0}'..='\u{30FF}' | '々')
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '々'
+            | '、'
+            | '，'
+    )
+}
+
+fn is_connector(between: &str) -> bool {
+    let text: String = between.chars().filter(|c| !c.is_whitespace()).collect();
+    matches!(
+        text.as_str(),
+        "及び" | "および" | "又は" | "または" | "若しくは" | "並びに" | "と" | "、" | "，" | "・"
+    )
 }
 
 fn already_marked(chars: &[char], end: usize) -> bool {
@@ -271,5 +409,41 @@ mod tests {
         assert!(lines.iter().all(|line| !line.contains("財産権")));
         assert!(text.contains("見出し: 売買"));
         assert!(text.contains("時点: 2026-04-01"));
+    }
+
+    #[test]
+    fn marking_follows_the_law_that_precedes_the_article() {
+        let verified = vec![
+            verified_cite(&["民法"], "32_4"),
+            verified_cite(&["個人情報の保護に関する法律", "個人情報保護法"], "27"),
+            verified_cite(&["民法"], "1"),
+            verified_cite(&["民法"], "548_2"),
+        ];
+        let same = mark_unverified("同法第32条の4第1項は適用されます。", &verified);
+        assert!(!same.contains("要確認"), "{same}");
+        let full = mark_unverified("個人情報の保護に関する法律第27条は第三者提供です。", &verified);
+        assert!(!full.contains("要確認"), "{full}");
+        let pair = mark_unverified("民法第1条及び第2条。", &verified);
+        assert!(pair.contains("第1条は") || pair.contains("民法第1条及"), "{pair}");
+        assert!(pair.contains("第2条（要確認）"), "{pair}");
+        assert!(!pair.contains("第1条（要確認）"), "{pair}");
+        let amended = mark_unverified("改正民法第548条の2は定型約款です。", &verified);
+        assert!(!amended.contains("要確認"), "{amended}");
+        let suppl = mark_unverified("民法附則第1条。", &[verified_cite(&["民法"], "1")]);
+        assert!(suppl.contains("附則第1条（要確認）"), "{suppl}");
+        let suppl_ok = mark_unverified("民法附則第1条。", &[verified_cite(&["民法"], "s1")]);
+        assert!(!suppl_ok.contains("要確認"), "{suppl_ok}");
+    }
+
+    #[test]
+    fn a_truncated_tool_result_does_not_count_as_verified() {
+        let full = "確認済み: 民法 第555条\n\n【民法 第555条】\n見出し: 売買\n本文です。\n";
+        assert_eq!(verified_from_delivered(full).len(), 1);
+        let stub = "（文脈の上限に達したため、この結果は省略しました）";
+        assert!(verified_from_delivered(stub).is_empty());
+        let cut = "確認済み: 民法 第555条\n確認済み: 民法 第1条\n\n【民法 第555条】\n本文です。\n\n【民法 第1条】\n途中…（長いので省略しました）";
+        let kept = verified_from_delivered(cut);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].key, "555");
     }
 }

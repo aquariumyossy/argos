@@ -106,7 +106,7 @@ impl AppState {
         let remote_server = RemoteServerHandle::new();
         let user_dict = Self::build_user_dict(&db);
         let mail = MailStaHandle::start(db.clone(), mail_backend.clone())?;
-        let statute = Arc::new(StatuteService::open(&data_dir)?);
+        let statute = Arc::new(StatuteService::open(&data_dir));
 
         Ok((
             Self {
@@ -184,7 +184,6 @@ impl AppState {
             self.db.clone(),
             self.settings.clone(),
             self.user_dict.clone(),
-            Some(self.statute.clone()),
         );
     }
 

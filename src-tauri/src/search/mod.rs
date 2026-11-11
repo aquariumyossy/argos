@@ -683,22 +683,14 @@ fn search_local_with_mail(
     Ok(merge_hits_by_score(file_hits, mail_hits, limit))
 }
 
-/// Built-in statutes join an unscoped search. A folder, extension, date, or sender
-/// filter stays on the user's files and mail.
+/// Built-in statute articles stay out of popup, folder, and remote search.
+/// The statute database is only for `law_article`. A later option may turn this on.
 pub fn include_builtin_statutes(
-    path_prefix: Option<&str>,
-    exts: Option<&[String]>,
-    filter: &SearchFilter,
+    _path_prefix: Option<&str>,
+    _exts: Option<&[String]>,
+    _filter: &SearchFilter,
 ) -> bool {
-    if filter.skip_files() || filter.date.is_active() {
-        return false;
-    }
-    if exts.is_some_and(|exts| !exts.is_empty()) {
-        return false;
-    }
-    !path_prefix
-        .map(str::trim)
-        .is_some_and(|prefix| !prefix.is_empty())
+    false
 }
 
 fn merge_builtin_statutes(
@@ -1232,8 +1224,8 @@ mod tests {
     use crate::search::tantivy_backend::EmailDocMeta;
 
     #[test]
-    fn builtin_statutes_join_only_an_unscoped_search() {
-        assert!(include_builtin_statutes(
+    fn builtin_statutes_stay_out_of_normal_search() {
+        assert!(!include_builtin_statutes(
             None,
             None,
             &SearchFilter::default()

@@ -825,12 +825,11 @@ fn run_index_search(
     // Force local so this half stays on for_llm. The host is a separate call.
     settings.search_mode = "local".into();
     let filter = prepare_chat_local_search(&mode, filter.clone());
-    let statute = state.statute.index.get().ok();
     let hits = search::run_search_precise(
         &settings,
         state.backend.as_ref(),
         Some(state.mail_backend.as_ref()),
-        statute.as_deref(),
+        None,
         query,
         unit_limit_for(k),
         path_prefix,
@@ -839,14 +838,6 @@ fn run_index_search(
         UNITS_PER_FILE,
         &filter,
     )?;
-    if search::include_builtin_statutes(path_prefix, None, &filter) {
-        let cites = crate::statute::citation_hits(&state.statute.db, query);
-        return Ok(crate::statute::merge_citation_hits(
-            hits,
-            cites,
-            unit_limit_for(k),
-        ));
-    }
     Ok(hits)
 }
 
@@ -2270,6 +2261,15 @@ fn trim_plain(preamble: &str, header: &str, body: &str, max_chars: usize) -> Str
 }
 
 fn tool_law_article(state: &AppState, args: &Value) -> ToolExec {
+    if !state
+        .statute
+        .enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return ToolExec::text(
+            "法令DBは起動時に準備できなかったため、条文を確認できません。",
+        );
+    }
     let mut queries = Vec::new();
     if let Some(list) = args.get("articles").and_then(|v| v.as_array()) {
         for item in list {

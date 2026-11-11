@@ -49,8 +49,12 @@ fn resolve_one(
     fetched_catalog: &mut bool,
     reloaded: &mut Vec<String>,
 ) -> ToolArticle {
-    let law_query = query.law.trim().to_string();
-    let article_query = query.article.trim().to_string();
+    let mut law_query = query.law.trim().to_string();
+    let mut article_query = query.article.trim().to_string();
+    if law_query.contains("附則") && !article_query.contains("附則") {
+        article_query = format!("附則{article_query}");
+        law_query = law_query.replace("附則", "");
+    }
     let Some((key, display)) = parse_article_query(&article_query) else {
         return miss(&law_query, &article_query, "条番号を読めませんでした。");
     };
@@ -92,6 +96,7 @@ fn resolve_one(
         through.as_deref(),
         count,
     );
+    let pending_due = db.pending_due(&law.law_id, today).unwrap_or(false);
     let action = revision_action(&RevisionInput {
         stored_as_of: &law.as_of,
         today,
@@ -100,6 +105,7 @@ fn resolve_one(
         offline,
         cached_articles: law.article_count,
         probed_on: &cached.probed_on,
+        pending_due,
     });
     match action {
         RevisionAction::Keep { offline } => hit_from_cache(&db, &law, &cached, offline),
@@ -123,6 +129,7 @@ fn resolve_one(
             }
             match reload_law(db, client, &law, &as_of, today) {
                 Ok(()) => {
+                    let _ = db.clear_pending(&law.law_id);
                     reloaded.push(law.law_id.clone());
                     let Some(row) = db.lookup_article(&law.law_id, &key).ok().flatten() else {
                         return probe_article(
@@ -238,6 +245,7 @@ fn store_fetched(
     } else {
         as_of.to_string()
     };
+    // One article does not make the rest of the law current.
     let stored_as_of = today.to_string();
     if db
         .upsert_article(&law.law_id, &article, &stored_as_of)
@@ -249,7 +257,6 @@ fn store_fetched(
             "取得した条文を保存できませんでした。",
         );
     }
-    let _ = db.set_law_revision(&law.law_id, &stored_as_of, today);
     let _ = as_of;
     let mut names = db.aliases_of(&law.law_id).unwrap_or_default();
     if !names.iter().any(|n| n == &name) {
@@ -303,6 +310,11 @@ fn probe_article(
                 return hit_from_cache(db, law, cached, false);
             }
             let as_of = remote_as_of
+                .filter(|remote| {
+                    parse_ymd(remote)
+                        .zip(parse_ymd(today))
+                        .is_some_and(|(remote, today)| remote <= today)
+                })
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| today.to_string());
             if db.upsert_article(&law.law_id, &fresh, &as_of).is_err() {
@@ -461,18 +473,17 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
         match client.fetch(&url) {
             Ok(xml) => match xmlparse::parse_update_list(&xml) {
                 Ok(rows) => {
-                    let pairs = rows
-                        .into_iter()
-                        .map(|row| (row.law_id, row.as_of))
-                        .collect::<Vec<_>>();
-                    if db.store_updates(&format_ymd(day), &pairs).is_err() {
+                    if db
+                        .store_updates(&format_ymd(day), today, &rows)
+                        .is_err()
+                    {
                         return true;
                     }
                 }
                 Err(_) => return true,
             },
             Err(EgovFailure::NotFound) => {
-                if db.store_updates(&format_ymd(day), &[]).is_err() {
+                if db.store_updates(&format_ymd(day), today, &[]).is_err() {
                     return true;
                 }
             }
@@ -571,17 +582,6 @@ mod tests {
             "bundle",
         )
         .unwrap();
-        db.replace_law(
-            "129AC0000000089",
-            "民法",
-            "明治二十九年法律第八十九号",
-            "2026-11-11",
-            "2026-11-11",
-            "bundle",
-            &["民法".into()],
-            &[],
-        )
-        .unwrap();
         let hits = resolve_articles(
             &db,
             &client,
@@ -671,5 +671,172 @@ mod tests {
         assert!(hits[0].verified);
         assert!(!hits[0].offline);
         assert_eq!(hits[0].body, body);
+    }
+
+    #[test]
+    fn fetching_one_article_does_not_mark_the_whole_law_current() {
+        let db = temp_db();
+        db.set_meta("updates_through", "2026-11-11").unwrap();
+        db.ensure_law("129AC0000000089", "民法", "", "bundle")
+            .unwrap();
+        let client = MapEgov::new(vec![(
+            "articles;lawId=129AC0000000089".into(),
+            Ok(include_str!("fixtures/article_555.xml").to_string()),
+        )]);
+        let hits = resolve_articles(
+            &db,
+            &client,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert!(hits[0].verified, "{:?}", hits[0].note);
+        let law = db.resolve_name("民法").unwrap().unwrap();
+        assert_eq!(law.as_of, "");
+        assert_eq!(law.checked_on, "");
+        let row = db.lookup_article(&law.law_id, "555").unwrap().unwrap();
+        assert_eq!(row.as_of, "2026-11-11");
+    }
+
+    #[test]
+    fn a_suppl_request_does_not_return_the_main_article() {
+        let db = temp_db();
+        db.set_meta("updates_through", "2026-11-11").unwrap();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2026-11-11",
+            "2026-11-11",
+            "bundle",
+            &["民法".into()],
+            &[
+                ParsedArticle {
+                    key: "1".into(),
+                    num: "第1条".into(),
+                    heading: "本則".into(),
+                    body: "本則の本文".into(),
+                    suppl: false,
+                },
+                ParsedArticle {
+                    key: "s1".into(),
+                    num: "附則第1条".into(),
+                    heading: "施行".into(),
+                    body: "附則の本文".into(),
+                    suppl: true,
+                },
+            ],
+        )
+        .unwrap();
+        let hits = resolve_articles(
+            &db,
+            &OfflineEgov,
+            &[
+                ArticleQuery {
+                    law: "民法".into(),
+                    article: "附則第1条".into(),
+                },
+                ArticleQuery {
+                    law: "民法附則".into(),
+                    article: "第1条".into(),
+                },
+            ],
+            "2026-11-11",
+        );
+        assert!(hits[0].verified, "{:?}", hits[0].note);
+        assert!(hits[0].body.contains("附則の本文"), "{}", hits[0].body);
+        assert!(!hits[0].body.contains("本則の本文"));
+        assert!(hits[1].body.contains("附則の本文"), "{:?}", hits[1].note);
+    }
+
+    #[test]
+    fn a_pending_amendment_is_refetched_once_it_is_in_force() {
+        let db = temp_db();
+        db.set_meta("updates_through", "2027-04-01").unwrap();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2020-04-01",
+            "2020-04-01",
+            "bundle",
+            &["民法".into()],
+            &[
+                ParsedArticle {
+                    key: "555".into(),
+                    num: "第555条".into(),
+                    heading: "売買".into(),
+                    body: "古い本文".into(),
+                    suppl: false,
+                },
+                ParsedArticle {
+                    key: "1".into(),
+                    num: "第1条".into(),
+                    heading: "原則".into(),
+                    body: "もう一条".into(),
+                    suppl: false,
+                },
+            ],
+        )
+        .unwrap();
+        db.store_updates(
+            "2026-11-11",
+            "2026-11-11",
+            &[crate::statute::xmlparse::ListedUpdate {
+                law_id: "129AC0000000089".into(),
+                as_of: String::new(),
+                enforce_on: "2027-04-01".into(),
+                pending: true,
+            }],
+        )
+        .unwrap();
+        let before = resolve_articles(
+            &db,
+            &OfflineEgov,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2026-11-11",
+        );
+        assert_eq!(before[0].body, "古い本文");
+        assert_eq!(
+            db.resolve_name("民法").unwrap().unwrap().as_of,
+            "2020-04-01"
+        );
+        let fresh = r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot><Result><Code>0</Code></Result><ApplData><LawFullText><Law>
+<LawNum>明治二十九年法律第八十九号</LawNum>
+<LawBody><LawTitle>民法</LawTitle><MainProvision>
+<Article Num="555"><ArticleCaption>（売買）</ArticleCaption><ArticleTitle>第五百五十五条</ArticleTitle>
+<Paragraph><ParagraphSentence><Sentence>新しい本文。</Sentence></ParagraphSentence></Paragraph></Article>
+<Article Num="1"><ArticleTitle>第一条</ArticleTitle>
+<Paragraph><ParagraphSentence><Sentence>新しい第一条。</Sentence></ParagraphSentence></Paragraph></Article>
+</MainProvision></LawBody></Law></LawFullText></ApplData></DataRoot>"#;
+        let client = MapEgov::new(vec![(
+            "lawdata/129AC0000000089".into(),
+            Ok(fresh.to_string()),
+        )]);
+        let after = resolve_articles(
+            &db,
+            &client,
+            &[ArticleQuery {
+                law: "民法".into(),
+                article: "555".into(),
+            }],
+            "2027-04-01",
+        );
+        assert!(after[0].body.contains("新しい本文"), "{:?}", after[0].note);
+        let stored = db.resolve_name("民法").unwrap().unwrap();
+        assert_eq!(stored.as_of, "2027-04-01");
+        assert!(!db.pending_due("129AC0000000089", "2027-04-01").unwrap());
+        assert!(db
+            .lookup_article("129AC0000000089", "1")
+            .unwrap()
+            .unwrap()
+            .body
+            .contains("新しい第一条"));
     }
 }

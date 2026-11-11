@@ -199,7 +199,7 @@ pub fn run() {
             app.manage(Arc::new(state));
             tauri::async_runtime::spawn(async move {
                 let joined = tauri::async_runtime::spawn_blocking(move || {
-                    crate::statute::ensure_service_index(&statute)
+                    crate::statute::prepare_service(&statute)
                 })
                 .await;
                 match joined {

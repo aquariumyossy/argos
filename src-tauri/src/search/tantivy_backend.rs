@@ -584,6 +584,13 @@ impl TantivyBackend {
         Ok(())
     }
 
+    /// Queue a path delete. Nothing is searchable until [`publish_staged`].
+    pub fn stage_delete_path(&self, path: &str) -> Result<(), String> {
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, path));
+        Ok(())
+    }
+
     /// One stored unit, committed later with [`publish_staged`].
     /// Used by the built-in statute index. `folder` stays empty so a user-folder
     /// rebuild does not see these rows; that index is a separate directory.

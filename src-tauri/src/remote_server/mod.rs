@@ -27,7 +27,6 @@ struct ServerState {
     share: Arc<Mutex<RemoteShareSnapshot>>,
     settings: Arc<RwLock<Settings>>,
     user_dict: Arc<RwLock<UserDictMatcher>>,
-    statute: Option<Arc<crate::statute::StatuteService>>,
 }
 
 #[derive(Serialize)]
@@ -279,28 +278,20 @@ async fn search(
     let mail_backend = state.mail_backend.clone();
     let settings = local_settings(&state.settings.read());
     let user_dict = state.user_dict.read().clone();
-    let statute = state.statute.clone();
 
     if loopback {
         let hits = tokio::task::spawn_blocking(move || {
-            let statute_index = statute.as_ref().and_then(|svc| svc.index.get().ok());
-            let mut hits = run_local_search_multi(
+            let hits = run_local_search_multi(
                 &settings,
                 backend.as_ref(),
                 Some(mail_backend.as_ref()),
-                statute_index.as_deref(),
+                None,
                 &query,
                 &prefixes,
                 limit,
                 exts.as_deref(),
                 &user_dict,
             )?;
-            if prefixes.is_empty() && exts.as_ref().map(|list| list.is_empty()).unwrap_or(true) {
-                if let Some(svc) = statute.as_ref() {
-                    let cites = crate::statute::citation_hits(&svc.db, &query);
-                    hits = crate::statute::merge_citation_hits(hits, cites, limit);
-                }
-            }
             Ok(hits)
         })
         .await
@@ -681,7 +672,6 @@ impl RemoteServerHandle {
         db: Arc<Db>,
         settings: Arc<RwLock<Settings>>,
         user_dict: Arc<RwLock<UserDictMatcher>>,
-        statute: Option<Arc<crate::statute::StatuteService>>,
     ) {
         if !(1..=65535).contains(&port) {
             eprintln!("argos: remote server not started (invalid port {port})");
@@ -721,7 +711,6 @@ impl RemoteServerHandle {
             share: self.share.clone(),
             settings,
             user_dict,
-            statute,
         };
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         let addr = if lan {
@@ -846,7 +835,6 @@ mod tests {
             user_dict: Arc::new(RwLock::new(UserDictMatcher::from_words(
                 Vec::<String>::new(),
             ))),
-            statute: None,
         };
         (dir, state)
     }
@@ -1136,7 +1124,6 @@ mod tests {
             db,
             settings,
             user_dict,
-            None,
         );
 
         let url = format!("http://127.0.0.1:{port}/health");

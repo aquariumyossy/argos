@@ -74,7 +74,7 @@ python3 scripts/fetch_statutes.py
 同じ取り込みを、アプリのパーサで行うコマンドもあります。
 
 ```bash
-cargo run --manifest-path src-tauri/Cargo.toml --bin statute-bundle -- src-tauri/resources/statutes.db.gz
+cargo run --manifest-path src-tauri/Cargo.toml --example statute-bundle -- src-tauri/resources/statutes.db.gz
 ```
 
 処理は次のとおりです。
@@ -82,15 +82,17 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin statute-bundle -- src-tauri
 1. `GET https://laws.e-gov.go.jp/api/1/lawlists/2` で憲法・法律の法令IDと法令名を取る
 2. 上の一覧の法令IDごとに `GET https://laws.e-gov.go.jp/api/1/lawdata/{法令ID}` を取る
 3. 条（附則を含む。改正規定の中の条と、削除された条は除く）に分けて SQLite に入れる
-4. gzip して `src-tauri/resources/statutes.db.gz` に書く。起動時にアプリデータへ展開する
+4. gzip して `src-tauri/resources/statutes.db.gz` に書く。起動のあと、バックグラウンドでアプリデータへ展開する
 
-2026-11-11 に取り直した同梱データは、法令52件・条文13,426件、SQLite が約 14.2 MiB、gzip が約 2.3 MiB（2,432,549 バイト）だった。インストーラにはこの gzip が入る。
+2026-11-11 に取り直した同梱データは、法令52件・条文13,458件、gzip が 2,437,966 バイトだった。条番号は枝番の段数をそのまま持つ（例: 第105条の2の2）。附則は本則と別のキーになる。独占禁止法の法令名は「私的独占の禁止及び公正取引の確保に関する法律」で、法令番号は名前に含めない。
+
+開発用の取り込みコマンドは example なので、配布するインストーラには入らない。リリースビルドの `statute-bundle.exe` は 133,121,405 バイトだった。同じ圧縮（NSIS、LZMA solid）で `argos.exe` だけのインストーラと、それにこの実行ファイルを足したインストーラを比べると、27,351,824 バイト増えた。これは Tauri が組む完全なインストーラそのものではなく、増える分の実測である。
 
 法令IDと略称の対応は `src-tauri/src/statute/catalog.rs` にあります。
 
 ## 検索
 
-全体検索では、ファイル索引とは別の索引に入った条文もヒットします。フォルダ、拡張子、日付、送信者で絞った検索には混ぜません。`民法 第555条` のように法令名と条番号がある検索は、索引の構築前でも SQLite からその条を返します。
+内蔵の条文は、ポップアップ検索、LAN 検索、チャットの `search_index` には出ません。チャットの `search_index` は、この変更のあと内蔵法令を返しません。法令DBとその索引は `law_article` が条文を引くためだけに使います。利用者がフォルダに置いた法令ファイルは、これまでどおりファイル検索の対象です。検索画面に法令検索の切り替えは付けていません。
 
 ## チャットの条文照合
 
@@ -100,4 +102,4 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin statute-bundle -- src-tauri
 
 ## 改正の確認
 
-保存済みの法令は、e-Gov の更新法令一覧（`/api/1/updatelawlists/{年月日}`）で施行日、無ければ改正公布日を見ます。保存している時点より新しければ取り直します。一覧を遡れないときは、その条の本文を比べます。通信できないときは保存済みの本文を返し、画面は止めません。
+保存済みの法令は、e-Gov の更新法令一覧（`/api/1/updatelawlists/{年月日}`）で、すでに施行されている改正の施行日、無ければ改正公布日を見ます。未施行（`EnforcementFlg` が 1、または施行日が未来）の改正は、その施行日を控えておき、施行日以降にもう一度確認します。未来の日付を、保存している本文の時点にはしません。1条だけ取得しても、法令全体を最新とは扱いません。通信できないときは保存済みの本文を返し、画面は止めません。法令DBを開けないときも、アプリ自体は起動し、条文の確認だけできません。

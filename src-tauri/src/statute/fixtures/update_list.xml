@@ -33,5 +33,12 @@
       <EnforcementDate>21171231</EnforcementDate>
       <AmendPromulgationDate></AmendPromulgationDate>
     </LawNameListInfo>
+    <LawNameListInfo>
+      <LawId>417AC0000000086</LawId>
+      <LawName>会社法</LawName>
+      <AmendPromulgationDate>20261101</AmendPromulgationDate>
+      <EnforcementDate>20270401</EnforcementDate>
+      <EnforcementFlg>1</EnforcementFlg>
+    </LawNameListInfo>
   </ApplData>
 </DataRoot>
