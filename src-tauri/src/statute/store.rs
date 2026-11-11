@@ -133,11 +133,13 @@ impl StatuteDb {
                 BEGIN;
                 INSERT INTO law_name (law_id, name, law_num)
                 SELECT law_id, name, law_num FROM seed.law_name
+                WHERE 1
                 ON CONFLICT(law_id) DO UPDATE SET
                   name = excluded.name,
                   law_num = excluded.law_num;
                 INSERT INTO law_alias (alias, law_id)
                 SELECT alias, law_id FROM seed.law_alias
+                WHERE 1
                 ON CONFLICT(alias) DO UPDATE SET law_id = excluded.law_id;
                 DELETE FROM article WHERE law_id IN (
                   SELECT s.law_id FROM seed.law s
@@ -156,6 +158,7 @@ impl StatuteDb {
                 );
                 INSERT INTO law (law_id, name, law_num, as_of, checked_on, source)
                 SELECT law_id, name, law_num, as_of, checked_on, source FROM seed.law
+                WHERE 1
                 ON CONFLICT(law_id) DO UPDATE SET
                   name = excluded.name,
                   law_num = excluded.law_num,
