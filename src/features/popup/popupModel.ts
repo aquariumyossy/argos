@@ -134,6 +134,9 @@ export function hitLocation(
   hit: SearchHit,
   roots: string[],
 ): { text: string; title: string } {
+  if (isStatuteHit(hit)) {
+    return { text: "法令DB", title: hit.title.trim() || "法令" };
+  }
   if (isOutlookHit(hit) || isInternalIdPath(hit.path)) {
     const folder = (hit.mailFolder ?? "").trim()
       ? formatMailFolderMeta(hit.mailFolder ?? "")
@@ -163,7 +166,12 @@ export function extTypeLabel(ext: string): string {
   return EXT_TYPE[key] ?? key.toUpperCase();
 }
 
+export function isStatuteHit(hit: Pick<SearchHit, "path" | "docKind">): boolean {
+  return (hit.docKind ?? "") === "statute" || hit.path.trim().toLowerCase().startsWith("statute:");
+}
+
 export function hitTypeLabel(hit: SearchHit): string {
+  if (isStatuteHit(hit)) return "法令";
   if (isOutlookHit(hit)) return "メール";
   return extTypeLabel(extFromPath(hit.path));
 }

@@ -29,6 +29,7 @@ use crate::db::{
     LLM_REREAD_HINT, LLM_REREAD_SENTINEL,
 };
 use crate::llm::context::ChatTurn;
+use crate::statute::{LLM_STATUTE_HINT, LLM_STATUTE_SENTINEL};
 
 pub fn normalize_base_url(raw: &str) -> String {
     let s = raw.trim().trim_end_matches('/').to_string();
@@ -200,6 +201,12 @@ pub fn system_for_request(settings: &Settings) -> String {
         }
         s.push_str(LLM_REREAD_HINT);
     }
+    if !s.contains(LLM_STATUTE_SENTINEL) && !s.contains(LLM_STATUTE_HINT) {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(LLM_STATUTE_HINT);
+    }
     s
 }
 
@@ -320,7 +327,9 @@ pub async fn test_connection(settings: &Settings) -> Result<(String, Vec<LlmMode
                     names.join(", ")
                 )
             };
-            message.push_str(&thinking_budget_sentence(refresh_thinking_budget(settings, None).await));
+            message.push_str(&thinking_budget_sentence(
+                refresh_thinking_budget(settings, None).await,
+            ));
             Ok((message, models))
         }
         Err(e) => {
@@ -750,14 +759,17 @@ fn ingest_payload(
     runaway_chars: usize,
     on_delta: &mut impl FnMut(&str, &str),
 ) -> Result<(), String> {
-    let v: Value = serde_json::from_str(data)
-        .map_err(|_| "応答の解釈に失敗しました。".to_string())?;
+    let v: Value =
+        serde_json::from_str(data).map_err(|_| "応答の解釈に失敗しました。".to_string())?;
     if let Some(id) = v.get("id").and_then(|value| value.as_str()) {
         if !id.is_empty() {
             parse.request_id = id.to_string();
         }
     }
-    if let Some(reason) = v.pointer("/choices/0/finish_reason").and_then(|value| value.as_str()) {
+    if let Some(reason) = v
+        .pointer("/choices/0/finish_reason")
+        .and_then(|value| value.as_str())
+    {
         if !reason.is_empty() {
             parse.finish_reason = reason.to_string();
         }
@@ -1050,9 +1062,12 @@ pub async fn transcribe_image(
     if !status.is_success() {
         return Err(http_error::ocr_failure(status.as_u16(), &text));
     }
-    let v: Value = serde_json::from_str(&text).map_err(|_| "応答の解釈に失敗しました。".to_string())?;
+    let v: Value =
+        serde_json::from_str(&text).map_err(|_| "応答の解釈に失敗しました。".to_string())?;
     if v.get("error").is_some() {
-        return Err("モデルが書き起こしを返しませんでした。画像に対応したモデルか確認してください。".into());
+        return Err(
+            "モデルが書き起こしを返しませんでした。画像に対応したモデルか確認してください。".into(),
+        );
     }
     let content = first_text(&[
         v.pointer("/choices/0/message/content"),
@@ -1105,12 +1120,16 @@ mod tests {
 
     #[test]
     fn transport_failures_stay_connection_messages() {
-        let conn = http_error::transport_failure("error sending request for url: connection refused");
+        let conn =
+            http_error::transport_failure("error sending request for url: connection refused");
         assert!(conn.contains("接続できません"), "{conn}");
         let lan = http_error::transport_failure(
             "error sending request for url (http://100.65.231.111:8000/v1/models)",
         );
-        assert!(lan.contains("127.0.0.1") || lan.contains("届きません"), "{lan}");
+        assert!(
+            lan.contains("127.0.0.1") || lan.contains("届きません"),
+            "{lan}"
+        );
         let refused = http_error::transport_failure("tcp connect error: os error 10061");
         assert!(refused.contains("接続できません"), "{refused}");
         let timed_out = http_error::transport_failure("os error 10060");
@@ -1151,7 +1170,10 @@ mod tests {
         assert!(!phrase.contains("API キーが拒否"), "{phrase}");
         assert!(!phrase.contains("Unauthorized"), "{phrase}");
         let missing = http_error::chat_failure(404, "model 'llama3.2-vision:7b' not found");
-        assert!(missing.contains("指定したモデルが見つかりません"), "{missing}");
+        assert!(
+            missing.contains("指定したモデルが見つかりません"),
+            "{missing}"
+        );
         assert!(!missing.contains("llama3"), "{missing}");
         assert!(!is_tools_unsupported_error(&missing), "{missing}");
         let tool_name = http_error::chat_failure(404, "llama3-groq-tool-use");
@@ -1166,9 +1188,15 @@ mod tests {
         let other = http_error::chat_failure(422, "secret-body");
         assert!(other.contains("HTTP 422"), "{other}");
         assert!(!other.contains("secret-body"), "{other}");
-        let tools = http_error::chat_failure(400, "registry.ollama.ai/library/llama3:latest does not support tools");
+        let tools = http_error::chat_failure(
+            400,
+            "registry.ollama.ai/library/llama3:latest does not support tools",
+        );
         assert_eq!(tools, http_error::TOOLS_UNSUPPORTED_ERROR);
-        let choice = http_error::chat_failure(400, r#""auto" tool choice requires --enable-auto-tool-choice"#);
+        let choice = http_error::chat_failure(
+            400,
+            r#""auto" tool choice requires --enable-auto-tool-choice"#,
+        );
         assert!(is_tools_unsupported_error(&choice), "{choice}");
         let choice_json = http_error::chat_failure(
             400,
@@ -1183,18 +1211,29 @@ mod tests {
         let vision = http_error::ocr_failure(400, "this model does not support image input");
         assert!(vision.contains("画像を読めません"), "{vision}");
         assert!(!vision.contains("image input"), "{vision}");
-        let vision_404 = http_error::ocr_failure(404, "llama3.2-vision:7b does not support image input");
-        assert!(vision_404.contains("指定したモデルが見つかりません"), "{vision_404}");
+        let vision_404 =
+            http_error::ocr_failure(404, "llama3.2-vision:7b does not support image input");
+        assert!(
+            vision_404.contains("指定したモデルが見つかりません"),
+            "{vision_404}"
+        );
         assert!(!vision_404.contains("画像を読めません"), "{vision_404}");
         assert!(!vision_404.contains("llama3"), "{vision_404}");
         let list = http_error::models_failure(404);
         assert!(list.contains("HTTP 404"), "{list}");
         assert!(!list.contains("見つかりません"), "{list}");
-        let image_on_chat = http_error::chat_failure(400, "this model does not support image input");
+        let image_on_chat =
+            http_error::chat_failure(400, "this model does not support image input");
         assert!(image_on_chat.contains("HTTP 400"), "{image_on_chat}");
-        assert!(!image_on_chat.contains("画像を読めません"), "{image_on_chat}");
+        assert!(
+            !image_on_chat.contains("画像を読めません"),
+            "{image_on_chat}"
+        );
         let generic_words = http_error::chat_failure(400, "tool image vision unsupported");
-        assert!(!is_tools_unsupported_error(&generic_words), "{generic_words}");
+        assert!(
+            !is_tools_unsupported_error(&generic_words),
+            "{generic_words}"
+        );
         assert!(generic_words.contains("HTTP 400"), "{generic_words}");
         let too_long = http_error::chat_failure(
             400,
@@ -1222,10 +1261,16 @@ mod tests {
             "{context_on_500}"
         );
         assert!(!context_on_500.contains("secret-body"), "{context_on_500}");
-        assert!(!context_on_500.contains("context length"), "{context_on_500}");
+        assert!(
+            !context_on_500.contains("context length"),
+            "{context_on_500}"
+        );
         let tools_on_404 = http_error::chat_failure(404, "model does not support tools");
         assert!(!is_tools_unsupported_error(&tools_on_404), "{tools_on_404}");
-        assert!(tools_on_404.contains("指定したモデルが見つかりません"), "{tools_on_404}");
+        assert!(
+            tools_on_404.contains("指定したモデルが見つかりません"),
+            "{tools_on_404}"
+        );
         let tools_on_500 = http_error::chat_failure(500, "does not support tools");
         assert!(!is_tools_unsupported_error(&tools_on_500), "{tools_on_500}");
         assert!(tools_on_500.contains("HTTP 500"), "{tools_on_500}");
@@ -1360,7 +1405,8 @@ mod tests {
                         Ok(0) => break,
                         Ok(n) => {
                             buf.extend_from_slice(&tmp[..n]);
-                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
                                 let headers = String::from_utf8_lossy(&buf[..header_end]);
                                 let len = headers
                                     .lines()
@@ -1427,7 +1473,10 @@ mod tests {
             is_tools_unsupported_error(&ollama_err),
             "ollama tools error must still reach the tool-free fallback: {ollama_err}"
         );
-        assert!(!ollama_err.contains("does not support tools"), "{ollama_err}");
+        assert!(
+            !ollama_err.contains("does not support tools"),
+            "{ollama_err}"
+        );
         assert!(!ollama_err.contains("registry.ollama.ai"), "{ollama_err}");
 
         let vllm = r#"{"error":{"message":"\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}}"#;
@@ -1494,7 +1543,10 @@ mod tests {
             let body = format!(r#"{{"error":"model '{model}' not found, try pulling it first"}}"#);
             let port = serve_http(404, "Not Found", &body, 1);
             let err = stream_chat_err_model(port, model, true).await;
-            assert!(err.contains("指定したモデルが見つかりません"), "{model}: {err}");
+            assert!(
+                err.contains("指定したモデルが見つかりません"),
+                "{model}: {err}"
+            );
             assert!(!is_tools_unsupported_error(&err), "{model}: {err}");
             assert!(!err.contains("画像を読めません"), "{model}: {err}");
             assert!(!err.contains(model), "{model}: {err}");
@@ -1643,19 +1695,48 @@ mod tests {
     #[test]
     fn reread_hint_is_added_once_before_answering_about_an_attachment() {
         let def = system_for_request(&Settings::default());
-        assert_eq!(def.matches(crate::db::LLM_REREAD_SENTINEL).count(), 1, "{def}");
+        assert_eq!(
+            def.matches(crate::db::LLM_REREAD_SENTINEL).count(),
+            1,
+            "{def}"
+        );
         assert!(def.contains("articles"));
         assert!(def.contains("start と end"));
         let mut custom = Settings::default();
         custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
         let sys = system_for_request(&custom);
         assert!(sys.contains("事務所の独自ルール"));
-        assert_eq!(sys.matches(crate::db::LLM_REREAD_SENTINEL).count(), 1, "{sys}");
+        assert_eq!(
+            sys.matches(crate::db::LLM_REREAD_SENTINEL).count(),
+            1,
+            "{sys}"
+        );
         let again = system_for_request(&Settings {
             llm_system_prompt: sys,
             ..Settings::default()
         });
-        assert_eq!(again.matches(crate::db::LLM_REREAD_SENTINEL).count(), 1, "{again}");
+        assert_eq!(
+            again.matches(crate::db::LLM_REREAD_SENTINEL).count(),
+            1,
+            "{again}"
+        );
+        assert_eq!(
+            again.matches(crate::statute::LLM_STATUTE_SENTINEL).count(),
+            1,
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn statute_hint_is_added_once() {
+        let def = system_for_request(&Settings::default());
+        assert_eq!(
+            def.matches(crate::statute::LLM_STATUTE_SENTINEL).count(),
+            1,
+            "{def}"
+        );
+        assert!(def.contains("要確認"));
+        assert!(def.contains("10回"));
     }
 
     #[test]

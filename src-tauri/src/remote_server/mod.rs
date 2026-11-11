@@ -27,6 +27,7 @@ struct ServerState {
     share: Arc<Mutex<RemoteShareSnapshot>>,
     settings: Arc<RwLock<Settings>>,
     user_dict: Arc<RwLock<UserDictMatcher>>,
+    statute: Option<Arc<crate::statute::StatuteService>>,
 }
 
 #[derive(Serialize)]
@@ -102,7 +103,10 @@ fn check_bearer(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode, 
     let Ok(raw) = value.to_str() else {
         return Err(unauthorized());
     };
-    let Some(token) = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) else {
+    let Some(token) = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+    else {
         return Err(unauthorized());
     };
     if token != expected || expected.is_empty() {
@@ -275,19 +279,29 @@ async fn search(
     let mail_backend = state.mail_backend.clone();
     let settings = local_settings(&state.settings.read());
     let user_dict = state.user_dict.read().clone();
+    let statute = state.statute.clone();
 
     if loopback {
         let hits = tokio::task::spawn_blocking(move || {
-            run_local_search_multi(
+            let statute_index = statute.as_ref().and_then(|svc| svc.index.get().ok());
+            let mut hits = run_local_search_multi(
                 &settings,
                 backend.as_ref(),
                 Some(mail_backend.as_ref()),
+                statute_index.as_deref(),
                 &query,
                 &prefixes,
                 limit,
                 exts.as_deref(),
                 &user_dict,
-            )
+            )?;
+            if prefixes.is_empty() && exts.as_ref().map(|list| list.is_empty()).unwrap_or(true) {
+                if let Some(svc) = statute.as_ref() {
+                    let cites = crate::statute::citation_hits(&svc.db, &query);
+                    hits = crate::statute::merge_citation_hits(hits, cites, limit);
+                }
+            }
+            Ok(hits)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -432,7 +446,10 @@ async fn path_matches(
     require_auth(&headers, &state.token, loopback)?;
     let path = body.path.trim().to_string();
     if path.is_empty() {
-        return Ok(Json(SearchResponse { hits: Vec::new(), ..SearchResponse::default() }));
+        return Ok(Json(SearchResponse {
+            hits: Vec::new(),
+            ..SearchResponse::default()
+        }));
     }
 
     if loopback {
@@ -456,15 +473,24 @@ async fn path_matches(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         let limit = body.limit.unwrap_or(50).clamp(1, 50);
         hits.truncate(limit);
-        return Ok(Json(SearchResponse { hits, ..SearchResponse::default() }));
+        return Ok(Json(SearchResponse {
+            hits,
+            ..SearchResponse::default()
+        }));
     }
 
     if crate::mail::is_outlook_path(&path) {
-        return Ok(Json(SearchResponse { hits: Vec::new(), ..SearchResponse::default() }));
+        return Ok(Json(SearchResponse {
+            hits: Vec::new(),
+            ..SearchResponse::default()
+        }));
     }
     let share = state.share.lock().clone();
     if !share.path_is_shared(&path) {
-        return Ok(Json(SearchResponse { hits: Vec::new(), ..SearchResponse::default() }));
+        return Ok(Json(SearchResponse {
+            hits: Vec::new(),
+            ..SearchResponse::default()
+        }));
     }
     let limit = body.limit.unwrap_or(50).clamp(1, 50);
     let backend = state.backend.clone();
@@ -481,7 +507,10 @@ async fn path_matches(
     for hit in &mut hits {
         hit.source = "remote".into();
     }
-    Ok(Json(SearchResponse { hits, ..SearchResponse::default() }))
+    Ok(Json(SearchResponse {
+        hits,
+        ..SearchResponse::default()
+    }))
 }
 
 #[derive(Deserialize)]
@@ -652,6 +681,7 @@ impl RemoteServerHandle {
         db: Arc<Db>,
         settings: Arc<RwLock<Settings>>,
         user_dict: Arc<RwLock<UserDictMatcher>>,
+        statute: Option<Arc<crate::statute::StatuteService>>,
     ) {
         if !(1..=65535).contains(&port) {
             eprintln!("argos: remote server not started (invalid port {port})");
@@ -691,6 +721,7 @@ impl RemoteServerHandle {
             share: self.share.clone(),
             settings,
             user_dict,
+            statute,
         };
         let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
         let addr = if lan {
@@ -812,7 +843,10 @@ mod tests {
             token: Arc::new(token.to_string()),
             share: Arc::new(Mutex::new(RemoteShareSnapshot::default())),
             settings: Arc::new(RwLock::new(Settings::default())),
-            user_dict: Arc::new(RwLock::new(UserDictMatcher::from_words(Vec::<String>::new()))),
+            user_dict: Arc::new(RwLock::new(UserDictMatcher::from_words(
+                Vec::<String>::new(),
+            ))),
+            statute: None,
         };
         (dir, state)
     }
@@ -1058,21 +1092,13 @@ mod tests {
             .unwrap();
         state
             .db
-            .upsert_file(
-                folder.id,
-                r"C:\cases\new.txt",
-                "txt",
-                1,
-                1_700_000_100,
-                "h",
-            )
+            .upsert_file(folder.id, r"C:\cases\new.txt", "txt", 1, 1_700_000_100, "h")
             .unwrap();
         let date = DateFilter {
             after_unix: Some(1_700_000_000),
             before_unix: Some(1_700_000_200),
         };
-        let paths =
-            dated_file_allowlist(state.db.as_ref(), date, Some(r"C:\cases"), None).unwrap();
+        let paths = dated_file_allowlist(state.db.as_ref(), date, Some(r"C:\cases"), None).unwrap();
         assert_eq!(paths, vec![r"C:\cases\new.txt".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1092,7 +1118,9 @@ mod tests {
         );
         let db = Arc::new(Db::open(&dir.join("argos.db")).unwrap());
         let settings = Arc::new(RwLock::new(Settings::default()));
-        let user_dict = Arc::new(RwLock::new(UserDictMatcher::from_words(Vec::<String>::new())));
+        let user_dict = Arc::new(RwLock::new(UserDictMatcher::from_words(
+            Vec::<String>::new(),
+        )));
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port() as u32;
@@ -1108,6 +1136,7 @@ mod tests {
             db,
             settings,
             user_dict,
+            None,
         );
 
         let url = format!("http://127.0.0.1:{port}/health");

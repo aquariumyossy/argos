@@ -29,6 +29,7 @@ import {
   hitDateLabel,
   hitLocation,
   hitTypeLabel,
+  isStatuteHit,
   INPUT_SUGGEST_HINT,
   inputSuggestHintVisible,
   isInternalIdPath,
@@ -708,6 +709,7 @@ export default function Popup() {
 
   const rescopeToHitFolder = useCallback(
     (hit: SearchHit) => {
+      if (isStatuteHit(hit)) return;
       if (isOutlookHit(hit)) {
         const folder = (hit.mailFolder ?? "").trim();
         if (!folder) {
@@ -1147,8 +1149,13 @@ export default function Popup() {
 
   const openSelected = useCallback(
     async (path?: string) => {
-      const target = path ?? hits[index]?.path;
+      const hit = path ? hits.find((row) => row.path === path) : hits[index];
+      const target = path ?? hit?.path;
       if (!target) return;
+      if (hit && isStatuteHit(hit)) {
+        openHitPreview(hit);
+        return;
+      }
       setActionError("");
       try {
         await invoke("open_hit", { path: target });
@@ -1157,14 +1164,14 @@ export default function Popup() {
         setActionError(String(e));
       }
     },
-    [hits, index],
+    [hits, index, openHitPreview],
   );
 
   const openFolder = useCallback(
     async (path?: string) => {
       const target = path ?? hits[index]?.path;
       if (!target) return;
-      if (target.startsWith("outlook:")) return;
+      if (target.startsWith("outlook:") || target.toLowerCase().startsWith("statute:")) return;
       setActionError("");
       try {
         await invoke("open_containing_folder", { path: target });
@@ -2428,6 +2435,7 @@ export default function Popup() {
                       >
                         <IconPreview />
                       </button>
+                      {isStatuteHit(hit) ? null : (
                       <button
                         type="button"
                         className="hit-action-btn"
@@ -2440,7 +2448,8 @@ export default function Popup() {
                       >
                         <IconOpenFile />
                       </button>
-                      {!mailHit ? (
+                      )}
+                      {!mailHit && !isStatuteHit(hit) ? (
                         <button
                           type="button"
                           className="hit-action-btn"
@@ -2454,6 +2463,7 @@ export default function Popup() {
                           <IconFolder />
                         </button>
                       ) : null}
+                      {isStatuteHit(hit) ? null : (
                       <button
                         type="button"
                         className="hit-action-btn"
@@ -2466,6 +2476,7 @@ export default function Popup() {
                       >
                         <IconRescope />
                       </button>
+                      )}
                     </div>
                   </li>
                 );

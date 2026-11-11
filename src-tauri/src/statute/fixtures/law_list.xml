@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot>
+  <Result>
+    <Code>0</Code>
+    <Message/>
+  </Result>
+  <ApplData>
+    <Category>2</Category>
+    <LawNameListInfo>
+      <LawId>129AC0000000089</LawId>
+      <LawName>民法</LawName>
+      <LawNo>明治二十九年法律第八十九号</LawNo>
+      <PromulgationDate>18960427</PromulgationDate>
+    </LawNameListInfo>
+    <LawNameListInfo>
+      <LawId>321CONSTITUTION</LawId>
+      <LawName>日本国憲法</LawName>
+      <LawNo>昭和二十一年憲法</LawNo>
+      <PromulgationDate>19461103</PromulgationDate>
+    </LawNameListInfo>
+  </ApplData>
+</DataRoot>

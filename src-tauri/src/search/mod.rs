@@ -15,9 +15,7 @@ pub use date::{format_unix_ymd, parse_date_range, today_ymd, DateFilter};
 pub use history::{extract_search_terms, suggest_from_history, SearchTermSuggestion};
 pub use morph::{apply_user_dictionary, is_noise_highlight_term, MorphAnalyzer, UserDictMatcher};
 pub use remote_backend::{hybrid_search, RemoteArgosBackend};
-pub use remote_share::{
-    filter_hits_by_share, path_is_remotely_shared, RemoteShareSnapshot,
-};
+pub use remote_share::{filter_hits_by_share, path_is_remotely_shared, RemoteShareSnapshot};
 pub use scopes::{
     assemble_search_scopes, collect_search_scopes, ScopeListOpts, SearchScopeRow,
     SearchScopesResult,
@@ -408,6 +406,7 @@ pub fn run_search(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
@@ -418,6 +417,7 @@ pub fn run_search(
         settings,
         local,
         mail,
+        statute,
         query,
         limit,
         path_prefix,
@@ -438,6 +438,7 @@ pub fn run_search_with_opts(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
@@ -498,12 +499,24 @@ pub fn run_search_with_opts(
                     hits = merge_hits_by_score(hits, mail_hits, limit);
                 }
             }
+            hits = merge_builtin_statutes(
+                hits,
+                statute,
+                &rewritten,
+                limit,
+                path_prefix,
+                exts,
+                pos_filter,
+                opts,
+                filter,
+            )?;
             Ok(hits)
         }
         _ => search_local_with_mail(
             settings,
             local,
             mail,
+            statute,
             &rewritten,
             limit,
             path_prefix,
@@ -562,15 +575,7 @@ fn search_mail(
             return Ok(Vec::new());
         }
     }
-    mail.search_filtered(
-        query,
-        limit,
-        path_prefix,
-        None,
-        pos_filter,
-        opts,
-        allow,
-    )
+    mail.search_filtered(query, limit, path_prefix, None, pos_filter, opts, allow)
 }
 
 fn search_files(
@@ -607,6 +612,7 @@ fn search_local_with_mail(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
@@ -656,14 +662,70 @@ fn search_local_with_mail(
     }
 
     let file_hits = search_files(local, query, limit, None, exts, pos_filter, opts, filter)?;
+    let file_hits = merge_builtin_statutes(
+        file_hits, statute, query, limit, None, exts, pos_filter, opts, filter,
+    )?;
     if !should_query_mail(settings, None, exts, filter) {
         return Ok(file_hits);
     }
     let Some(mail_be) = mail else {
         return Ok(file_hits);
     };
-    let mail_hits = search_mail(mail_be, query, limit, None, pos_filter, mail_opts(opts), filter)?;
+    let mail_hits = search_mail(
+        mail_be,
+        query,
+        limit,
+        None,
+        pos_filter,
+        mail_opts(opts),
+        filter,
+    )?;
     Ok(merge_hits_by_score(file_hits, mail_hits, limit))
+}
+
+/// Built-in statutes join an unscoped search. A folder, extension, date, or sender
+/// filter stays on the user's files and mail.
+pub fn include_builtin_statutes(
+    path_prefix: Option<&str>,
+    exts: Option<&[String]>,
+    filter: &SearchFilter,
+) -> bool {
+    if filter.skip_files() || filter.date.is_active() {
+        return false;
+    }
+    if exts.is_some_and(|exts| !exts.is_empty()) {
+        return false;
+    }
+    !path_prefix
+        .map(str::trim)
+        .is_some_and(|prefix| !prefix.is_empty())
+}
+
+fn merge_builtin_statutes(
+    hits: Vec<SearchHit>,
+    statute: Option<&TantivyBackend>,
+    query: &str,
+    limit: usize,
+    path_prefix: Option<&str>,
+    exts: Option<&[String]>,
+    pos_filter: bool,
+    opts: SearchOpts,
+    filter: &SearchFilter,
+) -> Result<Vec<SearchHit>, String> {
+    let Some(index) = statute else {
+        return Ok(hits);
+    };
+    if !include_builtin_statutes(path_prefix, exts, filter) {
+        return Ok(hits);
+    }
+    let mut extra = index.search_opts(query, limit, None, None, pos_filter, opts)?;
+    for hit in &mut extra {
+        if hit.path.starts_with("statute:") {
+            hit.doc_kind = "statute".into();
+            hit.source = "statute".into();
+        }
+    }
+    Ok(merge_hits_by_score(hits, extra, limit))
 }
 
 fn merge_hits_by_score(
@@ -682,6 +744,7 @@ pub fn run_search_with_mail_options(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
@@ -693,6 +756,7 @@ pub fn run_search_with_mail_options(
         settings,
         local,
         mail,
+        statute,
         query,
         limit,
         path_prefix,
@@ -709,6 +773,7 @@ pub fn run_search_precise(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
@@ -721,6 +786,7 @@ pub fn run_search_precise(
         settings,
         local,
         mail,
+        statute,
         query,
         limit,
         path_prefix,
@@ -740,6 +806,7 @@ pub fn run_local_search_multi(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     prefixes: &[String],
     limit: usize,
@@ -764,6 +831,7 @@ pub fn run_local_search_multi(
             &settings,
             local,
             mail,
+            statute,
             query,
             unit_limit,
             prefix,
@@ -785,6 +853,7 @@ pub fn run_search_with_mail_opts(
     settings: &Settings,
     local: &TantivyBackend,
     mail: Option<&TantivyBackend>,
+    statute: Option<&TantivyBackend>,
     query: &str,
     limit: usize,
     path_prefix: Option<&str>,
@@ -802,6 +871,7 @@ pub fn run_search_with_mail_opts(
         settings,
         local,
         mail,
+        statute,
         query,
         fetch,
         path_prefix,
@@ -1151,15 +1221,52 @@ pub fn ensure_server_token(settings: &mut Settings) {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_preview_file, build_search_filter, collapse_email_threads, list_mail_hits,
-        narrow_filter_to_prefix, preview_chunk_window, preview_keep_mask, run_preview_file,
-        sort_hits_by_mail_date, DateFilter, SearchFilter, SearchHit, TantivyBackend,
-        UserDictMatcher,
+        assemble_preview_file, build_search_filter, collapse_email_threads,
+        include_builtin_statutes, list_mail_hits, narrow_filter_to_prefix, preview_chunk_window,
+        preview_keep_mask, run_preview_file, sort_hits_by_mail_date, DateFilter, SearchFilter,
+        SearchHit, TantivyBackend, UserDictMatcher,
     };
     use crate::db::{Db, Settings};
-    use crate::extractor::ExtractedDoc;
     use crate::extractor::segment::SearchUnit;
+    use crate::extractor::ExtractedDoc;
     use crate::search::tantivy_backend::EmailDocMeta;
+
+    #[test]
+    fn builtin_statutes_join_only_an_unscoped_search() {
+        assert!(include_builtin_statutes(
+            None,
+            None,
+            &SearchFilter::default()
+        ));
+        assert!(!include_builtin_statutes(
+            Some(r"C:\laws"),
+            None,
+            &SearchFilter::default()
+        ));
+        assert!(!include_builtin_statutes(
+            Some("mailfolder:受信トレイ"),
+            None,
+            &SearchFilter::default()
+        ));
+        assert!(!include_builtin_statutes(
+            Some("source:remote"),
+            None,
+            &SearchFilter::default()
+        ));
+        assert!(!include_builtin_statutes(
+            None,
+            Some(&["pdf".into()]),
+            &SearchFilter::default()
+        ));
+        let dated = SearchFilter {
+            date: DateFilter {
+                after_unix: Some(1),
+                before_unix: None,
+            },
+            ..SearchFilter::default()
+        };
+        assert!(!include_builtin_statutes(None, None, &dated));
+    }
 
     fn dummy_hit(id: &str, chunk: u32, text: &str) -> SearchHit {
         SearchHit {
@@ -1235,20 +1342,17 @@ mod tests {
         let mut hit = all[2].clone();
         hit.highlight_terms = vec!["反社会的勢力".into(), "排除".into()];
         let preview = assemble_preview_file(all, vec![hit]);
-        assert!(preview
-            .units
+        assert!(preview.units.iter().all(|u| u
+            .highlight_terms
             .iter()
-            .all(|u| u.highlight_terms.iter().any(|t| t == "反社会的勢力")
-                && u.highlight_terms.iter().any(|t| t == "排除")));
+            .any(|t| t == "反社会的勢力")
+            && u.highlight_terms.iter().any(|t| t == "排除")));
     }
 
     #[test]
     fn preview_chunk_window_expands_neighbors() {
         let hit = dummy_hit("f#10", 10, "x");
-        assert_eq!(
-            preview_chunk_window(&[hit], 2, 200),
-            vec![8, 9, 10, 11, 12]
-        );
+        assert_eq!(preview_chunk_window(&[hit], 2, 200), vec![8, 9, 10, 11, 12]);
     }
 
     #[test]
@@ -1333,14 +1437,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn mail_hit(
-        id: &str,
-        path: &str,
-        from: &str,
-        date: &str,
-        conv: &str,
-        score: f32,
-    ) -> SearchHit {
+    fn mail_hit(id: &str, path: &str, from: &str, date: &str, conv: &str, score: f32) -> SearchHit {
         SearchHit {
             id: id.into(),
             title: "件名".into(),
@@ -1410,12 +1507,33 @@ mod tests {
         // Two path constraints in one query would ask a path to equal two values at once.
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\cases", "").unwrap();
-        db.upsert_file(folder.id, r"C:\cases\alpha\new.txt", "txt", 1, 1_700_000_100, "h")
-            .unwrap();
-        db.upsert_file(folder.id, r"C:\cases\alpha\old.txt", "txt", 1, 1_600_000_000, "h")
-            .unwrap();
-        db.upsert_file(folder.id, r"C:\cases\beta\new.txt", "txt", 1, 1_700_000_100, "h")
-            .unwrap();
+        db.upsert_file(
+            folder.id,
+            r"C:\cases\alpha\new.txt",
+            "txt",
+            1,
+            1_700_000_100,
+            "h",
+        )
+        .unwrap();
+        db.upsert_file(
+            folder.id,
+            r"C:\cases\alpha\old.txt",
+            "txt",
+            1,
+            1_600_000_000,
+            "h",
+        )
+        .unwrap();
+        db.upsert_file(
+            folder.id,
+            r"C:\cases\beta\new.txt",
+            "txt",
+            1,
+            1_700_000_100,
+            "h",
+        )
+        .unwrap();
 
         let date = DateFilter {
             after_unix: Some(1_700_000_000),
@@ -1439,8 +1557,15 @@ mod tests {
         // half, so this must not read as "no results anywhere".
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\cases", "").unwrap();
-        db.upsert_file(folder.id, r"C:\cases\beta\d.txt", "txt", 1, 1_700_000_000, "h")
-            .unwrap();
+        db.upsert_file(
+            folder.id,
+            r"C:\cases\beta\d.txt",
+            "txt",
+            1,
+            1_700_000_000,
+            "h",
+        )
+        .unwrap();
         let narrowed =
             narrow_filter_to_prefix(&db, &SearchFilter::default(), r"C:\cases\empty").unwrap();
         assert_eq!(narrowed.file_paths.as_deref(), Some(&[][..]));
@@ -1451,10 +1576,24 @@ mod tests {
     fn prefix_allowlist_treats_like_wildcards_literally() {
         let (dir, db) = temp_db();
         let folder = db.add_folder(r"C:\cases", "").unwrap();
-        db.upsert_file(folder.id, r"C:\cases\100%\a.txt", "txt", 1, 1_700_000_000, "h")
-            .unwrap();
-        db.upsert_file(folder.id, r"C:\cases\100X\b.txt", "txt", 1, 1_700_000_000, "h")
-            .unwrap();
+        db.upsert_file(
+            folder.id,
+            r"C:\cases\100%\a.txt",
+            "txt",
+            1,
+            1_700_000_000,
+            "h",
+        )
+        .unwrap();
+        db.upsert_file(
+            folder.id,
+            r"C:\cases\100X\b.txt",
+            "txt",
+            1,
+            1_700_000_000,
+            "h",
+        )
+        .unwrap();
         let narrowed =
             narrow_filter_to_prefix(&db, &SearchFilter::default(), r"C:\cases\100%").unwrap();
         assert_eq!(
@@ -1538,11 +1677,15 @@ mod tests {
             "indexed",
         )
         .unwrap();
-        let filter = build_search_filter(&db, DateFilter::default(), Some("Aさん"), None, None, false)
-            .unwrap();
+        let filter =
+            build_search_filter(&db, DateFilter::default(), Some("Aさん"), None, None, false)
+                .unwrap();
         assert!(filter.skip_files());
         assert_eq!(filter.file_paths.as_deref(), Some(&[][..]));
-        assert_eq!(filter.mail_paths.as_deref(), Some(&["outlook:a".to_string()][..]));
+        assert_eq!(
+            filter.mail_paths.as_deref(),
+            Some(&["outlook:a".to_string()][..])
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

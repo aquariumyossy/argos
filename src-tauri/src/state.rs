@@ -11,6 +11,7 @@ use crate::mail::MailStaHandle;
 use crate::remote_server::RemoteServerHandle;
 use crate::search::tantivy_backend::TantivyBackend;
 use crate::search::UserDictMatcher;
+use crate::statute::StatuteService;
 use crate::watcher::WatcherHandle;
 
 pub struct LlmJob {
@@ -58,6 +59,8 @@ pub struct AppState {
     pub user_dict: Arc<RwLock<UserDictMatcher>>,
     /// Outlook Classic COM worker (STA). Always present; errors if Outlook missing.
     pub mail: MailStaHandle,
+    /// Built-in statute database and its search index. Not a user folder.
+    pub statute: Arc<StatuteService>,
     /// Serializes Outlook + iCal calendar sync (manual waits, periodic skips).
     pub calendar_sync: parking_lot::Mutex<()>,
     pub llm_job: RwLock<Option<LlmJob>>,
@@ -103,6 +106,7 @@ impl AppState {
         let remote_server = RemoteServerHandle::new();
         let user_dict = Self::build_user_dict(&db);
         let mail = MailStaHandle::start(db.clone(), mail_backend.clone())?;
+        let statute = Arc::new(StatuteService::open(&data_dir)?);
 
         Ok((
             Self {
@@ -116,6 +120,7 @@ impl AppState {
                 watcher: RwLock::new(None),
                 user_dict: Arc::new(RwLock::new(user_dict)),
                 mail,
+                statute,
                 calendar_sync: parking_lot::Mutex::new(()),
                 llm_job: RwLock::new(None),
                 preview_target: RwLock::new(None),
@@ -179,6 +184,7 @@ impl AppState {
             self.db.clone(),
             self.settings.clone(),
             self.user_dict.clone(),
+            Some(self.statute.clone()),
         );
     }
 

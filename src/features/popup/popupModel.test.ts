@@ -6,7 +6,9 @@ import {
   extFilterShortLabel,
   folderFilterLabel,
   hitLocation,
+  hitTypeLabel,
   INPUT_SUGGEST_HINT,
+  isStatuteHit,
   inputSuggestHintVisible,
   isInternalIdPath,
   SUGGEST_OVERLAY_HINT,
@@ -253,6 +255,25 @@ describe("hit location", () => {
     expect(loc.text).not.toContain("outlook:");
     expect(loc.title).not.toContain("outlook:");
     expect(loc.text).toContain("受信トレイ");
+  });
+
+  it("labels a built-in statute without showing the virtual path", () => {
+    const hit: SearchHit = {
+      id: "statute:129AC0000000089:555",
+      title: "民法 第555条（売買）",
+      snippet: "売買は",
+      path: "statute:129AC0000000089:555",
+      score: 1,
+      source: "statute",
+      previewText: "売買は、当事者の一方がある財産権を相手方に移転することを約する。",
+      docKind: "statute",
+    };
+    expect(isStatuteHit(hit)).toBe(true);
+    expect(hitTypeLabel(hit)).toBe("法令");
+    const loc = hitLocation(hit, []);
+    expect(loc.text).toBe("法令DB");
+    expect(loc.text).not.toContain("statute:");
+    expect(loc.title).toContain("民法");
   });
 });
 
