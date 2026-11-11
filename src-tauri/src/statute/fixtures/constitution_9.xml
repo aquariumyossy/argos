@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot>
+  <Result>
+    <Code>0</Code>
+    <Message/>
+  </Result>
+  <ApplData>
+    <LawId>321CONSTITUTION</LawId>
+    <LawNum/>
+    <Article>第9条</Article>
+    <Paragraph/>
+    <AppdxTable/>
+    <LawContents>
+      <Article Num="9">
+        <ArticleTitle>第九条</ArticleTitle>
+        <Paragraph Num="1">
+          <ParagraphNum/>
+          <ParagraphSentence>
+            <Sentence>日本国民は、正義と秩序を基調とする国際平和を誠実に希求し、国権の発動たる戦争と、武力による威嚇又は武力の行使は、国際紛争を解決する手段としては、永久にこれを放棄する。</Sentence>
+          </ParagraphSentence>
+        </Paragraph>
+        <Paragraph Num="2">
+          <ParagraphNum/>
+          <ParagraphSentence>
+            <Sentence Num="1">前項の目的を達するため、陸海空軍その他の戦力は、これを保持しない。</Sentence>
+            <Sentence Num="2">国の交戦権は、これを認めない。</Sentence>
+          </ParagraphSentence>
+        </Paragraph>
+      </Article>
+    </LawContents>
+  </ApplData>
+</DataRoot>

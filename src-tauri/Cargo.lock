@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "argos"
-version = "1.17.0"
+version = "1.18.0"
 dependencies = [
  "arboard",
  "axum",
@@ -137,6 +137,7 @@ dependencies = [
  "dirs 6.0.0",
  "encoding_rs",
  "enigo",
+ "flate2",
  "futures-util",
  "icalendar",
  "lindera",

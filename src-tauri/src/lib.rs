@@ -11,6 +11,7 @@ pub mod remote_server;
 pub mod search;
 pub mod selection;
 pub mod state;
+pub mod statute;
 pub mod watcher;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,7 +195,19 @@ pub fn run() {
                 .map(|f| f.path)
                 .collect::<Vec<_>>();
             let indexer = state.indexer.clone();
+            let statute = state.statute.clone();
             app.manage(Arc::new(state));
+            tauri::async_runtime::spawn(async move {
+                let joined = tauri::async_runtime::spawn_blocking(move || {
+                    crate::statute::prepare_service(&statute)
+                })
+                .await;
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => eprintln!("argos: statute index: {err}"),
+                    Err(err) => eprintln!("argos: statute index join failed: {err}"),
+                }
+            });
             APP_READY.store(true, Ordering::SeqCst);
             // Frontend may have mounted before AppState was ready; wake retrying loaders.
             let _ = app.emit("argos-ready", ());

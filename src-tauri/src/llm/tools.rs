@@ -10,6 +10,11 @@ use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
 pub const TOOL_SEARCH: &str = "search_index";
+pub const TOOL_LAW: &str = "law_article";
+/// Articles accepted in one `law_article` call.
+pub const MAX_LAW_ARTICLES: usize = 10;
+/// `law_article` calls accepted in one answer. Separate from web search and tool rounds.
+pub const MAX_LAW_CALLS: usize = 10;
 pub const TOOL_LIST_CALENDAR: &str = "list_calendar";
 pub const TOOL_READ: &str = "read_unit";
 pub const TOOL_READ_URL: &str = "read_url";
@@ -130,7 +135,7 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
         "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
 時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
 「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
 送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。\
@@ -139,7 +144,7 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
         "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
 時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
 「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
 送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
@@ -147,7 +152,7 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
         "Argosの索引を検索する（ファイルとメール）。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
 時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
 「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
 送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。\
@@ -156,7 +161,7 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
         "Argosの索引を検索する（ファイルとメール）。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-条文を引くときは『民法 第555条』のように法令名と条番号を書く。\
+登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
 時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
 「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
 送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
@@ -180,8 +185,8 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
                         "path_prefix": {
                             "type": "string",
                             "description": "優先するフォルダパス（任意）。そのフォルダを厚く返すが、結果には他フォルダの関連候補も混ざる（どれかは応答に示す）。\
-ユーザーが特定の案件やフォルダを指したとき、または出典のパス配下を深掘りするときに、分かっているフルパスを渡す。\
-検索語にフォルダ名が入っているだけなら渡さなくてよい。スレッドに検索範囲があるときは、その配下だけが有効。"
+        ユーザーが特定の案件やフォルダを指したとき、または出典のパス配下を深掘りするときに、分かっているフルパスを渡す。\
+        検索語にフォルダ名が入っているだけなら渡さなくてよい。スレッドに検索範囲があるときは、その配下だけが有効。"
                         },
                         "k": { "type": "integer", "description": "件数（1〜16）" },
                         "after": {
@@ -208,6 +213,31 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
         json!({
             "type": "function",
             "function": {
+                "name": TOOL_LAW,
+                "description": "法令の条文本文を取得する。内蔵の法令DBを先に使い、無い条は e-Gov 法令APIから取得して保存する。回答で条を引用する前に、引用する条をすべて渡す。1回10条まで、1つの回答で10回まで。この回数はウェブ検索や他のツール往復の上限に数えない。返った見出しと本文にない効果は書かない。取得できない条は要確認と書く。オフラインなら保存済みの本文を返し、無ければ要確認。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "articles": {
+                            "type": "array",
+                            "description": "取得する条文。最大10件。",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "law": { "type": "string", "description": "法令名。例: 民法、会社法、労基法、憲法" },
+                                    "article": { "type": "string", "description": "条番号。例: 555、第555条、548の2" }
+                                },
+                                "required": ["law", "article"]
+                            }
+                        }
+                    },
+                    "required": ["articles"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": TOOL_LIST_CALENDAR,
                 "description": "このPCの予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。search_index の「直近は過去」は予定に使わない。資料が要るときは、返った件名や当事者名を search_index の query にする。",
                 "parameters": {
@@ -225,9 +255,9 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
             "function": {
                 "name": TOOL_READ,
                 "description": "段落の本文を読む。既読 [n] の原文は cite_no に n を渡すと、この会話に保存された本文を読む。\
-添付された契約書などの文書について答えるときは、根拠にする条を articles で指定し、答える前に読み直す。\
-条の見出しが無い文書は start と end で文字範囲を指定する。articles も範囲も省略すると保存された全文を返す。\
-出典に (paragraph_id: ...) と示された段落や、末尾が […] で切れている出典の続きは paragraph_id で索引から読む。",
+        添付された契約書などの文書について答えるときは、根拠にする条を articles で指定し、答える前に読み直す。\
+        条の見出しが無い文書は start と end で文字範囲を指定する。articles も範囲も省略すると保存された全文を返す。\
+        出典に (paragraph_id: ...) と示された段落や、末尾が […] で切れている出典の続きは paragraph_id で索引から読む。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -340,6 +370,15 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
 
 pub fn max_tool_rounds(rounds: u32) -> usize {
     crate::db::normalize_tool_rounds(rounds) as usize
+}
+
+/// A round that only calls `law_article` does not spend the tool-round budget.
+pub fn counts_toward_tool_round(names: &[impl AsRef<str>]) -> bool {
+    names.iter().any(|name| name.as_ref() != TOOL_LAW)
+}
+
+pub fn law_call_limit_message() -> &'static str {
+    "law_article は1つの回答で10回までです。残りの条は要確認と書いてください。"
 }
 
 /// Marker the tool description points at, so the model knows `read_unit` can fetch the
@@ -474,18 +513,7 @@ fn persist_hit(
     let (row, _) = state
         .db
         .insert_llm_source_full(
-            thread_id,
-            "tool",
-            &hit.path,
-            &title,
-            &hit.id,
-            &body,
-            query,
-            "unit",
-            kind,
-            "",
-            "",
-            None,
+            thread_id, "tool", &hit.path, &title, &hit.id, &body, query, "unit", kind, "", "", None,
         )
         .map_err(|e| e.to_string())?;
     consumed.push((row.id.clone(), row.cite_no));
@@ -527,18 +555,7 @@ fn persist_web_hit(
     let (row, _) = state
         .db
         .insert_llm_source_full(
-            thread_id,
-            "tool",
-            &hit.url,
-            &hit.title,
-            "",
-            &body,
-            query,
-            "unit",
-            "web",
-            "",
-            "",
-            None,
+            thread_id, "tool", &hit.url, &hit.title, "", &body, query, "unit", "web", "", "", None,
         )
         .map_err(|e| e.to_string())?;
     consumed.push((row.id.clone(), row.cite_no));
@@ -581,18 +598,7 @@ fn persist_web_page(
     let (row, _) = state
         .db
         .insert_llm_source_full(
-            thread_id,
-            origin,
-            url,
-            title,
-            "",
-            &body,
-            "",
-            "unit",
-            "web",
-            "",
-            "",
-            None,
+            thread_id, origin, url, title, "", &body, "", "unit", "web", "", "", None,
         )
         .map_err(|e| e.to_string())?;
     consumed.push((row.id.clone(), row.cite_no));
@@ -657,10 +663,7 @@ pub fn topical_query(query: &str, mail_from: Option<&str>) -> String {
         if !from.is_empty() && (t == from || from.contains(t) || t.contains(from)) {
             continue;
         }
-        if MAIL_QUERY_NOISE
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(t))
-        {
+        if MAIL_QUERY_NOISE.iter().any(|n| n.eq_ignore_ascii_case(t)) {
             continue;
         }
         parts.push(t.to_string());
@@ -757,14 +760,15 @@ pub fn remote_date_rejection(asked_date: bool, date_applied: bool) -> Option<&'s
 }
 
 /// Keep the host's rank. Paths already returned locally are omitted. Cap is paragraphs, not files.
-pub fn select_remote_chat_hits(local: &[SearchHit], remote: &[SearchHit], k: usize) -> Vec<SearchHit> {
+pub fn select_remote_chat_hits(
+    local: &[SearchHit],
+    remote: &[SearchHit],
+    k: usize,
+) -> Vec<SearchHit> {
     if k == 0 {
         return Vec::new();
     }
-    let local_paths: HashSet<String> = local
-        .iter()
-        .map(|h| h.path.to_ascii_lowercase())
-        .collect();
+    let local_paths: HashSet<String> = local.iter().map(|h| h.path.to_ascii_lowercase()).collect();
     let mut seen_ids = HashSet::new();
     let mut out = Vec::new();
     for hit in remote {
@@ -821,10 +825,11 @@ fn run_index_search(
     // Force local so this half stays on for_llm. The host is a separate call.
     settings.search_mode = "local".into();
     let filter = prepare_chat_local_search(&mode, filter.clone());
-    search::run_search_precise(
+    let hits = search::run_search_precise(
         &settings,
         state.backend.as_ref(),
         Some(state.mail_backend.as_ref()),
+        None,
         query,
         unit_limit_for(k),
         path_prefix,
@@ -832,7 +837,8 @@ fn run_index_search(
         &user_dict,
         UNITS_PER_FILE,
         &filter,
-    )
+    )?;
+    Ok(hits)
 }
 
 fn unit_limit_for(k: usize) -> usize {
@@ -867,21 +873,10 @@ fn run_index_search_multi(
     };
     let mut all = Vec::new();
     for prefix in prefixes {
-        let filter = search::build_search_filter(
-            &state.db,
-            date,
-            mail_from,
-            prefix,
-            None,
-            sort_date,
-        )?;
+        let filter =
+            search::build_search_filter(&state.db, date, mail_from, prefix, None, sort_date)?;
         all.extend(run_index_search(
-            state,
-            query,
-            prefix,
-            k,
-            &filter,
-            list_mail,
+            state, query, prefix, k, &filter, list_mail,
         )?);
     }
     if sort_date || list_mail {
@@ -901,14 +896,8 @@ fn run_index_search_multi(
         return Ok(merge_hits_diversified(all, limit));
     };
 
-    let base = search::build_search_filter(
-        &state.db,
-        date,
-        mail_from,
-        Some(preferred),
-        None,
-        sort_date,
-    )?;
+    let base =
+        search::build_search_filter(&state.db, date, mail_from, Some(preferred), None, sort_date)?;
     let filter = search::narrow_filter_to_prefix(&state.db, &base, preferred)?;
     let scoped = run_index_search(state, query, Some(preferred), k, &filter, list_mail)?;
     Ok(merge_with_folder_quota(scoped, all, preferred, limit))
@@ -956,8 +945,7 @@ fn merge_hits_diversified(mut hits: Vec<SearchHit>, limit: usize) -> Vec<SearchH
         hits.truncate(limit);
         return hits;
     }
-    let in_dominant =
-        |hit: &SearchHit| parent_folder(&hit.path).eq_ignore_ascii_case(&dominant);
+    let in_dominant = |hit: &SearchHit| parent_folder(&hit.path).eq_ignore_ascii_case(&dominant);
     // Only step in when the cut is a shutout; a mixed result needs no help.
     if !hits[..limit].iter().all(in_dominant) {
         hits.truncate(limit);
@@ -1252,9 +1240,7 @@ fn outside_folder_note(prefix: &str, rows: &[crate::db::LlmSourceRow]) -> Option
     let outside: Vec<String> = rows
         .iter()
         .filter(|r| {
-            !r.is_web()
-                && !r.is_remote()
-                && !crate::pathutil::path_starts_with(&r.path, prefix)
+            !r.is_web() && !r.is_remote() && !crate::pathutil::path_starts_with(&r.path, prefix)
         })
         .map(|r| format!("[{}]", r.cite_no))
         .collect();
@@ -1352,7 +1338,9 @@ fn bound_note(state: &AppState, thread_id: &str) -> Result<crate::db::NoteRow, S
         .db
         .get_note(id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| "対象ノートがありません。list_notes か create_note を使ってください。".into())
+        .ok_or_else(|| {
+            "対象ノートがありません。list_notes か create_note を使ってください。".into()
+        })
 }
 
 fn resolve_note(
@@ -1456,10 +1444,7 @@ fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec
         Ok(n) => n,
         Err(e) => return ToolExec::text(format!("ノートの作成に失敗しました: {e}")),
     };
-    match state
-        .db
-        .apply_llm_note_write(&note.id, memo, None, None)
-    {
+    match state.db.apply_llm_note_write(&note.id, memo, None, None) {
         Ok(note) => {
             bind_thread_note(state, thread_id, &note.id);
             ToolExec {
@@ -1521,7 +1506,9 @@ fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
 fn tool_list_calendar(state: &AppState, args: &Value) -> ToolExec {
     let settings = state.settings.read().clone();
     if !settings.calendar_enabled {
-        return ToolExec::text("予定表は設定でオフです。設定の予定表をオンにして同期してください。");
+        return ToolExec::text(
+            "予定表は設定でオフです。設定の予定表をオンにして同期してください。",
+        );
     }
     let now = chrono::Local::now();
     let synced = crate::mail::calendar::sync_window_filter(
@@ -1649,7 +1636,9 @@ fn arg_i64(value: Option<&serde_json::Value>) -> Option<i64> {
     if let Some(n) = value.as_u64() {
         return i64::try_from(n).ok();
     }
-    value.as_str().and_then(|text| text.trim().parse::<i64>().ok())
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<i64>().ok())
 }
 
 /// Re-read a source already stored on this thread. Does not allocate a citation number.
@@ -1699,7 +1688,9 @@ fn read_saved_selection(
     }
 }
 
-fn parse_article_args(value: Option<&Value>) -> Result<Vec<crate::llm::articles::ArticleNo>, String> {
+fn parse_article_args(
+    value: Option<&Value>,
+) -> Result<Vec<crate::llm::articles::ArticleNo>, String> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -2088,7 +2079,11 @@ fn refit_range_section(preamble: &str, section: &RereadSection, max_chars: usize
     let body: Vec<char> = section.body.chars().collect();
     let mut best = String::new();
     for k in 0..=body.len() {
-        let end = if k == 0 { start.saturating_sub(1) } else { start + k - 1 };
+        let end = if k == 0 {
+            start.saturating_sub(1)
+        } else {
+            start + k - 1
+        };
         let more = k < body.len() || end < total;
         let note = if k == 0 {
             format!("［再読］全{total}文字。続きは start={start}")
@@ -2220,7 +2215,13 @@ fn shrink_last_article(text: &str, room: usize) -> Option<String> {
     best
 }
 
-fn render_article_piece(label: &str, start: usize, body: &[char], k: usize, total: usize) -> String {
+fn render_article_piece(
+    label: &str,
+    start: usize,
+    body: &[char],
+    k: usize,
+    total: usize,
+) -> String {
     if k == 0 {
         return format!("［再読］{label}。続きは start={start}\n");
     }
@@ -2257,6 +2258,71 @@ fn trim_plain(preamble: &str, header: &str, body: &str, max_chars: usize) -> Str
         out = out.chars().take(max_chars).collect();
     }
     out
+}
+
+fn tool_law_article(state: &AppState, args: &Value) -> ToolExec {
+    if !state
+        .statute
+        .enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return ToolExec::text(
+            "法令DBは起動時に準備できなかったため、条文を確認できません。",
+        );
+    }
+    let mut queries = Vec::new();
+    if let Some(list) = args.get("articles").and_then(|v| v.as_array()) {
+        for item in list {
+            let law = item
+                .get("law")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let article = item
+                .get("article")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if law.is_empty() && article.is_empty() {
+                continue;
+            }
+            queries.push(crate::statute::ArticleQuery {
+                law: law.to_string(),
+                article: article.to_string(),
+            });
+        }
+    } else {
+        let law = args
+            .get("law")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let article = args
+            .get("article")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if !law.is_empty() || !article.is_empty() {
+            queries.push(crate::statute::ArticleQuery {
+                law: law.to_string(),
+                article: article.to_string(),
+            });
+        }
+    }
+    if queries.is_empty() {
+        return ToolExec::text("law と article を指定してください。例: 民法 555。");
+    }
+    let omitted = queries.len().saturating_sub(MAX_LAW_ARTICLES);
+    queries.truncate(MAX_LAW_ARTICLES);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let articles = crate::statute::resolve_articles(
+        &state.statute.db,
+        state.statute.client.as_ref(),
+        &queries,
+        &today,
+    );
+    crate::statute::index_verified(&state.statute.db, &state.statute.index, &articles);
+    ToolExec::text(crate::statute::format_tool_result(&articles, omitted))
 }
 
 pub fn execute_tool(
@@ -2297,6 +2363,7 @@ fn execute_tool_inner(
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     match name {
+        TOOL_LAW => Ok(tool_law_article(state, &args)),
         TOOL_LIST_CALENDAR => Ok(tool_list_calendar(state, &args)),
         TOOL_SEARCH => {
             let query = args
@@ -2314,8 +2381,11 @@ fn execute_tool_inner(
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
             let scopes = resolve_scopes(thread_scope, requested);
-            let settings_k = state.settings.read().llm_search_top_k.clamp(1, LLM_SEARCH_K_MAX as u32)
-                as usize;
+            let settings_k = state
+                .settings
+                .read()
+                .llm_search_top_k
+                .clamp(1, LLM_SEARCH_K_MAX as u32) as usize;
             let k = args
                 .get("k")
                 .and_then(|v| v.as_u64())
@@ -2358,7 +2428,9 @@ fn execute_tool_inner(
             let web_job = if run_web {
                 let settings = state.settings.read().clone();
                 let q = search_q.to_string();
-                Some(std::thread::spawn(move || crate::llm::searxng::search(&settings, &q)))
+                Some(std::thread::spawn(move || {
+                    crate::llm::searxng::search(&settings, &q)
+                }))
             } else {
                 None
             };
@@ -2399,14 +2471,7 @@ fn execute_tool_inner(
                 None
             };
             let hits = run_index_search_multi(
-                state,
-                search_q,
-                &scopes,
-                k,
-                date,
-                mail_from,
-                sort_date,
-                list_mail,
+                state, search_q, &scopes, k, date, mail_from, sort_date, list_mail,
             )?;
             let (remote_hits, remote_note) = match remote_job {
                 Some(job) => match job.join() {
@@ -2497,11 +2562,12 @@ fn execute_tool_inner(
                 let period = date_where_clause(after, before);
                 let remote_only = scopes_are_remote_only(&scopes.outer);
                 let which = empty_hit_subject(remote_only, remote_note.as_deref());
-                let mut msg = format!(
-                    "「{query}」に一致する{which}ヒットはありません{period}{where_}。"
-                );
+                let mut msg =
+                    format!("「{query}」に一致する{which}ヒットはありません{period}{where_}。");
                 if date.is_active() {
-                    msg.push_str("この期間にヒットがなければ after を過去へ広げて再検索してください。");
+                    msg.push_str(
+                        "この期間にヒットがなければ after を過去へ広げて再検索してください。",
+                    );
                     if !remote_only {
                         let days = state.settings.read().mail_days_back.max(1);
                         if date_reaches_before_sync(date, days) {
@@ -2924,7 +2990,10 @@ mod tests {
             file_hit(r"C:\law\x.txt", 8.0),
         ];
         let merged = merge_with_folder_quota(scoped, outer, r"C:\cases\alpha", 4);
-        assert_eq!(paths_of(&merged), vec![r"C:\cases\alpha\a1.txt", r"C:\law\x.txt"]);
+        assert_eq!(
+            paths_of(&merged),
+            vec![r"C:\cases\alpha\a1.txt", r"C:\law\x.txt"]
+        );
     }
 
     #[test]
@@ -2942,8 +3011,7 @@ mod tests {
             paths_of(&out)
         );
         assert_eq!(
-            out[0].path,
-            r"C:\cases\alpha\a1.txt",
+            out[0].path, r"C:\cases\alpha\a1.txt",
             "the top slot is never given away"
         );
     }
@@ -3015,7 +3083,10 @@ mod tests {
             vec![r"C:\docs\x.txt#1".to_string()],
             "unit 0 has no predecessor"
         );
-        assert!(neighbor_ids("outlook:abc").is_empty(), "no unit id, no neighbours");
+        assert!(
+            neighbor_ids("outlook:abc").is_empty(),
+            "no unit id, no neighbours"
+        );
     }
 
     #[test]
@@ -3023,9 +3094,16 @@ mod tests {
         let long: String = "あ".repeat(TOOL_BODY_CAP + 50);
         let capped = cap_chars(&long, TOOL_BODY_CAP);
         assert!(capped.ends_with(TRUNCATED_MARK));
-        assert_eq!(capped.chars().count(), TOOL_BODY_CAP + TRUNCATED_MARK.chars().count());
+        assert_eq!(
+            capped.chars().count(),
+            TOOL_BODY_CAP + TRUNCATED_MARK.chars().count()
+        );
         let short = "短い本文";
-        assert_eq!(cap_chars(short, TOOL_BODY_CAP), short, "no marker when it fits");
+        assert_eq!(
+            cap_chars(short, TOOL_BODY_CAP),
+            short,
+            "no marker when it fits"
+        );
     }
 
     #[test]
@@ -3247,7 +3325,11 @@ mod tests {
         assert_eq!(again.content, exec.content);
         assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), before);
         let missing = read_saved_cite(&db, &thread.id, row.cite_no + 50);
-        assert!(missing.content.contains("ありません"), "{}", missing.content);
+        assert!(
+            missing.content.contains("ありません"),
+            "{}",
+            missing.content
+        );
         assert!(missing.consumed.is_empty());
         assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), before);
         let user = db.insert_llm_message(&thread.id, "user", "最初").unwrap();
@@ -3258,7 +3340,9 @@ mod tests {
             .unwrap();
         let reread = read_saved_cite(&db, &thread.id, row.cite_no);
         assert!(reread.consumed.is_empty(), "{:?}", reread.consumed);
-        let later = db.insert_llm_message(&thread.id, "user", "もう一度").unwrap();
+        let later = db
+            .insert_llm_message(&thread.id, "user", "もう一度")
+            .unwrap();
         let later_answer = db
             .insert_llm_message(&thread.id, "assistant", "再掲")
             .unwrap();
@@ -3337,7 +3421,11 @@ mod tests {
         assert!(both.content.contains(&article6.text), "{}", both.content);
         assert!(both.content.contains("日本法による。"), "{}", both.content);
         assert!(!both.content.contains("30日前"), "{}", both.content);
-        assert!(both.content.contains(&format!("[{}]", row.cite_no)), "{}", both.content);
+        assert!(
+            both.content.contains(&format!("[{}]", row.cite_no)),
+            "{}",
+            both.content
+        );
         assert_eq!(both.consumed, vec![(row.id.clone(), row.cite_no)]);
 
         let branch = read_saved_selection(
@@ -3346,30 +3434,53 @@ mod tests {
             row.cite_no,
             &json!({"articles": ["6の2", "第六条の二"]}),
         );
-        assert!(branch.content.contains("甲は30日前に通知して解約できる。"), "{}", branch.content);
+        assert!(
+            branch.content.contains("甲は30日前に通知して解約できる。"),
+            "{}",
+            branch.content
+        );
         assert!(!branch.content.contains("解除できる"), "{}", branch.content);
 
         let missing = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [9]}));
-        assert!(missing.content.contains("第9条はありません"), "{}", missing.content);
         assert!(
-            missing.content.contains("ある条番号: 第6条、第6条の2、第7条。"),
+            missing.content.contains("第9条はありません"),
             "{}",
             missing.content
         );
-        assert!(!missing.content.contains("解除できる"), "{}", missing.content);
-
-        let partial = read_saved_selection(
-            &db,
-            &thread.id,
-            row.cite_no,
-            &json!({"articles": [6, 99]}),
+        assert!(
+            missing
+                .content
+                .contains("ある条番号: 第6条、第6条の2、第7条。"),
+            "{}",
+            missing.content
         );
-        assert!(partial.content.contains("第99条はありません"), "{}", partial.content);
-        assert!(partial.content.contains(&article6.text), "{}", partial.content);
+        assert!(
+            !missing.content.contains("解除できる"),
+            "{}",
+            missing.content
+        );
+
+        let partial =
+            read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [6, 99]}));
+        assert!(
+            partial.content.contains("第99条はありません"),
+            "{}",
+            partial.content
+        );
+        assert!(
+            partial.content.contains(&article6.text),
+            "{}",
+            partial.content
+        );
         assert!(!partial.content.contains("30日前"), "{}", partial.content);
 
-        let bad = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": ["解除"]}));
-        assert!(bad.content.contains("条番号として読めません"), "{}", bad.content);
+        let bad =
+            read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": ["解除"]}));
+        assert!(
+            bad.content.contains("条番号として読めません"),
+            "{}",
+            bad.content
+        );
         assert!(bad.consumed.is_empty(), "{:?}", bad.consumed);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3379,23 +3490,47 @@ mod tests {
         let (dir, db, thread) = temp_db("range");
         let memo = "これは条立てではないメモです。日付は令和2年。";
         let row = attach_text(&db, &thread.id, memo);
-        let no_articles = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [1]}));
-        assert!(no_articles.content.contains("条の見出し"), "{}", no_articles.content);
-        assert!(no_articles.content.contains("start と end"), "{}", no_articles.content);
+        let no_articles =
+            read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [1]}));
         assert!(
-            no_articles.content.contains(&format!("全{}文字", memo.chars().count())),
+            no_articles.content.contains("条の見出し"),
             "{}",
             no_articles.content
         );
-        assert!(!no_articles.content.contains("令和2年"), "{}", no_articles.content);
+        assert!(
+            no_articles.content.contains("start と end"),
+            "{}",
+            no_articles.content
+        );
+        assert!(
+            no_articles
+                .content
+                .contains(&format!("全{}文字", memo.chars().count())),
+            "{}",
+            no_articles.content
+        );
+        assert!(
+            !no_articles.content.contains("令和2年"),
+            "{}",
+            no_articles.content
+        );
 
-        let range = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 1, "end": 4}));
+        let range =
+            read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 1, "end": 4}));
         assert!(range.content.contains("これは条"), "{}", range.content);
         assert!(!range.content.contains("立てではない"), "{}", range.content);
-        assert!(range.content.contains("1文字目から4文字目"), "{}", range.content);
+        assert!(
+            range.content.contains("1文字目から4文字目"),
+            "{}",
+            range.content
+        );
 
         let tail = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 5}));
-        assert!(tail.content.contains("立てではないメモです。"), "{}", tail.content);
+        assert!(
+            tail.content.contains("立てではないメモです。"),
+            "{}",
+            tail.content
+        );
         assert!(!tail.content.contains("これは条"), "{}", tail.content);
 
         let clamped = read_saved_selection(
@@ -3406,17 +3541,30 @@ mod tests {
         );
         assert!(clamped.content.contains(memo), "{}", clamped.content);
         assert!(
-            clamped.content.contains(&format!("全{}文字", memo.chars().count())),
+            clamped
+                .content
+                .contains(&format!("全{}文字", memo.chars().count())),
             "{}",
             clamped.content
         );
-        assert!(!clamped.content.contains("1000文字目"), "{}", clamped.content);
+        assert!(
+            !clamped.content.contains("1000文字目"),
+            "{}",
+            clamped.content
+        );
 
-        let backwards = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 4, "end": 2}));
-        assert!(backwards.content.contains("end は start 以上"), "{}", backwards.content);
+        let backwards =
+            read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 4, "end": 2}));
+        assert!(
+            backwards.content.contains("end は start 以上"),
+            "{}",
+            backwards.content
+        );
         let past = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"start": 80}));
         assert!(past.content.contains("文書の長さ"), "{}", past.content);
-        assert!(past.content.contains(&format!("{}文字", memo.chars().count())));
+        assert!(past
+            .content
+            .contains(&format!("{}文字", memo.chars().count())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3427,7 +3575,9 @@ mod tests {
         body.push_str(&"甲".repeat(12_000));
         body.push_str("\n\n");
         for n in 2..=8 {
-            body.push_str(&format!("第{n}条（第{n}条の見出し）\n第{n}条だけの固有文言。\n\n"));
+            body.push_str(&format!(
+                "第{n}条（第{n}条の見出し）\n第{n}条だけの固有文言。\n\n"
+            ));
         }
         let row = attach_text(&db, &thread.id, &body);
         let history = vec![crate::db::LlmMessageRow {
@@ -3458,7 +3608,8 @@ mod tests {
             user.content
         );
         assert!(
-            user.content.contains(&format!("全{}文字", body.trim().chars().count())),
+            user.content
+                .contains(&format!("全{}文字", body.trim().chars().count())),
             "{}",
             user.content
         );
@@ -3473,11 +3624,17 @@ mod tests {
         assert_eq!(stored.body, body, "the stored copy stays the full text");
         let reread = read_saved_selection(&db, &thread.id, row.cite_no, &json!({"articles": [8]}));
         assert!(
-            reread.content.contains("第8条（第8条の見出し）\n第8条だけの固有文言。"),
+            reread
+                .content
+                .contains("第8条（第8条の見出し）\n第8条だけの固有文言。"),
             "{}",
             reread.content
         );
-        assert!(!reread.content.contains("第7条だけの固有文言"), "{}", reread.content);
+        assert!(
+            !reread.content.contains("第7条だけの固有文言"),
+            "{}",
+            reread.content
+        );
         assert!(!reread.content.contains(&"甲".repeat(12_000)));
         let whole = read_saved_cite(&db, &thread.id, row.cite_no);
         assert!(whole.content.contains("第8条だけの固有文言"));
@@ -3517,7 +3674,11 @@ mod tests {
             &json!({"start": 0, "end": 0, "articles": []}),
         );
         assert!(whole.content.contains("前文。"), "{}", whole.content);
-        assert!(whole.content.contains("日本法による。"), "{}", whole.content);
+        assert!(
+            whole.content.contains("日本法による。"),
+            "{}",
+            whole.content
+        );
         assert!(!whole.content.contains("1 以上"), "{}", whole.content);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3535,31 +3696,45 @@ mod tests {
         );
         let delivered = READ_BODY_CAP;
         assert!(
-            exec.content.contains(&format!("1文字目から{delivered}文字目")),
+            exec.content
+                .contains(&format!("1文字目から{delivered}文字目")),
             "{}",
             exec.content
         );
         assert!(
-            exec.content.contains(&format!("続きは start={}", delivered + 1)),
+            exec.content
+                .contains(&format!("続きは start={}", delivered + 1)),
             "{}",
             exec.content
         );
         assert!(
-            exec.content.contains(&format!("全{}文字", body.chars().count())),
+            exec.content
+                .contains(&format!("全{}文字", body.chars().count())),
             "{}",
             exec.content
         );
-        assert_eq!(exec.content.matches('あ').count(), delivered, "{}", exec.content.chars().take(80).collect::<String>());
+        assert_eq!(
+            exec.content.matches('あ').count(),
+            delivered,
+            "{}",
+            exec.content.chars().take(80).collect::<String>()
+        );
         let trimmed = crate::llm::context::fit_tool_text(exec.content.clone(), 200, 0);
         assert!(trimmed.contains("続きは start="), "{trimmed}");
         let claimed = claimed_span(&trimmed);
         let a_count = trimmed.matches('あ').count();
-        assert_eq!(claimed, a_count, "claim {claimed} vs delivered {a_count}: {trimmed}");
+        assert_eq!(
+            claimed, a_count,
+            "claim {claimed} vs delivered {a_count}: {trimmed}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn claimed_span(text: &str) -> usize {
-        let line = text.lines().find(|line| line.contains("文字目から")).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("文字目から"))
+            .unwrap();
         let start: usize = line
             .split("文字目から")
             .next()
@@ -3603,7 +3778,9 @@ mod tests {
         assert!(!exec.content.contains("UNIQUE3"), "{}", exec.content);
         let trimmed = crate::llm::context::fit_tool_text(exec.content, 90, 0);
         assert!(
-            !trimmed.lines().any(|line| line.starts_with("［再読］第3条")),
+            !trimmed
+                .lines()
+                .any(|line| line.starts_with("［再読］第3条")),
             "{trimmed}"
         );
         assert!(!trimmed.contains("UNIQUE3"), "{trimmed}");
@@ -3648,12 +3825,12 @@ mod tests {
             )
             .unwrap()
             .0;
-        let rows = db.list_llm_sources_by_cite(&thread.id, second.cite_no).unwrap();
+        let rows = db
+            .list_llm_sources_by_cite(&thread.id, second.cite_no)
+            .unwrap();
         assert!(rows.len() >= 2, "pages share a cite: {rows:?}");
-        let visible = crate::llm::transcript::transcript_body(
-            &rows.iter().collect::<Vec<_>>(),
-            true,
-        );
+        let visible =
+            crate::llm::transcript::transcript_body(&rows.iter().collect::<Vec<_>>(), true);
         assert!(visible.contains("## 1ページ目"), "{visible}");
         assert!(visible.contains("## 2ページ目"), "{visible}");
         let start = visible.chars().position(|c| c == '乙').unwrap() + 1;
@@ -3664,7 +3841,11 @@ mod tests {
             &json!({"start": start, "end": start + 2}),
         );
         assert!(exec.content.contains("乙ペ"), "{}", exec.content);
-        assert!(exec.content.contains("ページ見出しを含む"), "{}", exec.content);
+        assert!(
+            exec.content.contains("ページ見出しを含む"),
+            "{}",
+            exec.content
+        );
         let joined = format!("{}\n\n{}", "甲ページ本文", "乙ページ本文");
         let wrong: String = joined.chars().skip(start - 1).take(3).collect();
         assert_ne!(wrong, "乙ペ", "the no-heading join must not be the index");
@@ -3734,7 +3915,9 @@ mod tests {
             )
             .unwrap()
             .0;
-        let rows = db.list_llm_sources_by_cite(&thread.id, second.cite_no).unwrap();
+        let rows = db
+            .list_llm_sources_by_cite(&thread.id, second.cite_no)
+            .unwrap();
         assert!(rows.len() >= 2, "{rows:?}");
         let history = vec![crate::db::LlmMessageRow {
             id: "u1".into(),
@@ -3751,12 +3934,7 @@ mod tests {
         }];
         let mut saw = false;
         for budget in [500usize, 700, 900, 1_100, 1_400] {
-            let (turns, _) = crate::llm::context::assemble_turns(
-                "役割",
-                &rows,
-                &history,
-                budget,
-            );
+            let (turns, _) = crate::llm::context::assemble_turns("役割", &rows, &history, budget);
             let user = turns.iter().find(|turn| turn.role == "user").unwrap();
             if user.content.contains(&page1) {
                 continue;
@@ -3777,7 +3955,10 @@ mod tests {
                 exec.content.chars().take(240).collect::<String>()
             );
         }
-        assert!(saw, "no budget shortened page 1 while hiding the page 2 marker");
+        assert!(
+            saw,
+            "no budget shortened page 1 while hiding the page 2 marker"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3826,7 +4007,11 @@ mod tests {
                 assert_reread_claims_are_honest(&out, &format!("{labels:?} +{extra}"));
             }
             if labels.len() >= 3 {
-                let third = blocks.match_indices("［再読］").nth(2).map(|(i, _)| i).unwrap();
+                let third = blocks
+                    .match_indices("［再読］")
+                    .nth(2)
+                    .map(|(i, _)| i)
+                    .unwrap();
                 let budget = blocks[..third].chars().count() + 8;
                 let out = refit_reread_text(&blocks, budget).expect("refit third");
                 assert_reread_claims_are_honest(&out, &format!("{labels:?} third"));
@@ -3865,7 +4050,8 @@ mod tests {
             if let Some((start, end)) = claimed_range(header) {
                 let delivered = body.chars().count();
                 assert_eq!(
-                    delivered, end - start + 1,
+                    delivered,
+                    end - start + 1,
                     "{what} header claims {start}..={end} but body is {delivered}: {header}"
                 );
                 if !header.contains("続きは") {
@@ -3940,12 +4126,14 @@ mod tests {
             let start = notice_start(&user.content).expect("start");
             let shown = shown_page_chars(&user.content).expect("shown");
             assert_eq!(
-                start as usize, shown + 1,
+                start as usize,
+                shown + 1,
                 "budget {budget} advertised start={start} shown={shown}: {}",
                 user.content.chars().rev().take(80).collect::<String>()
             );
             assert!(
-                user.content.contains(&format!("書き起こし全{}文字", page.chars().count())),
+                user.content
+                    .contains(&format!("書き起こし全{}文字", page.chars().count())),
                 "{}",
                 user.content
             );
@@ -3969,9 +4157,10 @@ mod tests {
 
     #[test]
     fn empty_sibling_page_keeps_the_read_index_on_the_stored_transcript() {
-        let glyphs: Vec<char> = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめも"
-            .chars()
-            .collect();
+        let glyphs: Vec<char> =
+            "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめも"
+                .chars()
+                .collect();
         let page: String = (0..2_400).map(|i| glyphs[i % glyphs.len()]).collect();
         for status in ["error", ""] {
             let (dir, db, thread) = temp_db(&format!("sib-{status}"));
@@ -3994,7 +4183,9 @@ mod tests {
         insert_page(&db, &thread.id, path, 1, &page1, "");
         insert_page(&db, &thread.id, path, 2, "", "error");
         let third = insert_page(&db, &thread.id, path, 3, "乙PAGE_MARKER", "");
-        let rows = db.list_llm_sources_by_cite(&thread.id, third.cite_no).unwrap();
+        let rows = db
+            .list_llm_sources_by_cite(&thread.id, third.cite_no)
+            .unwrap();
         let history = vec![user_msg(&thread.id)];
         let mut saw = false;
         for budget in [500usize, 900, 1_400] {
@@ -4027,7 +4218,9 @@ mod tests {
         let page10 = "甲".repeat(2_400);
         insert_page(&db, &thread.id, path, 10, &page10, "");
         let eleventh = insert_page(&db, &thread.id, path, 11, "乙PAGE_MARKER", "");
-        let rows = db.list_llm_sources_by_cite(&thread.id, eleventh.cite_no).unwrap();
+        let rows = db
+            .list_llm_sources_by_cite(&thread.id, eleventh.cite_no)
+            .unwrap();
         let history = vec![user_msg(&thread.id)];
         let mut saw = false;
         for budget in [500usize, 900, 1_400] {
@@ -4105,13 +4298,14 @@ mod tests {
         page: &str,
         budgets: &[usize],
     ) {
-        let rows = db.list_llm_sources_by_cite(thread_id, filled.cite_no).unwrap();
+        let rows = db
+            .list_llm_sources_by_cite(thread_id, filled.cite_no)
+            .unwrap();
         let stored = saved_visible_text(&rows);
         let history = vec![user_msg(thread_id)];
         let mut saw = false;
         for budget in budgets {
-            let (turns, _) =
-                crate::llm::context::assemble_turns("役割", &rows, &history, *budget);
+            let (turns, _) = crate::llm::context::assemble_turns("役割", &rows, &history, *budget);
             let user = turns.iter().find(|turn| turn.role == "user").unwrap();
             if !user.content.contains("このページは先頭") {
                 continue;
@@ -4121,12 +4315,14 @@ mod tests {
             let from_stored: String = stored.chars().skip(start as usize - 1).take(8).collect();
             let from_page: String = page.chars().skip(shown).take(8).collect();
             assert_eq!(
-                from_stored, from_page,
+                from_stored,
+                from_page,
                 "budget {budget} start={start} shown={shown} stored={}",
                 stored.chars().take(24).collect::<String>()
             );
             assert!(
-                user.content.contains(&format!("書き起こし全{}文字", stored.chars().count())),
+                user.content
+                    .contains(&format!("書き起こし全{}文字", stored.chars().count())),
                 "{}",
                 user.content
             );
@@ -4147,7 +4343,9 @@ mod tests {
     }
 
     fn shown_page_chars(text: &str) -> Option<usize> {
-        let line = text.lines().find(|line| line.contains("このページは先頭"))?;
+        let line = text
+            .lines()
+            .find(|line| line.contains("このページは先頭"))?;
         let digits: String = line
             .split("このページは先頭")
             .nth(1)?
@@ -4170,13 +4368,35 @@ mod tests {
         let off = tools_schema(false, false, false).to_string();
         assert!(!off.contains("公開ウェブも同時に検索"));
         assert!(!off.contains("（リモート）"));
-        assert!(tools_schema(false, true, false).to_string().contains("（リモート）"));
+        assert!(tools_schema(false, true, false)
+            .to_string()
+            .contains("（リモート）"));
         assert!(!off.contains(TOOL_READ_URL));
         assert!(off.contains(TOOL_LIST_NOTES));
         assert!(off.contains(TOOL_READ_NOTE));
         assert!(off.contains(TOOL_CREATE_NOTE));
         assert!(off.contains(TOOL_WRITE_NOTE));
+        assert!(off.contains(TOOL_LAW));
+        assert!(off.contains("要確認"));
         assert!(!off.contains("propose_note_"));
+        let mut budgets_rounds = 0usize;
+        let mut law_calls = 0usize;
+        let read_urls = 0usize;
+        for _ in 0..MAX_LAW_CALLS {
+            assert!(law_calls < MAX_LAW_CALLS);
+            law_calls += 1;
+            assert!(!counts_toward_tool_round(&[TOOL_LAW]));
+        }
+        assert!(law_calls >= MAX_LAW_CALLS);
+        assert_eq!(budgets_rounds, 0);
+        assert!(counts_toward_tool_round(&[TOOL_SEARCH, TOOL_LAW]));
+        if counts_toward_tool_round(&[TOOL_SEARCH]) {
+            budgets_rounds += 1;
+        }
+        assert_eq!(budgets_rounds, 1);
+        assert_eq!(read_urls, 0);
+        assert_eq!(12.min(MAX_LAW_ARTICLES), MAX_LAW_ARTICLES);
+        assert!(law_call_limit_message().contains("10回"));
         let on = tools_schema(true, false, false).to_string();
         assert!(on.contains("公開ウェブも同時に検索"));
         assert!(on.contains(TOOL_READ_URL));
@@ -4208,21 +4428,18 @@ mod tests {
         assert!(runaway.text.contains("思考が長く続いたため止めました"));
         assert!(runaway.notice.is_none());
         assert!(!runaway.text.contains(secret));
-        let too_long = round_limit_failure(
-            8,
-            &format!("context length exceeded Bearer {secret}"),
-        );
+        let too_long = round_limit_failure(8, &format!("context length exceeded Bearer {secret}"));
         assert!(too_long.text.contains("コンテキストが長すぎます"));
         assert!(!too_long.text.contains(secret));
         assert!(!too_long.text.contains("Bearer"));
         let bridge = round_limit_failure(8, &crate::llm::thinking::thinking_bridge_error());
         assert!(bridge.text.contains("思考を閉じられず止めました"));
         assert!(bridge.notice.is_none());
-        let runaway_mapped = round_limit_failure(
-            8,
-            &crate::llm::thinking::runaway_thinking_error(24_576),
-        );
-        assert!(runaway_mapped.text.contains("思考が長く続いたため止めました"));
+        let runaway_mapped =
+            round_limit_failure(8, &crate::llm::thinking::runaway_thinking_error(24_576));
+        assert!(runaway_mapped
+            .text
+            .contains("思考が長く続いたため止めました"));
         assert!(!runaway_mapped.text.contains("24576"));
         assert!(!runaway_mapped.text.contains("HTTP"));
         let too_long_mapped = round_limit_failure(
@@ -4258,7 +4475,11 @@ mod tests {
     fn round_limit_names_only_a_status_already_in_our_message() {
         let secret = "sk-live-secret";
         let raw = round_limit_failure(8, &format!("500 internal api_key={secret}"));
-        assert!(raw.text.contains("応答を受け取れませんでした"), "{}", raw.text);
+        assert!(
+            raw.text.contains("応答を受け取れませんでした"),
+            "{}",
+            raw.text
+        );
         assert!(!raw.text.contains("HTTP"), "{}", raw.text);
         assert!(!raw.text.contains(secret), "{}", raw.text);
         assert!(!raw.text.contains("api_key"), "{}", raw.text);
@@ -4283,13 +4504,25 @@ mod tests {
             assert!(!bare.text.contains("認証"), "{port}: {}", bare.text);
         }
         let auth_status = round_limit_failure(8, "401 Unauthorized");
-        assert!(auth_status.text.contains("応答を受け取れませんでした"), "{}", auth_status.text);
+        assert!(
+            auth_status.text.contains("応答を受け取れませんでした"),
+            "{}",
+            auth_status.text
+        );
         assert!(!auth_status.text.contains("認証"), "{}", auth_status.text);
         let http_line = round_limit_failure(8, "HTTP/1.1 404 Not Found");
-        assert!(http_line.text.contains("応答を受け取れませんでした"), "{}", http_line.text);
+        assert!(
+            http_line.text.contains("応答を受け取れませんでした"),
+            "{}",
+            http_line.text
+        );
         assert!(!http_line.text.contains("HTTP"), "{}", http_line.text);
         let status_field = round_limit_failure(8, "status_code=503");
-        assert!(status_field.text.contains("応答を受け取れませんでした"), "{}", status_field.text);
+        assert!(
+            status_field.text.contains("応答を受け取れませんでした"),
+            "{}",
+            status_field.text
+        );
         assert!(!status_field.text.contains("HTTP"), "{}", status_field.text);
         assert!(!status_field.text.contains("503"), "{}", status_field.text);
     }
@@ -4301,12 +4534,28 @@ mod tests {
             r#"{"message":"request failed: HTTP 404 Not Found"}"#,
         );
         let wrapped_reason = round_limit_failure(8, &wrapped);
-        assert!(wrapped_reason.text.contains("HTTP 500"), "{}", wrapped_reason.text);
-        assert!(!wrapped_reason.text.contains("404"), "{}", wrapped_reason.text);
+        assert!(
+            wrapped_reason.text.contains("HTTP 500"),
+            "{}",
+            wrapped_reason.text
+        );
+        assert!(
+            !wrapped_reason.text.contains("404"),
+            "{}",
+            wrapped_reason.text
+        );
         let gateway = crate::llm::http_error::chat_failure(502, r#"{"error":"upstream HTTP 500"}"#);
         let gateway_reason = round_limit_failure(8, &gateway);
-        assert!(gateway_reason.text.contains("HTTP 502"), "{}", gateway_reason.text);
-        assert!(!gateway_reason.text.contains("500"), "{}", gateway_reason.text);
+        assert!(
+            gateway_reason.text.contains("HTTP 502"),
+            "{}",
+            gateway_reason.text
+        );
+        assert!(
+            !gateway_reason.text.contains("500"),
+            "{}",
+            gateway_reason.text
+        );
         let missing = round_limit_failure(
             8,
             &crate::llm::http_error::chat_failure(404, "HTTP/1.1 404 Not Found"),
@@ -4355,7 +4604,11 @@ mod tests {
             8,
             &crate::llm::http_error::chat_failure(401, r#"{"request_id":"req_10061"}"#),
         );
-        assert!(msg.text.contains("サーバが認証を拒否しました"), "{}", msg.text);
+        assert!(
+            msg.text.contains("サーバが認証を拒否しました"),
+            "{}",
+            msg.text
+        );
         assert!(!msg.text.contains("接続"), "{}", msg.text);
         assert!(!msg.text.contains("req_10061"), "{}", msg.text);
     }
@@ -4384,7 +4637,11 @@ mod tests {
     #[test]
     fn round_limit_unauthorized_phrase_inside_a_server_error_stays_a_server_error() {
         let raw = round_limit_failure(8, "500 Internal Server Error Unauthorized for url");
-        assert!(raw.text.contains("応答を受け取れませんでした"), "{}", raw.text);
+        assert!(
+            raw.text.contains("応答を受け取れませんでした"),
+            "{}",
+            raw.text
+        );
         assert!(!raw.text.contains("認証"), "{}", raw.text);
         assert!(!raw.text.contains("Unauthorized"), "{}", raw.text);
         let msg = round_limit_failure(
@@ -4402,7 +4659,11 @@ mod tests {
         assert!(msg.text.contains("サーバに接続できません"), "{}", msg.text);
         assert!(!msg.text.contains("HTTP"), "{}", msg.text);
         let timed_out = round_limit_failure(8, "os error 10060");
-        assert!(timed_out.text.contains("サーバに接続できません"), "{}", timed_out.text);
+        assert!(
+            timed_out.text.contains("サーバに接続できません"),
+            "{}",
+            timed_out.text
+        );
     }
 
     #[test]
@@ -4447,7 +4708,10 @@ mod tests {
     #[test]
     fn date_where_clause_and_zero_hit_sync_hint() {
         assert_eq!(date_where_clause(None, None), "");
-        assert_eq!(date_where_clause(Some("2026-08-01"), None), "（期間: 2026-08-01〜）");
+        assert_eq!(
+            date_where_clause(Some("2026-08-01"), None),
+            "（期間: 2026-08-01〜）"
+        );
         assert_eq!(
             date_where_clause(Some("2026-08-01"), Some("2026-08-18")),
             "（期間: 2026-08-01〜2026-08-18）"

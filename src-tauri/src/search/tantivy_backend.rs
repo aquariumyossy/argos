@@ -584,6 +584,46 @@ impl TantivyBackend {
         Ok(())
     }
 
+    /// Queue a path delete. Nothing is searchable until [`publish_staged`].
+    pub fn stage_delete_path(&self, path: &str) -> Result<(), String> {
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, path));
+        Ok(())
+    }
+
+    /// One stored unit, committed later with [`publish_staged`].
+    /// Used by the built-in statute index. `folder` stays empty so a user-folder
+    /// rebuild does not see these rows; that index is a separate directory.
+    pub fn stage_plain_unit(
+        &self,
+        title: &str,
+        body: &str,
+        path: &str,
+        label: &str,
+    ) -> Result<(), String> {
+        let key = format!("{path}#0");
+        let writer = self.writer.lock();
+        writer.delete_term(Term::from_field_text(self.fields.path, path));
+        writer
+            .add_document(doc!(
+                self.fields.title => title,
+                self.fields.body => body,
+                self.fields.path => path,
+                self.fields.mtime => "",
+                self.fields.size => "",
+                self.fields.ext => "",
+                self.fields.folder => "",
+                self.fields.page => "",
+                self.fields.chunk_id => "0",
+                self.fields.doc_key => key.as_str(),
+                self.fields.unit_id => "0",
+                self.fields.unit_label => label,
+                self.fields.unit_kind => "statute",
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// Queue a delete+add for one file. Nothing is searchable until [`publish_staged`].
     /// Crawl uses this so a folder does not commit (and mmap) a segment per file.
     pub fn stage_extracted(

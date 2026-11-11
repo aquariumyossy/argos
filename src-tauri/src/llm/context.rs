@@ -572,7 +572,12 @@ struct PageIndex {
     total: usize,
 }
 
-pub(crate) fn attachment_cut_note(shown: usize, total: usize, next_start: usize, page: bool) -> String {
+pub(crate) fn attachment_cut_note(
+    shown: usize,
+    total: usize,
+    next_start: usize,
+    page: bool,
+) -> String {
     if page {
         format!(
             "…（このページは先頭{shown}文字のみ。書き起こし全{total}文字。続きは start={next_start}、または条番号）"
@@ -873,8 +878,7 @@ fn select_sources(
             .map(|(i, _)| i)
             .unwrap_or(0);
         let next = char_len(&rows[idx].body) / 2;
-        let pending_attach =
-            pending_ids.contains(&rows[idx].id) && rows[idx].origin == "attach";
+        let pending_attach = pending_ids.contains(&rows[idx].id) && rows[idx].origin == "attach";
         if precise || pending_attach {
             let before = rows[idx].body.clone();
             fit_pending_prefix(&mut rows, idx, pool, budget, ledger);
@@ -980,9 +984,7 @@ pub fn pending_attachment_borrow(
 ) -> usize {
     let mut excerpt: Vec<LlmSourceRow> = sources
         .iter()
-        .filter(|source| {
-            source.is_pending() && source.origin == "attach" && source.is_injectable()
-        })
+        .filter(|source| source.is_pending() && source.origin == "attach" && source.is_injectable())
         .cloned()
         .collect();
     if excerpt.is_empty() {
@@ -1234,7 +1236,11 @@ pub fn assemble_turns(
         };
         built.push(BuiltTurn {
             turn,
-            original_sources: if summary { Vec::new() } else { attached.clone() },
+            original_sources: if summary {
+                Vec::new()
+            } else {
+                attached.clone()
+            },
             sources: attached,
             question,
             message_id: m.id.clone(),
@@ -1257,17 +1263,35 @@ pub fn assemble_turns(
     // Keep the last two user turns while they fit. If a recent source is what
     // overflows, shorten it before dropping the previous question and answer.
     trim_keeping(&mut built, max_tokens, RECENT_USER_TURNS, &mut truncated);
-    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources, carried_summary.as_ref())
+    if tokens_of(&built) > max_tokens
+        && refit_sources(
+            &mut built,
+            pool,
+            max_tokens,
+            &pending_ids,
+            sources,
+            carried_summary.as_ref(),
+        )
     {
         truncated = true;
     }
-    if tokens_of(&built) > max_tokens && shrink_recent_sources(&mut built, pool, max_tokens, sources) {
+    if tokens_of(&built) > max_tokens
+        && shrink_recent_sources(&mut built, pool, max_tokens, sources)
+    {
         truncated = true;
     }
     if tokens_of(&built) > max_tokens {
         trim_keeping(&mut built, max_tokens, 1, &mut truncated);
     }
-    if tokens_of(&built) > max_tokens && refit_sources(&mut built, pool, max_tokens, &pending_ids, sources, carried_summary.as_ref())
+    if tokens_of(&built) > max_tokens
+        && refit_sources(
+            &mut built,
+            pool,
+            max_tokens,
+            &pending_ids,
+            sources,
+            carried_summary.as_ref(),
+        )
     {
         truncated = true;
     }
@@ -1279,7 +1303,14 @@ pub fn assemble_turns(
     }
     // The first refit can drop a pending attachment while an older exchange is
     // still protected. Put the original sources back into the room that trim freed.
-    if refit_freed_budget(&mut built, pool, max_tokens, &pending_ids, sources, carried_summary.as_ref()) {
+    if refit_freed_budget(
+        &mut built,
+        pool,
+        max_tokens,
+        &pending_ids,
+        sources,
+        carried_summary.as_ref(),
+    ) {
         truncated = true;
     }
     if restore_recent_rereads(&mut built, max_tokens) {
@@ -1546,7 +1577,8 @@ fn cite_nos_of(sources: &[LlmSourceRow]) -> HashSet<i64> {
 
 fn full_sources_on_recent_turns(built: &[BuiltTurn]) -> Vec<LlmSourceRow> {
     let recent = recent_user_ids(built);
-    built.iter()
+    built
+        .iter()
         .filter(|row| row.turn.role == "user" && recent.contains(&row.message_id))
         .flat_map(|row| row.sources.iter().cloned())
         .collect()
@@ -1699,7 +1731,9 @@ fn reread_claimed_ends(content: &str) -> Vec<usize> {
 /// Last stored character the attachment note says is on screen.
 /// `続きは start=K` means characters through K-1 were shown, including a page heading.
 fn excerpt_covers_through(excerpt: &str) -> Option<usize> {
-    let line = excerpt.lines().find(|line| line.contains("続きは start="))?;
+    let line = excerpt
+        .lines()
+        .find(|line| line.contains("続きは start="))?;
     let digits: String = line
         .split("続きは start=")
         .nth(1)?
@@ -1714,7 +1748,9 @@ fn reread_extends_past_excerpt(backup: &str, excerpt: &str) -> bool {
     let Some(covered) = excerpt_covers_through(excerpt) else {
         return false;
     };
-    reread_claimed_ends(backup).into_iter().any(|end| end > covered)
+    reread_claimed_ends(backup)
+        .into_iter()
+        .any(|end| end > covered)
 }
 
 fn reread_body_sample(content: &str) -> String {
@@ -1736,7 +1772,11 @@ fn reread_body_sample(content: &str) -> String {
                 buf.push_str(line);
             }
         }
-        return buf.chars().filter(|c| !c.is_whitespace()).take(24).collect();
+        return buf
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .take(24)
+            .collect();
     };
     let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     let n = compact.chars().count();
@@ -1836,6 +1876,9 @@ pub(crate) fn summary_stubs_for_tool(
     tool_name: Option<&str>,
 ) -> Vec<String> {
     if let Some(name) = tool_name.map(str::trim).filter(|name| !name.is_empty()) {
+        if name == crate::llm::tools::TOOL_LAW {
+            return crate::statute::summary_lines(content);
+        }
         if !tool_result_lists_sources(Some(name)) {
             return Vec::new();
         }
@@ -1953,7 +1996,9 @@ fn refit_freed_budget(
     let recent = recent_user_ids(built);
     let mut changed = false;
     for row in built.iter_mut() {
-        if row.turn.role != "user" || !recent.contains(&row.message_id) || row.original_sources.is_empty()
+        if row.turn.role != "user"
+            || !recent.contains(&row.message_id)
+            || row.original_sources.is_empty()
         {
             continue;
         }
@@ -2254,7 +2299,8 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
         let len = char_len(&built[idx].turn.content);
         let next = (len / 2).max(40);
         if built[idx].summary {
-            let clipped = crate::llm::summary::clip_injected_summary(&built[idx].turn.content, next);
+            let clipped =
+                crate::llm::summary::clip_injected_summary(&built[idx].turn.content, next);
             if char_len(&clipped) >= len {
                 break;
             }
@@ -2409,12 +2455,7 @@ fn carried_summary(built: &[BuiltTurn], covered: &[LlmSourceRow]) -> Option<Carr
     Some(CarriedSummary { block, stubs })
 }
 
-fn combine_user_text(
-    left: &str,
-    right: &str,
-    left_summary: bool,
-    right_summary: bool,
-) -> String {
+fn combine_user_text(left: &str, right: &str, left_summary: bool, right_summary: bool) -> String {
     let left = left.trim();
     let right = right.trim();
     if left.is_empty() {
@@ -2510,7 +2551,11 @@ fn merge_adjacent_user_turns(built: &mut Vec<BuiltTurn>) {
             combine_user_text(&left_content, &right_content, left_summary, right_summary);
         built[index + 1].carries_summary = left_summary || right_summary;
         for source in left_sources {
-            if !built[index + 1].sources.iter().any(|have| have.id == source.id) {
+            if !built[index + 1]
+                .sources
+                .iter()
+                .any(|have| have.id == source.id)
+            {
                 built[index + 1].sources.push(source);
             }
         }
@@ -2547,17 +2592,18 @@ fn restore_carried_stubs(built: &mut [BuiltTurn], stubs: &[String]) {
     if stubs.is_empty() {
         return;
     }
-    let Some(row) = built
-        .iter_mut()
-        .find(|row| row.carries_summary)
-    else {
+    let Some(row) = built.iter_mut().find(|row| row.carries_summary) else {
         return;
     };
     append_stub_lines(&mut row.turn.content, stubs);
 }
 /// The disclaimer and 既読 lines are the smallest summary this request can send.
 /// When that still exceeds the message budget, omit them. The stored summary stays.
-fn drop_summary_if_over_budget(built: &mut Vec<BuiltTurn>, max_tokens: usize, stubs: &[String]) -> bool {
+fn drop_summary_if_over_budget(
+    built: &mut Vec<BuiltTurn>,
+    max_tokens: usize,
+    stubs: &[String],
+) -> bool {
     if tokens_of(built) <= max_tokens {
         return false;
     }
@@ -2617,10 +2663,7 @@ fn shrink_carried_summary(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
     let mut guard = 0;
     while tokens_of(built) > max_tokens && guard < 24 {
         guard += 1;
-        let Some(index) = built
-            .iter()
-            .position(|row| row.carries_summary)
-        else {
+        let Some(index) = built.iter().position(|row| row.carries_summary) else {
             break;
         };
         let (block, user) = crate::llm::summary::split_merged_user(&built[index].turn.content);
@@ -2761,6 +2804,36 @@ mod tests {
     }
 
     #[test]
+    fn law_article_text_is_in_the_meter_and_can_be_trimmed() {
+        let body = "売買".repeat(4_000);
+        let mut tool = msg("t1", "tool", &body);
+        tool.tool_name = crate::llm::tools::TOOL_LAW.into();
+        let history = vec![msg("u1", "user", "民法第555条は？"), tool];
+        let tokens = meter_usage_tokens("役割", &[], &history, "", 100, 100_000);
+        assert!(
+            tokens > estimate_tokens(&body) / 2,
+            "tool text must count toward the meter, got {tokens}"
+        );
+        let mut turns = vec![ChatTurn {
+            role: "tool".into(),
+            content: body.clone(),
+            name: Some(crate::llm::tools::TOOL_LAW.into()),
+            tool_call_id: Some("c".into()),
+            tool_calls: None,
+            reasoning: None,
+        }];
+        cap_tool_results(&mut turns, 1_000);
+        assert!(turns[0].content.chars().count() < body.chars().count());
+        let lines = summary_stubs_for_tool(
+            "確認済み: 民法 第555条\n\n本文です",
+            &[],
+            Some(crate::llm::tools::TOOL_LAW),
+        );
+        assert_eq!(lines, vec!["確認済み: 民法 第555条".to_string()]);
+        assert!(lines.iter().all(|line| !line.contains("本文です")));
+    }
+
+    #[test]
     fn notices_stay_out_of_later_turns() {
         let mut short = msg(
             "n1",
@@ -2854,7 +2927,9 @@ mod tests {
         assert!(!stats.question_exceeds);
         assert!(turns.iter().any(|t| t.content == "続き"));
         assert!(turns.iter().all(|t| t.content != "調べて"));
-        assert!(!turns.iter().any(|t| t.content.contains(&"あ".repeat(20_000))));
+        assert!(!turns
+            .iter()
+            .any(|t| t.content.contains(&"あ".repeat(20_000))));
     }
 
     #[test]
@@ -3456,7 +3531,9 @@ mod tests {
             "stubbed file must not push out turns that fit: {users:?}"
         );
         assert!(users.iter().any(|text| text.contains("質問7")));
-        assert!(users.iter().any(|text| *text == "質問8" || text.contains("質問8")));
+        assert!(users
+            .iter()
+            .any(|text| *text == "質問8" || text.contains("質問8")));
         assert!(users.iter().any(|text| text.contains("既読 [12]")));
         assert!(!users.iter().any(|text| text.contains(&body)));
         assert!(stats.total_tokens < 32_000, "{}", stats.total_tokens);
@@ -3481,10 +3558,7 @@ mod tests {
             .filter(|turn| turn.role == "user")
             .map(|turn| turn.content.as_str())
             .collect();
-        assert!(
-            users.len() >= 2,
-            "the last two user turns stay: {users:?}"
-        );
+        assert!(users.len() >= 2, "the last two user turns stay: {users:?}");
         assert!(users.iter().any(|text| text.contains("質問8")));
         assert!(users.iter().any(|text| text.contains("質問7")));
         let blob = users.join("\n");
@@ -3500,7 +3574,9 @@ mod tests {
         hit.paragraph_id = r"C:\law\民法.txt#9".into();
         let tool_body = format_sources(&[hit.clone()]);
         let mut assistant = msg("a2", "assistant", "");
-        assistant.tool_calls = r#"[{"id":"c2","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        assistant.tool_calls =
+            r#"[{"id":"c2","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#
+                .into();
         let mut tool = msg("t2", "tool", &tool_body);
         tool.tool_call_id = "c2".into();
         tool.tool_name = "read_unit".into();
@@ -3540,7 +3616,10 @@ mod tests {
         let user = turns.iter().find(|turn| turn.role == "user").unwrap();
         assert!(user.content.contains("見て"), "{}", user.content);
         assert!(user.content.contains("【質問】"), "{}", user.content);
-        assert!(!user.content.contains(&body), "the attachment is cut to fit");
+        assert!(
+            !user.content.contains(&body),
+            "the attachment is cut to fit"
+        );
         assert!(
             user.content.contains("[5]") || user.content.contains("添"),
             "a header or a body prefix stays whenever the question fits: {}",
@@ -3548,7 +3627,8 @@ mod tests {
         );
         assert!(!user.content.contains("既読 [5]"), "{}", user.content);
         assert!(
-            user.content.contains("文字のみ。全20000文字。続きは start="),
+            user.content
+                .contains("文字のみ。全20000文字。続きは start="),
             "a cut attachment must name the cut and the total"
         );
         assert!(user.content.contains("または条番号"), "{}", user.content);
@@ -3586,7 +3666,9 @@ mod tests {
             "【出典】\n[1] 契約.txt — C:\\docs\\契約.txt\n［再読］第8条。100文字目から120文字目。全20文字\n{later}\n"
         );
         let mut assistant = msg("a1", "assistant", "第8条を確認します [1]");
-        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        assistant.tool_calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#
+                .into();
         let mut tool = msg("t1", "tool", &tool_body);
         tool.tool_call_id = "c1".into();
         tool.tool_name = "read_unit".into();
@@ -3598,7 +3680,10 @@ mod tests {
         ];
         let original = file.body.clone();
         let (turns, _) = assemble_turns("役割", &[file.clone()], &history, 1_200);
-        assert_eq!(file.body, original, "assembling must not rewrite the stored body");
+        assert_eq!(
+            file.body, original,
+            "assembling must not rewrite the stored body"
+        );
         let blob = turns
             .iter()
             .map(|turn| turn.content.as_str())
@@ -3655,13 +3740,18 @@ mod tests {
                 msg("u2", "user", "続きは"),
             ];
             let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
-            let user = turns.iter().find(|turn| turn.content.contains("契約を見て")).unwrap();
+            let user = turns
+                .iter()
+                .find(|turn| turn.content.contains("契約を見て"))
+                .unwrap();
             let blob = turns
                 .iter()
                 .map(|turn| turn.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !user.content.contains(opening) || user.content.contains(tail) || user.content.contains(eighth)
+            if !user.content.contains(opening)
+                || user.content.contains(tail)
+                || user.content.contains(eighth)
             {
                 continue;
             }
@@ -3694,7 +3784,10 @@ mod tests {
     fn quoting_the_ending_does_not_drop_that_cites_reread() {
         let ending = "ただし、乙の故意又は重大な過失による場合はこの限りでない。";
         let article = format!("{}{ending}", "償".repeat(560));
-        let body = format!("第1条（目的）\n{}\n\n第8条（賠償）\n{article}\n", "前".repeat(4_000));
+        let body = format!(
+            "第1条（目的）\n{}\n\n第8条（賠償）\n{article}\n",
+            "前".repeat(4_000)
+        );
         let mut file = src_file("big", "attach", 0, &body);
         file.cite_no = 1;
         file.path = r"C:\docs\契約.txt".into();
@@ -3707,7 +3800,9 @@ mod tests {
             article.chars().count()
         );
         let mut assistant = msg("a1", "assistant", "第8条です [1]");
-        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        assistant.tool_calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#
+                .into();
         let mut tool = msg("t1", "tool", &tool_body);
         tool.tool_call_id = "c1".into();
         tool.tool_name = "read_unit".into();
@@ -3726,7 +3821,10 @@ mod tests {
                 msg("u2", "user", &quoted),
             ];
             let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
-            let Some(user) = turns.iter().find(|turn| turn.content.contains("契約を見て")) else {
+            let Some(user) = turns
+                .iter()
+                .find(|turn| turn.content.contains("契約を見て"))
+            else {
                 continue;
             };
             let source_part = user.content.split("【質問】").next().unwrap_or("");
@@ -3744,7 +3842,10 @@ mod tests {
                 tool_turn.map(|turn| turn.content.as_str()).unwrap_or("")
             );
         }
-        assert!(saw, "every budget still showed the ending inside the attachment");
+        assert!(
+            saw,
+            "every budget still showed the ending inside the attachment"
+        );
 
         let mut other = src_file("other", "attach", 1, &format!("別の契約です。{ending}"));
         other.cite_no = 1;
@@ -3764,7 +3865,9 @@ mod tests {
             article.chars().count()
         );
         let mut assistant = msg("a1", "assistant", "比べます [2]");
-        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        assistant.tool_calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#
+                .into();
         let mut tool = msg("t1", "tool", &mine_tool);
         tool.tool_call_id = "c1".into();
         tool.tool_name = "read_unit".into();
@@ -3776,8 +3879,12 @@ mod tests {
                 tool.clone(),
                 msg("u2", "user", "違いは何ですか"),
             ];
-            let (turns, _) = assemble_turns("役割", &[other.clone(), mine.clone()], &history, budget);
-            let Some(user) = turns.iter().find(|turn| turn.content.contains("二つを見て")) else {
+            let (turns, _) =
+                assemble_turns("役割", &[other.clone(), mine.clone()], &history, budget);
+            let Some(user) = turns
+                .iter()
+                .find(|turn| turn.content.contains("二つを見て"))
+            else {
                 continue;
             };
             if !user.content.contains("[1]") || !user.content.contains(&sample) {
@@ -3805,7 +3912,10 @@ mod tests {
                 tool_turn.map(|turn| turn.content.as_str()).unwrap_or("")
             );
         }
-        assert!(saw_other, "no budget showed the other cite's copy of the ending");
+        assert!(
+            saw_other,
+            "no budget showed the other cite's copy of the ending"
+        );
     }
 
     #[test]
@@ -3831,7 +3941,9 @@ mod tests {
             article.trim_end()
         );
         let mut assistant = msg("a1", "assistant", "第18条です [1]");
-        assistant.tool_calls = r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        assistant.tool_calls =
+            r#"[{"id":"c1","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#
+                .into();
         let mut tool = msg("t1", "tool", &tool_body);
         tool.tool_call_id = "c1".into();
         tool.tool_name = "read_unit".into();
@@ -3849,7 +3961,10 @@ mod tests {
                 msg("u2", "user", "その承諾は口頭でもよいですか"),
             ];
             let (turns, _) = assemble_turns("役割", &[file.clone()], &history, budget);
-            let Some(user) = turns.iter().find(|turn| turn.content.contains("契約を見て")) else {
+            let Some(user) = turns
+                .iter()
+                .find(|turn| turn.content.contains("契約を見て"))
+            else {
                 continue;
             };
             let source_part = user.content.split("【質問】").next().unwrap_or("");
@@ -3903,7 +4018,10 @@ mod tests {
                 user.content
             );
         }
-        assert!(saw, "no budget left the second attachment without its marker");
+        assert!(
+            saw,
+            "no budget left the second attachment without its marker"
+        );
     }
 
     #[test]
@@ -3937,8 +4055,12 @@ mod tests {
             file.path = r"C:\docs\scan.pdf".into();
             file.title = "scan.pdf".into();
             file.paragraph_id.clear();
-            let (turns, stats) =
-                assemble_turns("役割", &[file], &[msg("u1", "user", "見て")], split.messages);
+            let (turns, stats) = assemble_turns(
+                "役割",
+                &[file],
+                &[msg("u1", "user", "見て")],
+                split.messages,
+            );
             assert!(!stats.question_exceeds, "{n}");
             let user = turns.iter().find(|turn| turn.role == "user").unwrap();
             assert!(
@@ -3965,19 +4087,23 @@ mod tests {
         let required = turn_tokens(&ChatTurn::text("system", system))
             + turn_tokens(&ChatTurn::text("user", question_turn));
         let split = context_budget(16_384, 2_105, required).expect("the question fits");
-        let borrow =
-            pending_attachment_borrow(system, &question, std::slice::from_ref(&file), split.messages);
-        let budget = split.messages + borrow.min(split.tool_allowance);
-        let (turns, stats) = assemble_turns(
+        let borrow = pending_attachment_borrow(
             system,
-            &[file],
-            &[msg("u1", "user", &question)],
-            budget,
+            &question,
+            std::slice::from_ref(&file),
+            split.messages,
         );
+        let budget = split.messages + borrow.min(split.tool_allowance);
+        let (turns, stats) =
+            assemble_turns(system, &[file], &[msg("u1", "user", &question)], budget);
         assert!(!stats.question_exceeds);
         assert!(stats.consumed.iter().any(|source| source.id == "big"));
         let user = turns.iter().find(|turn| turn.role == "user").unwrap();
-        assert!(user.content.contains("[1]"), "{}", user.content.chars().take(240).collect::<String>());
+        assert!(
+            user.content.contains("[1]"),
+            "{}",
+            user.content.chars().take(240).collect::<String>()
+        );
         assert!(!user.content.contains("既読 [1]"), "{}", user.content);
         assert!(
             user.content.contains("添") || user.content.contains("memo.txt"),
@@ -3988,12 +4114,17 @@ mod tests {
 
     #[test]
     fn previous_protected_turn_is_dropped_instead_of_refusing() {
-        let mut history = vec![msg("u1", "user", &"あ".repeat(8_000)), msg("a1", "assistant", "答え")];
+        let mut history = vec![
+            msg("u1", "user", &"あ".repeat(8_000)),
+            msg("a1", "assistant", "答え"),
+        ];
         history.push(msg("u2", "user", "今回の質問"));
         let (turns, stats) = assemble_turns("役割", &[], &history, 400);
         assert!(!stats.question_exceeds);
         assert!(turns.iter().any(|turn| turn.content == "今回の質問"));
-        assert!(turns.iter().all(|turn| !turn.content.contains(&"あ".repeat(8_000))));
+        assert!(turns
+            .iter()
+            .all(|turn| !turn.content.contains(&"あ".repeat(8_000))));
     }
 
     #[test]
@@ -4103,11 +4234,17 @@ mod tests {
         hit.title = "民法.txt".into();
         hit.paragraph_id = r"C:\law\民法.txt#3".into();
         let stored = fit_tool_text(format_sources(std::slice::from_ref(&hit)), 8_000, 0);
-        assert!(estimate_tokens(&stored) > 1_000, "{}", estimate_tokens(&stored));
+        assert!(
+            estimate_tokens(&stored) > 1_000,
+            "{}",
+            estimate_tokens(&stored)
+        );
         assert!(stored.contains(marker));
         assert!(!stored.contains(&body));
         let mut assistant = msg("a2", "assistant", "");
-        assistant.tool_calls = r#"[{"id":"c2","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#.into();
+        assistant.tool_calls =
+            r#"[{"id":"c2","type":"function","function":{"name":"read_unit","arguments":"{}"}}]"#
+                .into();
         let mut tool = msg("t2", "tool", &stored);
         tool.tool_call_id = "c2".into();
         tool.tool_name = "read_unit".into();
@@ -4133,7 +4270,9 @@ mod tests {
             tool_turn.content.chars().take(200).collect::<String>()
         );
         assert!(turns.iter().any(|turn| {
-            turn.role == "user" && turn.content.contains("読み直して") && turn.content.contains(marker)
+            turn.role == "user"
+                && turn.content.contains("読み直して")
+                && turn.content.contains(marker)
         }));
     }
 
@@ -4156,7 +4295,9 @@ mod tests {
             let (turns, stats) = assemble_turns("役割", &[file.clone()], &history, split.messages);
             assert!(!stats.question_exceeds, "{limit}");
             assert!(
-                turns.iter().any(|turn| turn.content.contains("この条文を見て")),
+                turns
+                    .iter()
+                    .any(|turn| turn.content.contains("この条文を見て")),
                 "{limit}"
             );
             assert!(
@@ -4214,7 +4355,11 @@ mod tests {
             "the fake header must not keep the rest of the entry: {}",
             tool_turn.content
         );
-        assert!(!tool_turn.content.contains("既読 [4]"), "{}", tool_turn.content);
+        assert!(
+            !tool_turn.content.contains("既読 [4]"),
+            "{}",
+            tool_turn.content
+        );
         let old = {
             let mut aged = msg("t0", "tool", &tool_body);
             aged.tool_call_id = "c0".into();
@@ -4345,7 +4490,10 @@ mod tests {
             if kept.contains(&page) {
                 assert!(user.content.contains(&heading), "{heading} missing");
             } else {
-                assert!(!user.content.contains(&heading), "{heading} was emptied but kept");
+                assert!(
+                    !user.content.contains(&heading),
+                    "{heading} was emptied but kept"
+                );
             }
         }
     }
@@ -4527,10 +4675,7 @@ mod tests {
             "a slightly long result keeps its prefix: {}",
             kept.chars().take(40).collect::<String>()
         );
-        assert!(
-            !kept.starts_with("（文脈の上限に達したため"),
-            "{kept}"
-        );
+        assert!(!kept.starts_with("（文脈の上限に達したため"), "{kept}");
     }
 
     #[test]
@@ -4678,21 +4823,13 @@ mod tests {
         turns.push(note);
         let reasoning_at: Vec<usize> = turns
             .iter()
-            .map(|turn| {
-                turn.reasoning
-                    .as_deref()
-                    .map(estimate_tokens)
-                    .unwrap_or(0)
-            })
+            .map(|turn| turn.reasoning.as_deref().map(estimate_tokens).unwrap_or(0))
             .filter(|tokens| *tokens > 0)
             .collect();
         assert_eq!(reasoning_at, vec![2_500; 7]);
         let fixed = turn_list_tokens(&turns);
         let user_tokens = ceiling + 14_000 - fixed;
-        let user = ChatTurn::text(
-            "user",
-            "問".repeat(tokens_to_chars(user_tokens - 4)),
-        );
+        let user = ChatTurn::text("user", "問".repeat(tokens_to_chars(user_tokens - 4)));
         assert_eq!(turn_tokens(&user), user_tokens);
         turns.insert(1, user);
         let before = turn_list_tokens(&turns);
@@ -4708,12 +4845,7 @@ mod tests {
         assert_eq!(kept.content, note_body);
         let reasoning_left: usize = turns
             .iter()
-            .map(|turn| {
-                turn.reasoning
-                    .as_deref()
-                    .map(estimate_tokens)
-                    .unwrap_or(0)
-            })
+            .map(|turn| turn.reasoning.as_deref().map(estimate_tokens).unwrap_or(0))
             .sum();
         assert!(
             reasoning_left < 5_157,
@@ -4738,14 +4870,9 @@ mod tests {
         let room = 34;
         let user = ChatTurn::text(
             "user",
-            "問".repeat(tokens_to_chars(
-                ceiling - room - turn_tokens(&system) - 4,
-            )),
+            "問".repeat(tokens_to_chars(ceiling - room - turn_tokens(&system) - 4)),
         );
-        assert_eq!(
-            ceiling - turn_tokens(&system) - turn_tokens(&user),
-            room
-        );
+        assert_eq!(ceiling - turn_tokens(&system) - turn_tokens(&user), room);
         let mut turns = vec![system, user, first, second];
         assert_eq!(turn_list_tokens(&turns) - ceiling, 6);
         fit_followup_request(&mut turns, ceiling);
@@ -4774,14 +4901,9 @@ mod tests {
         let room = 30;
         let user = ChatTurn::text(
             "user",
-            "問".repeat(tokens_to_chars(
-                ceiling - room - turn_tokens(&system) - 4,
-            )),
+            "問".repeat(tokens_to_chars(ceiling - room - turn_tokens(&system) - 4)),
         );
-        assert_eq!(
-            ceiling - turn_tokens(&system) - turn_tokens(&user),
-            room
-        );
+        assert_eq!(ceiling - turn_tokens(&system) - turn_tokens(&user), room);
         let mut turns = vec![system, user, first, second];
         fit_followup_request(&mut turns, ceiling);
         let after = turn_list_tokens(&turns);
@@ -4953,7 +5075,12 @@ mod tests {
         let system = "役割";
         let sources = [file];
         let used = meter_usage_tokens(system, &sources, &history, "", schema, budget);
-        let (turns, _) = assemble_turns(system, &sources, &history_with_question(&history, ""), budget);
+        let (turns, _) = assemble_turns(
+            system,
+            &sources,
+            &history_with_question(&history, ""),
+            budget,
+        );
         let assembled = conversation_tokens(&turns) + schema;
         let naive = naive_meter_tokens(&history, &sources, schema);
         assert_eq!(naive, 64_952, "the old meter counted the full attachment");
@@ -4996,11 +5123,15 @@ mod tests {
         let schema = 2_410;
         let budget = 200_000;
         let system = "役割";
-        let before = conversation_tokens(
-            &assemble_turns(system, &sources, &history, budget).0,
-        ) + schema;
+        let before =
+            conversation_tokens(&assemble_turns(system, &sources, &history, budget).0) + schema;
         let used = meter_usage_tokens(system, &sources, &history, "", schema, budget);
-        let (turns, _) = assemble_turns(system, &sources, &history_with_question(&history, ""), budget);
+        let (turns, _) = assemble_turns(
+            system,
+            &sources,
+            &history_with_question(&history, ""),
+            budget,
+        );
         let assembled = conversation_tokens(&turns) + schema;
         let naive = naive_meter_tokens(&history, &sources, schema);
         let blob = turns
@@ -5009,7 +5140,11 @@ mod tests {
             .map(|turn| turn.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(blob.matches(body.as_str()).count(), 0, "the next send stubs the old hits");
+        assert_eq!(
+            blob.matches(body.as_str()).count(),
+            0,
+            "the next send stubs the old hits"
+        );
         let assistant_turn = turns.iter().find(|turn| turn.role == "assistant").unwrap();
         assert!(turn_tokens(assistant_turn) < estimate_tokens(calls) + 4);
         assert_eq!(before, 47_567);
@@ -5025,12 +5160,7 @@ mod tests {
         let budget = 200_000;
         let system = "役割";
         let empty = meter_usage_tokens(system, &[], &[], "  ", schema, budget);
-        let (turns, _) = assemble_turns(
-            system,
-            &[],
-            &history_with_question(&[], ""),
-            budget,
-        );
+        let (turns, _) = assemble_turns(system, &[], &history_with_question(&[], ""), budget);
         assert_eq!(empty, conversation_tokens(&turns) + schema);
         assert_eq!(empty, 2_415);
 
@@ -5055,7 +5185,8 @@ mod tests {
         schema: usize,
         budget: usize,
     ) -> (usize, usize) {
-        let before = conversation_tokens(&assemble_turns(system, sources, history, budget).0) + schema;
+        let before =
+            conversation_tokens(&assemble_turns(system, sources, history, budget).0) + schema;
         let used = meter_usage_tokens(system, sources, history, "", schema, budget);
         let next = history_with_question(history, "");
         let assembled =
@@ -5077,19 +5208,25 @@ mod tests {
             msg("a1", "assistant", "はい"),
             msg("u2", "user", "次へ"),
         ];
-        let (before, used) =
-            empty_draft_matches_next_send("役割", std::slice::from_ref(&file), &history, 2_410, 200_000);
+        let (before, used) = empty_draft_matches_next_send(
+            "役割",
+            std::slice::from_ref(&file),
+            &history,
+            2_410,
+            200_000,
+        );
         let next = history_with_question(&history, "");
         let (turns, _) = assemble_turns("役割", std::slice::from_ref(&file), &next, 200_000);
-        assert!(
-            turns
-                .iter()
-                .filter(|turn| turn.role != "system")
-                .all(|turn| !turn.content.contains(&body))
-        );
+        assert!(turns
+            .iter()
+            .filter(|turn| turn.role != "system")
+            .all(|turn| !turn.content.contains(&body)));
         assert_eq!(before, 64_947);
         assert_eq!(used, 2_485);
-        assert!(before > 62_400, "empty meter without the extra turn warned: {before}");
+        assert!(
+            before > 62_400,
+            "empty meter without the extra turn warned: {before}"
+        );
         assert!(used < 62_400, "the next send does not warn: {used}");
     }
 
@@ -5113,8 +5250,13 @@ mod tests {
             tool,
             msg("u2", "user", "次へ"),
         ];
-        let (before, used) =
-            empty_draft_matches_next_send("役割", std::slice::from_ref(&hit), &history, 2_410, 200_000);
+        let (before, used) = empty_draft_matches_next_send(
+            "役割",
+            std::slice::from_ref(&hit),
+            &history,
+            2_410,
+            200_000,
+        );
         let next = history_with_question(&history, "");
         let (turns, _) = assemble_turns("役割", std::slice::from_ref(&hit), &next, 200_000);
         assert!(turns.iter().all(|turn| !turn.content.contains(&body)));
@@ -5142,7 +5284,9 @@ mod tests {
         let next = history_with_question(&history, "");
         let (turns, _) = assemble_turns("役割", &[], &next, 200_000);
         assert!(turns.iter().all(|turn| !turn.content.contains(&note)));
-        assert!(turns.iter().any(|turn| turn.content.contains(OLD_TOOL_STUB)));
+        assert!(turns
+            .iter()
+            .any(|turn| turn.content.contains(OLD_TOOL_STUB)));
         assert_eq!(before, 9_938);
         assert_eq!(used, 2_453);
     }
@@ -5176,7 +5320,11 @@ mod tests {
             turn: ChatTurn::text("user", content),
             sources: Vec::new(),
             original_sources: Vec::new(),
-            question: if summary { String::new() } else { content.into() },
+            question: if summary {
+                String::new()
+            } else {
+                content.into()
+            },
             message_id: id.into(),
             tool_backup: None,
             summary,

@@ -94,16 +94,18 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
     let q = query.clone();
     let pos_filter = settings.pos_filter_enabled;
     let search_result = tauri::async_runtime::spawn_blocking(move || {
-        let result = search::run_search(
+        let found = search::run_search(
             &settings,
             backend.as_ref(),
             Some(mail_backend.as_ref()),
+            None,
             &q,
             limit,
             None,
             None,
             &user_dict,
         );
+        let result = found;
         let terms = search::extract_search_terms(&q, |text| {
             backend.morph_content_surfaces(text, pos_filter)
         })
@@ -215,10 +217,11 @@ pub fn update_settings(
     let prev_search = state.settings.read().shortcut.clone();
     let prev_notes = state.settings.read().notes_shortcut.clone();
 
-    let ical_keep: Vec<String> = crate::mail::ical::enabled_ical_feeds(&settings.calendar_ical_feeds)
-        .into_iter()
-        .map(|f| crate::mail::ical::ical_folder_id(&f.id))
-        .collect();
+    let ical_keep: Vec<String> =
+        crate::mail::ical::enabled_ical_feeds(&settings.calendar_ical_feeds)
+            .into_iter()
+            .map(|f| crate::mail::ical::ical_folder_id(&f.id))
+            .collect();
 
     state
         .db
@@ -545,7 +548,8 @@ pub async fn search_query(
                 date_before.as_deref(),
                 exts.as_deref(),
             )?;
-            if let Some(msg) = crate::llm::tools::remote_date_rejection(date.is_active(), found.date_applied)
+            if let Some(msg) =
+                crate::llm::tools::remote_date_rejection(date.is_active(), found.date_applied)
             {
                 return Err(msg.to_string());
             }
@@ -553,17 +557,19 @@ pub async fn search_query(
         }
         let filter =
             search::build_search_filter(&state.db, date, None, prefix, exts.as_deref(), false)?;
-        search::run_search_with_mail_options(
+        let hits = search::run_search_with_mail_options(
             &settings,
             state.backend.as_ref(),
             Some(state.mail_backend.as_ref()),
+            None,
             &query,
             limit,
             prefix,
             exts.as_deref(),
             &user_dict,
             &filter,
-        )
+        )?;
+        Ok(hits)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1206,7 +1212,9 @@ pub fn calendar_related(
     Ok(views)
 }
 
-fn calendar_row_view(row: &crate::db::CalendarEventRow) -> crate::mail::calendar::CalendarEventView {
+fn calendar_row_view(
+    row: &crate::db::CalendarEventRow,
+) -> crate::mail::calendar::CalendarEventView {
     let appt = crate::mail::calendar::OutlookAppointment {
         store_id: row.store_id.clone(),
         entry_id: row.entry_id.clone(),
@@ -1447,10 +1455,7 @@ pub fn append_note_memo(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "ノートが見つかりません".to_string())?
     };
-    let heading_ref = heading
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let heading_ref = heading.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let next = crate::notes_md::append_chunk(&note.memo, heading_ref, &chunk)
         .map_err(|e| e.message(heading_ref.unwrap_or("")))?;
     let note = state

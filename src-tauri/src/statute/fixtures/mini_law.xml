@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DataRoot>
+  <Result>
+    <Code>0</Code>
+    <Message/>
+  </Result>
+  <ApplData>
+    <LawId>TEST0001</LawId>
+    <LawFullText>
+      <Law>
+        <LawNum>令和八年法律第一号</LawNum>
+        <LawBody>
+          <LawTitle Abbrev="試法">試法</LawTitle>
+          <TOC>
+            <TOCLabel>目次</TOCLabel>
+            <Article>
+              <ArticleTitle>目次の第一条</ArticleTitle>
+            </Article>
+          </TOC>
+          <MainProvision>
+            <Article Num="1">
+              <ArticleCaption>（趣旨）</ArticleCaption>
+              <ArticleTitle>第一条</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>この法律は、試験のためのものである。</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+            </Article>
+            <Article Num="2" Delete="true">
+              <ArticleTitle>第二条</ArticleTitle>
+              <Paragraph>
+                <ParagraphSentence>
+                  <Sentence>削除条文</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+            </Article>
+            <Article Num="3_2">
+              <ArticleCaption>（枝番）</ArticleCaption>
+              <ArticleTitle>第三条の二</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>枝番の本文。<Ruby>売主<Rt>うりぬし</Rt></Ruby>が約する。</Sentence>
+                </ParagraphSentence>
+                <Item Num="1">
+                  <ItemTitle>一</ItemTitle>
+                  <ItemSentence>
+                    <Sentence>号の本文。</Sentence>
+                  </ItemSentence>
+                </Item>
+              </Paragraph>
+            </Article>
+            <Article Num="32_4_2">
+              <ArticleCaption>（二重枝番）</ArticleCaption>
+              <ArticleTitle>第三十二条の四の二</ArticleTitle>
+              <Paragraph Num="1">
+                <ParagraphSentence>
+                  <Sentence>二重枝番の本文。</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+            </Article>
+          </MainProvision>
+          <SupplProvision>
+            <Article Num="1">
+              <ArticleTitle>第一条</ArticleTitle>
+              <Paragraph>
+                <ParagraphSentence>
+                  <Sentence>附則の本文。</Sentence>
+                </ParagraphSentence>
+              </Paragraph>
+            </Article>
+            <AmendProvision>
+              <Article Num="9">
+                <ArticleTitle>第九条</ArticleTitle>
+                <Paragraph>
+                  <ParagraphSentence>
+                    <Sentence>改正規定であり本文ではない。</Sentence>
+                  </ParagraphSentence>
+                </Paragraph>
+              </Article>
+            </AmendProvision>
+          </SupplProvision>
+        </LawBody>
+      </Law>
+    </LawFullText>
+  </ApplData>
+</DataRoot>

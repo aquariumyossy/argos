@@ -194,6 +194,7 @@ pub fn assemble_search_scopes(
                 settings,
                 backend,
                 mail,
+                None,
                 q,
                 SCOPE_QUERY_HIT_LIMIT,
                 None,
