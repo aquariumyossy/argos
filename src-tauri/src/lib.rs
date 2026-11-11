@@ -169,6 +169,11 @@ pub fn run() {
                             });
                         }
                         ShortcutAction::Chat => {
+                            // Search copies the selection with Ctrl+C. If Alt is still
+                            // down, that chord is Ctrl+Alt+C and must not open chat.
+                            if selection::chat_shortcut_blocked_by_selection_copy() {
+                                return;
+                            }
                             tauri::async_runtime::spawn(async move {
                                 open_chat_from_shortcut(&app);
                             });

@@ -1231,4 +1231,60 @@ describe("Ctrl+Alt+C", () => {
       );
     });
   });
+
+  it("places the caret when the input becomes usable after a reply finishes", async () => {
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    try {
+      await renderChat();
+      fireEvent.click(screen.getByRole("button", { name: "再送" }));
+      await screen.findByText("生成中…");
+      const during = screen.getByPlaceholderText(
+        COMPOSER_PLACEHOLDER,
+      ) as HTMLTextAreaElement;
+      expect(during.disabled).toBe(true);
+      const handler = await shortcutHandler();
+      await act(async () => {
+        handler({ payload: { threadId: "thread-a" } });
+      });
+      expect(document.activeElement).not.toBe(during);
+      await act(async () => {
+        releaseSend();
+      });
+      await vi.waitFor(() => {
+        const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+        expect((box as HTMLTextAreaElement).disabled).toBe(false);
+        expect(document.activeElement).toBe(box);
+      });
+    } finally {
+      hasFocus.mockRestore();
+    }
+  });
+
+  it("does not pull the caret back after the shortcut focus has landed", async () => {
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    try {
+      await renderChat();
+      const handler = await shortcutHandler();
+      await act(async () => {
+        handler({ payload: { threadId: "thread-a" } });
+      });
+      const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+      await vi.waitFor(() => expect(document.activeElement).toBe(box));
+      const search = screen.getByRole("searchbox");
+      await act(async () => {
+        search.focus();
+      });
+      expect(document.activeElement).toBe(search);
+      const onFocus = focusHandlers[focusHandlers.length - 1];
+      if (!onFocus) throw new Error("focus handler missing");
+      await act(async () => {
+        onFocus({ payload: true });
+      });
+      await vi.waitFor(() => {
+        expect(document.activeElement).not.toBe(box);
+      });
+    } finally {
+      hasFocus.mockRestore();
+    }
+  });
 });

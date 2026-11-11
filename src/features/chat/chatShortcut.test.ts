@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { planChatShortcut } from "./chatShortcut";
+import {
+  composerFocusLanded,
+  planChatShortcut,
+  shortcutInputLocked,
+} from "./chatShortcut";
 
 describe("chat shortcut", () => {
   it("focuses the conversation already open", () => {
@@ -47,5 +51,22 @@ describe("chat shortcut", () => {
         knownThreadIds: ["a"],
       }),
     ).toEqual({ action: "focus" });
+  });
+});
+
+describe("shortcut focus", () => {
+  it("counts as landed only when the window and the input both have focus", () => {
+    const input = new EventTarget();
+    const other = new EventTarget();
+    expect(composerFocusLanded(true, input, input)).toBe(true);
+    expect(composerFocusLanded(false, input, input)).toBe(false);
+    expect(composerFocusLanded(true, other, input)).toBe(false);
+    expect(composerFocusLanded(true, input, null)).toBe(false);
+  });
+
+  it("locks the input while a reply or an attachment is in progress", () => {
+    expect(shortcutInputLocked(false, false)).toBe(false);
+    expect(shortcutInputLocked(true, false)).toBe(true);
+    expect(shortcutInputLocked(false, true)).toBe(true);
   });
 });

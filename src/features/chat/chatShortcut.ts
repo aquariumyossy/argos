@@ -23,3 +23,20 @@ export function planChatShortcut(args: {
   }
   return { action: "reload" };
 }
+
+/** The composer cannot take the caret while a reply or an attach is in progress. */
+export function shortcutInputLocked(
+  attaching: boolean,
+  generatingOnThisChat: boolean,
+): boolean {
+  return attaching || generatingOnThisChat;
+}
+
+/** The shortcut focus request is finished only when the window and the input both have it. */
+export function composerFocusLanded(
+  windowFocused: boolean,
+  active: EventTarget | null,
+  input: EventTarget | null,
+): boolean {
+  return windowFocused && input !== null && active === input;
+}

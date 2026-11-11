@@ -31,7 +31,11 @@ import {
   type LiveGeneration,
 } from "./chatLive";
 import { noticeFromSend, SummaryAfterMessage } from "./conversationSummary";
-import { planChatShortcut } from "./chatShortcut";
+import {
+  composerFocusLanded,
+  planChatShortcut,
+  shortcutInputLocked,
+} from "./chatShortcut";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -636,11 +640,13 @@ export default function Chat() {
     const el = textareaRef.current;
     if (!el || el.disabled) return false;
     el.focus();
-    if (document.activeElement === el) {
-      shortcutFocusPending.current = false;
-      return true;
-    }
-    return false;
+    const landed = composerFocusLanded(
+      document.hasFocus(),
+      document.activeElement,
+      el,
+    );
+    if (landed) shortcutFocusPending.current = false;
+    return landed;
   }, []);
 
   const loadNoteReview = useCallback(async (noteId: string | undefined) => {
@@ -949,6 +955,11 @@ export default function Chat() {
   }, [showLive]);
   const generatingThreadId = busy ? (live?.threadId ?? null) : null;
   const onGeneratingThread = !!generatingThreadId && active?.id === generatingThreadId;
+  const inputLocked = shortcutInputLocked(attaching, onGeneratingThread);
+  useEffect(() => {
+    if (inputLocked || !shortcutFocusPending.current) return;
+    focusComposer();
+  }, [inputLocked, focusComposer]);
 
   const noteProgrammaticScroll = useCallback(() => {
     programmaticScroll.current = true;
