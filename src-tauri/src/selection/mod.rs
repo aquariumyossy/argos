@@ -1,15 +1,29 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arboard::Clipboard;
+
+/// How long Ctrl+Alt+C is ignored after a search starts copying the selection.
+const SELECTION_COPY_GUARD_MS: u64 = 1000;
+/// Extra ignore time measured from the synthetic Ctrl+C itself.
+const SELECTION_COPY_SEND_TAIL_MS: u64 = 400;
+
+static COPY_GUARD_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Capture currently selected text by simulating Ctrl+C, then restore clipboard.
 ///
 /// Important: global shortcuts often fire while Ctrl/Shift are still held
 /// (e.g. Ctrl+Alt+A). We wait for modifiers to release first, then
-/// send a real Ctrl+C via Win32 SendInput.
+/// send a real Ctrl+C via Win32 SendInput. If they are still held, we do not
+/// send Ctrl+C: with Alt down that chord is Ctrl+Alt+C and would open chat.
 pub fn capture_selection(timeout_ms: u64) -> Result<String, String> {
-    wait_for_modifiers_release(Duration::from_millis(800))?;
+    push_chat_guard(SELECTION_COPY_GUARD_MS);
+    let released = wait_for_modifiers_release(Duration::from_millis(800))?;
+    if !should_copy_selection(released) {
+        eprintln!("argos: modifier keys still down; not sending Ctrl+C");
+        return Ok(String::new());
+    }
 
     // Brief settle so the foreground app regains a clean key state
     thread::sleep(Duration::from_millis(40));
@@ -23,6 +37,7 @@ pub fn capture_selection(timeout_ms: u64) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     thread::sleep(Duration::from_millis(40));
 
+    push_chat_guard(SELECTION_COPY_SEND_TAIL_MS);
     send_ctrl_c()?;
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(300));
@@ -45,8 +60,47 @@ pub fn capture_selection(timeout_ms: u64) -> Result<String, String> {
     Ok(captured.trim().to_string())
 }
 
+/// True when Ctrl+Alt+C should be ignored because search is copying a selection.
+pub fn chat_shortcut_blocked_by_selection_copy() -> bool {
+    guard_blocks_chat(unix_ms(), COPY_GUARD_UNTIL_MS.load(Ordering::SeqCst))
+}
+
+fn push_chat_guard(extra_ms: u64) {
+    let now = unix_ms();
+    loop {
+        let current = COPY_GUARD_UNTIL_MS.load(Ordering::SeqCst);
+        let next = extend_guard_deadline(current, now, extra_ms);
+        if COPY_GUARD_UNTIL_MS
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Send the synthetic Ctrl+C only after Ctrl/Alt/Shift have been released.
+pub(crate) fn should_copy_selection(modifiers_released: bool) -> bool {
+    modifiers_released
+}
+
+pub(crate) fn guard_blocks_chat(now_ms: u64, until_ms: u64) -> bool {
+    until_ms != 0 && now_ms < until_ms
+}
+
+pub(crate) fn extend_guard_deadline(current_until: u64, now_ms: u64, extra_ms: u64) -> u64 {
+    current_until.max(now_ms.saturating_add(extra_ms))
+}
+
 #[cfg(windows)]
-fn wait_for_modifiers_release(max_wait: Duration) -> Result<(), String> {
+fn wait_for_modifiers_release(max_wait: Duration) -> Result<bool, String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
         VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_SPACE,
@@ -69,21 +123,19 @@ fn wait_for_modifiers_release(max_wait: Duration) -> Result<(), String> {
                 .iter()
                 .any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) as u16 } & 0x8000 != 0);
             if !still_down {
-                return Ok(());
+                return Ok(true);
             }
         }
         if start.elapsed() > max_wait {
-            // Proceed anyway; SendInput may still work
-            eprintln!("argos: modifier keys still down after wait; continuing");
-            return Ok(());
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(15));
     }
 }
 
 #[cfg(not(windows))]
-fn wait_for_modifiers_release(_max_wait: Duration) -> Result<(), String> {
-    Ok(())
+fn wait_for_modifiers_release(_max_wait: Duration) -> Result<bool, String> {
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -145,4 +197,26 @@ fn send_ctrl_c() -> Result<(), String> {
         .key(Key::Control, Direction::Release)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extend_guard_deadline, guard_blocks_chat, should_copy_selection};
+
+    #[test]
+    fn selection_copy_waits_until_modifiers_are_released() {
+        assert!(should_copy_selection(true));
+        assert!(!should_copy_selection(false));
+    }
+
+    #[test]
+    fn chat_shortcut_stays_blocked_through_the_copy_and_not_after() {
+        assert!(!guard_blocks_chat(1_000, 0));
+        assert!(guard_blocks_chat(1_000, 2_000));
+        assert!(!guard_blocks_chat(2_000, 2_000));
+        let until = extend_guard_deadline(0, 1_000, 1_000);
+        assert_eq!(until, 2_000);
+        assert_eq!(extend_guard_deadline(until, 1_500, 400), until);
+        assert_eq!(extend_guard_deadline(until, 1_900, 400), 2_300);
+    }
 }

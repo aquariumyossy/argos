@@ -157,6 +157,11 @@ pub async fn trigger_search(app: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn consume_chat_shortcut_focus() -> bool {
+    crate::take_chat_shortcut_focus()
+}
+
+#[tauri::command]
 pub fn get_settings(state: State<'_, Arc<AppState>>) -> Settings {
     state.settings.read().clone()
 }

@@ -1101,3 +1101,190 @@ describe("finished answer stays put", () => {
     expect(log.scrollTop).toBe(parked);
   });
 });
+
+const COMPOSER_PLACEHOLDER =
+  "メッセージを入力（Enter で送信、Shift+Enter で改行）";
+
+describe("Ctrl+Alt+C", () => {
+  async function shortcutHandler() {
+    await vi.waitFor(() => {
+      if (!listeners.get("chat-shortcut-open")) {
+        throw new Error("chat-shortcut-open is not listening");
+      }
+    });
+    const handler = listeners.get("chat-shortcut-open");
+    if (!handler) throw new Error("chat-shortcut-open is not listening");
+    return handler;
+  }
+
+  it("focuses the composer of the conversation already open", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    box.blur();
+    const before = mockInvoke.mock.calls.filter(
+      (call) => call[0] === "llm_set_active_thread" || call[0] === "llm_create_thread",
+    );
+    const handler = await shortcutHandler();
+    await act(async () => {
+      handler({ payload: { threadId: "thread-a" } });
+    });
+    await vi.waitFor(() => {
+      expect(document.activeElement).toBe(box);
+    });
+    const after = mockInvoke.mock.calls.filter(
+      (call) => call[0] === "llm_set_active_thread" || call[0] === "llm_create_thread",
+    );
+    expect(after).toEqual(before);
+  });
+
+  it("opens another existing conversation and focuses the composer", async () => {
+    await renderChat();
+    const handler = await shortcutHandler();
+    await act(async () => {
+      handler({ payload: { threadId: "thread-b" } });
+    });
+    await screen.findByText("別スレッドの発言");
+    await vi.waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByPlaceholderText(COMPOSER_PLACEHOLDER),
+      );
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("llm_set_active_thread", {
+      id: "thread-b",
+    });
+  });
+
+  it("shows the new empty conversation from the shortcut without creating a second one", async () => {
+    const created = {
+      id: "thread-new",
+      title: "",
+      pathPrefix: "",
+      noteId: "",
+      sortOrder: -1,
+      createdAt: 3,
+      updatedAt: 3,
+    };
+    let opened = false;
+    const previous = mockInvoke.getMockImplementation();
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "llm_list_threads") return opened ? [created] : [];
+      if (cmd === "llm_get_active_thread") return opened ? created : null;
+      if (cmd === "llm_list_messages" || cmd === "llm_list_sources") return [];
+      if (cmd === "llm_create_thread") {
+        throw new Error("the shortcut already created the conversation");
+      }
+      return previous?.(cmd, args);
+    });
+    render(<Chat />);
+    await screen.findByText("会話はまだありません。");
+    opened = true;
+    const handler = await shortcutHandler();
+    await act(async () => {
+      handler({ payload: { threadId: created.id } });
+    });
+    await screen.findByRole("button", { name: "新しい会話" });
+    await vi.waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByPlaceholderText(COMPOSER_PLACEHOLDER),
+      );
+    });
+    expect(mockInvoke.mock.calls.some((call) => call[0] === "llm_create_thread")).toBe(
+      false,
+    );
+  });
+
+  it("starts an empty conversation when the shortcut has no conversation to open", async () => {
+    const created = {
+      id: "thread-new",
+      title: "",
+      pathPrefix: "",
+      noteId: "",
+      sortOrder: -1,
+      createdAt: 4,
+      updatedAt: 4,
+    };
+    let threads: Array<typeof created> = [];
+    let active: typeof created | null = null;
+    const previous = mockInvoke.getMockImplementation();
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "llm_list_threads") return threads;
+      if (cmd === "llm_get_active_thread") return active;
+      if (cmd === "llm_create_thread") {
+        threads = [created];
+        active = created;
+        return created;
+      }
+      if (cmd === "llm_list_messages" || cmd === "llm_list_sources") return [];
+      return previous?.(cmd, args);
+    });
+    render(<Chat />);
+    await screen.findByText("会話はまだありません。");
+    const handler = await shortcutHandler();
+    await act(async () => {
+      handler({ payload: { threadId: "" } });
+    });
+    await screen.findByRole("button", { name: "新しい会話" });
+    expect(mockInvoke).toHaveBeenCalledWith("llm_create_thread", { title: "" });
+    await vi.waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByPlaceholderText(COMPOSER_PLACEHOLDER),
+      );
+    });
+  });
+
+  it("places the caret when the input becomes usable after a reply finishes", async () => {
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    try {
+      await renderChat();
+      fireEvent.click(screen.getByRole("button", { name: "再送" }));
+      await screen.findByText("生成中…");
+      const during = screen.getByPlaceholderText(
+        COMPOSER_PLACEHOLDER,
+      ) as HTMLTextAreaElement;
+      expect(during.disabled).toBe(true);
+      const handler = await shortcutHandler();
+      await act(async () => {
+        handler({ payload: { threadId: "thread-a" } });
+      });
+      expect(document.activeElement).not.toBe(during);
+      await act(async () => {
+        releaseSend();
+      });
+      await vi.waitFor(() => {
+        const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+        expect((box as HTMLTextAreaElement).disabled).toBe(false);
+        expect(document.activeElement).toBe(box);
+      });
+    } finally {
+      hasFocus.mockRestore();
+    }
+  });
+
+  it("does not pull the caret back after the shortcut focus has landed", async () => {
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    try {
+      await renderChat();
+      const handler = await shortcutHandler();
+      await act(async () => {
+        handler({ payload: { threadId: "thread-a" } });
+      });
+      const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+      await vi.waitFor(() => expect(document.activeElement).toBe(box));
+      const search = screen.getByRole("searchbox");
+      await act(async () => {
+        search.focus();
+      });
+      expect(document.activeElement).toBe(search);
+      const onFocus = focusHandlers[focusHandlers.length - 1];
+      if (!onFocus) throw new Error("focus handler missing");
+      await act(async () => {
+        onFocus({ payload: true });
+      });
+      await vi.waitFor(() => {
+        expect(document.activeElement).not.toBe(box);
+      });
+    } finally {
+      hasFocus.mockRestore();
+    }
+  });
+});

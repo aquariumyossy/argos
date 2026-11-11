@@ -4600,6 +4600,42 @@ impl Db {
         Ok(())
     }
 
+    /// Newest conversation by `updated_at`, then `created_at`, then id.
+    pub fn most_recent_llm_thread(&self) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {LLM_THREAD_COLS} FROM llm_threads
+             ORDER BY updated_at DESC, created_at DESC, id ASC
+             LIMIT 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query_map([], map_llm_thread)?;
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Conversation for Ctrl+Alt+C.
+    /// The active thread is the one left open. If that row is gone, the newest
+    /// update is used. If there is no conversation yet, an empty one is created.
+    /// The bool is true only when this call created the row.
+    pub fn prepare_last_used_chat(&self) -> Result<(LlmThreadRow, bool), rusqlite::Error> {
+        if let Some(id) = self.get_active_llm_thread_id() {
+            if let Some(thread) = self.get_llm_thread(&id)? {
+                return Ok((thread, false));
+            }
+        }
+        if let Some(thread) = self.most_recent_llm_thread()? {
+            self.set_active_llm_thread_id(Some(&thread.id))?;
+            return Ok((thread, false));
+        }
+        let thread = self.create_llm_thread("", true)?;
+        self.set_active_llm_thread_id(Some(&thread.id))?;
+        Ok((thread, true))
+    }
+
     pub fn insert_note_proposal(
         &self,
         thread_id: &str,
@@ -6371,6 +6407,92 @@ mod folder_index_status_tests {
         assert_eq!(thread.summary, "要約本文");
         assert_eq!(thread.summary_through_id, "m1");
         assert_eq!(db.list_llm_messages("t1").unwrap()[0].content, "元の質問");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod last_used_chat_tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-chat-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("argos.db")).unwrap();
+        (dir, db)
+    }
+
+    fn set_thread_times(db: &Db, id: &str, created_at: i64, updated_at: i64) {
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE llm_threads SET created_at=?1, updated_at=?2 WHERE id=?3",
+                rusqlite::params![created_at, updated_at, id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn open_conversation_wins_over_a_newer_update() {
+        let (dir, db) = temp_db();
+        let older = db.create_llm_thread("開いている", true).unwrap();
+        let newer = db.create_llm_thread("更新が新しい", true).unwrap();
+        set_thread_times(&db, &older.id, 10, 10);
+        set_thread_times(&db, &newer.id, 20, 50);
+        db.set_active_llm_thread_id(Some(&older.id)).unwrap();
+        let (thread, created) = db.prepare_last_used_chat().unwrap();
+        assert!(!created);
+        assert_eq!(thread.id, older.id);
+        assert_eq!(
+            db.get_active_llm_thread_id().as_deref(),
+            Some(older.id.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_open_conversation_falls_back_to_the_newest_update() {
+        let (dir, db) = temp_db();
+        let older = db.create_llm_thread("古い", true).unwrap();
+        let newer = db.create_llm_thread("新しい", true).unwrap();
+        set_thread_times(&db, &older.id, 10, 10);
+        set_thread_times(&db, &newer.id, 11, 11);
+        let same_time = db.create_llm_thread("同時刻", true).unwrap();
+        set_thread_times(&db, &same_time.id, 30, 11);
+        db.set_active_llm_thread_id(Some("missing")).unwrap();
+        let (thread, created) = db.prepare_last_used_chat().unwrap();
+        assert!(!created);
+        assert_eq!(thread.id, same_time.id);
+        assert_eq!(
+            db.get_active_llm_thread_id().as_deref(),
+            Some(same_time.id.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_conversation_starts_one_empty_chat_and_reuses_it() {
+        let (dir, db) = temp_db();
+        let (thread, created) = db.prepare_last_used_chat().unwrap();
+        assert!(created);
+        assert!(thread.title.is_empty());
+        assert!(thread.search_enabled);
+        assert!(db.list_llm_messages(&thread.id).unwrap().is_empty());
+        assert_eq!(db.list_llm_threads().unwrap().len(), 1);
+        assert_eq!(
+            db.get_active_llm_thread_id().as_deref(),
+            Some(thread.id.as_str())
+        );
+        let (again, created_again) = db.prepare_last_used_chat().unwrap();
+        assert!(!created_again);
+        assert_eq!(again.id, thread.id);
+        assert_eq!(db.list_llm_threads().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
