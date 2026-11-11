@@ -22,7 +22,7 @@ pub fn resolve_articles(
     queries: &[ArticleQuery],
     today: &str,
 ) -> Vec<ToolArticle> {
-    let offline = sync_updates(db, client, today);
+    let mut offline = sync_updates(db, client, today);
     let mut fetched_catalog = db.meta("lawlist_full").unwrap_or_default() == "1";
     let mut reloaded = Vec::new();
     let mut out = Vec::new();
@@ -32,7 +32,7 @@ pub fn resolve_articles(
             client,
             query,
             today,
-            offline,
+            &mut offline,
             &mut fetched_catalog,
             &mut reloaded,
         ));
@@ -45,7 +45,7 @@ fn resolve_one(
     client: &dyn EgovSource,
     query: &ArticleQuery,
     today: &str,
-    offline: bool,
+    offline: &mut bool,
     fetched_catalog: &mut bool,
     reloaded: &mut Vec<String>,
 ) -> ToolArticle {
@@ -65,7 +65,7 @@ fn resolve_one(
             "附則は改正ごとに本文が分かれるため、確認済みにはしません。",
         );
     }
-    let law = match resolve_law(db, client, &law_query, fetched_catalog) {
+    let law = match resolve_law(db, client, &law_query, fetched_catalog, offline) {
         Ok(Some(law)) => law,
         Ok(None) => return miss(&law_query, &article_query, "法令名を特定できませんでした。"),
         Err(EgovFailure::Offline) | Err(EgovFailure::NotFound) => {
@@ -109,7 +109,7 @@ fn resolve_one(
         today,
         remote_as_of: remote.as_deref(),
         covered,
-        offline,
+        offline: *offline,
         cached_articles: law.article_count,
         probed_on: &cached.probed_on,
         pending_due,
@@ -126,6 +126,7 @@ fn resolve_one(
             remote.as_deref(),
             &law_query,
             &article_query,
+            offline,
         ),
         RevisionAction::ReloadLaw { as_of } => {
             if reloaded.iter().any(|id| id == &law.law_id) {
@@ -149,13 +150,16 @@ fn resolve_one(
                             Some(&as_of),
                             &law_query,
                             &article_query,
+                            offline,
                         );
                     };
                     hit_from_cache(db, &law, &row, false)
                 }
-                Err(EgovFailure::Offline) | Err(EgovFailure::NotFound) => {
+                Err(EgovFailure::Offline) => {
+                    *offline = true;
                     hit_from_cache(db, &law, &cached, true)
                 }
+                Err(EgovFailure::NotFound) => hit_from_cache(db, &law, &cached, true),
                 Err(EgovFailure::Bad(_)) => probe_article(
                     db,
                     client,
@@ -166,6 +170,7 @@ fn resolve_one(
                     Some(&as_of),
                     &law_query,
                     &article_query,
+                    offline,
                 ),
             }
         }
@@ -181,9 +186,9 @@ fn fetch_missing(
     law_query: &str,
     article_query: &str,
     today: &str,
-    offline: bool,
+    offline: &mut bool,
 ) -> ToolArticle {
-    if offline {
+    if *offline {
         return miss(
             law_query,
             article_query,
@@ -211,11 +216,14 @@ fn fetch_missing(
             };
             store_fetched(db, law, article, today, law_query, article_query, false)
         }
-        Err(EgovFailure::Offline) => miss(
+        Err(EgovFailure::Offline) => {
+            *offline = true;
+            miss(
             law_query,
             article_query,
             "法令DBに無く、オフラインのため e-Gov から取得できませんでした。",
-        ),
+            )
+        }
         Err(EgovFailure::NotFound) => miss(
             law_query,
             article_query,
@@ -293,6 +301,7 @@ fn probe_article(
     remote_as_of: Option<&str>,
     law_query: &str,
     article_query: &str,
+    offline: &mut bool,
 ) -> ToolArticle {
     match fetch_article(client, &law.law_id, display) {
         Ok(parsed) => {
@@ -348,6 +357,10 @@ fn probe_article(
                 law_query: law_query.to_string(),
                 article_query: article_query.to_string(),
             }
+        }
+        Err(EgovFailure::Offline) => {
+            *offline = true;
+            hit_from_cache(db, law, cached, true)
         }
         Err(_) => hit_from_cache(db, law, cached, true),
     }
@@ -446,14 +459,25 @@ fn resolve_law(
     client: &dyn EgovSource,
     name: &str,
     fetched_catalog: &mut bool,
+    offline: &mut bool,
 ) -> Result<Option<LawRef>, EgovFailure> {
     if let Some(law) = db.resolve_name(name).map_err(EgovFailure::Bad)? {
         return Ok(Some(law));
     }
+    if *offline {
+        return Err(EgovFailure::Offline);
+    }
     if *fetched_catalog {
         return Ok(None);
     }
-    let xml = client.fetch(&lawlist_url(1))?;
+    let xml = match client.fetch(&lawlist_url(1)) {
+        Ok(xml) => xml,
+        Err(EgovFailure::Offline) => {
+            *offline = true;
+            return Err(EgovFailure::Offline);
+        }
+        Err(err) => return Err(err),
+    };
     let names = xmlparse::parse_law_list(&xml)
         .map_err(|_| EgovFailure::Bad("法令名一覧を読めませんでした".into()))?;
     let rows: Vec<(String, String, String)> = names
@@ -492,6 +516,7 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
     }
     let mut fetched = 0i64;
     let mut finished_today = false;
+    let mut today_timed_out = false;
     while day <= today_d && fetched < UPDATE_WALK_DAYS {
         if day == today_d && today_list_is_fresh(db) {
             break;
@@ -523,12 +548,13 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
                     finished_today = true;
                 }
             }
-            Err(_) => {
-                // A down or 5xx list for today is one attempt. It must not block
-                // fetching an article, and it must not be retried for an hour.
+            Err(err) => {
+                // One attempt per hour either way. A connection timeout stops
+                // the rest of this call. A fast 5xx does not.
                 if is_today {
                     note_today_checked(db);
                     finished_today = true;
+                    today_timed_out = matches!(err, EgovFailure::Offline);
                     break;
                 }
                 return true;
@@ -555,7 +581,7 @@ fn sync_updates(db: &StatuteDb, client: &dyn EgovSource, today: &str) -> bool {
         };
         let _ = db.set_meta("updates_through", &format_ymd(settled));
     }
-    false
+    today_timed_out
 }
 
 fn today_list_is_fresh(db: &StatuteDb) -> bool {
@@ -1007,7 +1033,7 @@ mod tests {
         fn fetch(&self, url: &str) -> Result<String, EgovFailure> {
             if url.contains("updatelawlists/") {
                 *self.list_hits.lock().unwrap() += 1;
-                return Err(EgovFailure::Offline);
+                return Err(EgovFailure::Bad("HTTP 503".into()));
             }
             if url.contains("articles;") {
                 return Ok(self.article.clone());
@@ -1060,6 +1086,82 @@ mod tests {
         assert!(!second[0].offline);
         assert_eq!(*client.list_hits.lock().unwrap(), 1);
         assert_ne!(db.meta("updates_through").unwrap(), "2026-11-11");
+    }
+
+    struct TimeoutNet {
+        hits: std::sync::Mutex<usize>,
+    }
+
+    impl EgovSource for TimeoutNet {
+        fn fetch(&self, _url: &str) -> Result<String, EgovFailure> {
+            *self.hits.lock().unwrap() += 1;
+            Err(EgovFailure::Offline)
+        }
+    }
+
+    #[test]
+    fn a_timeout_does_not_check_every_cached_article() {
+        let db = temp_db();
+        db.set_meta("updates_through", "2026-11-10").unwrap();
+        db.replace_law(
+            "129AC0000000089",
+            "民法",
+            "",
+            "2020-04-01",
+            "2020-04-01",
+            "bundle",
+            &["民法".into()],
+            &[
+                ParsedArticle {
+                    key: "1".into(),
+                    num: "第1条".into(),
+                    heading: String::new(),
+                    body: "第一条".into(),
+                    suppl: false,
+                },
+                ParsedArticle {
+                    key: "2".into(),
+                    num: "第2条".into(),
+                    heading: String::new(),
+                    body: "第二条".into(),
+                    suppl: false,
+                },
+                ParsedArticle {
+                    key: "555".into(),
+                    num: "第555条".into(),
+                    heading: "売買".into(),
+                    body: "古い本文".into(),
+                    suppl: false,
+                },
+            ],
+        )
+        .unwrap();
+        let client = TimeoutNet {
+            hits: std::sync::Mutex::new(0),
+        };
+        let hits = resolve_articles(
+            &db,
+            &client,
+            &[
+                ArticleQuery {
+                    law: "民法".into(),
+                    article: "1".into(),
+                },
+                ArticleQuery {
+                    law: "民法".into(),
+                    article: "2".into(),
+                },
+                ArticleQuery {
+                    law: "民法".into(),
+                    article: "555".into(),
+                },
+            ],
+            "2026-11-11",
+        );
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|hit| hit.verified && hit.offline));
+        assert_eq!(*client.hits.lock().unwrap(), 1);
+        assert_eq!(db.meta("updates_through").unwrap(), "2026-11-10");
     }
 
     #[test]
