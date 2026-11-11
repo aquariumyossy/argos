@@ -23,6 +23,7 @@ use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewWindow,
     WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use crate::state::AppState;
@@ -36,6 +37,11 @@ static APP_READY: AtomicBool = AtomicBool::new(false);
 static SETUP_DONE: AtomicBool = AtomicBool::new(false);
 /// Show the settings window once setup can do so (user launch or a second instance).
 static OPEN_SETTINGS: AtomicBool = AtomicBool::new(false);
+/// Ctrl+Alt+C asked the chat window to put the caret in the composer.
+/// Taken once so a later ordinary focus does not move the caret.
+static CHAT_SHORTCUT_FOCUS: AtomicBool = AtomicBool::new(false);
+
+const CHAT_SHORTCUT: &str = "Ctrl+Alt+C";
 
 fn spawn_folder_sync(indexer: Arc<crate::indexer::Indexer>, app_handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -155,26 +161,26 @@ pub fn run() {
                         let s = state.settings.read();
                         (s.shortcut.clone(), s.notes_shortcut.clone())
                     };
-                    let is_notes = parse_shortcut(&notes_sc)
-                        .map(|sc| &sc == shortcut)
-                        .unwrap_or(false);
-                    let is_search = parse_shortcut(&search_sc)
-                        .map(|sc| &sc == shortcut)
-                        .unwrap_or(false);
                     let app = app.clone();
-                    if is_notes && !is_search {
-                        tauri::async_runtime::spawn(async move {
-                            show_notes(&app);
-                        });
-                        return;
-                    }
-                    // Default / search shortcut (also if both resolve equal — prefer search).
-                    if is_search || !is_notes {
-                        tauri::async_runtime::spawn(async move {
-                            if let Err(e) = commands::trigger_search(&app).await {
-                                eprintln!("search trigger failed: {e}");
-                            }
-                        });
+                    match shortcut_action(shortcut, &search_sc, &notes_sc) {
+                        ShortcutAction::Notes => {
+                            tauri::async_runtime::spawn(async move {
+                                show_notes(&app);
+                            });
+                        }
+                        ShortcutAction::Chat => {
+                            tauri::async_runtime::spawn(async move {
+                                open_chat_from_shortcut(&app);
+                            });
+                        }
+                        // Search, including when the pressed key matches both search and notes.
+                        ShortcutAction::Search => {
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = commands::trigger_search(&app).await {
+                                    eprintln!("search trigger failed: {e}");
+                                }
+                            });
+                        }
                     }
                 })
                 .build(),
@@ -458,6 +464,7 @@ pub fn run() {
             commands::reorder_note_items,
             commands::reorder_notes,
             llm::commands::show_chat_window,
+            commands::consume_chat_shortcut_focus,
             llm::commands::llm_list_threads,
             llm::commands::llm_search_threads,
             llm::commands::llm_create_thread,
@@ -703,6 +710,36 @@ pub fn show_chat(app: &AppHandle) {
     }
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatShortcutOpen {
+    thread_id: String,
+}
+
+/// Bring the chat window forward and open the last-used conversation.
+/// Same show / unminimize / focus path as the other global shortcuts.
+fn open_chat_from_shortcut(app: &AppHandle) {
+    let thread_id = match app.try_state::<Arc<AppState>>() {
+        Some(state) => match state.db.prepare_last_used_chat() {
+            Ok((thread, _)) => thread.id,
+            Err(e) => {
+                eprintln!("argos: prepare chat shortcut failed: {e}");
+                String::new()
+            }
+        },
+        None => String::new(),
+    };
+    CHAT_SHORTCUT_FOCUS.store(true, Ordering::SeqCst);
+    show_chat(app);
+    if let Err(e) = app.emit_to("chat", "chat-shortcut-open", ChatShortcutOpen { thread_id }) {
+        eprintln!("argos: emit chat-shortcut-open failed: {e}");
+    }
+}
+
+pub(crate) fn take_chat_shortcut_focus() -> bool {
+    CHAT_SHORTCUT_FOCUS.swap(false, Ordering::SeqCst)
+}
+
 fn create_preview_window(app: &AppHandle) -> Option<WebviewWindow> {
     let config = app
         .config()
@@ -781,19 +818,97 @@ pub fn register_app_shortcuts(
     search: &str,
     notes: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Unregister known previous combos best-effort, then register both.
+    // Drop previous combos, then register search, notes, and the fixed chat key.
+    // Chat registration failing is announced on its own and does not fail search.
     let _ = app.global_shortcut().unregister_all();
     let search_parsed = parse_shortcut(search)
         .unwrap_or_else(|| Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyA));
-    app.global_shortcut().register(search_parsed)?;
+    let search_result = app.global_shortcut().register(search_parsed);
+    let search_ok = search_result.is_ok();
+    let mut notes_ok = false;
+    let mut notes_held: Option<Shortcut> = None;
     if let Some(notes_parsed) = parse_shortcut(notes) {
-        if notes_parsed != search_parsed {
-            if let Err(e) = app.global_shortcut().register(notes_parsed) {
-                eprintln!("argos: notes shortcut register failed: {e}");
+        if notes_parsed == search_parsed {
+            notes_ok = search_ok;
+            if search_ok {
+                notes_held = Some(notes_parsed);
+            }
+        } else {
+            match app.global_shortcut().register(notes_parsed) {
+                Ok(()) => {
+                    notes_ok = true;
+                    notes_held = Some(notes_parsed);
+                }
+                Err(e) => eprintln!("argos: notes shortcut register failed: {e}"),
             }
         }
     }
+    if !try_register_chat_shortcut(
+        app,
+        search_ok,
+        &search_parsed,
+        notes_ok,
+        notes_held.as_ref(),
+    ) {
+        notify_chat_shortcut_unavailable(app);
+    }
+    search_result?;
     Ok(())
+}
+
+fn try_register_chat_shortcut(
+    app: &AppHandle,
+    search_ok: bool,
+    search: &Shortcut,
+    notes_ok: bool,
+    notes: Option<&Shortcut>,
+) -> bool {
+    if chat_key_already_held(search_ok, search, notes_ok, notes) {
+        return true;
+    }
+    match app.global_shortcut().register(chat_shortcut()) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("argos: chat shortcut register failed: {e}");
+            false
+        }
+    }
+}
+
+/// True when Ctrl+Alt+C is the search or notes key that was just registered.
+/// A failed registration does not count: the chat key must still be tried.
+fn chat_key_already_held(
+    search_ok: bool,
+    search: &Shortcut,
+    notes_ok: bool,
+    notes: Option<&Shortcut>,
+) -> bool {
+    let chat = chat_shortcut();
+    (search_ok && search == &chat) || (notes_ok && notes.is_some_and(|sc| sc == &chat))
+}
+
+fn chat_shortcut() -> Shortcut {
+    parse_shortcut(CHAT_SHORTCUT)
+        .unwrap_or_else(|| Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyC))
+}
+
+fn chat_shortcut_unavailable_message() -> &'static str {
+    "Ctrl+Alt+C を登録できませんでした。ほかのアプリがこのキーを使っている可能性があります。アプリ自体はそのまま使えます。"
+}
+
+fn notify_chat_shortcut_unavailable(app: &AppHandle) {
+    let mut dialog = app
+        .dialog()
+        .message(chat_shortcut_unavailable_message())
+        .title("Argos")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::Ok);
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) {
+            dialog = dialog.parent(&window);
+        }
+    }
+    dialog.show(|_| {});
 }
 
 fn create_main_window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -933,6 +1048,30 @@ pub fn hide_popup_window(app: &AppHandle) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutAction {
+    Search,
+    Notes,
+    Chat,
+}
+
+/// Search wins when the same key is also notes or chat. Notes wins over chat.
+/// Anything else that is Ctrl+Alt+C opens chat. Other keys stay on search.
+fn shortcut_action(pressed: &Shortcut, search: &str, notes: &str) -> ShortcutAction {
+    let is_search = parse_shortcut(search).is_some_and(|sc| &sc == pressed);
+    let is_notes = parse_shortcut(notes).is_some_and(|sc| &sc == pressed);
+    if is_search {
+        return ShortcutAction::Search;
+    }
+    if is_notes {
+        return ShortcutAction::Notes;
+    }
+    if &chat_shortcut() == pressed {
+        return ShortcutAction::Chat;
+    }
+    ShortcutAction::Search
+}
+
 fn parse_shortcut(s: &str) -> Option<Shortcut> {
     let lower = s.to_lowercase();
     let mut mods = Modifiers::empty();
@@ -996,12 +1135,72 @@ fn parse_shortcut(s: &str) -> Option<Shortcut> {
 
 #[cfg(test)]
 mod startup_tests {
-    use super::args_indicate_autostart;
+    use super::{
+        args_indicate_autostart, chat_key_already_held, chat_shortcut,
+        chat_shortcut_unavailable_message, parse_shortcut, shortcut_action, ShortcutAction,
+    };
 
     #[test]
     fn autostart_flag_is_detected() {
         assert!(args_indicate_autostart(["argos.exe", "--autostart"]));
         assert!(!args_indicate_autostart(["argos.exe"]));
         assert!(!args_indicate_autostart(["argos.exe", "--foo"]));
+    }
+
+    #[test]
+    fn ctrl_alt_c_opens_chat_and_leaves_search_and_notes_alone() {
+        let search = parse_shortcut("Ctrl+Alt+A").unwrap();
+        let notes = parse_shortcut("Ctrl+Alt+N").unwrap();
+        let chat = parse_shortcut("Ctrl+Alt+C").unwrap();
+        assert_eq!(chat, chat_shortcut());
+        assert_eq!(
+            shortcut_action(&search, "Ctrl+Alt+A", "Ctrl+Alt+N"),
+            ShortcutAction::Search
+        );
+        assert_eq!(
+            shortcut_action(&notes, "Ctrl+Alt+A", "Ctrl+Alt+N"),
+            ShortcutAction::Notes
+        );
+        assert_eq!(
+            shortcut_action(&chat, "Ctrl+Alt+A", "Ctrl+Alt+N"),
+            ShortcutAction::Chat
+        );
+        let other = parse_shortcut("Ctrl+Alt+B").unwrap();
+        assert_eq!(
+            shortcut_action(&other, "Ctrl+Alt+A", "Ctrl+Alt+N"),
+            ShortcutAction::Search
+        );
+    }
+
+    #[test]
+    fn configured_search_or_notes_key_wins_over_chat() {
+        let chat = chat_shortcut();
+        assert_eq!(
+            shortcut_action(&chat, "Ctrl+Alt+C", "Ctrl+Alt+N"),
+            ShortcutAction::Search
+        );
+        assert_eq!(
+            shortcut_action(&chat, "Ctrl+Alt+A", "Ctrl+Alt+C"),
+            ShortcutAction::Notes
+        );
+    }
+
+    #[test]
+    fn chat_key_is_registered_unless_search_or_notes_already_holds_it() {
+        let search = parse_shortcut("Ctrl+Alt+A").unwrap();
+        let notes = parse_shortcut("Ctrl+Alt+N").unwrap();
+        let chat = chat_shortcut();
+        assert!(!chat_key_already_held(true, &search, true, Some(&notes)));
+        assert!(chat_key_already_held(true, &chat, false, None));
+        assert!(chat_key_already_held(false, &search, true, Some(&chat)));
+        // A failed notes registration must not suppress the chat attempt.
+        assert!(!chat_key_already_held(false, &search, false, Some(&chat)));
+    }
+
+    #[test]
+    fn chat_shortcut_failure_notice_names_the_key() {
+        let message = chat_shortcut_unavailable_message();
+        assert!(message.contains("Ctrl+Alt+C"));
+        assert!(message.contains("登録できませんでした"));
     }
 }

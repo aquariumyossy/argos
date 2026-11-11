@@ -31,6 +31,7 @@ import {
   type LiveGeneration,
 } from "./chatLive";
 import { noticeFromSend, SummaryAfterMessage } from "./conversationSummary";
+import { planChatShortcut } from "./chatShortcut";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
@@ -603,6 +604,8 @@ export default function Chat() {
   const liveHeightRef = useRef(0);
   const logObserverRef = useRef<ResizeObserver | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const shortcutFocusPending = useRef(false);
+  const openFromShortcutRef = useRef<(threadId: string) => void>(() => {});
   const threadsRef = useRef(threads);
   const messagesRef = useRef(messages);
   const seenMessageKeyRef = useRef("");
@@ -628,6 +631,17 @@ export default function Chat() {
   useEffect(() => {
     attachingRef.current = attaching;
   }, [attaching]);
+
+  const focusComposer = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el || el.disabled) return false;
+    el.focus();
+    if (document.activeElement === el) {
+      shortcutFocusPending.current = false;
+      return true;
+    }
+    return false;
+  }, []);
 
   const loadNoteReview = useCallback(async (noteId: string | undefined) => {
     const id = (noteId ?? "").trim();
@@ -753,12 +767,18 @@ export default function Chat() {
       refreshThinkingBudget();
       await loadThreads();
       setError("");
+      try {
+        const focus = await invoke<boolean>("consume_chat_shortcut_focus");
+        if (focus) focusComposer();
+      } catch {
+        /* the window is already open; the shortcut event focuses too */
+      }
     } catch (e) {
       setError(formatInvokeError(e));
     } finally {
       bootstrappingRef.current = false;
     }
-  }, [applySettings, loadThreads, refreshThinkingBudget]);
+  }, [applySettings, focusComposer, loadThreads, refreshThinkingBudget]);
 
   useEffect(() => {
     void bootstrap();
@@ -772,7 +792,16 @@ export default function Chat() {
     let unlistenSettings: (() => void) | undefined;
     void win
       .onFocusChanged((event) => {
-        if (event.payload && !busyRef.current && !ocrBusyRef.current && !attachingRef.current) void bootstrap();
+        if (!event.payload) return;
+        const idle =
+          !busyRef.current && !ocrBusyRef.current && !attachingRef.current;
+        if (!idle) {
+          if (shortcutFocusPending.current) focusComposer();
+          return;
+        }
+        void bootstrap().finally(() => {
+          if (shortcutFocusPending.current) focusComposer();
+        });
       })
       .then((fn) => {
         if (cancelled) fn();
@@ -801,7 +830,22 @@ export default function Chat() {
       unlistenReady?.();
       unlistenSettings?.();
     };
-  }, [applySettings, bootstrap, refreshThinkingBudget]);
+  }, [applySettings, bootstrap, focusComposer, refreshThinkingBudget]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ threadId?: string }>("chat-shortcut-open", (event) => {
+      openFromShortcutRef.current(event.payload?.threadId ?? "");
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let unlistenDelta: (() => void) | undefined;
@@ -1240,6 +1284,32 @@ export default function Chat() {
       setError(formatInvokeError(e));
     }
   }
+
+  openFromShortcutRef.current = (threadId: string) => {
+    shortcutFocusPending.current = true;
+    void invoke("consume_chat_shortcut_focus").catch(() => {
+      /* a later focus of this window can still place the caret */
+    });
+    void (async () => {
+      const plan = planChatShortcut({
+        threadId,
+        activeId: activeIdRef.current,
+        knownThreadIds: threadsRef.current.map((t) => t.id),
+      });
+      try {
+        if (plan.action === "select") await selectThread(plan.threadId);
+        else if (plan.action === "reload") await loadThreads();
+        else if (plan.action === "create") await createThread();
+      } catch (e) {
+        setError(formatInvokeError(e));
+      }
+      if (!focusComposer()) {
+        requestAnimationFrame(() => {
+          if (!focusComposer()) window.setTimeout(() => focusComposer(), 50);
+        });
+      }
+    })();
+  };
 
   async function deleteThread(id: string) {
     if (blocked) return;
