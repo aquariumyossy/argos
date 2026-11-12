@@ -492,6 +492,7 @@ pub fn run() {
             llm::commands::llm_file_grain_meter,
             llm::commands::llm_attach_sources,
             llm::commands::llm_attach_files,
+            llm::commands::llm_attach_pasted_image,
             llm::commands::llm_retry_ocr,
             llm::commands::llm_source_image,
             llm::commands::llm_image_source_group,

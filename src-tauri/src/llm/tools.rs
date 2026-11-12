@@ -17,6 +17,7 @@ pub const MAX_LAW_ARTICLES: usize = 10;
 pub const MAX_LAW_CALLS: usize = 10;
 pub const TOOL_LIST_CALENDAR: &str = "list_calendar";
 pub const TOOL_READ: &str = "read_unit";
+pub const TOOL_LOOK_IMAGE: &str = "look_image";
 pub const TOOL_READ_URL: &str = "read_url";
 pub const TOOL_LIST_NOTES: &str = "list_notes";
 pub const TOOL_READ_NOTE: &str = "read_note";
@@ -131,7 +132,12 @@ const UNITS_PER_FILE: usize = 3;
 /// Cap on simultaneous thread folder scopes (each prefix is a separate index search).
 pub const MAX_THREAD_SCOPES: usize = 8;
 
-pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> Value {
+pub fn tools_schema(
+    web_search: bool,
+    remote_index: bool,
+    remote_only: bool,
+    look_image: bool,
+) -> Value {
     let mut search_desc = if remote_only && web_search {
         "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
@@ -292,6 +298,24 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
             }
         }),
     ];
+    if look_image {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": TOOL_LOOK_IMAGE,
+                "description": "添付画像の書き起こしでは足りないとき、その画像をもう一度見る。画素を送るのはこの呼び出しだけ。結果は文章で会話に残る。cite_no は出典番号 [n]。複数ページは page にページ番号。focus に確認したい点（矢印の接続、続柄、表の行と列など）を書く。画像を読めないときは失敗するので、書き起こしだけを根拠にする。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cite_no": { "type": "integer", "description": "出典番号 [n]。画像が1件なら省略できる。" },
+                        "page": { "type": "integer", "description": "複数ページのスキャンのページ番号。1ページなら省略できる。" },
+                        "focus": { "type": "string", "description": "確認したい点。矢印の接続、続柄、表の行と列など。" }
+                    },
+                    "required": ["focus"]
+                }
+            }
+        }));
+    }
     if web_search {
         tools.push(json!({
             "type": "function",
@@ -462,7 +486,7 @@ pub struct ToolExec {
 }
 
 impl ToolExec {
-    fn text(content: impl Into<String>) -> Self {
+    pub(crate) fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             consumed: Vec::new(),
@@ -728,6 +752,198 @@ pub fn format_search_date_system_line(mail_days_back: u32) -> String {
 
 pub fn format_web_search_system_line() -> String {
     "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。添付出典とインデックスを優先してください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_index を呼んでください。".into()
+}
+
+pub fn thread_has_relook_image(sources: &[crate::db::LlmSourceRow]) -> bool {
+    sources
+        .iter()
+        .any(|row| row.is_image() && !row.stored_relpath.trim().is_empty())
+}
+
+pub fn format_look_image_system_line() -> String {
+    "\n添付画像の画素は会話に入っていない。入っているのは書き起こしだけである。書き起こしで足りないとき（矢印や線の接続、続柄、婚姻、死亡、相続、表の行と列）は look_image を呼ぶ。cite_no は出典番号、複数ページは page、focus は確認したい点。画像を送るのはその呼び出しだけ。見返せないときは書き起こしだけを根拠にして答える。".into()
+}
+
+pub fn format_look_image_answer(label: &str, answer: &str) -> String {
+    let answer = answer.trim();
+    let label = label.trim();
+    if label.is_empty() {
+        return answer.to_string();
+    }
+    format!("{label}\n{answer}")
+}
+
+/// Tool text when the re-look itself fails. The chat keeps going from the pre-read.
+pub fn look_image_failure(error: &str) -> String {
+    let error = error.trim();
+    let base = if error == crate::llm::http_error::VISION_UNSUPPORTED_ERROR {
+        crate::llm::http_error::VISION_UNSUPPORTED_ERROR.to_string()
+    } else if error.is_empty() {
+        "画像を見返せませんでした。".to_string()
+    } else {
+        error.to_string()
+    };
+    if base.contains("書き起こしだけ") {
+        return base;
+    }
+    format!("{base} 書き起こしだけを根拠にして答えてください。")
+}
+
+#[derive(Debug)]
+pub struct LookImageTarget {
+    pub source_id: String,
+    pub focus: String,
+    pub label: String,
+}
+
+/// Pick one stored image. Does not read pixels.
+pub fn resolve_look_image(
+    sources: &[crate::db::LlmSourceRow],
+    args: &Value,
+) -> Result<LookImageTarget, String> {
+    let focus = args
+        .get("focus")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if focus.is_empty() {
+        return Err("focus に、確認したい点を書いてください。".into());
+    }
+    let images: Vec<&crate::db::LlmSourceRow> = sources
+        .iter()
+        .filter(|row| row.is_image() && !row.stored_relpath.trim().is_empty())
+        .collect();
+    if images.is_empty() {
+        return Err("見返せる添付画像がありません。".into());
+    }
+    let chosen_cite = match arg_i64(args.get("cite_no")).filter(|n| *n > 0) {
+        Some(n) => n,
+        None => {
+            let mut cites: Vec<i64> = images
+                .iter()
+                .map(|row| row.cite_no)
+                .filter(|n| *n > 0)
+                .collect();
+            cites.sort_unstable();
+            cites.dedup();
+            if cites.len() == 1 {
+                cites[0]
+            } else {
+                return Err(format!(
+                    "cite_no に出典番号を指定してください。{}",
+                    image_choice_line(&images)
+                ));
+            }
+        }
+    };
+    let mut rows: Vec<crate::db::LlmSourceRow> = images
+        .iter()
+        .filter(|row| row.cite_no == chosen_cite)
+        .map(|row| (*row).clone())
+        .collect();
+    if rows.is_empty() {
+        return Err(format!(
+            "出典 [{chosen_cite}] は見返せる画像ではありません。"
+        ));
+    }
+    crate::llm::transcript::sort_image_pages(&mut rows);
+    let page = arg_i64(args.get("page")).filter(|n| *n > 0);
+    let row = if rows.len() == 1 {
+        let only = &rows[0];
+        if let Some(want) = page {
+            match crate::llm::transcript::parse_pdf_page_no(&only.paragraph_id) {
+                Some(have) if i64::from(have) == want => only.clone(),
+                Some(_) => {
+                    return Err(format!(
+                        "出典 [{chosen_cite}] に {want} ページ目はありません。{}",
+                        page_list(&rows)
+                    ));
+                }
+                None => only.clone(),
+            }
+        } else {
+            only.clone()
+        }
+    } else if let Some(want) = page {
+        rows.iter()
+            .find(|row| {
+                crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id)
+                    .is_some_and(|n| i64::from(n) == want)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "出典 [{chosen_cite}] に {want} ページ目はありません。{}",
+                    page_list(&rows)
+                )
+            })?
+    } else {
+        return Err(format!(
+            "出典 [{chosen_cite}] は複数ページです。page にページ番号を指定してください。{}",
+            page_list(&rows)
+        ));
+    };
+    Ok(LookImageTarget {
+        source_id: row.id.clone(),
+        focus: focus.to_string(),
+        label: look_label(chosen_cite, &row),
+    })
+}
+
+fn look_label(cite: i64, row: &crate::db::LlmSourceRow) -> String {
+    let name = if row.title.trim().is_empty() {
+        row.path.trim()
+    } else {
+        row.title.trim()
+    };
+    let name = if name.is_empty() {
+        "添付画像"
+    } else {
+        name
+    };
+    match crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id) {
+        Some(page) => format!("[{cite}] {name} {page}ページ目を見返した結果"),
+        None => format!("[{cite}] {name}を見返した結果"),
+    }
+}
+
+fn image_choice_line(rows: &[&crate::db::LlmSourceRow]) -> String {
+    let mut seen = HashSet::new();
+    let mut parts = Vec::new();
+    for row in rows {
+        if row.cite_no <= 0 || !seen.insert(row.cite_no) {
+            continue;
+        }
+        let name = if row.title.trim().is_empty() {
+            row.path.trim()
+        } else {
+            row.title.trim()
+        };
+        let name = if name.is_empty() {
+            "添付画像"
+        } else {
+            name
+        };
+        parts.push(format!("[{}] {name}", row.cite_no));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join("、"))
+    }
+}
+
+fn page_list(rows: &[crate::db::LlmSourceRow]) -> String {
+    let pages: Vec<String> = rows
+        .iter()
+        .filter_map(|row| crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id))
+        .map(|n| n.to_string())
+        .collect();
+    if pages.is_empty() {
+        String::new()
+    } else {
+        format!("ページ: {}", pages.join("、"))
+    }
 }
 
 pub fn format_remote_index_system_line() -> String {
@@ -2309,9 +2525,7 @@ fn tool_law_article(state: &AppState, args: &Value) -> ToolExec {
         .enabled
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return ToolExec::text(
-            "法令DBは起動時に準備できなかったため、条文を確認できません。",
-        );
+        return ToolExec::text("法令DBは起動時に準備できなかったため、条文を確認できません。");
     }
     let mut queries = Vec::new();
     if let Some(list) = args.get("articles").and_then(|v| v.as_array()) {
@@ -3236,7 +3450,7 @@ mod tests {
             empty_hit_subject(false, Some(REMOTE_DATE_UNSUPPORTED)),
             "このPCの索引"
         );
-        let schema = tools_schema(false, true, true).to_string();
+        let schema = tools_schema(false, true, true, false).to_string();
         assert!(schema.contains("別PCの共有ファイルだけ"));
         assert!(!schema.contains("（ファイルとメール）"));
         assert!(!schema.contains("メールと送信者はこのPCだけ"));
@@ -3328,7 +3542,7 @@ mod tests {
 
     #[test]
     fn read_unit_schema_accepts_a_citation_number() {
-        let schema = tools_schema(false, false, false).to_string();
+        let schema = tools_schema(false, false, false, false).to_string();
         assert!(schema.contains("cite_no"), "{schema}");
         assert!(schema.contains("既読"), "{schema}");
         assert!(schema.contains("articles"), "{schema}");
@@ -4410,11 +4624,118 @@ mod tests {
     }
 
     #[test]
+    fn look_image_is_offered_only_for_a_stored_image_and_counts_as_a_round() {
+        let plain = tools_schema(false, false, false, false);
+        let with = tools_schema(false, false, false, true);
+        assert!(!plain.to_string().contains(TOOL_LOOK_IMAGE));
+        let offered = with.to_string();
+        assert!(offered.contains(TOOL_LOOK_IMAGE), "{offered}");
+        assert!(
+            offered.contains("画素を送るのはこの呼び出しだけ"),
+            "{offered}"
+        );
+        assert!(offered.contains("focus"), "{offered}");
+        assert!(
+            crate::llm::context::tool_schema_tokens(&with)
+                > crate::llm::context::tool_schema_tokens(&plain)
+        );
+        assert!(counts_toward_tool_round(&[TOOL_LOOK_IMAGE]));
+        assert!(!counts_toward_tool_round(&[TOOL_LAW]));
+        assert!(!thread_has_relook_image(&[]));
+        let mut text = source_row("text", r"C:\a.txt", 1);
+        text.stored_relpath.clear();
+        assert!(!thread_has_relook_image(std::slice::from_ref(&text)));
+        let image = stored_image("img", 2, "戸籍.png", None);
+        assert!(thread_has_relook_image(std::slice::from_ref(&image)));
+        let line = format_look_image_system_line();
+        assert!(line.contains("look_image"), "{line}");
+        assert!(line.contains("書き起こしだけ"), "{line}");
+        assert!(line.contains("その呼び出しだけ"), "{line}");
+    }
+
+    #[test]
+    fn look_image_picks_one_page_and_does_not_guess_a_missing_image() {
+        let single = vec![stored_image("a", 3, "戸籍.png", None)];
+        let target = resolve_look_image(&single, &json!({"focus": "続柄"})).unwrap();
+        assert_eq!(target.source_id, "a");
+        assert_eq!(target.focus, "続柄");
+        assert!(target.label.contains("[3]"), "{}", target.label);
+        assert!(target.label.contains("戸籍.png"), "{}", target.label);
+        let answer = format_look_image_answer(&target.label, "父と子。");
+        assert!(answer.contains("父と子。"), "{answer}");
+        assert!(!answer.contains("image_url"), "{answer}");
+
+        let pages = vec![
+            stored_image("p1", 4, "相続関係図.pdf", Some(1)),
+            stored_image("p2", 4, "相続関係図.pdf", Some(2)),
+        ];
+        let need_page = resolve_look_image(&pages, &json!({"focus": "矢印"})).unwrap_err();
+        assert!(need_page.contains("page"), "{need_page}");
+        let page = resolve_look_image(
+            &pages,
+            &json!({"cite_no": "4", "page": 2, "focus": "矢印の接続"}),
+        )
+        .unwrap();
+        assert_eq!(page.source_id, "p2");
+        assert!(page.label.contains("2ページ目"), "{}", page.label);
+        let missing =
+            resolve_look_image(&pages, &json!({"cite_no": 4, "page": 9, "focus": "矢印"}))
+                .unwrap_err();
+        assert!(missing.contains("9"), "{missing}");
+        assert!(
+            resolve_look_image(&pages, &json!({"cite_no": 4, "page": 1})).is_err(),
+            "focus is required"
+        );
+
+        let two = vec![
+            stored_image("a", 1, "戸籍.png", None),
+            stored_image("b", 2, "関係図.png", None),
+        ];
+        let which = resolve_look_image(&two, &json!({"focus": "続柄"})).unwrap_err();
+        assert!(which.contains("[1]"), "{which}");
+        assert!(which.contains("[2]"), "{which}");
+        let not_image =
+            resolve_look_image(&two, &json!({"cite_no": 9, "focus": "続柄"})).unwrap_err();
+        assert!(not_image.contains("見返せ"), "{not_image}");
+
+        let mut bare = stored_image("bare", 5, "空.png", None);
+        bare.stored_relpath.clear();
+        assert!(
+            resolve_look_image(std::slice::from_ref(&bare), &json!({"focus": "文字"}))
+                .unwrap_err()
+                .contains("見返せ")
+        );
+
+        let failure = look_image_failure(crate::llm::http_error::VISION_UNSUPPORTED_ERROR);
+        assert!(failure.contains("画像を読めません"), "{failure}");
+        assert!(failure.contains("書き起こしだけを根拠にして"), "{failure}");
+        assert!(!failure.contains("image input"), "{failure}");
+        let down =
+            look_image_failure("LLM サーバに接続できません。起動と URL を確認してください。");
+        assert!(down.contains("接続できません"), "{down}");
+        assert!(down.contains("書き起こしだけ"), "{down}");
+        assert!(!down.contains("sk-live"), "{down}");
+    }
+
+    fn stored_image(id: &str, cite: i64, title: &str, page: Option<u32>) -> LlmSourceRow {
+        let mut row = source_row("image", title, cite);
+        row.id = id.into();
+        row.title = title.into();
+        row.path = title.into();
+        row.stored_relpath = format!("chat-files/t/{id}.png");
+        row.origin = "attach".into();
+        row.paragraph_id = page.map(|n| format!("pdf-page:{n}")).unwrap_or_default();
+        row.body = "書き起こし".into();
+        row.grain = "file".into();
+        row
+    }
+
+    #[test]
     fn tools_schema_mentions_web_only_when_enabled() {
-        let off = tools_schema(false, false, false).to_string();
+        let off = tools_schema(false, false, false, false).to_string();
         assert!(!off.contains("公開ウェブも同時に検索"));
         assert!(!off.contains("（リモート）"));
-        assert!(tools_schema(false, true, false)
+        assert!(tools_schema(false, true, false, false)
             .to_string()
             .contains("（リモート）"));
         assert!(!off.contains(TOOL_READ_URL));
@@ -4443,7 +4764,7 @@ mod tests {
         assert_eq!(read_urls, 0);
         assert_eq!(12.min(MAX_LAW_ARTICLES), MAX_LAW_ARTICLES);
         assert!(law_call_limit_message().contains("10回"));
-        let on = tools_schema(true, false, false).to_string();
+        let on = tools_schema(true, false, false, false).to_string();
         assert!(on.contains("公開ウェブも同時に検索"));
         assert!(on.contains(TOOL_READ_URL));
         assert!(on.contains("read_url"));
