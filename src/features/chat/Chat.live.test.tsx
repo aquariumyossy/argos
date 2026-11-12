@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Chat from "./Chat";
+import { PASTE_WHILE_GENERATING, PASTE_WHILE_READING } from "./pasteImage";
 import { contextMeterLabel, contextMeterLimit } from "./contextEstimate";
 
 type Handler = (event: { payload: unknown }) => void;
@@ -98,6 +99,7 @@ const messagesB = [
 
 let messagesA: Array<typeof originalUser & { reasoning?: string }> = [originalUser];
 let sourcesA: Array<Record<string, unknown>> = [];
+let pastedAttachResult: Record<string, unknown> | null = null;
 let releaseSend: () => void = () => {};
 
 const meterLimit = contextMeterLimit(131_072);
@@ -236,6 +238,7 @@ beforeEach(() => {
   vi.stubGlobal("ResizeObserver", ContentResizeObserver);
   messagesA = [originalUser];
   sourcesA = [];
+  pastedAttachResult = null;
   releaseSend = () => {};
   listeners.clear();
   mockWriteText.mockReset();
@@ -283,6 +286,8 @@ beforeEach(() => {
       }
       case "llm_context_meter":
         return args?.threadId === threadB.id ? 1111 : 2222;
+      case "llm_attach_pasted_image":
+        return pastedAttachResult;
       case "llm_send": {
         const content = String(args?.content ?? "");
         return new Promise((resolve) => {
@@ -1241,12 +1246,12 @@ describe("Ctrl+Alt+C", () => {
       const during = screen.getByPlaceholderText(
         COMPOSER_PLACEHOLDER,
       ) as HTMLTextAreaElement;
-      expect(during.disabled).toBe(true);
+      expect(during.disabled).toBe(false);
       const handler = await shortcutHandler();
       await act(async () => {
         handler({ payload: { threadId: "thread-a" } });
       });
-      expect(document.activeElement).not.toBe(during);
+      expect(document.activeElement).toBe(during);
       await act(async () => {
         releaseSend();
       });
@@ -1286,5 +1291,212 @@ describe("Ctrl+Alt+C", () => {
     } finally {
       hasFocus.mockRestore();
     }
+  });
+});
+
+describe("Ctrl+V image paste", () => {
+  const pasteTitle = "貼り付け画像（2026-11-12 11時59分01秒）";
+
+  function pastedSource() {
+    return {
+      id: "paste-1",
+      threadId: threadA.id,
+      sortOrder: 0,
+      origin: "attach",
+      path: pasteTitle,
+      title: pasteTitle,
+      paragraphId: "",
+      body: "",
+      query: "",
+      createdAt: 1,
+      grain: "file",
+      kind: "image",
+      citeNo: 3,
+      ocrStatus: "pending",
+      storedRelpath: "chat-files/thread-a/paste-1.png",
+    };
+  }
+
+  it("attaches a clipboard image and leaves typed text alone", async () => {
+    pastedAttachResult = {
+      thread: threadA,
+      sources: [pastedSource()],
+      added: 1,
+      skipped: 0,
+      createdThread: false,
+      errors: [],
+      remoteOcr: true,
+      ocrStarted: false,
+      warnings: [],
+    };
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "この図の続柄は" } });
+    const file = new File([Uint8Array.from([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    });
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [file],
+        items: [],
+      },
+    });
+    expect(pasted).toBe(false);
+    expect(box.value).toBe("この図の続柄は");
+    const chips = await screen.findAllByRole("button", {
+      name: /貼り付け画像（2026-11-12 11時59分01秒）/,
+    });
+    expect(chips.some((button) => button.textContent?.includes(pasteTitle))).toBe(true);
+    expect(screen.getByText("画像は設定中の LLM サーバへ送られます")).toBeTruthy();
+    const call = mockInvoke.mock.calls.find((entry) => entry[0] === "llm_attach_pasted_image");
+    expect(call?.[1]).toEqual(
+      expect.objectContaining({
+        mime: "image/png",
+        threadId: "thread-a",
+        dataBase64: btoa(String.fromCharCode(137, 80, 78, 71)),
+      }),
+    );
+  });
+
+  it("pastes plain text without attaching an image", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [],
+        items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
+        getData: (type: string) => (type === "text/plain" ? "条文を見て" : ""),
+      },
+    });
+    expect(pasted).toBe(true);
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+  });
+
+  function screenshot() {
+    return new File([Uint8Array.from([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    });
+  }
+
+  it("pastes cell text when the clipboard also holds a picture", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "下に" } });
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [screenshot()],
+        items: [],
+        getData: (type: string) => (type === "text/plain" ? "甲の住所" : "<table><td>甲の住所</td></table>"),
+      },
+    });
+    expect(pasted).toBe(true);
+    expect(box.value).toBe("下に");
+    expect(box.disabled).toBe(false);
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+  });
+
+  it("attaches a browser copy-image even when the plain text is the address", async () => {
+    pastedAttachResult = {
+      thread: threadA,
+      sources: [pastedSource()],
+      added: 1,
+      skipped: 0,
+      createdThread: false,
+      errors: [],
+      remoteOcr: false,
+      ocrStarted: false,
+      warnings: [],
+    };
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [screenshot()],
+        items: [],
+        getData: (type: string) =>
+          type === "text/plain"
+            ? "https://example.com/koseki.png"
+            : '<img src="https://example.com/koseki.png" alt="戸籍"/>',
+      },
+    });
+    expect(pasted).toBe(false);
+    await screen.findAllByRole("button", {
+      name: /貼り付け画像（2026-11-12 11時59分01秒）/,
+    });
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      true,
+    );
+  });
+
+  it("says to retry a screenshot that arrives during pre-read and leaves the composer open", async () => {
+    await renderChat();
+    await vi.waitFor(() => {
+      if (!listeners.get("llm-ocr-status")) throw new Error("ocr listener missing");
+    });
+    const onOcr = listeners.get("llm-ocr-status");
+    await act(async () => {
+      onOcr?.({ payload: { threadId: threadA.id, active: true } });
+    });
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(false);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: { files: [screenshot()], items: [], getData: () => "" },
+    });
+    expect(pasted).toBe(false);
+    expect(screen.getByText(PASTE_WHILE_READING)).toBeTruthy();
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+    fireEvent.change(box, { target: { value: "終わってから聞く" } });
+    expect(box.value).toBe("終わってから聞く");
+    expect(box.disabled).toBe(false);
+  });
+
+  it("says generation is the reason a screenshot cannot be attached", async () => {
+    await renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "再送" }));
+    await screen.findByText("生成中…");
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(false);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: { files: [screenshot()], items: [], getData: () => "" },
+    });
+    expect(pasted).toBe(false);
+    expect(screen.getByText(PASTE_WHILE_GENERATING)).toBeTruthy();
+    expect(screen.queryByText(PASTE_WHILE_READING)).toBeNull();
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+    const sends = sendCalls().length;
+    fireEvent.change(box, { target: { value: "生成中の下書き" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(box.disabled).toBe(false);
+    expect(box.value).toBe("生成中の下書き");
+    expect(sendCalls()).toHaveLength(sends);
+    const sendButton = screen.queryByRole("button", { name: "送信" }) as HTMLButtonElement | null;
+    expect(sendButton === null || sendButton.disabled).toBe(true);
+  });
+
+  it("rejects an image over 8MB before calling the backend", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const huge = {
+      type: "image/png",
+      size: 8 * 1024 * 1024 + 1,
+      arrayBuffer: async () => {
+        throw new Error("should not read");
+      },
+    };
+    fireEvent.paste(box, {
+      clipboardData: { files: [huge], items: [] },
+    });
+    expect(await screen.findByText("画像が大きすぎます（8 MBまで）。")).toBeTruthy();
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
   });
 });
