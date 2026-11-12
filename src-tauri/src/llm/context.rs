@@ -1042,13 +1042,14 @@ pub fn meter_question(draft: &str) -> &str {
     }
 }
 
-/// Tokens the next request spends on replayed turns, plus the tool schema.
+/// Tokens the next request spends, including the system prompt and the tool schema.
 /// `assemble_turns` applies age stubs, cited-body dedupe, tool-call name and
 /// arguments, and trimming at `message_budget`. An empty draft still appends
 /// [`METER_PLACEHOLDER_QUESTION`], so the recent window matches a real send.
-/// The system prompt is not included. Reply headroom and the tool-result
-/// allowance are not included. Callers that have a stored summary pass history
-/// already folded by `prepare_model_history`.
+/// The system turn is the prompt that would be sent, including parts added for
+/// this chat (citation guide, diagram hint, folder scope, and tool lines). Reply headroom and
+/// the tool-result allowance are not included. Callers that have a stored
+/// summary pass history already folded by `prepare_model_history`.
 pub fn meter_usage_tokens(
     system: &str,
     sources: &[LlmSourceRow],
@@ -1058,10 +1059,19 @@ pub fn meter_usage_tokens(
     message_budget: usize,
 ) -> usize {
     let history = history_including_draft(history, draft);
-    sent_usage_tokens(system, sources, &history, schema_tokens, message_budget)
+    let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
+    meter_request_tokens(&turns, schema_tokens)
 }
 
-/// Same numerator as [`meter_usage_tokens`], for a history that already contains the question.
+/// Assembled turns plus the tool schema. The system prompt is included.
+pub(crate) fn meter_request_tokens(turns: &[ChatTurn], schema_tokens: usize) -> usize {
+    turns.iter().map(turn_tokens).sum::<usize>() + schema_tokens
+}
+
+/// Replay and tool-schema tokens for a history that already contains the question.
+/// The system prompt is left out. The summary gate uses this, so a longer
+/// instruction does not by itself fold the thread. The chat meter is
+/// [`meter_usage_tokens`], which counts that prompt.
 pub fn sent_usage_tokens(
     system: &str,
     sources: &[LlmSourceRow],
@@ -5033,6 +5043,19 @@ mod tests {
             .sum()
     }
 
+    fn system_turn_tokens(turns: &[ChatTurn]) -> usize {
+        turns
+            .iter()
+            .filter(|turn| turn.role == "system")
+            .map(turn_tokens)
+            .sum()
+    }
+
+    /// Meter numerator: replayed turns, the system prompt, and the tool schema.
+    fn meter_tokens(turns: &[ChatTurn], schema: usize) -> usize {
+        conversation_tokens(turns) + system_turn_tokens(turns) + schema
+    }
+
     /// The pre-fix meter: every message, the full tool-call JSON, and every source
     /// body, with no age stub and no cite dedupe.
     fn naive_meter_tokens(
@@ -5051,6 +5074,70 @@ mod tests {
             total += estimate_tokens(&source.body) + estimate_tokens(&source.title);
         }
         total
+    }
+
+    #[test]
+    fn meter_counts_the_system_prompt_assemble_would_send() {
+        let schema = 100;
+        let budget = 80_000;
+        let draft = "質問です";
+        let short = "役割";
+        let long =
+            format!("{short}\n図は mermaid フェンス（言語タグ mermaid）で1本出してください。");
+        let short_used = meter_usage_tokens(short, &[], &[], draft, schema, budget);
+        let long_used = meter_usage_tokens(&long, &[], &[], draft, schema, budget);
+        let short_history = history_with_question(&[], draft);
+        let (short_turns, _) = assemble_turns(short, &[], &short_history, budget);
+        let (long_turns, _) = assemble_turns(&long, &[], &short_history, budget);
+        let short_system = system_turn_tokens(&short_turns);
+        let long_system = system_turn_tokens(&long_turns);
+        assert!(short_system > 0);
+        assert!(long_system > short_system);
+        assert_eq!(long_used - short_used, long_system - short_system);
+        assert_eq!(short_turns[0].content, short);
+        assert_eq!(short_used, meter_tokens(&short_turns, schema));
+
+        let gate = sent_usage_tokens(short, &[], &short_history, schema, budget);
+        let gate_long = sent_usage_tokens(&long, &[], &short_history, schema, budget);
+        assert_eq!(
+            gate, gate_long,
+            "the summary gate ignores the instruction text"
+        );
+        assert_eq!(short_used, gate + short_system);
+
+        let bare = meter_usage_tokens("", &[], &[], draft, schema, budget);
+        let (bare_turns, _) = assemble_turns("", &[], &short_history, budget);
+        assert!(bare_turns.iter().all(|turn| turn.role != "system"));
+        assert_eq!(
+            bare,
+            sent_usage_tokens("", &[], &short_history, schema, budget)
+        );
+
+        let mut file = src_file("f1", "attach", 0, "条項本文");
+        file.path = r"C:\docs\契約.txt".into();
+        file.title = "契約.txt".into();
+        let sources = [file];
+        let with_sources = meter_usage_tokens(short, &sources, &[], draft, schema, budget);
+        let (turns, _) = assemble_turns(short, &sources, &short_history, budget);
+        let system = turns.iter().find(|turn| turn.role == "system").unwrap();
+        assert!(system.content.starts_with(short));
+        assert!(
+            system.content.contains(CITATION_GUIDE.trim()),
+            "sources append the citation guide onto the sent prompt"
+        );
+        assert!(!short.contains("[n]"));
+        assert_eq!(with_sources, meter_tokens(&turns, schema));
+        assert!(system_turn_tokens(&turns) > short_system);
+
+        let already = "根拠箇所には [n] を付けてください。";
+        let (guided, _) = assemble_turns(already, &sources, &short_history, budget);
+        let guided_system = guided.iter().find(|turn| turn.role == "system").unwrap();
+        assert_eq!(guided_system.content, already);
+        assert!(!guided_system.content.contains(CITATION_GUIDE.trim()));
+        assert_eq!(
+            meter_usage_tokens(already, &sources, &[], draft, schema, budget),
+            meter_tokens(&guided, schema)
+        );
     }
 
     #[test]
@@ -5081,9 +5168,10 @@ mod tests {
             &history_with_question(&history, ""),
             budget,
         );
-        let assembled = conversation_tokens(&turns) + schema;
+        let assembled = meter_tokens(&turns, schema);
         let naive = naive_meter_tokens(&history, &sources, schema);
         assert_eq!(naive, 64_952, "the old meter counted the full attachment");
+        assert!(system_turn_tokens(&turns) > 0);
         assert_eq!(used, assembled);
         assert!(
             turns
@@ -5132,7 +5220,7 @@ mod tests {
             &history_with_question(&history, ""),
             budget,
         );
-        let assembled = conversation_tokens(&turns) + schema;
+        let assembled = meter_tokens(&turns, schema);
         let naive = naive_meter_tokens(&history, &sources, schema);
         let blob = turns
             .iter()
@@ -5148,7 +5236,7 @@ mod tests {
         let assistant_turn = turns.iter().find(|turn| turn.role == "assistant").unwrap();
         assert!(turn_tokens(assistant_turn) < estimate_tokens(calls) + 4);
         assert_eq!(before, 47_567);
-        assert_eq!(used, 2_499);
+        assert_eq!(used, 2_550);
         assert_eq!(naive, 92_560);
         assert_eq!(used, assembled);
         assert!(used < 62_400, "warning stays off: {used} / 78,000");
@@ -5161,15 +5249,16 @@ mod tests {
         let system = "役割";
         let empty = meter_usage_tokens(system, &[], &[], "  ", schema, budget);
         let (turns, _) = assemble_turns(system, &[], &history_with_question(&[], ""), budget);
-        assert_eq!(empty, conversation_tokens(&turns) + schema);
-        assert_eq!(empty, 2_415);
+        assert_eq!(empty, meter_tokens(&turns, schema));
+        assert_eq!(system_turn_tokens(&turns), 6);
+        assert_eq!(empty, 2_421);
 
         let draft = " 質問です ";
         let used = meter_usage_tokens(system, &[], &[], draft, schema, budget);
         let history = history_with_question(&[], draft);
         let (turns, _) = assemble_turns(system, &[], &history, budget);
-        assert_eq!(used, conversation_tokens(&turns) + schema);
-        assert_eq!(used, 2_417);
+        assert_eq!(used, meter_tokens(&turns, schema));
+        assert_eq!(used, 2_423);
     }
 
     fn history_with_question(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMessageRow> {
@@ -5189,8 +5278,7 @@ mod tests {
             conversation_tokens(&assemble_turns(system, sources, history, budget).0) + schema;
         let used = meter_usage_tokens(system, sources, history, "", schema, budget);
         let next = history_with_question(history, "");
-        let assembled =
-            conversation_tokens(&assemble_turns(system, sources, &next, budget).0) + schema;
+        let assembled = meter_tokens(&assemble_turns(system, sources, &next, budget).0, schema);
         assert_eq!(used, assembled);
         (before, used)
     }
@@ -5222,7 +5310,7 @@ mod tests {
             .filter(|turn| turn.role != "system")
             .all(|turn| !turn.content.contains(&body)));
         assert_eq!(before, 64_947);
-        assert_eq!(used, 2_485);
+        assert_eq!(used, 2_536);
         assert!(
             before > 62_400,
             "empty meter without the extra turn warned: {before}"
@@ -5261,7 +5349,7 @@ mod tests {
         let (turns, _) = assemble_turns("役割", std::slice::from_ref(&hit), &next, 200_000);
         assert!(turns.iter().all(|turn| !turn.content.contains(&body)));
         assert_eq!(before, 27_513);
-        assert_eq!(used, 2_476);
+        assert_eq!(used, 2_527);
     }
 
     #[test]
@@ -5288,7 +5376,7 @@ mod tests {
             .iter()
             .any(|turn| turn.content.contains(OLD_TOOL_STUB)));
         assert_eq!(before, 9_938);
-        assert_eq!(used, 2_453);
+        assert_eq!(used, 2_459);
     }
 
     #[test]
@@ -5310,7 +5398,7 @@ mod tests {
             );
             assert_eq!(before, 2_410);
             let chars = body.chars().count();
-            let expected = if chars == 20_000 { 14_932 } else { 64_932 };
+            let expected = if chars == 20_000 { 14_983 } else { 64_983 };
             assert_eq!(used, expected, "{chars} chars");
         }
     }
