@@ -6,6 +6,7 @@ pub mod indexer;
 pub mod llm;
 pub mod mail;
 pub mod notes_md;
+pub mod office_edit;
 pub mod pathutil;
 pub mod remote_server;
 pub mod search;

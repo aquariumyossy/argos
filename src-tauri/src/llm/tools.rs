@@ -22,6 +22,7 @@ pub const TOOL_LIST_NOTES: &str = "list_notes";
 pub const TOOL_READ_NOTE: &str = "read_note";
 pub const TOOL_CREATE_NOTE: &str = "create_note";
 pub const TOOL_WRITE_NOTE: &str = "write_note";
+pub const TOOL_EDIT_OFFICE: &str = "edit_office";
 pub const MAX_TOOL_ROUNDS: usize = 8;
 
 /// Shown alone when the no-tools final call fails or comes back empty.
@@ -362,6 +363,48 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
                     "memo": { "type": "string", "description": "新しい本文（Markdown）。全文置換ならメモ全体。" }
                 },
                 "required": ["memo"]
+            }
+        }
+    }));
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_EDIT_OFFICE,
+            "description": "添付の .docx / .xlsx を編集し、元ファイルは変えず新しいファイルを保存する。確認は取らない。書式・表・フォントは残し文字だけ変える。1回の呼び出しに編集をすべて入れる（元の添付から作り、前回の出力には重ねない）。.doc と .xls は対象外。\
+replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・コメント・変更履歴の文字（複数のランに分かれた名前を含む）。履歴としては記録しない。Excel は全シートのセルとシート名。\
+paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
+cite_no は出典 [n]。添付が1件なら省略できる。filename か path でも指定できる。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cite_no": { "type": "integer", "description": "添付の出典番号 [n]。添付が1件なら省略できる。" },
+                    "filename": { "type": "string", "description": "添付ファイル名。.docx か .xlsx。" },
+                    "path": { "type": "string", "description": "出典に書かれたフルパス。この会話の添付だけ。" },
+                    "replacements": {
+                        "type": "array",
+                        "description": "文字列置換。find を replace にすべて置き換える。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "find": { "type": "string" },
+                                "replace": { "type": "string" }
+                            },
+                            "required": ["find", "replace"]
+                        }
+                    },
+                    "paragraphs": {
+                        "type": "array",
+                        "description": "段落（Excel はセル）の書き換え。match を含む段落を text にする。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "match": { "type": "string" },
+                                "text": { "type": "string" }
+                            },
+                            "required": ["match", "text"]
+                        }
+                    }
+                }
             }
         }
     }));
@@ -2801,6 +2844,9 @@ fn execute_tool_inner(
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
         TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
+        TOOL_EDIT_OFFICE => Ok(ToolExec::text(crate::office_edit::edit_from_tool(
+            state, thread_id, &args,
+        ))),
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),
             consumed: Vec::new(),
@@ -4730,5 +4776,15 @@ mod tests {
     fn topical_query_sender_only_is_empty() {
         assert_eq!(topical_query("Aさん", Some("Aさん")), "");
         assert_eq!(topical_query("「Aさん」のメール", Some("Aさん")), "");
+    }
+
+    #[test]
+    fn edit_office_is_offered_and_counts_as_a_round() {
+        let schema = tools_schema(false, false, false).to_string();
+        assert!(schema.contains(TOOL_EDIT_OFFICE), "{schema}");
+        assert!(schema.contains("確認は取らない"), "{schema}");
+        assert!(schema.contains("変更履歴"), "{schema}");
+        assert!(counts_toward_tool_round(&[TOOL_EDIT_OFFICE]));
+        assert!(!counts_toward_tool_round(&[TOOL_LAW]));
     }
 }

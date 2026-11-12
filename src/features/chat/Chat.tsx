@@ -37,6 +37,7 @@ import {
   shortcutInputLocked,
 } from "./chatShortcut";
 import { useChatContextMeter } from "./useChatContextMeter";
+import { officeOutputLink } from "./officeOutput";
 import { shouldRestoreDraft } from "./refusedSend";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
@@ -1422,6 +1423,16 @@ export default function Chat() {
     }
   }
 
+  async function openOfficeOutput(path: string) {
+    const target = path.trim();
+    if (!target) return;
+    try {
+      await invoke("open_hit", { path: target });
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
   async function openSource(s: LlmSourceRow) {
     const path = s.path.trim();
     if (!path) return;
@@ -2150,6 +2161,7 @@ export default function Chat() {
               const citeGroups = groupSources(cites);
               const citeInfo = openableCitesFromGroups(citeGroups);
               const calls = toolCallNames(m.toolCalls);
+              const office = m.role === "tool" ? officeOutputLink(m.content) : null;
               const isNotice = m.kind === "notice";
               const roleClass =
                 m.role === "user"
@@ -2169,10 +2181,31 @@ export default function Chat() {
                     </details>
                   ) : null}
                   {m.role === "tool" ? (
-                    <details className="chat-thinking">
-                      <summary>{(m.toolName ?? "").trim() || "操作"} の結果</summary>
-                      <div className="chat-thinking-body">{m.content}</div>
-                    </details>
+                    <>
+                      <details className="chat-thinking">
+                        <summary>{(m.toolName ?? "").trim() || "操作"} の結果</summary>
+                        <div className="chat-thinking-body">{m.content}</div>
+                      </details>
+                      {office ? (
+                        <div className="chat-office-out">
+                          <button
+                            type="button"
+                            className="chat-cite-badge clickable"
+                            title={office.path}
+                            onClick={() => void openOfficeOutput(office.path)}
+                          >
+                            {office.name}
+                          </button>
+                          {office.leftovers.length > 0 ? (
+                            <div className="chat-office-left">
+                              {office.leftovers.map((line, index) => (
+                                <div key={`${index}:${line}`}>{line}</div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </>
                   ) : m.role === "assistant" ? (
                     <>
                       {calls.length > 0 ? (
