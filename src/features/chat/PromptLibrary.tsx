@@ -10,6 +10,7 @@ import {
   saveWasTooLong,
   titleFromBody,
 } from "./savedPrompts";
+import { isImeEnter } from "./imeEnter";
 
 type LibraryMode = "list" | "name" | "confirm";
 
@@ -18,10 +19,6 @@ type PromptLibraryProps = {
   disabled: boolean;
   onRecall: (body: string) => void;
 };
-
-function isImeEnter(event: { nativeEvent: KeyboardEvent; keyCode: number }): boolean {
-  return event.nativeEvent.isComposing || event.keyCode === 229;
-}
 
 export default function PromptLibrary({ text, disabled, onRecall }: PromptLibraryProps) {
   const [open, setOpen] = useState(false);

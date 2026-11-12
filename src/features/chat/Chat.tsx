@@ -20,6 +20,7 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
+import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
 import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
 import {
@@ -2041,6 +2042,7 @@ export default function Chat() {
                       onBlur={() => void commitRename(t.id)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") {
+                          if (isImeEnter(e)) return;
                           e.preventDefault();
                           void commitRename(t.id);
                         }
@@ -2571,6 +2573,7 @@ export default function Chat() {
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
+                  if (isImeEnter(e)) return;
                   e.preventDefault();
                   void send();
                 }
