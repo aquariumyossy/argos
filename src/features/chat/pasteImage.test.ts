@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import { fileLabel } from "./sourceGroups";
 import {
   IMAGE_MAX_BYTES,
+  PASTE_WHILE_GENERATING,
+  PASTE_WHILE_READING,
   bytesToBase64,
+  chooseClipboardPaste,
   clipboardImages,
+  pasteBlockedMessage,
   pastedImageSizeError,
   pastedImageTypeError,
   type ClipboardImageFile,
@@ -55,6 +59,45 @@ describe("clipboard paste", () => {
         items: [{ kind: "file", type: "image/jpeg", getAsFile: () => fromItem }],
       }),
     ).toEqual([shot]);
+  });
+
+  it("pastes text when a picture rides along, and keeps a lone copied image", () => {
+    const shot = imageFile([9, 8, 7]);
+    const cells: ClipboardLike = {
+      files: [shot],
+      getData: (type) => {
+        if (type === "text/plain") return "売上\t12";
+        if (type === "text/html") return "<table><tr><td>売上</td><td>12</td></tr></table>";
+        return "";
+      },
+    };
+    expect(chooseClipboardPaste(cells)).toEqual({ kind: "text" });
+    const copiedImage: ClipboardLike = {
+      files: [shot],
+      getData: (type) => {
+        if (type === "text/plain") return "https://example.com/koseki.png";
+        if (type === "text/html") {
+          return "<html><body><!--StartFragment--><img src=\"https://example.com/koseki.png\" alt=\"戸籍\"/><!--EndFragment--></body></html>";
+        }
+        return "";
+      },
+    };
+    expect(chooseClipboardPaste(copiedImage)).toEqual({ kind: "image", files: [shot] });
+    expect(chooseClipboardPaste({ files: [shot], getData: () => "" })).toEqual({
+      kind: "image",
+      files: [shot],
+    });
+    expect(chooseClipboardPaste({ files: [shot], getData: () => "   " })).toEqual({
+      kind: "image",
+      files: [shot],
+    });
+  });
+
+  it("names generation separately from a pre-read", () => {
+    expect(pasteBlockedMessage(true, true)).toBe(PASTE_WHILE_GENERATING);
+    expect(pasteBlockedMessage(true, false)).toBe(PASTE_WHILE_GENERATING);
+    expect(pasteBlockedMessage(false, true)).toBe(PASTE_WHILE_READING);
+    expect(pasteBlockedMessage(false, false)).toBeNull();
   });
 
   it("uses the same 8MB limit and the paste label as a filename", () => {

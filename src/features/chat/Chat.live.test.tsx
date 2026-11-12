@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Chat from "./Chat";
+import { PASTE_WHILE_GENERATING, PASTE_WHILE_READING } from "./pasteImage";
 import { contextMeterLabel, contextMeterLimit } from "./contextEstimate";
 
 type Handler = (event: { payload: unknown }) => void;
@@ -1368,6 +1369,104 @@ describe("Ctrl+V image paste", () => {
       },
     });
     expect(pasted).toBe(true);
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+  });
+
+  function screenshot() {
+    return new File([Uint8Array.from([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    });
+  }
+
+  it("pastes cell text when the clipboard also holds a picture", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "下に" } });
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [screenshot()],
+        items: [],
+        getData: (type: string) => (type === "text/plain" ? "甲の住所" : "<table><td>甲の住所</td></table>"),
+      },
+    });
+    expect(pasted).toBe(true);
+    expect(box.value).toBe("下に");
+    expect(box.disabled).toBe(false);
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+  });
+
+  it("attaches a browser copy-image even when the plain text is the address", async () => {
+    pastedAttachResult = {
+      thread: threadA,
+      sources: [pastedSource()],
+      added: 1,
+      skipped: 0,
+      createdThread: false,
+      errors: [],
+      remoteOcr: false,
+      ocrStarted: false,
+      warnings: [],
+    };
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [screenshot()],
+        items: [],
+        getData: (type: string) =>
+          type === "text/plain"
+            ? "https://example.com/koseki.png"
+            : '<img src="https://example.com/koseki.png" alt="戸籍"/>',
+      },
+    });
+    expect(pasted).toBe(false);
+    await screen.findAllByRole("button", {
+      name: /貼り付け画像（2026-11-12 11時59分01秒）/,
+    });
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      true,
+    );
+  });
+
+  it("says to retry a screenshot that arrives during pre-read and leaves the composer open", async () => {
+    await renderChat();
+    await vi.waitFor(() => {
+      if (!listeners.get("llm-ocr-status")) throw new Error("ocr listener missing");
+    });
+    const onOcr = listeners.get("llm-ocr-status");
+    await act(async () => {
+      onOcr?.({ payload: { threadId: threadA.id, active: true } });
+    });
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(false);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: { files: [screenshot()], items: [], getData: () => "" },
+    });
+    expect(pasted).toBe(false);
+    expect(screen.getByText(PASTE_WHILE_READING)).toBeTruthy();
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+    fireEvent.change(box, { target: { value: "終わってから聞く" } });
+    expect(box.value).toBe("終わってから聞く");
+    expect(box.disabled).toBe(false);
+  });
+
+  it("says generation is the reason a screenshot cannot be attached", async () => {
+    await renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "再送" }));
+    await screen.findByText("生成中…");
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: { files: [screenshot()], items: [], getData: () => "" },
+    });
+    expect(pasted).toBe(false);
+    expect(screen.getByText(PASTE_WHILE_GENERATING)).toBeTruthy();
+    expect(screen.queryByText(PASTE_WHILE_READING)).toBeNull();
     expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
       false,
     );

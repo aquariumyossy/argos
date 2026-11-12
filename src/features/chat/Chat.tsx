@@ -41,7 +41,8 @@ import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
 import {
   bytesToBase64,
-  clipboardImages,
+  chooseClipboardPaste,
+  pasteBlockedMessage,
   pastedImageSizeError,
   pastedImageTypeError,
 } from "./pasteImage";
@@ -1576,10 +1577,18 @@ export default function Chat() {
 
   const pasteClipboardImage = useCallback(
     async (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
-      const images = clipboardImages(event.clipboardData);
-      if (images.length === 0) return;
+      const decision = chooseClipboardPaste(event.clipboardData);
+      if (decision.kind !== "image") return;
       event.preventDefault();
-      if (busyRef.current || ocrBusyRef.current || attachingRef.current) return;
+      const blocked = pasteBlockedMessage(
+        busyRef.current,
+        ocrBusyRef.current || attachingRef.current,
+      );
+      if (blocked) {
+        setNotice("");
+        setError(blocked);
+        return;
+      }
       setError("");
       setNotice("");
       setAttaching(true);
@@ -1587,7 +1596,7 @@ export default function Chat() {
       let last: LlmAttachFilesResult | null = null;
       let threadId = activeIdRef.current ?? undefined;
       try {
-        for (const image of images) {
+        for (const image of decision.files) {
           const typeError = pastedImageTypeError(image.type);
           if (typeError) {
             problems.push(typeError);
