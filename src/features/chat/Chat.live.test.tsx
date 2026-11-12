@@ -1246,12 +1246,12 @@ describe("Ctrl+Alt+C", () => {
       const during = screen.getByPlaceholderText(
         COMPOSER_PLACEHOLDER,
       ) as HTMLTextAreaElement;
-      expect(during.disabled).toBe(true);
+      expect(during.disabled).toBe(false);
       const handler = await shortcutHandler();
       await act(async () => {
         handler({ payload: { threadId: "thread-a" } });
       });
-      expect(document.activeElement).not.toBe(during);
+      expect(document.activeElement).toBe(during);
       await act(async () => {
         releaseSend();
       });
@@ -1460,7 +1460,8 @@ describe("Ctrl+V image paste", () => {
     await renderChat();
     fireEvent.click(screen.getByRole("button", { name: "再送" }));
     await screen.findByText("生成中…");
-    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    expect(box.disabled).toBe(false);
     const pasted = fireEvent.paste(box, {
       clipboardData: { files: [screenshot()], items: [], getData: () => "" },
     });
@@ -1470,6 +1471,14 @@ describe("Ctrl+V image paste", () => {
     expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
       false,
     );
+    const sends = sendCalls().length;
+    fireEvent.change(box, { target: { value: "生成中の下書き" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(box.disabled).toBe(false);
+    expect(box.value).toBe("生成中の下書き");
+    expect(sendCalls()).toHaveLength(sends);
+    const sendButton = screen.queryByRole("button", { name: "送信" }) as HTMLButtonElement | null;
+    expect(sendButton === null || sendButton.disabled).toBe(true);
   });
 
   it("rejects an image over 8MB before calling the backend", async () => {

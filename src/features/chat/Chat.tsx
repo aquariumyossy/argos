@@ -2650,7 +2650,6 @@ export default function Chat() {
               rows={3}
               value={draft}
               placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"
-              disabled={attaching || onGeneratingThread}
               onChange={(e) => setDraft(e.target.value)}
               onPaste={(e) => {
                 void pasteClipboardImage(e);
