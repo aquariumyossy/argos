@@ -5101,8 +5101,13 @@ mod tests {
 
     #[test]
     fn edit_office_is_offered_and_counts_as_a_round() {
-        let schema = tools_schema(false, false, false).to_string();
+        let schema = tools_schema(false, false, false, false).to_string();
         assert!(schema.contains(TOOL_EDIT_OFFICE), "{schema}");
+        assert!(
+            tools_schema(false, false, false, true)
+                .to_string()
+                .contains(TOOL_EDIT_OFFICE)
+        );
         assert!(schema.contains("確認は取らない"), "{schema}");
         assert!(schema.contains("変更履歴"), "{schema}");
         assert!(counts_toward_tool_round(&[TOOL_EDIT_OFFICE]));
