@@ -1770,13 +1770,7 @@ export default function Chat() {
       content: text,
       createdAt: Math.floor(Date.now() / 1000),
     };
-    // The ref is written in an effect, so a click on the first painted frame can
-    // still see null while `active` already names this thread.
-    const viewingId = activeIdRef.current ?? active?.id ?? null;
-    if (viewingId === originId) {
-      if (activeIdRef.current == null) activeIdRef.current = originId;
-      // Drop a thread load that is still in flight so it cannot erase this row.
-      contentEpoch.current += 1;
+    if (activeIdRef.current === originId) {
       setMessages((prev) => [...prev, optimistic]);
     }
     try {
