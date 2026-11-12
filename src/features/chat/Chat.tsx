@@ -40,6 +40,7 @@ import {
   shortcutInputLocked,
 } from "./chatShortcut";
 import { useChatContextMeter } from "./useChatContextMeter";
+import { editOfficeFileLink } from "./officeOutput";
 import { shouldRestoreDraft } from "./refusedSend";
 import {
   bytesToBase64,
@@ -2250,6 +2251,8 @@ export default function Chat() {
               const citeGroups = groupSources(cites);
               const citeInfo = openableCitesFromGroups(citeGroups);
               const calls = toolCallNames(m.toolCalls);
+              const office =
+                m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
               const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
               const roleClass =
@@ -2270,10 +2273,32 @@ export default function Chat() {
                     </details>
                   ) : null}
                   {m.role === "tool" ? (
-                    <details className="chat-thinking">
-                      <summary>{(m.toolName ?? "").trim() || "操作"} の結果</summary>
-                      <div className="chat-thinking-body">{m.content}</div>
-                    </details>
+                    <>
+                      <details className="chat-thinking">
+                        <summary>{(m.toolName ?? "").trim() || "操作"} の結果</summary>
+                        <div className="chat-thinking-body">{m.content}</div>
+                      </details>
+                      {office ? (
+                        <div className="chat-office-out">
+                          <button
+                            type="button"
+                            className="chat-cite-badge clickable"
+                            title={office.name}
+                            aria-label={`${office.name} を開く`}
+                            onClick={() => void openSavedFile(office.name)}
+                          >
+                            {office.name}
+                          </button>
+                          {office.leftovers.length > 0 ? (
+                            <div className="chat-office-left">
+                              {office.leftovers.map((line, index) => (
+                                <div key={`${index}:${line}`}>{line}</div>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </>
                   ) : m.role === "assistant" ? (
                     <>
                       {calls.length > 0 ? (
