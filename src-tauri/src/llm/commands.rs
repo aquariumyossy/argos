@@ -9,9 +9,10 @@ use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
     estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
-    meter_usage_tokens, parse_cited_nos, sent_usage_tokens, silent_end_notice,
-    sources_for_consumed, summary_trigger_reached, tool_schema_tokens, ChatTurn, ContextBudget,
-    PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
+    meter_request_tokens, meter_usage_tokens, parse_cited_nos, sent_usage_tokens,
+    silent_end_notice, sources_for_consumed, summary_trigger_reached, tool_schema_tokens, ChatTurn,
+    ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
+    STOP_TOOLS_HINT,
 };
 use crate::llm::summary::{self, SummaryAttempt};
 use crate::llm::tools::{self, ToolExec};
@@ -114,6 +115,77 @@ impl Drop for LlmBusyGuard {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+enum ToolRun {
+    Done(ToolExec),
+    /// The model cannot read images. The text is the existing vision error, and
+    /// later calls in this turn must not send the image again.
+    VisionUnsupported(ToolExec),
+    Cancelled,
+}
+
+async fn run_look_image(
+    state: Arc<AppState>,
+    thread_id: String,
+    arguments: String,
+    cancel: Arc<AtomicBool>,
+) -> ToolRun {
+    let args: serde_json::Value =
+        serde_json::from_str(&arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let sources = state.db.list_llm_sources(&thread_id).unwrap_or_default();
+    let target = match tools::resolve_look_image(&sources, &args) {
+        Ok(target) => target,
+        Err(message) => return ToolRun::Done(ToolExec::text(message)),
+    };
+    let Some(row) = sources.into_iter().find(|row| row.id == target.source_id) else {
+        return ToolRun::Done(ToolExec::text("見返せる添付画像がありません。"));
+    };
+    let path = match files::resolve_stored(&state.data_dir, &row.stored_relpath) {
+        Ok(path) => path,
+        Err(message) => return ToolRun::Done(ToolExec::text(message)),
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return ToolRun::Done(ToolExec::text(format!("画像を読めません（{err}）。")));
+        }
+    };
+    let mime = files::mime_for_ext(&files::file_ext(&path));
+    let settings = state.settings.read().clone();
+    let prompt = llm::look_image_prompt(&target.focus);
+    match llm::ask_vision(&settings, mime, &bytes, &prompt, cancel).await {
+        Ok(text) => ToolRun::Done(ToolExec::text(tools::format_look_image_answer(
+            &target.label,
+            &text,
+        ))),
+        Err(err) if llm::is_cancelled_error(&err) => ToolRun::Cancelled,
+        Err(err) if err == crate::llm::http_error::VISION_UNSUPPORTED_ERROR => {
+            ToolRun::VisionUnsupported(ToolExec::text(tools::look_image_failure(&err)))
+        }
+        Err(err) => ToolRun::Done(ToolExec::text(tools::look_image_failure(&err))),
+    }
+}
+
+fn push_tool_turn(
+    db: &crate::db::Db,
+    thread_id: &str,
+    turns: &mut Vec<ChatTurn>,
+    name: &str,
+    tool_call_id: &str,
+    content: String,
+) -> Result<(), String> {
+    let tool_turn = ChatTurn {
+        role: "tool".into(),
+        content,
+        name: Some(name.to_string()),
+        tool_call_id: Some(tool_call_id.to_string()),
+        tool_calls: None,
+        reasoning: None,
+    };
+    store_turn(db, thread_id, &tool_turn)?;
+    turns.push(tool_turn);
+    Ok(())
 }
 
 async fn execute_tool_off_runtime(
@@ -673,7 +745,11 @@ fn plan_chat_request(
         system.push_str(line);
     }
     let remote_only = tools::is_remote_only_thread(&thread.path_prefix);
-    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only);
+    let look_image = tools::thread_has_relook_image(sources);
+    if look_image {
+        system.push_str(&tools::format_look_image_system_line());
+    }
+    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only, look_image);
     let schema_tokens = tool_schema_tokens(&tools_schema);
     let full_limit = settings.llm_max_context_tokens as usize;
     let required = required_prompt_tokens(&system, content, sources);
@@ -844,7 +920,9 @@ async fn llm_send_inner<R: Runtime>(
     let cancel = Arc::new(AtomicBool::new(false));
     let state_arc = Arc::clone(state);
     let mut busy: Option<LlmBusyGuard> = None;
-    // Same numerator the meter reports, against 80% of the meter denominator.
+    // Summary keys off replayed turns and the tool schema, against 80% of the
+    // meter denominator. The system prompt is on the meter only, so a longer
+    // instruction does not by itself fold the thread.
     let baseline =
         summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
     let usage = sent_usage_tokens(&system, &sources, &baseline, schema_tokens, prompt_budget);
@@ -1010,6 +1088,9 @@ async fn llm_send_inner<R: Runtime>(
     let mut tool_used = 0usize;
     let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
+    // Set after a vision model rejects the image. Further look_image calls
+    // return the same text and do not send the pixels again.
+    let mut vision_blocked = false;
     let mut final_reasoning = String::new();
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
@@ -1326,8 +1407,8 @@ async fn llm_send_inner<R: Runtime>(
                     if tools::counts_toward_tool_round(&names) {
                         rounds += 1;
                     }
-                    let law_only = !names.is_empty()
-                        && names.iter().all(|name| *name == tools::TOOL_LAW);
+                    let law_only =
+                        !names.is_empty() && names.iter().all(|name| *name == tools::TOOL_LAW);
                     let tool_calls_json = serde_json::json!(out
                         .tool_calls
                         .iter()
@@ -1358,7 +1439,41 @@ async fn llm_send_inner<R: Runtime>(
                     store_turn(&state.db, &thread.id, &assistant_turn)?;
                     current_turns.push(assistant_turn);
                     let mut read_url_in_round = 0usize;
+                    let mut cancel_tools = false;
                     for tc in out.tool_calls {
+                        if cancel_tools {
+                            let content =
+                                fit_tool_text("中断しました。".into(), tool_budget, tool_used);
+                            tool_used += estimate_tokens(&content);
+                            push_tool_turn(
+                                &state.db,
+                                &thread.id,
+                                &mut current_turns,
+                                &tc.name,
+                                &tc.id,
+                                content,
+                            )?;
+                            continue;
+                        }
+                        if tc.name == tools::TOOL_LOOK_IMAGE && vision_blocked {
+                            let content = fit_tool_text(
+                                tools::look_image_failure(
+                                    crate::llm::http_error::VISION_UNSUPPORTED_ERROR,
+                                ),
+                                tool_budget,
+                                tool_used,
+                            );
+                            tool_used += estimate_tokens(&content);
+                            push_tool_turn(
+                                &state.db,
+                                &thread.id,
+                                &mut current_turns,
+                                &tc.name,
+                                &tc.id,
+                                content,
+                            )?;
+                            continue;
+                        }
                         if tc.name == tools::TOOL_LAW && law_calls >= tools::MAX_LAW_CALLS {
                             let content = fit_tool_text(
                                 tools::law_call_limit_message().to_string(),
@@ -1423,16 +1538,50 @@ async fn llm_send_inner<R: Runtime>(
                         if tc.name == tools::TOOL_READ_NOTE {
                             read_note_called = true;
                         }
-                        let exec = execute_tool_off_runtime(
-                            state_arc.clone(),
-                            thread.id.clone(),
-                            tc.name.clone(),
-                            tc.arguments.clone(),
-                            thread_scope.clone(),
-                            web_search,
-                            request_id.clone(),
-                        )
-                        .await;
+                        let run = if tc.name == tools::TOOL_LOOK_IMAGE {
+                            run_look_image(
+                                state_arc.clone(),
+                                thread.id.clone(),
+                                tc.arguments.clone(),
+                                cancel.clone(),
+                            )
+                            .await
+                        } else {
+                            ToolRun::Done(
+                                execute_tool_off_runtime(
+                                    state_arc.clone(),
+                                    thread.id.clone(),
+                                    tc.name.clone(),
+                                    tc.arguments.clone(),
+                                    thread_scope.clone(),
+                                    web_search,
+                                    request_id.clone(),
+                                )
+                                .await,
+                            )
+                        };
+                        let exec = match run {
+                            ToolRun::Cancelled => {
+                                let content =
+                                    fit_tool_text("中断しました。".into(), tool_budget, tool_used);
+                                tool_used += estimate_tokens(&content);
+                                push_tool_turn(
+                                    &state.db,
+                                    &thread.id,
+                                    &mut current_turns,
+                                    &tc.name,
+                                    &tc.id,
+                                    content,
+                                )?;
+                                cancel_tools = true;
+                                continue;
+                            }
+                            ToolRun::VisionUnsupported(exec) => {
+                                vision_blocked = true;
+                                exec
+                            }
+                            ToolRun::Done(exec) => exec,
+                        };
                         consumed.extend(exec.consumed);
                         emit_sources_updated(&app, &thread.id);
                         if let Some(nid) = exec.wrote_note_id.clone() {
@@ -1467,6 +1616,30 @@ async fn llm_send_inner<R: Runtime>(
                         };
                         store_turn(&state.db, &thread.id, &tool_turn)?;
                         current_turns.push(tool_turn);
+                    }
+                    if cancel_tools {
+                        busy.finish();
+                        kick_pending_ocr(&app, state_arc.clone());
+                        let _ = state.db.delete_uncited_tool_sources(&thread.id);
+                        emit_sources_updated(&app, &thread.id);
+                        let thread = state
+                            .db
+                            .get_llm_thread(&thread.id)
+                            .map_err(|err| err.to_string())?
+                            .unwrap_or(thread);
+                        return Ok(LlmSendResult {
+                            thread,
+                            user_message,
+                            assistant_message: None,
+                            cancelled: true,
+                            error: None,
+                            truncated,
+                            context_tokens,
+                            thinking_budget_state: budget_fields(&settings.llm_base_url).0,
+                            thinking_budget_tokens: budget_fields(&settings.llm_base_url).1,
+                            warning,
+                            note_writes: note_write_notices(state.as_ref(), &wrote_note_ids),
+                        });
                     }
                     // A law-only round does not spend the web-search budget, but it must
                     // not keep requesting the model after law_article is exhausted.
@@ -1812,7 +1985,7 @@ fn attach_thread_title(explicit: Option<&str>, items: &[LlmAttachItem]) -> Strin
     "新しい会話".into()
 }
 
-/// Size of the next request: assembled turns, without the system prompt, plus the tool schema.
+/// Size of the next request: assembled turns, including the system prompt, plus the tool schema.
 /// Runs off the UI thread. An empty draft is measured as one new question.
 #[tauri::command]
 pub async fn llm_context_meter(
@@ -1903,11 +2076,6 @@ fn file_grain_reading(
 ) -> FileGrainReading {
     let history = history_with_meter_draft(history, draft);
     let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
-    let sent: usize = turns
-        .iter()
-        .filter(|turn| turn.role != "system")
-        .map(crate::llm::context::turn_tokens)
-        .sum();
     let full = sources
         .iter()
         .find(|source| source.id == source_id)
@@ -1920,7 +2088,7 @@ fn file_grain_reading(
         .map(|turn| turn.content.as_str())
         .unwrap_or("");
     FileGrainReading {
-        tokens: sent + schema_tokens,
+        tokens: meter_request_tokens(&turns, schema_tokens),
         body_trimmed: !full.is_empty() && !latest.contains(full.as_str()),
     }
 }
@@ -2688,6 +2856,111 @@ pub fn llm_attach_files(
         return Err(msg);
     }
 
+    finish_attach(
+        &app,
+        state.inner(),
+        thread,
+        added,
+        skipped,
+        created_thread,
+        errors,
+        warnings,
+        wants_ocr,
+    )
+}
+
+fn decode_pasted_image(data_base64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let cleaned: String = data_base64.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return Err("画像ファイルが空です。".into());
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned)
+        .map_err(|_| "画像データが不正です。".to_string())
+}
+
+fn prepare_pasted_image(data_base64: &str, mime: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let bytes = decode_pasted_image(data_base64)?;
+    let ext = files::pasted_image_ext(mime)?;
+    if let Some(err) = files::image_len_error(bytes.len() as u64) {
+        return Err(err);
+    }
+    Ok((bytes, ext))
+}
+
+fn unique_paste_label(db: &crate::db::Db, thread_id: &str, base: &str) -> Result<String, String> {
+    for n in 1..50u32 {
+        let label = files::disambiguate_paste_label(base, n);
+        let exists = db
+            .find_llm_source_by_path(thread_id, &label)
+            .map_err(|e| e.to_string())?;
+        if exists.is_none() {
+            return Ok(label);
+        }
+    }
+    Ok(format!(
+        "{}-{}",
+        files::disambiguate_paste_label(base, 50),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn attach_pasted_image_bytes(
+    db: &crate::db::Db,
+    data_dir: &Path,
+    thread_id: &str,
+    bytes: &[u8],
+    ext: &str,
+    base_title: &str,
+) -> Result<AttachOutcome, String> {
+    let label = unique_paste_label(db, thread_id, base_title)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let rel = files::stored_relpath(thread_id, &id, ext);
+    files::write_bytes_into_store(data_dir, &rel, bytes)?;
+    match db.insert_llm_source_full(
+        thread_id,
+        "attach",
+        &label,
+        &label,
+        "",
+        "",
+        "",
+        "file",
+        "image",
+        &rel,
+        "pending",
+        Some(&id),
+    ) {
+        Ok((row, created)) => {
+            if row.id != id && row.stored_relpath != rel {
+                files::remove_stored(data_dir, &rel);
+            }
+            Ok(AttachOutcome {
+                created: usize::from(created),
+                skipped: usize::from(!created),
+                needs_ocr: row.is_image() && !row.is_injectable(),
+                warning: None,
+            })
+        }
+        Err(err) => {
+            files::remove_stored(data_dir, &rel);
+            Err(err.to_string())
+        }
+    }
+}
+
+fn finish_attach(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    thread: LlmThreadRow,
+    added: usize,
+    skipped: usize,
+    created_thread: bool,
+    errors: Vec<LlmAttachFileError>,
+    warnings: Vec<String>,
+    wants_ocr: bool,
+) -> Result<LlmAttachFilesResult, String> {
     let sources = state
         .db
         .list_llm_sources(&thread.id)
@@ -2697,17 +2970,14 @@ pub fn llm_attach_files(
         .get_llm_thread(&thread.id)
         .map_err(|e| e.to_string())?
         .unwrap_or(thread);
-
-    crate::show_chat(&app);
-    emit_sources_updated(&app, &thread.id);
-
+    crate::show_chat(app);
+    emit_sources_updated(app, &thread.id);
     let settings = state.settings.read().clone();
     let remote_ocr = wants_ocr && !llm::is_loopback_url(&settings.llm_base_url);
     let ocr_started = wants_ocr && !state.is_llm_busy();
     if ocr_started {
-        kick_pending_ocr(&app, state.inner().clone());
+        kick_pending_ocr(app, Arc::clone(state));
     }
-
     Ok(LlmAttachFilesResult {
         thread,
         sources,
@@ -2719,6 +2989,60 @@ pub fn llm_attach_files(
         ocr_started,
         warnings,
     })
+}
+
+#[tauri::command]
+pub fn llm_attach_pasted_image(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    data_base64: String,
+    mime: String,
+    thread_id: Option<String>,
+) -> Result<LlmAttachFilesResult, String> {
+    let (bytes, ext) = prepare_pasted_image(&data_base64, &mime)?;
+    let title = files::pasted_image_title(chrono::Local::now().naive_local());
+    let (thread, created_thread) =
+        resolve_attach_thread(state.inner(), thread_id.as_deref(), &title)?;
+    if !state.is_llm_busy() {
+        state
+            .db
+            .set_active_llm_thread_id(Some(&thread.id))
+            .map_err(|e| e.to_string())?;
+    }
+    let outcome = match attach_pasted_image_bytes(
+        &state.db,
+        &state.data_dir,
+        &thread.id,
+        &bytes,
+        ext,
+        &title,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if created_thread {
+                let _ = state.db.delete_llm_thread(&thread.id);
+                files::remove_thread_store(&state.data_dir, &thread.id);
+            }
+            return Err(err);
+        }
+    };
+    if created_thread && outcome.created == 0 {
+        let _ = state.db.delete_llm_thread(&thread.id);
+        files::remove_thread_store(&state.data_dir, &thread.id);
+        return Err("同じ出典がすでに読込前にあります。".into());
+    }
+    let warnings = outcome.warning.into_iter().collect();
+    finish_attach(
+        &app,
+        state.inner(),
+        thread,
+        outcome.created,
+        outcome.skipped,
+        created_thread,
+        Vec::new(),
+        warnings,
+        outcome.needs_ocr,
+    )
 }
 
 #[tauri::command]
@@ -3460,6 +3784,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn pasted_image_is_stored_for_the_same_pre_read_as_a_file() {
+        let (dir, db) = temp_db("paste-image");
+        let thread = db.create_llm_thread("会話", false).unwrap();
+        let png = [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let title = "貼り付け画像（2026-11-12 11時59分01秒）";
+        let outcome = attach_pasted_image_bytes(&db, &dir, &thread.id, &png, "png", title).unwrap();
+        assert_eq!(outcome.created, 1);
+        assert!(outcome.needs_ocr);
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert_eq!(sources.len(), 1);
+        let row = &sources[0];
+        assert_eq!(row.kind, "image");
+        assert_eq!(row.ocr_status, "pending");
+        assert_eq!(row.title, title);
+        assert_eq!(row.path, title);
+        assert!(row.body.is_empty());
+        assert!(row.cite_no > 0);
+        assert!(crate::llm::tools::thread_has_relook_image(&sources));
+        let stored = files::resolve_stored(&dir, &row.stored_relpath).unwrap();
+        assert_eq!(std::fs::read(&stored).unwrap(), png);
+        let again = attach_pasted_image_bytes(&db, &dir, &thread.id, &png, "png", title).unwrap();
+        assert_eq!(again.created, 1);
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_ne!(sources[0].path, sources[1].path);
+        assert!(sources[1].title.contains('・'), "{}", sources[1].title);
+        assert_ne!(sources[0].cite_no, sources[1].cite_no);
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+        let prepared = prepare_pasted_image(&encoded, "image/png").unwrap();
+        assert_eq!(prepared.0, png);
+        assert_eq!(prepared.1, "png");
+        assert!(prepare_pasted_image("@@@@", "image/png").is_err());
+        assert!(prepare_pasted_image(&encoded, "image/bmp")
+            .unwrap_err()
+            .contains("対応していない形式"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn temp_db(label: &str) -> (std::path::PathBuf, crate::db::Db) {
         let dir = std::env::temp_dir().join(format!(
             "argos-{label}-{}",
@@ -4025,7 +4389,7 @@ mod tests {
         let reading = file_grain_reading("役割", &expanded, &[], "", 2_410, budget, "f1");
         assert!(!reading.body_trimmed);
         assert_eq!(
-            reading.tokens, 64_932,
+            reading.tokens, 64_983,
             "same count as the chat meter for a pending attachment"
         );
         assert_eq!(
@@ -4099,6 +4463,261 @@ mod tests {
             large_reading.tokens,
             meter_usage_tokens("役割", &large, &history, "", 2_410, budget)
         );
+    }
+
+    struct MeterParts {
+        tokens: usize,
+        system_tokens: usize,
+        schema_tokens: usize,
+        system: String,
+    }
+
+    fn replay_tokens(parts: &MeterParts) -> usize {
+        parts.tokens - parts.system_tokens - parts.schema_tokens
+    }
+
+    fn delta(later: usize, earlier: usize) -> i64 {
+        later as i64 - earlier as i64
+    }
+
+    /// What `llm_context_meter` reports for this thread, and the system turn it counted.
+    fn meter_parts(
+        state: &std::sync::Arc<crate::state::AppState>,
+        thread_id: &str,
+        draft: &str,
+        web_search: bool,
+    ) -> MeterParts {
+        let (tokens, trimmed) = measure_context_meter(
+            std::sync::Arc::clone(state),
+            thread_id.to_string(),
+            draft.to_string(),
+            web_search,
+            None,
+        )
+        .unwrap();
+        assert!(!trimmed);
+        let settings = state.settings.read().clone();
+        let (thread, history, sources) = if thread_id.trim().is_empty() {
+            (blank_llm_thread(), Vec::new(), Vec::new())
+        } else {
+            let thread = state.db.get_llm_thread(thread_id).unwrap().unwrap();
+            let history = state.db.list_llm_messages(thread_id).unwrap();
+            let sources = state.db.list_llm_sources(thread_id).unwrap();
+            (thread, history, sources)
+        };
+        let history =
+            summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
+        let plan = plan_chat_request(
+            state,
+            &settings,
+            &thread,
+            meter_question(draft),
+            web_search,
+            &sources,
+            None,
+        );
+        assert_eq!(
+            tokens,
+            meter_usage_tokens(
+                &plan.system,
+                &sources,
+                &history,
+                draft,
+                plan.schema_tokens,
+                plan.prompt_budget,
+            )
+        );
+        let folded = history_with_meter_draft(&history, draft);
+        let (turns, _) = assemble_turns(&plan.system, &sources, &folded, plan.prompt_budget.max(1));
+        assert_eq!(tokens, meter_request_tokens(&turns, plan.schema_tokens));
+        assert_eq!(turns.iter().filter(|turn| turn.role == "system").count(), 1);
+        let system_tokens: usize = turns
+            .iter()
+            .filter(|turn| turn.role == "system")
+            .map(crate::llm::context::turn_tokens)
+            .sum();
+        let gate = sent_usage_tokens(
+            &plan.system,
+            &sources,
+            &folded,
+            plan.schema_tokens,
+            plan.prompt_budget,
+        );
+        assert_eq!(tokens, gate + system_tokens);
+        assert!(system_tokens > 0);
+        MeterParts {
+            tokens,
+            system_tokens,
+            schema_tokens: plan.schema_tokens,
+            system: turns
+                .into_iter()
+                .find(|turn| turn.role == "system")
+                .unwrap()
+                .content,
+        }
+    }
+
+    #[test]
+    fn context_meter_counts_the_system_prompt_this_chat_would_send() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-meter-system-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+            settings.searxng_url = "http://127.0.0.1:8888".into();
+            settings.search_mode = "local".into();
+            settings.mail_days_back = 45;
+            settings.llm_max_context_tokens = 131_072;
+        }
+        let created = state.db.create_llm_thread("調査", true).unwrap();
+        state
+            .db
+            .set_llm_thread_scope(&created.id, r"C:\docs\案件")
+            .unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        state
+            .db
+            .update_note_memo(&note.id, "## 請求原因\n売買代金")
+            .unwrap();
+        state.db.set_llm_thread_note(&created.id, &note.id).unwrap();
+        state
+            .db
+            .insert_llm_message(&created.id, "user", "前回の質問")
+            .unwrap();
+        state
+            .db
+            .insert_llm_source(
+                &created.id,
+                "attach",
+                r"C:\docs\契約.txt",
+                "契約.txt",
+                "p1",
+                "条項本文",
+                "",
+            )
+            .unwrap();
+
+        let draft = "質問です";
+        let baseline = meter_parts(&state, &created.id, draft, false);
+        let thread = state.db.get_llm_thread(&created.id).unwrap().unwrap();
+        let note = state.db.get_note(&note.id).unwrap().unwrap();
+        let scope = tools::format_thread_scope_system_line(&thread.path_prefix).unwrap();
+        let note_line = tools::format_note_target_system_line(&note.title, &note.memo);
+        assert!(baseline
+            .system
+            .contains("事務所の独自ルールだけを守ってください。"));
+        assert!(!baseline.system.contains("言語タグ mermaid"));
+        assert!(baseline.system.contains(scope.trim()));
+        assert!(baseline.system.contains(note_line.trim()));
+        assert!(baseline
+            .system
+            .contains(tools::format_search_date_system_line(45).trim()));
+        assert!(baseline
+            .system
+            .contains(tools::format_calendar_system_line().trim()));
+        assert!(baseline.system.contains("生のHTMLは書かないでください"));
+        assert!(baseline
+            .system
+            .contains("根拠にする条を read_unit で読み直して"));
+        assert!(baseline
+            .system
+            .contains("書いた内容はすぐメモに反映されます"));
+        assert!(baseline
+            .system
+            .contains(crate::statute::LLM_STATUTE_SENTINEL));
+        assert!(
+            baseline.system.contains("出典ブロックがあるときは"),
+            "a pending source adds the citation guide to the counted prompt"
+        );
+        assert!(!baseline.system.contains("ウェブ検索が有効です"));
+        assert!(!baseline.system.contains("別PCの共有フォルダも検索対象です"));
+
+        let diagram = meter_parts(&state, &created.id, "契約を図にして", false);
+        assert!(diagram.system.contains(llm::LLM_DIAGRAM_HINT));
+        assert!(
+            !diagram.system.contains("出典ブロックがあるときは"),
+            "the diagram hint already shows [n], so the citation guide is not added again"
+        );
+        assert!(diagram.system_tokens > baseline.system_tokens);
+        assert_eq!(diagram.schema_tokens, baseline.schema_tokens);
+
+        let fresh = meter_parts(&state, "", draft, false);
+        assert!(fresh
+            .system
+            .contains("事務所の独自ルールだけを守ってください。"));
+        assert!(!fresh.system.contains("言語タグ mermaid"));
+        assert!(!fresh.system.contains("配下に限定"));
+        assert!(!fresh.system.contains("出典ブロックがあるときは"));
+        assert!(baseline.system_tokens > fresh.system_tokens);
+
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = "短く。".into();
+        }
+        let shorter = meter_parts(&state, &created.id, draft, false);
+        assert!(shorter.system.contains("短く。"));
+        assert!(!shorter.system.contains("事務所の独自ルール"));
+        assert_eq!(shorter.schema_tokens, baseline.schema_tokens);
+        assert_eq!(replay_tokens(&shorter), replay_tokens(&baseline));
+        assert!(baseline.tokens > shorter.tokens);
+        assert_eq!(
+            baseline.tokens - shorter.tokens,
+            baseline.system_tokens - shorter.system_tokens
+        );
+
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+        }
+        let restored = meter_parts(&state, &created.id, draft, false);
+        assert_eq!(restored.tokens, baseline.tokens);
+
+        let web = meter_parts(&state, &created.id, draft, true);
+        assert!(web.system.contains("ウェブ検索が有効です"));
+        assert_ne!(web.schema_tokens, restored.schema_tokens);
+        assert_eq!(replay_tokens(&web), replay_tokens(&restored));
+        assert_eq!(
+            delta(web.tokens, restored.tokens),
+            delta(web.system_tokens, restored.system_tokens)
+                + delta(web.schema_tokens, restored.schema_tokens)
+        );
+
+        {
+            let mut settings = state.settings.write();
+            settings.search_mode = "hybrid".into();
+        }
+        let hybrid = meter_parts(&state, &created.id, draft, true);
+        assert!(hybrid.system.contains("別PCの共有フォルダも検索対象です"));
+        assert_eq!(replay_tokens(&hybrid), replay_tokens(&web));
+        assert_eq!(
+            delta(hybrid.tokens, web.tokens),
+            delta(hybrid.system_tokens, web.system_tokens)
+                + delta(hybrid.schema_tokens, web.schema_tokens)
+        );
+        assert!(hybrid.tokens > web.tokens);
+
+        state.db.set_llm_thread_scope(&created.id, "").unwrap();
+        let unscoped = meter_parts(&state, &created.id, draft, true);
+        assert!(!unscoped.system.contains("配下に限定"));
+        assert_eq!(unscoped.schema_tokens, hybrid.schema_tokens);
+        assert_eq!(replay_tokens(&unscoped), replay_tokens(&hybrid));
+        assert_eq!(
+            delta(hybrid.tokens, unscoped.tokens),
+            delta(hybrid.system_tokens, unscoped.system_tokens)
+        );
+
+        let plain = meter_parts(&state, &created.id, "見て", true);
+        assert!(!plain.system.contains("言語タグ mermaid"));
+        assert!(plain.system.contains("ウェブ検索が有効です"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn cut_then_answer(tools: bool, body: &str) -> (llm::thinking::CutHold, Option<RecoveredCut>) {

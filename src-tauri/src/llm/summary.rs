@@ -830,12 +830,13 @@ mod tests {
         let mut with_draft = prepared.clone();
         with_draft.push(msg("draft", "user", draft));
         let (turns, stats) = assemble_turns("役割", &sources, &with_draft, budget);
-        let assembled = turns
-            .iter()
-            .filter(|turn| turn.role != "system")
-            .map(turn_tokens)
-            .sum::<usize>()
-            + schema;
+        let assembled = turns.iter().map(turn_tokens).sum::<usize>() + schema;
+        let system = turns.iter().find(|turn| turn.role == "system").unwrap();
+        assert!(system.content.contains("役割"));
+        assert!(
+            system.content.contains("[n]"),
+            "the citation guide is part of the counted prompt"
+        );
         assert_eq!(used, assembled);
         let blob = turns
             .iter()

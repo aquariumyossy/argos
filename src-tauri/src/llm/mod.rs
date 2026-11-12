@@ -996,8 +996,29 @@ pub async fn refresh_thinking_budget(
     thinking::known_budget_for(&base)
 }
 
-const OCR_PROMPT: &str =
-    "この画像に書かれている文字を、見えるとおり書き起こしてください。表や図は簡潔に説明してください。読み取れない箇所は「（判読不能）」としてください。画像にない条文・事実・日付を推測で補わないでください。";
+const OCR_PROMPT: &str = "\
+この画像を、次の2つに分けて書き起こしてください。戸籍謄本や相続関係図のように、文字と図・表が一緒にある資料を想定しています。
+
+## 画像に書かれている文字
+見える文字を、見えるとおり書き起こしてください。表は、どの行がどの列に対応するか分かるように書いてください。読み取れない箇所は「（判読不能）」としてください。
+
+## 図・表から読み取れること
+図や表の配置から読み取れる関係を書いてください。人物の続柄、婚姻、死亡、相続、矢印や線が何と何をつないでいるか、表の行と列の対応を含みます。
+画像に書かれていない条文・事実・日付や、線や配置から読み取れない関係を推測で補わないでください。図や表が無いときは「図・表から読み取れることはありません。」と書いてください。";
+
+/// Prompt for one re-look. The image is sent only with this request.
+pub fn look_image_prompt(focus: &str) -> String {
+    let focus: String = focus.trim().chars().take(2_000).collect();
+    format!(
+        "添付画像を、次の確認点に絞って見返してください。\n確認点: {focus}\n\n\
+答えは次の2つに分けてください。\n\
+## 画像に書かれている文字\n\
+確認点に関係する、画像に見える文字だけを見えるとおり書いてください。読み取れない箇所は「（判読不能）」としてください。\n\
+## 図・表から読み取れること\n\
+確認点に関係する、図や表の配置から読み取れる関係を書いてください。人物の続柄、婚姻、死亡、相続、矢印や線が何と何をつないでいるか、表の行と列の対応を含みます。\n\
+画像に書かれていない条文・事実・日付や、線や配置から読み取れない関係を推測で補わないでください。"
+    )
+}
 
 async fn wait_cancel_flag(cancel: Arc<AtomicBool>) {
     loop {
@@ -1013,6 +1034,17 @@ pub async fn transcribe_image(
     settings: &Settings,
     mime: &str,
     bytes: &[u8],
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    ask_vision(settings, mime, bytes, OCR_PROMPT, cancel).await
+}
+
+/// One vision request. The image is only in this body. Callers keep the reply as text.
+pub async fn ask_vision(
+    settings: &Settings,
+    mime: &str,
+    bytes: &[u8],
+    prompt: &str,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
     if cancel.load(Ordering::SeqCst) {
@@ -1038,7 +1070,7 @@ pub async fn transcribe_image(
         "messages": [{
             "role": "user",
             "content": [
-                { "type": "text", "text": OCR_PROMPT },
+                { "type": "text", "text": prompt },
                 { "type": "image_url", "image_url": { "url": data_url } }
             ]
         }]
@@ -1441,6 +1473,60 @@ mod tests {
         port
     }
 
+    fn serve_capture(
+        status: u16,
+        reason: &str,
+        body: &str,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let slot = captured.clone();
+        let reason = reason.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut sock, &mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..header_end]);
+                            let len = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        value.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            if buf.len() - (header_end + 4) >= len {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            *slot.lock().expect("capture") = String::from_utf8_lossy(&buf).into_owned();
+            let resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut sock, resp.as_bytes());
+        });
+        (port, captured)
+    }
+
     async fn stream_chat_err(port: u16, tools: bool) -> String {
         stream_chat_err_model(port, "test-model", tools).await
     }
@@ -1587,6 +1673,125 @@ mod tests {
         );
         assert!(!missing_err.contains("画像を読めません"), "{missing_err}");
         assert!(!missing_err.contains("llama3.2-vision"), "{missing_err}");
+    }
+
+    #[test]
+    fn ocr_prompt_separates_literal_text_from_the_diagram() {
+        assert!(
+            OCR_PROMPT.contains("## 画像に書かれている文字"),
+            "{OCR_PROMPT}"
+        );
+        assert!(
+            OCR_PROMPT.contains("## 図・表から読み取れること"),
+            "{OCR_PROMPT}"
+        );
+        assert!(OCR_PROMPT.contains("（判読不能）"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("推測で補わない"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("続柄"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("婚姻"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("死亡"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("相続"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("矢印"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("行と列"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("戸籍謄本"), "{OCR_PROMPT}");
+        assert!(OCR_PROMPT.contains("相続関係図"), "{OCR_PROMPT}");
+        let focus = look_image_prompt("矢印が誰と誰をつなぐか");
+        assert!(focus.contains("確認点: 矢印が誰と誰をつなぐか"), "{focus}");
+        assert!(focus.contains("## 画像に書かれている文字"), "{focus}");
+        assert!(focus.contains("## 図・表から読み取れること"), "{focus}");
+        assert!(focus.contains("（判読不能）"), "{focus}");
+        assert!(focus.contains("推測で補わない"), "{focus}");
+        assert!(focus.contains("続柄"), "{focus}");
+        let mut long = "あ".repeat(2_000);
+        long.push('☆');
+        assert!(!look_image_prompt(&long).contains('☆'));
+        assert!(look_image_prompt(&"あ".repeat(2_000)).contains(&"あ".repeat(2_000)));
+    }
+
+    #[tokio::test]
+    async fn vision_call_sends_the_image_once_and_returns_text() {
+        let reply = json!({
+            "choices": [{
+                "message": {
+                    "content": "## 画像に書かれている文字\n山田太郎\n## 図・表から読み取れること\n矢印は父から子へ向かう。"
+                }
+            }]
+        })
+        .to_string();
+        let (port, captured) = serve_capture(200, "OK", &reply);
+        let text = ask_vision(
+            &local_llm_settings(port),
+            "image/png",
+            &[0x89, 0x50, 0x4e, 0x47],
+            &look_image_prompt("矢印の向き"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("vision reply");
+        assert!(text.contains("山田太郎"), "{text}");
+        assert!(text.contains("矢印は父から子"), "{text}");
+        assert!(!text.contains("image_url"), "{text}");
+        assert!(!text.contains("base64"), "{text}");
+        let req = captured.lock().expect("capture").clone();
+        assert!(req.contains("確認点: 矢印の向き"), "{req}");
+        assert!(!req.contains("\"tools\""), "{req}");
+        assert_eq!(req.matches("data:image/png;base64,").count(), 1, "{req}");
+
+        let unsupported = r#"{"error":{"message":"this model does not support image input"}}"#;
+        let denied = serve_http(400, "Bad Request", unsupported, 1);
+        let err = ask_vision(
+            &local_llm_settings(denied),
+            "image/png",
+            &[0x89, 0x50, 0x4e, 0x47],
+            OCR_PROMPT,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect_err("vision unsupported");
+        assert_eq!(err, http_error::VISION_UNSUPPORTED_ERROR);
+
+        let (ocr_port, ocr_req) = serve_capture(200, "OK", &reply);
+        let ocr = transcribe_image(
+            &local_llm_settings(ocr_port),
+            "image/png",
+            &[0x89, 0x50, 0x4e, 0x47],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("pre-read");
+        assert!(ocr.contains("山田太郎"), "{ocr}");
+        let ocr_body = ocr_req.lock().expect("ocr capture").clone();
+        assert!(ocr_body.contains("## 画像に書かれている文字"), "{ocr_body}");
+        assert!(
+            ocr_body.contains("## 図・表から読み取れること"),
+            "{ocr_body}"
+        );
+        assert!(ocr_body.contains("（判読不能）"), "{ocr_body}");
+        assert!(ocr_body.contains("推測で補わない"), "{ocr_body}");
+        assert!(!ocr_body.contains("\"tools\""), "{ocr_body}");
+        assert_eq!(
+            ocr_body.matches("data:image/png;base64,").count(),
+            1,
+            "{ocr_body}"
+        );
+    }
+
+    #[test]
+    fn replayed_tool_text_does_not_carry_the_image() {
+        let turn = ChatTurn {
+            role: "tool".into(),
+            content: "[1] 戸籍.pngを見返した結果\n続柄は記載のとおり。".into(),
+            name: Some("look_image".into()),
+            tool_call_id: Some("c1".into()),
+            tool_calls: None,
+            reasoning: None,
+        };
+        let msg = turn_to_message(&turn).expect("tool turn");
+        let raw = msg.to_string();
+        assert!(!raw.contains("image_url"), "{raw}");
+        assert!(!raw.contains("data:image"), "{raw}");
+        assert!(raw.contains("続柄は記載のとおり"), "{raw}");
+        assert_eq!(msg["role"], "tool");
     }
 
     #[tokio::test]

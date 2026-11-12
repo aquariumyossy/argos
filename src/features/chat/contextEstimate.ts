@@ -32,7 +32,7 @@ export function toolSchemaTokens(schemaJson: string): number {
 /**
  * Denominator of the chat meter: the configured limit minus the reply headroom
  * and the tool-result allowance. The numerator is the next request's size from
- * `llm_context_meter`, which measures `assemble_turns`.
+ * `llm_context_meter`, which measures `assemble_turns` and includes the system prompt.
  */
 export function contextMeterLimit(limit: number): number {
   if (!(limit > 0)) return 0;
