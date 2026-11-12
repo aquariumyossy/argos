@@ -21,7 +21,9 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import ChatScopePicker from "./ChatScopePicker";
 import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
+import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
+import { parseOfficeFileNotice } from "./officeFile";
 import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
 import {
   applyChatDelta,
@@ -1446,7 +1448,7 @@ export default function Chat() {
     }
   }
 
-  async function openSavedOfficeFile(name: string) {
+  async function openSavedFile(name: string) {
     try {
       await invoke("open_output_file", { name });
     } catch (e) {
@@ -1768,7 +1770,13 @@ export default function Chat() {
       content: text,
       createdAt: Math.floor(Date.now() / 1000),
     };
-    if (activeIdRef.current === originId) {
+    // The ref is written in an effect, so a click on the first painted frame can
+    // still see null while `active` already names this thread.
+    const viewingId = activeIdRef.current ?? active?.id ?? null;
+    if (viewingId === originId) {
+      if (activeIdRef.current == null) activeIdRef.current = originId;
+      // Drop a thread load that is still in flight so it cannot erase this row.
+      contentEpoch.current += 1;
       setMessages((prev) => [...prev, optimistic]);
     }
     try {
@@ -2133,6 +2141,7 @@ export default function Chat() {
                       onBlur={() => void commitRename(t.id)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") {
+                          if (isImeEnter(e)) return;
                           e.preventDefault();
                           void commitRename(t.id);
                         }
@@ -2245,6 +2254,7 @@ export default function Chat() {
               const office =
                 m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
+              const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
               const roleClass =
                 m.role === "user"
                   ? "chat-msg user"
@@ -2275,7 +2285,7 @@ export default function Chat() {
                             className="chat-cite-badge clickable"
                             title={office.name}
                             aria-label={`${office.name} を開く`}
-                            onClick={() => void openSavedOfficeFile(office.name)}
+                            onClick={() => void openSavedFile(office.name)}
                           >
                             {office.name}
                           </button>
@@ -2294,7 +2304,20 @@ export default function Chat() {
                       {calls.length > 0 ? (
                         <p className="chat-tool-hint">{calls.join("、")}</p>
                       ) : null}
-                      {m.content.trim() ? (
+                      {officeFile ? (
+                        <div className="chat-office-file">
+                          <span>{officeFile.label}</span>
+                          <button
+                            type="button"
+                            className="chat-cite-badge clickable"
+                            title={officeFile.name}
+                            aria-label={`${officeFile.name} を開く`}
+                            onClick={() => void openSavedFile(officeFile.name)}
+                          >
+                            {officeFile.name}
+                          </button>
+                        </div>
+                      ) : m.content.trim() ? (
                         <AssistantBody
                           text={m.content}
                           citeNos={citeInfo.nos}
@@ -2689,6 +2712,7 @@ export default function Chat() {
               }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
+                  if (isImeEnter(e)) return;
                   e.preventDefault();
                   void send();
                 }

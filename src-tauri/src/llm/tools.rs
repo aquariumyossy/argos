@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::db::LlmSourceRow;
 use crate::llm::context::format_sources;
+pub use crate::llm::create_office::{TOOL_CREATE_DOCX, TOOL_CREATE_XLSX};
 use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
@@ -432,6 +433,7 @@ cite_no は出典 [n]。添付が1件なら省略できる。filename か path �
             }
         }
     }));
+    tools.extend(crate::llm::create_office::tool_schemas());
     Value::Array(tools)
 }
 
@@ -483,6 +485,8 @@ pub struct ToolExec {
     pub content: String,
     pub consumed: Vec<(String, i64)>,
     pub wrote_note_id: Option<String>,
+    /// Set only by `create_docx` / `create_xlsx`. Never parsed out of tool text.
+    pub saved_file: Option<crate::llm::create_office::SavedOfficeFile>,
 }
 
 impl ToolExec {
@@ -490,7 +494,7 @@ impl ToolExec {
         Self {
             content: content.into(),
             consumed: Vec::new(),
-            wrote_note_id: None,
+            saved_file: None, wrote_note_id: None,
         }
     }
 }
@@ -1712,7 +1716,7 @@ fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec
                     note.title, note.id
                 ),
                 consumed: Vec::new(),
-                wrote_note_id: Some(note.id),
+                saved_file: None, wrote_note_id: Some(note.id),
             }
         }
         Err(e) => ToolExec::text(format!("ノートの作成に失敗しました: {e}")),
@@ -1755,7 +1759,7 @@ fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
             ToolExec {
                 content,
                 consumed: Vec::new(),
-                wrote_note_id: Some(note.id),
+                saved_file: None, wrote_note_id: Some(note.id),
             }
         }
         Err(e) => ToolExec::text(e),
@@ -1943,7 +1947,7 @@ fn read_saved_selection(
     ToolExec {
         content: format_sources(&rows),
         consumed,
-        wrote_note_id: None,
+        saved_file: None, wrote_note_id: None,
     }
 }
 
@@ -2078,7 +2082,7 @@ fn finish_read(content: impl Into<String>, consumed: Vec<(String, i64)>) -> Tool
     ToolExec {
         content: content.into(),
         consumed,
-        wrote_note_id: None,
+        saved_file: None, wrote_note_id: None,
     }
 }
 
@@ -2582,6 +2586,15 @@ fn tool_law_article(state: &AppState, args: &Value) -> ToolExec {
     ToolExec::text(crate::statute::format_tool_result(&articles, omitted))
 }
 
+fn office_tool_exec(wrote: crate::llm::create_office::OfficeToolResult) -> ToolExec {
+    ToolExec {
+        content: wrote.message,
+        consumed: Vec::new(),
+        wrote_note_id: None,
+        saved_file: wrote.saved,
+    }
+}
+
 pub fn execute_tool(
     state: &AppState,
     thread_id: &str,
@@ -2604,7 +2617,7 @@ pub fn execute_tool(
         Err(e) => ToolExec {
             content: format!("ツールエラー: {e}"),
             consumed: Vec::new(),
-            wrote_note_id: None,
+            saved_file: None, wrote_note_id: None,
         },
     }
 }
@@ -2633,7 +2646,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "query が空です。".into(),
                     consumed: Vec::new(),
-                    wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None,
                 });
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
@@ -2661,7 +2674,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: e,
                         consumed: Vec::new(),
-                        wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None,
                     });
                 }
             };
@@ -2880,7 +2893,7 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                wrote_note_id: None,
+                saved_file: None, wrote_note_id: None,
             })
         }
         TOOL_READ => {
@@ -2897,7 +2910,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: "paragraph_id が空です。".into(),
                         consumed: Vec::new(),
-                        wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None,
                     });
                 }
                 ReadRoute::Paragraph(id) => id,
@@ -2907,7 +2920,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: format!("段落 {paragraph_id} は索引にありません。"),
                     consumed: Vec::new(),
-                    wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None,
                 });
             };
             let mut new_rows = Vec::new();
@@ -2959,7 +2972,7 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                wrote_note_id: None,
+                saved_file: None, wrote_note_id: None,
             })
         }
         TOOL_READ_URL => {
@@ -2967,7 +2980,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "ウェブ検索がオフです。".into(),
                     consumed: Vec::new(),
-                    wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None,
                 });
             }
             let url = args
@@ -2980,7 +2993,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "url が空です。".into(),
                     consumed: Vec::new(),
-                    wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None,
                 });
             }
             if let Some(existing) = state
@@ -2996,7 +3009,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: already_line(&existing),
                         consumed,
-                        wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None,
                     });
                 }
             }
@@ -3011,7 +3024,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: format!("URL を読めません: {e}"),
                         consumed: Vec::new(),
-                        wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None,
                     });
                 }
             };
@@ -3051,7 +3064,7 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                wrote_note_id: None,
+                saved_file: None, wrote_note_id: None,
             })
         }
         TOOL_LIST_NOTES => Ok(tool_list_notes(state)),
@@ -3061,10 +3074,16 @@ fn execute_tool_inner(
         TOOL_EDIT_OFFICE => Ok(ToolExec::text(crate::office_edit::edit_from_tool(
             state, thread_id, &args,
         ))),
+        TOOL_CREATE_DOCX => Ok(office_tool_exec(crate::llm::create_office::exec_docx(
+            state, &args,
+        ))),
+        TOOL_CREATE_XLSX => Ok(office_tool_exec(crate::llm::create_office::exec_xlsx(
+            state, &args,
+        ))),
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),
             consumed: Vec::new(),
-            wrote_note_id: None,
+            saved_file: None, wrote_note_id: None,
         }),
     }
 }

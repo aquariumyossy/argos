@@ -215,7 +215,7 @@ async fn execute_tool_off_runtime(
         Err(e) => ToolExec {
             content: format!("ツール実行に失敗しました: {e}"),
             consumed: Vec::new(),
-            wrote_note_id: None,
+            saved_file: None, wrote_note_id: None,
         },
     }
 }
@@ -683,8 +683,8 @@ pub fn open_output_file(
     state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<(), String> {
-    let path = crate::office_edit::output_file_path(&state.data_dir, &name)?;
-    let path = crate::office_edit::strip_verbatim_prefix(&path);
+    let path = crate::llm::create_office::output_file_path(&state.data_dir, &name)?;
+    let path = crate::llm::create_office::strip_verbatim_prefix(&path);
     let display = path.to_string_lossy().to_string();
     app.opener()
         .open_path(display.as_str(), None::<&str>)
@@ -1606,6 +1606,7 @@ async fn llm_send_inner<R: Runtime>(
                                 wrote_note_ids.push(nid);
                             }
                         }
+                        let saved_file = exec.saved_file.clone();
                         let mut content = exec.content;
                         if tc.name == tools::TOOL_WRITE_NOTE && !read_note_called {
                             content.push_str(
@@ -1625,13 +1626,19 @@ async fn llm_send_inner<R: Runtime>(
                         let tool_turn = ChatTurn {
                             role: "tool".into(),
                             content,
-                            name: Some(tc.name),
+                            name: Some(tc.name.clone()),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
                             reasoning: None,
                         };
                         store_turn(&state.db, &thread.id, &tool_turn)?;
                         current_turns.push(tool_turn);
+                        if let Some(notice) = crate::llm::create_office::notice_for_tool(
+                            &tc.name,
+                            saved_file.as_ref(),
+                        ) {
+                            let _ = state.db.insert_llm_notice(&thread.id, &notice);
+                        }
                     }
                     if cancel_tools {
                         busy.finish();

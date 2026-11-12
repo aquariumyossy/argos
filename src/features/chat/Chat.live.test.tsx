@@ -1294,6 +1294,75 @@ describe("Ctrl+Alt+C", () => {
   });
 });
 
+describe("IME composition Enter", () => {
+  it("does not send while IME composition is confirming and still sends on a plain Enter", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "変換中の文章" } });
+
+    const composing = fireEvent.keyDown(box, {
+      key: "Enter",
+      isComposing: true,
+      keyCode: 229,
+    });
+    expect(composing).toBe(true);
+    expect(sendCalls()).toHaveLength(0);
+    expect(box.value).toBe("変換中の文章");
+
+    const processKey = fireEvent.keyDown(box, {
+      key: "Enter",
+      isComposing: false,
+      keyCode: 229,
+    });
+    expect(processKey).toBe(true);
+    expect(sendCalls()).toHaveLength(0);
+    expect(box.value).toBe("変換中の文章");
+
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(sendCalls()).toEqual([
+      [
+        "llm_send",
+        { threadId: "thread-a", content: "変換中の文章", webSearch: false },
+      ],
+    ]);
+  });
+
+  it("does not rename a conversation on IME composition Enter", async () => {
+    const previous = mockInvoke.getMockImplementation();
+    mockInvoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "llm_rename_thread") {
+        return { ...threadA, title: String(args?.title ?? "") };
+      }
+      return previous?.(cmd, args);
+    });
+
+    await renderChat();
+    fireEvent.doubleClick(screen.getByRole("button", { name: "契約の相談" }));
+    const input = document.querySelector(".chat-rename");
+    if (!(input instanceof HTMLInputElement)) throw new Error("rename field missing");
+    fireEvent.change(input, { target: { value: "新しい相談" } });
+
+    const composing = fireEvent.keyDown(input, {
+      key: "Enter",
+      isComposing: true,
+      keyCode: 229,
+    });
+    expect(composing).toBe(true);
+    expect(mockInvoke.mock.calls.some((call) => call[0] === "llm_rename_thread")).toBe(false);
+    expect(input.value).toBe("新しい相談");
+    expect(document.querySelector(".chat-rename")).toBe(input);
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("llm_rename_thread", {
+      id: "thread-a",
+      title: "新しい相談",
+    });
+  });
+});
+
 describe("Ctrl+V image paste", () => {
   const pasteTitle = "貼り付け画像（2026-11-12 11時59分01秒）";
 
