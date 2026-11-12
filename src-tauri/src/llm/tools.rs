@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::db::LlmSourceRow;
 use crate::llm::context::format_sources;
+pub use crate::llm::create_office::{TOOL_CREATE_DOCX, TOOL_CREATE_XLSX};
 use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
@@ -365,6 +366,7 @@ pub fn tools_schema(web_search: bool, remote_index: bool, remote_only: bool) -> 
             }
         }
     }));
+    tools.extend(crate::llm::create_office::tool_schemas());
     Value::Array(tools)
 }
 
@@ -2801,6 +2803,12 @@ fn execute_tool_inner(
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
         TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
+        TOOL_CREATE_DOCX => Ok(ToolExec::text(crate::llm::create_office::exec_docx(
+            state, &args,
+        ))),
+        TOOL_CREATE_XLSX => Ok(ToolExec::text(crate::llm::create_office::exec_xlsx(
+            state, &args,
+        ))),
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),
             consumed: Vec::new(),

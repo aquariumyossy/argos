@@ -1444,7 +1444,8 @@ async fn llm_send_inner<R: Runtime>(
                                 wrote_note_ids.push(nid);
                             }
                         }
-                        let mut content = exec.content;
+                        let (mut content, saved_files) =
+                            crate::llm::create_office::detach_saved_files(exec.content);
                         if tc.name == tools::TOOL_WRITE_NOTE && !read_note_called {
                             content.push_str(
                                 "\n（警告: この請求では read_note の前に書きました。読んでいない部分を消していないか確認してください。）",
@@ -1470,6 +1471,12 @@ async fn llm_send_inner<R: Runtime>(
                         };
                         store_turn(&state.db, &thread.id, &tool_turn)?;
                         current_turns.push(tool_turn);
+                        for file in &saved_files {
+                            let _ = state.db.insert_llm_notice(
+                                &thread.id,
+                                &crate::llm::create_office::notice_body(file),
+                            );
+                        }
                     }
                     // A law-only round does not spend the web-search budget, but it must
                     // not keep requesting the model after law_article is exhausted.
