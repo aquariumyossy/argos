@@ -501,6 +501,7 @@ pub fn run() {
             llm::commands::llm_preview_source_file,
             llm::commands::llm_set_source_grain,
             llm::commands::llm_send,
+            llm::commands::open_output_file,
             llm::commands::llm_cancel,
             llm::commands::llm_test_connection,
             llm::commands::llm_thinking_budget,

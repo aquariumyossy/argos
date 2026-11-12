@@ -1446,9 +1446,9 @@ export default function Chat() {
     }
   }
 
-  async function openSavedFile(path: string) {
+  async function openSavedFile(name: string) {
     try {
-      await invoke("open_hit", { path });
+      await invoke("open_output_file", { name });
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -2277,9 +2277,9 @@ export default function Chat() {
                           <button
                             type="button"
                             className="chat-cite-badge clickable"
-                            title={officeFile.path}
+                            title={officeFile.name}
                             aria-label={`${officeFile.name} を開く`}
-                            onClick={() => void openSavedFile(officeFile.path)}
+                            onClick={() => void openSavedFile(officeFile.name)}
                           >
                             {officeFile.name}
                           </button>

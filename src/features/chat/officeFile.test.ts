@@ -2,35 +2,40 @@ import { describe, expect, it } from "vitest";
 import { parseOfficeFileNotice } from "./officeFile";
 
 describe("parseOfficeFileNotice", () => {
-  it("reads the filename and path from a saved-file notice", () => {
-    const path = "C:\\Users\\a\\AppData\\Roaming\\Argos\\output\\契約メモ.docx";
+  it("reads only the file name from a saved-file notice", () => {
     const notice = [
       "Wordファイルを保存しました（Argos の出力フォルダ）",
-      `[[argos-office]]\tdocx\t契約メモ.docx\t${path}`,
+      "[[argos-office]]\tdocx\t契約メモ.docx",
     ].join("\n");
     expect(parseOfficeFileNotice(notice)).toEqual({
       kind: "docx",
       name: "契約メモ.docx",
-      path,
       label: "Wordファイルを保存しました（Argos の出力フォルダ）",
     });
   });
 
-  it("reads an Excel notice with forward slashes", () => {
-    const path = "/tmp/Argos/output/売上集計.xlsx";
-    const notice = `Excelファイルを保存しました（Argos の出力フォルダ）\n[[argos-office]]\txlsx\t売上集計.xlsx\t${path}`;
-    const parsed = parseOfficeFileNotice(notice);
-    expect(parsed?.kind).toBe("xlsx");
-    expect(parsed?.name).toBe("売上集計.xlsx");
-    expect(parsed?.path).toBe(path);
+  it("keeps the file name when an old notice still carries a path", () => {
+    const notice =
+      "Excelファイルを保存しました（Argos の出力フォルダ）\n[[argos-office]]\txlsx\t売上集計.xlsx\tC:\\Users\\a\\AppData\\Roaming\\Argos\\output\\売上集計.xlsx";
+    expect(parseOfficeFileNotice(notice)).toEqual({
+      kind: "xlsx",
+      name: "売上集計.xlsx",
+      label: "Excelファイルを保存しました（Argos の出力フォルダ）",
+    });
   });
 
-  it("ignores ordinary assistant text and a path that climbs out", () => {
+  it("ignores ordinary text and names that are not a single file", () => {
     expect(parseOfficeFileNotice("契約メモ.docx を作りました")).toBeNull();
     expect(
       parseOfficeFileNotice(
-        "[[argos-office]]\tdocx\t契約メモ.docx\tC:\\output\\..\\Windows\\契約メモ.docx",
+        "[[argos-office]]\tdocx\t..\\契約メモ.docx\tC:\\output\\契約メモ.docx",
       ),
+    ).toBeNull();
+    expect(
+      parseOfficeFileNotice("[[argos-office]]\tdocx\tC:\\Windows\\cmd.docx"),
+    ).toBeNull();
+    expect(
+      parseOfficeFileNotice("[[argos-office]]\txlsx\t\\\\server\\share\\a.xlsx"),
     ).toBeNull();
   });
 });

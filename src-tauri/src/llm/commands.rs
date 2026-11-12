@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime, State};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
@@ -214,7 +215,7 @@ async fn execute_tool_off_runtime(
         Err(e) => ToolExec {
             content: format!("ツール実行に失敗しました: {e}"),
             consumed: Vec::new(),
-            wrote_note_id: None,
+            saved_file: None, wrote_note_id: None,
         },
     }
 }
@@ -674,6 +675,20 @@ pub async fn llm_thinking_budget(
 pub async fn llm_list_models(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmModelInfo>, String> {
     let settings = state.settings.read().clone();
     llm::list_models(&settings).await
+}
+
+#[tauri::command]
+pub fn open_output_file(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<(), String> {
+    let path = crate::llm::create_office::output_file_path(&state.data_dir, &name)?;
+    let display = path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(display.as_str(), None::<&str>)
+        .map_err(|e| format!("ファイルを開けません（{e}）。"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1590,8 +1605,8 @@ async fn llm_send_inner<R: Runtime>(
                                 wrote_note_ids.push(nid);
                             }
                         }
-                        let (mut content, saved_files) =
-                            crate::llm::create_office::detach_saved_files(exec.content);
+                        let saved_file = exec.saved_file.clone();
+                        let mut content = exec.content;
                         if tc.name == tools::TOOL_WRITE_NOTE && !read_note_called {
                             content.push_str(
                                 "\n（警告: この請求では read_note の前に書きました。読んでいない部分を消していないか確認してください。）",
@@ -1610,18 +1625,18 @@ async fn llm_send_inner<R: Runtime>(
                         let tool_turn = ChatTurn {
                             role: "tool".into(),
                             content,
-                            name: Some(tc.name),
+                            name: Some(tc.name.clone()),
                             tool_call_id: Some(tc.id),
                             tool_calls: None,
                             reasoning: None,
                         };
                         store_turn(&state.db, &thread.id, &tool_turn)?;
                         current_turns.push(tool_turn);
-                        for file in &saved_files {
-                            let _ = state.db.insert_llm_notice(
-                                &thread.id,
-                                &crate::llm::create_office::notice_body(file),
-                            );
+                        if let Some(notice) = crate::llm::create_office::notice_for_tool(
+                            &tc.name,
+                            saved_file.as_ref(),
+                        ) {
+                            let _ = state.db.insert_llm_notice(&thread.id, &notice);
                         }
                     }
                     if cancel_tools {
