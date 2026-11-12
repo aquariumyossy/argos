@@ -183,15 +183,56 @@ pub fn copy_into_store(data_dir: &Path, src: &Path, rel: &str) -> Result<PathBuf
     Ok(dest)
 }
 
-pub fn write_bytes_into_store(data_dir: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    if bytes.is_empty() {
-        return Err("画像ファイルが空です。".into());
+pub fn image_len_error(n: u64) -> Option<String> {
+    if n == 0 {
+        return Some("画像ファイルが空です。".into());
     }
-    if bytes.len() as u64 > IMAGE_MAX_BYTES {
-        return Err(format!(
+    if n > IMAGE_MAX_BYTES {
+        return Some(format!(
             "画像が大きすぎます（{} MBまで）。",
             IMAGE_MAX_BYTES / (1024 * 1024)
         ));
+    }
+    None
+}
+
+/// Display name for an image pasted into the composer. No `:` or path separator,
+/// so Windows `Path::file_name` keeps the whole label.
+pub fn pasted_image_title(at: chrono::NaiveDateTime) -> String {
+    format!("貼り付け画像（{}）", at.format("%Y-%m-%d %H時%M分%S秒"))
+}
+
+pub fn pasted_image_ext(mime: &str) -> Result<&'static str, String> {
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "image/png" => Ok("png"),
+        "image/jpeg" | "image/jpg" => Ok("jpg"),
+        "image/gif" => Ok("gif"),
+        "image/webp" => Ok("webp"),
+        _ => Err("対応していない形式です。".into()),
+    }
+}
+
+/// `貼り付け画像（…）` plus a numeric suffix when that label is already stored.
+pub fn disambiguate_paste_label(base: &str, n: u32) -> String {
+    if n <= 1 {
+        return base.to_string();
+    }
+    if let Some(head) = base.strip_suffix('）') {
+        format!("{head}・{n}）")
+    } else {
+        format!("{base}・{n}")
+    }
+}
+
+pub fn write_bytes_into_store(data_dir: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    if let Some(err) = image_len_error(bytes.len() as u64) {
+        return Err(err);
     }
     let dest = resolve_stored(data_dir, rel)?;
     if let Some(parent) = dest.parent() {
@@ -223,14 +264,8 @@ pub fn remove_thread_store(data_dir: &Path, thread_id: &str) {
 pub fn check_image_size(path: &Path) -> Result<u64, String> {
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     let n = meta.len();
-    if n == 0 {
-        return Err("画像ファイルが空です。".into());
-    }
-    if n > IMAGE_MAX_BYTES {
-        return Err(format!(
-            "画像が大きすぎます（{} MBまで）。",
-            IMAGE_MAX_BYTES / (1024 * 1024)
-        ));
+    if let Some(err) = image_len_error(n) {
+        return Err(err);
     }
     Ok(n)
 }
@@ -311,5 +346,40 @@ mod tests {
         let err =
             pdf_extract_to_attach(Err("pdf extract failed: boom".into()), "a.pdf").unwrap_err();
         assert!(err.contains("読み込みに失敗しました"), "{err}");
+    }
+
+    #[test]
+    fn pasted_image_name_stays_a_single_filename() {
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 11, 12)
+            .unwrap()
+            .and_hms_opt(11, 59, 1)
+            .unwrap();
+        let title = pasted_image_title(at);
+        assert_eq!(title, "貼り付け画像（2026-11-12 11時59分01秒）");
+        assert!(!title.contains(':'));
+        assert!(!title.contains('\\'));
+        assert!(!title.contains('/'));
+        assert_eq!(
+            crate::llm::transcript::file_label(&title, &title),
+            title,
+            "the chip and the citation header use this label"
+        );
+        assert_eq!(
+            disambiguate_paste_label(&title, 2),
+            "貼り付け画像（2026-11-12 11時59分01秒・2）"
+        );
+        assert_eq!(pasted_image_ext("image/png").unwrap(), "png");
+        assert_eq!(
+            pasted_image_ext("image/jpeg; charset=binary").unwrap(),
+            "jpg"
+        );
+        assert_eq!(pasted_image_ext("IMAGE/WEBP").unwrap(), "webp");
+        assert!(pasted_image_ext("image/svg+xml").is_err());
+        assert!(image_len_error(0).unwrap().contains("空です"));
+        assert!(image_len_error(IMAGE_MAX_BYTES + 1)
+            .unwrap()
+            .contains("8 MB"));
+        assert!(image_len_error(IMAGE_MAX_BYTES).is_none());
+        assert!(image_len_error(1).is_none());
     }
 }
