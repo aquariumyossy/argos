@@ -38,7 +38,7 @@ import {
   shortcutInputLocked,
 } from "./chatShortcut";
 import { useChatContextMeter } from "./useChatContextMeter";
-import { officeOutputLink } from "./officeOutput";
+import { editOfficeFileLink } from "./officeOutput";
 import { shouldRestoreDraft } from "./refusedSend";
 import {
   bytesToBase64,
@@ -1446,11 +1446,9 @@ export default function Chat() {
     }
   }
 
-  async function openOfficeOutput(path: string) {
-    const target = path.trim();
-    if (!target) return;
+  async function openSavedOfficeFile(name: string) {
     try {
-      await invoke("open_hit", { path: target });
+      await invoke("open_output_file", { name });
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -2244,7 +2242,8 @@ export default function Chat() {
               const citeGroups = groupSources(cites);
               const citeInfo = openableCitesFromGroups(citeGroups);
               const calls = toolCallNames(m.toolCalls);
-              const office = m.role === "tool" ? officeOutputLink(m.content) : null;
+              const office =
+                m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
               const roleClass =
                 m.role === "user"
@@ -2274,8 +2273,9 @@ export default function Chat() {
                           <button
                             type="button"
                             className="chat-cite-badge clickable"
-                            title={office.path}
-                            onClick={() => void openOfficeOutput(office.path)}
+                            title={office.name}
+                            aria-label={`${office.name} を開く`}
+                            onClick={() => void openSavedOfficeFile(office.name)}
                           >
                             {office.name}
                           </button>

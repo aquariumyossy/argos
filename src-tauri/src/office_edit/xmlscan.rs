@@ -230,10 +230,13 @@ pub fn render_nodes(xml: &str, nodes: &[TextNode]) -> String {
 }
 
 fn render_text_element(open: &str, text: &str, local: &str) -> String {
-    let open = ensure_preserve(open, text);
-    let close = close_tag(&open);
     let text = text.replace('\r', "");
-    if local != "t" || !text.contains('\n') {
+    // Word splits a line break into w:br. Excel shared strings keep a newline
+    // inside <t xml:space="preserve">; a w:br there is not valid xlsx.
+    let word_break = local == "t" && text.contains('\n') && is_word_text_tag(open);
+    let open = ensure_preserve(open, &text);
+    if !word_break {
+        let close = close_tag(&open);
         return format!("{open}{}{close}", escape_text(&text));
     }
     let mut out = String::new();
@@ -249,6 +252,11 @@ fn render_text_element(open: &str, text: &str, local: &str) -> String {
     out
 }
 
+fn is_word_text_tag(open: &str) -> bool {
+    let trimmed = open.trim_start();
+    trimmed.starts_with("<w:t") || trimmed.starts_with("<w:delText")
+}
+
 fn close_tag(open: &str) -> String {
     let inner = open.trim_start_matches('<').trim_end_matches('>').trim();
     let name = inner
@@ -260,7 +268,9 @@ fn close_tag(open: &str) -> String {
 }
 
 fn ensure_preserve(open: &str, text: &str) -> String {
-    let needs = text.starts_with(char::is_whitespace)
+    let needs = text.contains('\n')
+        || text.contains('\t')
+        || text.starts_with(char::is_whitespace)
         || text.ends_with(char::is_whitespace)
         || text.contains("  ");
     if !needs || open.contains("xml:space") {

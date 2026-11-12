@@ -1,8 +1,9 @@
 //! Edit WordprocessingML text without touching paragraph or run properties.
 
 use super::xmlscan::{
-    collect_attr_local, decode_xml_bytes, group_nodes, joined, leaf_texts, map_attr_local,
-    render_nodes, replace_in_group, rewrite_group, scan_text_nodes, ParaGroup, ScanOpt, TextNode,
+    attr_local_value, collect_attr_local, decode_xml_bytes, group_nodes, joined, leaf_texts,
+    map_attr_local, next_tag, render_nodes, replace_in_group, rewrite_group, scan_text_nodes,
+    ParaGroup, ScanOpt, TextNode,
 };
 use super::{push_leftover, ChangeStats, EditRequest, Leftover, Probe, MAX_LEFTOVERS};
 
@@ -229,6 +230,28 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                     );
                 }
             }
+            for (local, text) in leaf_texts(&xml) {
+                if local != "instrText" && local != "delInstrText" {
+                    continue;
+                }
+                for probe in probes {
+                    consider(&mut leftovers, &mut truncated, probe, &text, "フィールド");
+                }
+            }
+            continue;
+        }
+        if is_rels(name) {
+            for target in hyperlink_targets(&xml) {
+                for probe in probes {
+                    consider(
+                        &mut leftovers,
+                        &mut truncated,
+                        probe,
+                        &target,
+                        "ハイパーリンク",
+                    );
+                }
+            }
             continue;
         }
         if !is_xml_name(name) {
@@ -316,6 +339,32 @@ fn other_label(name: &str) -> String {
     } else {
         format!("その他（{path}）")
     }
+}
+
+fn hyperlink_targets(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some(tag) = next_tag(xml, pos) {
+        if !tag.is_end && tag.local == "Relationship" {
+            let raw = &xml[tag.start..tag.end];
+            let kind = attr_local_value(raw, "Type").unwrap_or_default();
+            if kind.to_ascii_lowercase().contains("hyperlink") {
+                if let Some(target) = attr_local_value(raw, "Target") {
+                    if !target.is_empty() {
+                        out.push(target);
+                    }
+                }
+            }
+        }
+        pos = tag.end;
+    }
+    out
+}
+
+fn is_rels(name: &str) -> bool {
+    name.replace('\\', "/")
+        .to_ascii_lowercase()
+        .ends_with(".rels")
 }
 
 fn is_xml_name(name: &str) -> bool {

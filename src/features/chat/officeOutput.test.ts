@@ -1,36 +1,50 @@
 import { describe, expect, it } from "vitest";
-import { officeOutputLink } from "./officeOutput";
+import { editOfficeFileLink } from "./officeOutput";
 
-describe("officeOutputLink", () => {
-  it("reads the saved file and leftover locations", () => {
-    const content = [
-      "出力ファイル: 契約書_編集済み（2026-11-12 09-30-00）.docx",
-      String.raw`保存先: C:\Users\me\AppData\Roaming\Argos\出力\契約書_編集済み（2026-11-12 09-30-00）.docx`,
-      "残存: あり",
-      "「山田太郎」が残っています。",
-      "- 文書のプロパティ（山田太郎事件）",
-      "文字列置換: 「山田太郎」→「佐藤花子」を 6 箇所",
-      "段落の書き換え: 1 件",
-    ].join("\n");
-    const link = officeOutputLink(content);
-    expect(link?.name).toBe("契約書_編集済み（2026-11-12 09-30-00）.docx");
-    expect(link?.path).toBe(
-      String.raw`C:\Users\me\AppData\Roaming\Argos\出力\契約書_編集済み（2026-11-12 09-30-00）.docx`,
-    );
-    expect(link?.leftovers).toEqual([
-      "「山田太郎」が残っています。",
-      "- 文書のプロパティ（山田太郎事件）",
-    ]);
+const saved = [
+  "出力ファイル: 契約書_編集済み（2026-11-12 09-30-00）.docx",
+  "[[argos-office]]\tdocx\t契約書_編集済み（2026-11-12 09-30-00）.docx",
+  String.raw`保存先: C:\Users\me\AppData\Roaming\Argos\output\契約書_編集済み（2026-11-12 09-30-00）.docx`,
+  "残存: あり",
+  "「山田太郎」が残っています。",
+  "- フィールド（REF 山田太郎）",
+  "文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所",
+].join("\n");
+
+describe("editOfficeFileLink", () => {
+  it("opens an edit_office result by file name and keeps leftover lines", () => {
+    expect(editOfficeFileLink("edit_office", saved)).toEqual({
+      name: "契約書_編集済み（2026-11-12 09-30-00）.docx",
+      leftovers: ["「山田太郎」が残っています。", "- フィールド（REF 山田太郎）"],
+    });
   });
 
-  it("returns no leftovers when the check is clean", () => {
-    const link = officeOutputLink(
-      "出力ファイル: 一覧_編集済み（2026-11-12 10-00-00）.xlsx\n保存先: /tmp/一覧.xlsx\n残存: なし\n",
-    );
-    expect(link?.leftovers).toEqual([]);
+  it("does not open another tool even when the text contains a path", () => {
+    expect(editOfficeFileLink("search_index", saved)).toBeNull();
+    expect(editOfficeFileLink("read_unit", saved)).toBeNull();
+    expect(editOfficeFileLink(undefined, saved)).toBeNull();
   });
 
-  it("ignores tool results that are not an edited file", () => {
-    expect(officeOutputLink("出典 [1] 契約書")).toBeNull();
+  it("does not treat a saved-path line as something to open", () => {
+    const pathOnly = String.raw`保存先: C:\Users\me\AppData\Roaming\Argos\output\契約書.docx`;
+    expect(editOfficeFileLink("edit_office", pathOnly)).toBeNull();
+    expect(
+      editOfficeFileLink(
+        "edit_office",
+        "[[argos-office]]\tdocx\tC:\\Windows\\cmd.docx",
+      ),
+    ).toBeNull();
+    expect(
+      editOfficeFileLink(
+        "edit_office",
+        "[[argos-office]]\tdocx\t..\\契約書.docx",
+      ),
+    ).toBeNull();
+    expect(
+      editOfficeFileLink(
+        "edit_office",
+        "[[argos-office]]\txlsx\t\\\\server\\share\\a.xlsx",
+      ),
+    ).toBeNull();
   });
 });

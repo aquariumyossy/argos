@@ -1,32 +1,33 @@
-/** A file the edit_office tool saved. The path is opened with the OS. */
-export type OfficeOutputLink = {
+/** Kept in step with `OFFICE_MARKER` in `office_edit`. The third field is a bare file name. */
+export const OFFICE_MARKER = "[[argos-office]]";
+
+export type EditOfficeFile = {
   name: string;
-  path: string;
   leftovers: string[];
 };
 
-const FILE_LINE = "出力ファイル: ";
-const PATH_LINE = "保存先: ";
-
 /**
- * Read the tool result. The first lines are the file name and path so a
- * truncated result still has something to open.
+ * Open button for an `edit_office` tool result only.
+ * The name is the marker's file name. A path in the tool text is never returned.
  */
-export function officeOutputLink(content: string): OfficeOutputLink | null {
+export function editOfficeFileLink(
+  toolName: string | undefined,
+  content: string,
+): EditOfficeFile | null {
+  if ((toolName ?? "").trim() !== "edit_office") return null;
   const lines = content.split(/\r?\n/);
   let name = "";
-  let path = "";
   const leftovers: string[] = [];
   let inLeftovers = false;
   for (const raw of lines) {
     const line = raw.trim();
-    if (line.startsWith(FILE_LINE)) {
-      name = line.slice(FILE_LINE.length).trim();
-      inLeftovers = false;
-      continue;
-    }
-    if (line.startsWith(PATH_LINE)) {
-      path = line.slice(PATH_LINE.length).trim();
+    if (line.startsWith(`${OFFICE_MARKER}\t`)) {
+      if (name) return null;
+      const parts = line.split("\t");
+      if (parts.length < 3) return null;
+      const candidate = parts[2]?.trim() ?? "";
+      if (!isBareOfficeName(candidate)) return null;
+      name = candidate;
       inLeftovers = false;
       continue;
     }
@@ -49,6 +50,14 @@ export function officeOutputLink(content: string): OfficeOutputLink | null {
     }
     if (line) leftovers.push(line);
   }
-  if (!name || !path) return null;
-  return { name, path, leftovers };
+  if (!name) return null;
+  return { name, leftovers };
+}
+
+function isBareOfficeName(name: string): boolean {
+  if (!name || name.startsWith(".")) return false;
+  if (/[/\\:\0]/.test(name) || name.includes("..")) return false;
+  if ([...name].some((ch) => ch.charCodeAt(0) < 32)) return false;
+  const lower = name.toLowerCase();
+  return lower.endsWith(".docx") || lower.endsWith(".xlsx");
 }

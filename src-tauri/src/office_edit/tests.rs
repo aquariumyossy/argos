@@ -6,7 +6,10 @@ use serde_json::json;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-use super::{edit_path, resolve_office_path, EditRequest, FILE_LINE, PATH_LINE};
+use super::{
+    edit_path, output_file_path, resolve_office_path, strip_verbatim_prefix, EditRequest,
+    FILE_LINE, OFFICE_MARKER, OUTPUT_DIR_NAME, PATH_LINE,
+};
 use crate::db::LlmSourceRow;
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -178,7 +181,7 @@ fn docx_edits_split_runs_stories_and_reports_property_leftovers() {
     );
     assert!(edited.path.starts_with(&out_dir));
     assert!(edited.report.starts_with(&format!(
-        "{FILE_LINE}契約書_編集済み（2026-11-12 09-30-00）.docx\n"
+        "{FILE_LINE}契約書_編集済み（2026-11-12 09-30-00）.docx\n{OFFICE_MARKER}\tdocx\t契約書_編集済み（2026-11-12 09-30-00）.docx\n"
     )));
     assert!(edited
         .report
@@ -520,5 +523,151 @@ fn xls_is_rejected() {
     )
     .unwrap_err();
     assert!(err.contains(".xls"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn search_hits_are_not_editable() {
+    let mut hit = source(r"C:\cases\契約書.docx", 3);
+    hit.origin = "tool".into();
+    let by_cite =
+        resolve_office_path(std::slice::from_ref(&hit), &json!({"cite_no": 3})).unwrap_err();
+    assert!(by_cite.contains("添付"), "{by_cite}");
+    let by_name = resolve_office_path(
+        std::slice::from_ref(&hit),
+        &json!({"filename": "契約書.docx"}),
+    )
+    .unwrap_err();
+    assert!(by_name.contains("添付"), "{by_name}");
+    let attached = source(r"C:\cases\契約書.docx", 3);
+    assert_eq!(
+        resolve_office_path(std::slice::from_ref(&attached), &json!({"cite_no": 3})).unwrap(),
+        r"C:\cases\契約書.docx"
+    );
+}
+
+#[test]
+fn output_names_stay_inside_the_output_folder() {
+    let dir = temp_dir("open");
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let name = "契約書_編集済み（2026-11-12 09-30-00）.docx";
+    fs::write(out.join(name), b"x").unwrap();
+    let resolved = output_file_path(&dir, name).unwrap();
+    let canon_dir = fs::canonicalize(&out).unwrap();
+    assert!(resolved.starts_with(&canon_dir), "{resolved:?}");
+    assert_eq!(resolved.file_name().and_then(|n| n.to_str()), Some(name));
+    for bad in [
+        r"..\secret.docx",
+        "../secret.docx",
+        r"C:\Windows\cmd.docx",
+        r"\\server\share\a.docx",
+        "foo/bar.docx",
+        r"foo\bar.docx",
+        "..",
+        ".hidden.docx",
+        "a..b.docx",
+    ] {
+        assert!(output_file_path(&dir, bad).is_err(), "{bad}");
+    }
+    assert_eq!(
+        strip_verbatim_prefix(Path::new(
+            r"\\?\C:\Users\a\AppData\Roaming\Argos\output\契約.docx"
+        ))
+        .to_string_lossy(),
+        r"C:\Users\a\AppData\Roaming\Argos\output\契約.docx"
+    );
+    assert_eq!(
+        strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\Argos\output\a.xlsx"))
+            .to_string_lossy(),
+        r"\\server\share\Argos\output\a.xlsx"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_outside_the_output_folder_is_rejected() {
+    let dir = temp_dir("link");
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let outside = dir.join("outside.docx");
+    fs::write(&outside, b"x").unwrap();
+    std::os::unix::fs::symlink(&outside, out.join("link.docx")).unwrap();
+    let err = output_file_path(&dir, "link.docx").unwrap_err();
+    assert!(err.contains("外"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_line_break_stays_inside_the_text_node() {
+    let dir = temp_dir("xlsx-break");
+    let src = dir.join("一覧.xlsx");
+    let files = xlsx_package();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    write_zip(&src, &borrowed);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-12 11-00-00",
+        &request(&[], &[("このセルだけを変える", "1行目\n2行目")]),
+    )
+    .unwrap();
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(!shared.contains("<w:br"), "{shared}");
+    assert!(shared.contains("xml:space=\"preserve\""), "{shared}");
+    assert!(shared.contains("1行目\n2行目"), "{shared}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn docx_leftover_check_reports_fields_and_hyperlinks_without_rewriting_them() {
+    let dir = temp_dir("field");
+    let src = dir.join("契約書.docx");
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>
+    <w:p>
+      <w:r><w:instrText xml:space="preserve"> REF 山田太郎 \h </w:instrText></w:r>
+      <w:hyperlink r:id="rId5"><w:r><w:t>表示名</w:t></w:r></w:hyperlink>
+    </w:p>
+  </w:body>
+</w:document>"#
+    );
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/山田太郎" TargetMode="External"/>
+</Relationships>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/_rels/document.xml.rels", rels),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-12 11-30-00",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("本文の佐藤花子"), "{document}");
+    assert!(document.contains("REF 山田太郎"), "{document}");
+    assert!(!document.contains("REF 佐藤花子"), "{document}");
+    let rels = read_entry(&edited.path, "word/_rels/document.xml.rels");
+    assert!(rels.contains("https://example.com/山田太郎"), "{rels}");
+    assert!(edited.report.contains("フィールド"), "{}", edited.report);
+    assert!(
+        edited.report.contains("ハイパーリンク"),
+        "{}",
+        edited.report
+    );
     let _ = fs::remove_dir_all(&dir);
 }

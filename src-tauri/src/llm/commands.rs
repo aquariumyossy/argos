@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime, State};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
@@ -674,6 +675,21 @@ pub async fn llm_thinking_budget(
 pub async fn llm_list_models(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmModelInfo>, String> {
     let settings = state.settings.read().clone();
     llm::list_models(&settings).await
+}
+
+#[tauri::command]
+pub fn open_output_file(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<(), String> {
+    let path = crate::office_edit::output_file_path(&state.data_dir, &name)?;
+    let path = crate::office_edit::strip_verbatim_prefix(&path);
+    let display = path.to_string_lossy().to_string();
+    app.opener()
+        .open_path(display.as_str(), None::<&str>)
+        .map_err(|e| format!("ファイルを開けません（{e}）。"))?;
+    Ok(())
 }
 
 #[tauri::command]

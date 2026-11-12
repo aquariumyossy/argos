@@ -397,7 +397,7 @@ pub fn tools_schema(
             "description": "添付の .docx / .xlsx を編集し、元ファイルは変えず新しいファイルを保存する。確認は取らない。書式・表・フォントは残し文字だけ変える。1回の呼び出しに編集をすべて入れる（元の添付から作り、前回の出力には重ねない）。.doc と .xls は対象外。\
 replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・コメント・変更履歴の文字（複数のランに分かれた名前を含む）。履歴としては記録しない。Excel は全シートのセルとシート名。\
 paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
-cite_no は出典 [n]。添付が1件なら省略できる。filename か path でも指定できる。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
+cite_no は出典 [n]。添付が1件なら省略できる。filename か path でも指定できる。検索でヒットしたファイルは編集できない。添付だけ。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -5103,11 +5103,9 @@ mod tests {
     fn edit_office_is_offered_and_counts_as_a_round() {
         let schema = tools_schema(false, false, false, false).to_string();
         assert!(schema.contains(TOOL_EDIT_OFFICE), "{schema}");
-        assert!(
-            tools_schema(false, false, false, true)
-                .to_string()
-                .contains(TOOL_EDIT_OFFICE)
-        );
+        assert!(tools_schema(false, false, false, true)
+            .to_string()
+            .contains(TOOL_EDIT_OFFICE));
         assert!(schema.contains("確認は取らない"), "{schema}");
         assert!(schema.contains("変更履歴"), "{schema}");
         assert!(counts_toward_tool_round(&[TOOL_EDIT_OFFICE]));

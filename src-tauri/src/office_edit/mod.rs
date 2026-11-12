@@ -14,9 +14,12 @@ use serde_json::Value;
 use crate::db::LlmSourceRow;
 use crate::pathutil;
 
-pub const OUTPUT_DIR_NAME: &str = "出力";
+/// Same folder as chat file creation (`data_dir/output`).
+pub const OUTPUT_DIR_NAME: &str = "output";
 pub const FILE_LINE: &str = "出力ファイル: ";
 pub const PATH_LINE: &str = "保存先: ";
+/// Third field is a bare file name. The chat button passes that name, never a path.
+pub const OFFICE_MARKER: &str = "[[argos-office]]";
 const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 80 * 1024 * 1024;
 const MAX_REPLACEMENTS: usize = 40;
@@ -168,16 +171,18 @@ pub fn edit_path(
 }
 
 pub fn resolve_office_path(sources: &[LlmSourceRow], args: &Value) -> Result<String, String> {
-    let office: Vec<&LlmSourceRow> = sources
+    let cited: Vec<&LlmSourceRow> = sources
         .iter()
         .filter(|row| is_office_path(&row.path))
         .collect();
-    if office.is_empty() {
-        return Err("この会話に添付された .docx / .xlsx がありません。".into());
-    }
+    let office: Vec<&LlmSourceRow> = cited
+        .iter()
+        .copied()
+        .filter(|row| is_attached(row))
+        .collect();
     let cite = arg_i64(args.get("cite_no")).filter(|value| *value > 0);
     if let Some(cite_no) = cite {
-        let rows: Vec<&LlmSourceRow> = office
+        let rows: Vec<&LlmSourceRow> = cited
             .iter()
             .copied()
             .filter(|row| row.cite_no == cite_no)
@@ -191,7 +196,18 @@ pub fn resolve_office_path(sources: &[LlmSourceRow], args: &Value) -> Result<Str
             }
             return Err(format!("出典 [{cite_no}] はこの会話にありません。"));
         }
-        return Ok(rows[0].path.clone());
+        if rows.iter().all(|row| !is_attached(row)) {
+            return Err(not_attached_message());
+        }
+        let attached: Vec<&LlmSourceRow> =
+            rows.into_iter().filter(|row| is_attached(row)).collect();
+        return Ok(attached[0].path.clone());
+    }
+    if office.is_empty() {
+        if cited.iter().any(|row| !is_attached(row)) {
+            return Err(not_attached_message());
+        }
+        return Err("この会話に添付された .docx / .xlsx がありません。".into());
     }
     let wanted = first_text(args, &["path", "filename", "file"]);
     if wanted.is_empty() {
@@ -209,7 +225,7 @@ pub fn resolve_office_path(sources: &[LlmSourceRow], args: &Value) -> Result<Str
     }
     let wanted_name = file_name_of(&wanted);
     let wanted_key = pathutil::normalize_for_compare(&wanted);
-    let matched: Vec<&LlmSourceRow> = office
+    let name_hits: Vec<&LlmSourceRow> = cited
         .iter()
         .copied()
         .filter(|row| {
@@ -217,7 +233,15 @@ pub fn resolve_office_path(sources: &[LlmSourceRow], args: &Value) -> Result<Str
                 || file_name_of(&row.path).eq_ignore_ascii_case(&wanted_name)
         })
         .collect();
+    let matched: Vec<&LlmSourceRow> = name_hits
+        .iter()
+        .copied()
+        .filter(|row| is_attached(row))
+        .collect();
     if matched.is_empty() {
+        if !name_hits.is_empty() {
+            return Err(not_attached_message());
+        }
         return Err(
             "指定されたファイルはこの会話の添付ではありません。.docx / .xlsx の出典を指定してください。"
                 .into(),
@@ -413,6 +437,80 @@ pub(crate) fn push_leftover(
     }
 }
 
+fn is_attached(row: &LlmSourceRow) -> bool {
+    row.origin.eq_ignore_ascii_case("attach")
+}
+
+fn not_attached_message() -> String {
+    "検索で見つかったファイルは編集できません。この会話に添付した .docx / .xlsx を指定してください。"
+        .into()
+}
+
+/// Resolve a bare file name inside `data_dir/output`.
+/// Rejects separators, `..`, drive letters, and UNC names, then checks the
+/// canonical path stays inside that folder.
+pub fn output_file_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = bare_output_name(name)?;
+    let dir = data_dir.join(OUTPUT_DIR_NAME);
+    if !dir.is_dir() {
+        return Err("出力フォルダがありません。".into());
+    }
+    let joined = dir.join(name);
+    if joined.parent() != Some(dir.as_path())
+        || joined.file_name().and_then(|n| n.to_str()) != Some(name)
+    {
+        return Err("ファイル名だけを指定してください。".into());
+    }
+    let canon_dir = fs::canonicalize(&dir).map_err(|_| "出力フォルダがありません。".to_string())?;
+    let canon_file =
+        fs::canonicalize(&joined).map_err(|_| "ファイルが見つかりません。".to_string())?;
+    if !canon_file.starts_with(&canon_dir) {
+        return Err("出力フォルダの外は開けません。".into());
+    }
+    Ok(canon_file)
+}
+
+/// `canonicalize` on Windows returns `\\?\C:\...` or `\\?\UNC\server\...`.
+/// Drop that prefix after the containment check, immediately before opening.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    PathBuf::from(strip_verbatim_text(&path.to_string_lossy()))
+}
+
+fn strip_verbatim_text(path: &str) -> String {
+    if starts_with_ignore_ascii(path, r"\\?\UNC\") {
+        return format!(r"\\{}", &path["\\\\?\\UNC\\".len()..]);
+    }
+    if starts_with_ignore_ascii(path, r"\\?\") {
+        return path[r"\\?\".len()..].to_string();
+    }
+    path.to_string()
+}
+
+fn starts_with_ignore_ascii(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn bare_output_name(raw: &str) -> Result<&str, String> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.contains('\0')
+        || name.contains("..")
+        || name.starts_with('.')
+        || name.chars().any(|c| c.is_control())
+    {
+        return Err("ファイル名だけを指定してください。".into());
+    }
+    let lower = name.to_ascii_lowercase();
+    if !lower.ends_with(".docx") && !lower.ends_with(".xlsx") {
+        return Err("Word か Excel のファイル名を指定してください。".into());
+    }
+    Ok(name)
+}
+
 fn format_report(
     filename: &str,
     path: &Path,
@@ -422,6 +520,17 @@ fn format_report(
 ) -> String {
     let mut out = String::new();
     out.push_str(FILE_LINE);
+    out.push_str(filename);
+    out.push('\n');
+    let kind = if filename.to_ascii_lowercase().ends_with(".xlsx") {
+        "xlsx"
+    } else {
+        "docx"
+    };
+    out.push_str(OFFICE_MARKER);
+    out.push('\t');
+    out.push_str(kind);
+    out.push('\t');
     out.push_str(filename);
     out.push('\n');
     out.push_str(PATH_LINE);
