@@ -9,9 +9,10 @@ use crate::db::{LlmMessageRow, LlmSourceRow, LlmThreadRow, NoteReview};
 use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
     estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
-    meter_usage_tokens, parse_cited_nos, sent_usage_tokens, silent_end_notice,
-    sources_for_consumed, summary_trigger_reached, tool_schema_tokens, ChatTurn, ContextBudget,
-    PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP, STOP_TOOLS_HINT,
+    meter_request_tokens, meter_usage_tokens, parse_cited_nos, sent_usage_tokens,
+    silent_end_notice, sources_for_consumed, summary_trigger_reached, tool_schema_tokens, ChatTurn,
+    ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
+    STOP_TOOLS_HINT,
 };
 use crate::llm::summary::{self, SummaryAttempt};
 use crate::llm::tools::{self, ToolExec};
@@ -844,7 +845,9 @@ async fn llm_send_inner<R: Runtime>(
     let cancel = Arc::new(AtomicBool::new(false));
     let state_arc = Arc::clone(state);
     let mut busy: Option<LlmBusyGuard> = None;
-    // Same numerator the meter reports, against 80% of the meter denominator.
+    // Summary keys off replayed turns and the tool schema, against 80% of the
+    // meter denominator. The system prompt is on the meter only, so a longer
+    // instruction does not by itself fold the thread.
     let baseline =
         summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
     let usage = sent_usage_tokens(&system, &sources, &baseline, schema_tokens, prompt_budget);
@@ -1812,7 +1815,7 @@ fn attach_thread_title(explicit: Option<&str>, items: &[LlmAttachItem]) -> Strin
     "新しい会話".into()
 }
 
-/// Size of the next request: assembled turns, without the system prompt, plus the tool schema.
+/// Size of the next request: assembled turns, including the system prompt, plus the tool schema.
 /// Runs off the UI thread. An empty draft is measured as one new question.
 #[tauri::command]
 pub async fn llm_context_meter(
@@ -1903,11 +1906,6 @@ fn file_grain_reading(
 ) -> FileGrainReading {
     let history = history_with_meter_draft(history, draft);
     let (turns, _) = assemble_turns(system, sources, &history, message_budget.max(1));
-    let sent: usize = turns
-        .iter()
-        .filter(|turn| turn.role != "system")
-        .map(crate::llm::context::turn_tokens)
-        .sum();
     let full = sources
         .iter()
         .find(|source| source.id == source_id)
@@ -1920,7 +1918,7 @@ fn file_grain_reading(
         .map(|turn| turn.content.as_str())
         .unwrap_or("");
     FileGrainReading {
-        tokens: sent + schema_tokens,
+        tokens: meter_request_tokens(&turns, schema_tokens),
         body_trimmed: !full.is_empty() && !latest.contains(full.as_str()),
     }
 }
@@ -4025,7 +4023,7 @@ mod tests {
         let reading = file_grain_reading("役割", &expanded, &[], "", 2_410, budget, "f1");
         assert!(!reading.body_trimmed);
         assert_eq!(
-            reading.tokens, 64_932,
+            reading.tokens, 64_983,
             "same count as the chat meter for a pending attachment"
         );
         assert_eq!(
@@ -4099,6 +4097,261 @@ mod tests {
             large_reading.tokens,
             meter_usage_tokens("役割", &large, &history, "", 2_410, budget)
         );
+    }
+
+    struct MeterParts {
+        tokens: usize,
+        system_tokens: usize,
+        schema_tokens: usize,
+        system: String,
+    }
+
+    fn replay_tokens(parts: &MeterParts) -> usize {
+        parts.tokens - parts.system_tokens - parts.schema_tokens
+    }
+
+    fn delta(later: usize, earlier: usize) -> i64 {
+        later as i64 - earlier as i64
+    }
+
+    /// What `llm_context_meter` reports for this thread, and the system turn it counted.
+    fn meter_parts(
+        state: &std::sync::Arc<crate::state::AppState>,
+        thread_id: &str,
+        draft: &str,
+        web_search: bool,
+    ) -> MeterParts {
+        let (tokens, trimmed) = measure_context_meter(
+            std::sync::Arc::clone(state),
+            thread_id.to_string(),
+            draft.to_string(),
+            web_search,
+            None,
+        )
+        .unwrap();
+        assert!(!trimmed);
+        let settings = state.settings.read().clone();
+        let (thread, history, sources) = if thread_id.trim().is_empty() {
+            (blank_llm_thread(), Vec::new(), Vec::new())
+        } else {
+            let thread = state.db.get_llm_thread(thread_id).unwrap().unwrap();
+            let history = state.db.list_llm_messages(thread_id).unwrap();
+            let sources = state.db.list_llm_sources(thread_id).unwrap();
+            (thread, history, sources)
+        };
+        let history =
+            summary::prepare_model_history(&history, &thread.summary, &thread.summary_through_id);
+        let plan = plan_chat_request(
+            state,
+            &settings,
+            &thread,
+            meter_question(draft),
+            web_search,
+            &sources,
+            None,
+        );
+        assert_eq!(
+            tokens,
+            meter_usage_tokens(
+                &plan.system,
+                &sources,
+                &history,
+                draft,
+                plan.schema_tokens,
+                plan.prompt_budget,
+            )
+        );
+        let folded = history_with_meter_draft(&history, draft);
+        let (turns, _) = assemble_turns(&plan.system, &sources, &folded, plan.prompt_budget.max(1));
+        assert_eq!(tokens, meter_request_tokens(&turns, plan.schema_tokens));
+        assert_eq!(turns.iter().filter(|turn| turn.role == "system").count(), 1);
+        let system_tokens: usize = turns
+            .iter()
+            .filter(|turn| turn.role == "system")
+            .map(crate::llm::context::turn_tokens)
+            .sum();
+        let gate = sent_usage_tokens(
+            &plan.system,
+            &sources,
+            &folded,
+            plan.schema_tokens,
+            plan.prompt_budget,
+        );
+        assert_eq!(tokens, gate + system_tokens);
+        assert!(system_tokens > 0);
+        MeterParts {
+            tokens,
+            system_tokens,
+            schema_tokens: plan.schema_tokens,
+            system: turns
+                .into_iter()
+                .find(|turn| turn.role == "system")
+                .unwrap()
+                .content,
+        }
+    }
+
+    #[test]
+    fn context_meter_counts_the_system_prompt_this_chat_would_send() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-meter-system-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+            settings.searxng_url = "http://127.0.0.1:8888".into();
+            settings.search_mode = "local".into();
+            settings.mail_days_back = 45;
+            settings.llm_max_context_tokens = 131_072;
+        }
+        let created = state.db.create_llm_thread("調査", true).unwrap();
+        state
+            .db
+            .set_llm_thread_scope(&created.id, r"C:\docs\案件")
+            .unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        state
+            .db
+            .update_note_memo(&note.id, "## 請求原因\n売買代金")
+            .unwrap();
+        state.db.set_llm_thread_note(&created.id, &note.id).unwrap();
+        state
+            .db
+            .insert_llm_message(&created.id, "user", "前回の質問")
+            .unwrap();
+        state
+            .db
+            .insert_llm_source(
+                &created.id,
+                "attach",
+                r"C:\docs\契約.txt",
+                "契約.txt",
+                "p1",
+                "条項本文",
+                "",
+            )
+            .unwrap();
+
+        let draft = "質問です";
+        let baseline = meter_parts(&state, &created.id, draft, false);
+        let thread = state.db.get_llm_thread(&created.id).unwrap().unwrap();
+        let note = state.db.get_note(&note.id).unwrap().unwrap();
+        let scope = tools::format_thread_scope_system_line(&thread.path_prefix).unwrap();
+        let note_line = tools::format_note_target_system_line(&note.title, &note.memo);
+        assert!(baseline
+            .system
+            .contains("事務所の独自ルールだけを守ってください。"));
+        assert!(!baseline.system.contains("言語タグ mermaid"));
+        assert!(baseline.system.contains(scope.trim()));
+        assert!(baseline.system.contains(note_line.trim()));
+        assert!(baseline
+            .system
+            .contains(tools::format_search_date_system_line(45).trim()));
+        assert!(baseline
+            .system
+            .contains(tools::format_calendar_system_line().trim()));
+        assert!(baseline.system.contains("生のHTMLは書かないでください"));
+        assert!(baseline
+            .system
+            .contains("根拠にする条を read_unit で読み直して"));
+        assert!(baseline
+            .system
+            .contains("書いた内容はすぐメモに反映されます"));
+        assert!(baseline
+            .system
+            .contains(crate::statute::LLM_STATUTE_SENTINEL));
+        assert!(
+            baseline.system.contains("出典ブロックがあるときは"),
+            "a pending source adds the citation guide to the counted prompt"
+        );
+        assert!(!baseline.system.contains("ウェブ検索が有効です"));
+        assert!(!baseline.system.contains("別PCの共有フォルダも検索対象です"));
+
+        let diagram = meter_parts(&state, &created.id, "契約を図にして", false);
+        assert!(diagram.system.contains(llm::LLM_DIAGRAM_HINT));
+        assert!(
+            !diagram.system.contains("出典ブロックがあるときは"),
+            "the diagram hint already shows [n], so the citation guide is not added again"
+        );
+        assert!(diagram.system_tokens > baseline.system_tokens);
+        assert_eq!(diagram.schema_tokens, baseline.schema_tokens);
+
+        let fresh = meter_parts(&state, "", draft, false);
+        assert!(fresh
+            .system
+            .contains("事務所の独自ルールだけを守ってください。"));
+        assert!(!fresh.system.contains("言語タグ mermaid"));
+        assert!(!fresh.system.contains("配下に限定"));
+        assert!(!fresh.system.contains("出典ブロックがあるときは"));
+        assert!(baseline.system_tokens > fresh.system_tokens);
+
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = "短く。".into();
+        }
+        let shorter = meter_parts(&state, &created.id, draft, false);
+        assert!(shorter.system.contains("短く。"));
+        assert!(!shorter.system.contains("事務所の独自ルール"));
+        assert_eq!(shorter.schema_tokens, baseline.schema_tokens);
+        assert_eq!(replay_tokens(&shorter), replay_tokens(&baseline));
+        assert!(baseline.tokens > shorter.tokens);
+        assert_eq!(
+            baseline.tokens - shorter.tokens,
+            baseline.system_tokens - shorter.system_tokens
+        );
+
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+        }
+        let restored = meter_parts(&state, &created.id, draft, false);
+        assert_eq!(restored.tokens, baseline.tokens);
+
+        let web = meter_parts(&state, &created.id, draft, true);
+        assert!(web.system.contains("ウェブ検索が有効です"));
+        assert_ne!(web.schema_tokens, restored.schema_tokens);
+        assert_eq!(replay_tokens(&web), replay_tokens(&restored));
+        assert_eq!(
+            delta(web.tokens, restored.tokens),
+            delta(web.system_tokens, restored.system_tokens)
+                + delta(web.schema_tokens, restored.schema_tokens)
+        );
+
+        {
+            let mut settings = state.settings.write();
+            settings.search_mode = "hybrid".into();
+        }
+        let hybrid = meter_parts(&state, &created.id, draft, true);
+        assert!(hybrid.system.contains("別PCの共有フォルダも検索対象です"));
+        assert_eq!(replay_tokens(&hybrid), replay_tokens(&web));
+        assert_eq!(
+            delta(hybrid.tokens, web.tokens),
+            delta(hybrid.system_tokens, web.system_tokens)
+                + delta(hybrid.schema_tokens, web.schema_tokens)
+        );
+        assert!(hybrid.tokens > web.tokens);
+
+        state.db.set_llm_thread_scope(&created.id, "").unwrap();
+        let unscoped = meter_parts(&state, &created.id, draft, true);
+        assert!(!unscoped.system.contains("配下に限定"));
+        assert_eq!(unscoped.schema_tokens, hybrid.schema_tokens);
+        assert_eq!(replay_tokens(&unscoped), replay_tokens(&hybrid));
+        assert_eq!(
+            delta(hybrid.tokens, unscoped.tokens),
+            delta(hybrid.system_tokens, unscoped.system_tokens)
+        );
+
+        let plain = meter_parts(&state, &created.id, "見て", true);
+        assert!(!plain.system.contains("言語タグ mermaid"));
+        assert!(plain.system.contains("ウェブ検索が有効です"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn cut_then_answer(tools: bool, body: &str) -> (llm::thinking::CutHold, Option<RecoveredCut>) {
