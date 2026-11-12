@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -38,6 +39,12 @@ import {
 } from "./chatShortcut";
 import { useChatContextMeter } from "./useChatContextMeter";
 import { shouldRestoreDraft } from "./refusedSend";
+import {
+  bytesToBase64,
+  clipboardImages,
+  pastedImageSizeError,
+  pastedImageTypeError,
+} from "./pasteImage";
 import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/NoteReviewPanel";
 import { openPreview } from "../preview/openPreview";
@@ -234,6 +241,21 @@ const ATTACH_EXTENSIONS = [
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function attachFollowup(result: LlmAttachFilesResult): { error: string; notice: string } {
+  const error = result.errors
+    .map((item) => item.message)
+    .filter((message) => message.trim())
+    .join("\n");
+  const notice = [
+    result.skipped > 0 ? "同じ出典がすでに読込前にあります" : "",
+    result.remoteOcr ? "画像は設定中の LLM サーバへ送られます" : "",
+    ...(result.warnings ?? []),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return { error, notice };
 }
 
 function formatInvokeError(e: unknown): string {
@@ -1542,26 +1564,78 @@ export default function Chat() {
         return [result.thread, ...rest];
       });
       setSources(result.sources);
-      if (result.errors.length) {
-        setError(result.errors.map((e) => `${e.message}`).join("\n"));
-      }
-      const bits: string[] = [];
-      if (result.skipped > 0) {
-        bits.push("同じ出典がすでに読込前にあります");
-      }
-      if (result.remoteOcr) {
-        bits.push("画像は設定中の LLM サーバへ送られます");
-      }
-      if (result.warnings?.length) {
-        bits.push(...result.warnings);
-      }
-      if (bits.length) setNotice(bits.join(" · "));
+      const follow = attachFollowup(result);
+      if (follow.error) setError(follow.error);
+      if (follow.notice) setNotice(follow.notice);
     } catch (e) {
       setError(formatInvokeError(e));
     } finally {
       setAttaching(false);
     }
   }, []);
+
+  const pasteClipboardImage = useCallback(
+    async (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+      const images = clipboardImages(event.clipboardData);
+      if (images.length === 0) return;
+      event.preventDefault();
+      if (busyRef.current || ocrBusyRef.current || attachingRef.current) return;
+      setError("");
+      setNotice("");
+      setAttaching(true);
+      const problems: string[] = [];
+      let last: LlmAttachFilesResult | null = null;
+      let threadId = activeIdRef.current ?? undefined;
+      try {
+        for (const image of images) {
+          const typeError = pastedImageTypeError(image.type);
+          if (typeError) {
+            problems.push(typeError);
+            continue;
+          }
+          const sizeError = pastedImageSizeError(image.size);
+          if (sizeError) {
+            problems.push(sizeError);
+            continue;
+          }
+          const bytes = new Uint8Array(await image.arrayBuffer());
+          const readError = pastedImageSizeError(bytes.byteLength);
+          if (readError) {
+            problems.push(readError);
+            continue;
+          }
+          const result = await invoke<LlmAttachFilesResult>("llm_attach_pasted_image", {
+            dataBase64: bytesToBase64(bytes),
+            mime: image.type,
+            threadId,
+          });
+          last = result;
+          threadId = result.thread.id;
+          for (const item of result.errors) {
+            if (item.message.trim()) problems.push(item.message);
+          }
+        }
+      } catch (e) {
+        problems.push(formatInvokeError(e));
+      } finally {
+        const attached = last;
+        if (attached) {
+          setActive(attached.thread);
+          activeIdRef.current = attached.thread.id;
+          setThreads((prev) => {
+            const rest = prev.filter((item) => item.id !== attached.thread.id);
+            return [attached.thread, ...rest];
+          });
+          setSources(attached.sources);
+          const follow = attachFollowup({ ...attached, errors: [] });
+          if (follow.notice) setNotice(follow.notice);
+        }
+        if (problems.length) setError(problems.join("\n"));
+        setAttaching(false);
+      }
+    },
+    [],
+  );
 
   async function pickFiles() {
     if (blocked) return;
@@ -2569,6 +2643,9 @@ export default function Chat() {
               placeholder="メッセージを入力（Enter で送信、Shift+Enter で改行）"
               disabled={attaching || onGeneratingThread}
               onChange={(e) => setDraft(e.target.value)}
+              onPaste={(e) => {
+                void pasteClipboardImage(e);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();

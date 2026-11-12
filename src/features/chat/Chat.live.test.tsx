@@ -98,6 +98,7 @@ const messagesB = [
 
 let messagesA: Array<typeof originalUser & { reasoning?: string }> = [originalUser];
 let sourcesA: Array<Record<string, unknown>> = [];
+let pastedAttachResult: Record<string, unknown> | null = null;
 let releaseSend: () => void = () => {};
 
 const meterLimit = contextMeterLimit(131_072);
@@ -236,6 +237,7 @@ beforeEach(() => {
   vi.stubGlobal("ResizeObserver", ContentResizeObserver);
   messagesA = [originalUser];
   sourcesA = [];
+  pastedAttachResult = null;
   releaseSend = () => {};
   listeners.clear();
   mockWriteText.mockReset();
@@ -283,6 +285,8 @@ beforeEach(() => {
       }
       case "llm_context_meter":
         return args?.threadId === threadB.id ? 1111 : 2222;
+      case "llm_attach_pasted_image":
+        return pastedAttachResult;
       case "llm_send": {
         const content = String(args?.content ?? "");
         return new Promise((resolve) => {
@@ -1286,5 +1290,105 @@ describe("Ctrl+Alt+C", () => {
     } finally {
       hasFocus.mockRestore();
     }
+  });
+});
+
+describe("Ctrl+V image paste", () => {
+  const pasteTitle = "貼り付け画像（2026-11-12 11時59分01秒）";
+
+  function pastedSource() {
+    return {
+      id: "paste-1",
+      threadId: threadA.id,
+      sortOrder: 0,
+      origin: "attach",
+      path: pasteTitle,
+      title: pasteTitle,
+      paragraphId: "",
+      body: "",
+      query: "",
+      createdAt: 1,
+      grain: "file",
+      kind: "image",
+      citeNo: 3,
+      ocrStatus: "pending",
+      storedRelpath: "chat-files/thread-a/paste-1.png",
+    };
+  }
+
+  it("attaches a clipboard image and leaves typed text alone", async () => {
+    pastedAttachResult = {
+      thread: threadA,
+      sources: [pastedSource()],
+      added: 1,
+      skipped: 0,
+      createdThread: false,
+      errors: [],
+      remoteOcr: true,
+      ocrStarted: false,
+      warnings: [],
+    };
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "この図の続柄は" } });
+    const file = new File([Uint8Array.from([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    });
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [file],
+        items: [],
+      },
+    });
+    expect(pasted).toBe(false);
+    expect(box.value).toBe("この図の続柄は");
+    const chips = await screen.findAllByRole("button", {
+      name: /貼り付け画像（2026-11-12 11時59分01秒）/,
+    });
+    expect(chips.some((button) => button.textContent?.includes(pasteTitle))).toBe(true);
+    expect(screen.getByText("画像は設定中の LLM サーバへ送られます")).toBeTruthy();
+    const call = mockInvoke.mock.calls.find((entry) => entry[0] === "llm_attach_pasted_image");
+    expect(call?.[1]).toEqual(
+      expect.objectContaining({
+        mime: "image/png",
+        threadId: "thread-a",
+        dataBase64: btoa(String.fromCharCode(137, 80, 78, 71)),
+      }),
+    );
+  });
+
+  it("pastes plain text without attaching an image", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const pasted = fireEvent.paste(box, {
+      clipboardData: {
+        files: [],
+        items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
+        getData: (type: string) => (type === "text/plain" ? "条文を見て" : ""),
+      },
+    });
+    expect(pasted).toBe(true);
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
+  });
+
+  it("rejects an image over 8MB before calling the backend", async () => {
+    await renderChat();
+    const box = screen.getByPlaceholderText(COMPOSER_PLACEHOLDER);
+    const huge = {
+      type: "image/png",
+      size: 8 * 1024 * 1024 + 1,
+      arrayBuffer: async () => {
+        throw new Error("should not read");
+      },
+    };
+    fireEvent.paste(box, {
+      clipboardData: { files: [huge], items: [] },
+    });
+    expect(await screen.findByText("画像が大きすぎます（8 MBまで）。")).toBeTruthy();
+    expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
+      false,
+    );
   });
 });
