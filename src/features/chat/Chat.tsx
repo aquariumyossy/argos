@@ -23,6 +23,7 @@ import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
+import { parseOfficeFileNotice } from "./officeFile";
 import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
 import {
   applyChatDelta,
@@ -1446,6 +1447,14 @@ export default function Chat() {
     }
   }
 
+  async function openSavedFile(name: string) {
+    try {
+      await invoke("open_output_file", { name });
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
   async function openSource(s: LlmSourceRow) {
     const path = s.path.trim();
     if (!path) return;
@@ -2236,6 +2245,7 @@ export default function Chat() {
               const citeInfo = openableCitesFromGroups(citeGroups);
               const calls = toolCallNames(m.toolCalls);
               const isNotice = m.kind === "notice";
+              const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
               const roleClass =
                 m.role === "user"
                   ? "chat-msg user"
@@ -2263,7 +2273,20 @@ export default function Chat() {
                       {calls.length > 0 ? (
                         <p className="chat-tool-hint">{calls.join("、")}</p>
                       ) : null}
-                      {m.content.trim() ? (
+                      {officeFile ? (
+                        <div className="chat-office-file">
+                          <span>{officeFile.label}</span>
+                          <button
+                            type="button"
+                            className="chat-cite-badge clickable"
+                            title={officeFile.name}
+                            aria-label={`${officeFile.name} を開く`}
+                            onClick={() => void openSavedFile(officeFile.name)}
+                          >
+                            {officeFile.name}
+                          </button>
+                        </div>
+                      ) : m.content.trim() ? (
                         <AssistantBody
                           text={m.content}
                           citeNos={citeInfo.nos}

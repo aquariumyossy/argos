@@ -402,6 +402,13 @@
   color: var(--muted);
 }
 
+.chat-office-file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .chat-msg.assistant.streaming {
   opacity: 0.98;
 }
