@@ -133,6 +133,29 @@ pub fn output_file_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> 
     Ok(canon_file)
 }
 
+/// `canonicalize` on Windows returns `\\?\C:\...` or `\\?\UNC\server\...`.
+/// `ShellExecuteExW` rejects that verbatim form, so drop the prefix after the
+/// containment check. Other paths are unchanged.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    PathBuf::from(strip_verbatim_text(&text))
+}
+
+fn strip_verbatim_text(path: &str) -> String {
+    if starts_with_ignore_ascii(path, r"\\?\UNC\") {
+        return format!(r"\\{}", &path["\\\\?\\UNC\\".len()..]);
+    }
+    if starts_with_ignore_ascii(path, r"\\?\") {
+        return path[r"\\?\".len()..].to_string();
+    }
+    path.to_string()
+}
+
+fn starts_with_ignore_ascii(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 fn bare_output_name(raw: &str) -> Result<&str, String> {
     let name = raw.trim();
     if name.is_empty()
@@ -1775,6 +1798,7 @@ const DYNAMIC_ARRAY_FUNCS: &[&str] = &[
     "PIVOTBY",
     "RANDARRAY",
     "REDUCE",
+    "REGEXEXTRACT",
     "SCAN",
     "SEQUENCE",
     "SORT",
@@ -1795,6 +1819,7 @@ const XLFN_FUNCS: &[&str] = &[
     "ACOTH",
     "AGGREGATE",
     "ARABIC",
+    "ARRAYTOTEXT",
     "BASE",
     "BETA.DIST",
     "BETA.INV",
@@ -1807,6 +1832,7 @@ const XLFN_FUNCS: &[&str] = &[
     "BITRSHIFT",
     "BITXOR",
     "CEILING.MATH",
+    "CEILING.PRECISE",
     "CHISQ.DIST",
     "CHISQ.DIST.RT",
     "CHISQ.INV",
@@ -1816,6 +1842,7 @@ const XLFN_FUNCS: &[&str] = &[
     "CONCAT",
     "CONFIDENCE.NORM",
     "CONFIDENCE.T",
+    "COPILOT",
     "COT",
     "COTH",
     "COVARIANCE.P",
@@ -1824,6 +1851,7 @@ const XLFN_FUNCS: &[&str] = &[
     "CSCH",
     "DAYS",
     "DECIMAL",
+    "ENCODEURL",
     "ERF.PRECISE",
     "ERFC.PRECISE",
     "EXPON.DIST",
@@ -1832,7 +1860,9 @@ const XLFN_FUNCS: &[&str] = &[
     "F.INV",
     "F.INV.RT",
     "F.TEST",
+    "FIELDVALUE",
     "FLOOR.MATH",
+    "FLOOR.PRECISE",
     "FORECAST.ETS",
     "FORECAST.ETS.CONFINT",
     "FORECAST.ETS.SEASONALITY",
@@ -1856,17 +1886,17 @@ const XLFN_FUNCS: &[&str] = &[
     "IMSINH",
     "IMTAN",
     "ISFORMULA",
-    "ISO.CEILING",
+    "ISOMITTED",
     "ISOWEEKNUM",
     "LOGNORM.DIST",
     "LOGNORM.INV",
+    "LONGTEXT",
     "MAXIFS",
     "MINIFS",
     "MODE.MULT",
     "MODE.SNGL",
     "MUNIT",
     "NEGBINOM.DIST",
-    "NETWORKDAYS.INTL",
     "NORM.DIST",
     "NORM.INV",
     "NORM.S.DIST",
@@ -1880,10 +1910,17 @@ const XLFN_FUNCS: &[&str] = &[
     "PERMUTATIONA",
     "PHI",
     "POISSON.DIST",
+    "PQSOURCE",
+    "PYTHON_STR",
+    "PYTHON_TYPE",
+    "PYTHON_TYPENAME",
     "QUARTILE.EXC",
     "QUARTILE.INC",
+    "QUERYSTRING",
     "RANK.AVG",
     "RANK.EQ",
+    "REGEXREPLACE",
+    "REGEXTEST",
     "RRI",
     "SEC",
     "SECH",
@@ -1899,13 +1936,15 @@ const XLFN_FUNCS: &[&str] = &[
     "T.INV",
     "T.INV.2T",
     "T.TEST",
+    "TEXTAFTER",
+    "TEXTBEFORE",
     "TEXTJOIN",
     "UNICHAR",
     "UNICODE",
+    "VALUETOTEXT",
     "VAR.P",
     "VAR.S",
     "WEIBULL.DIST",
-    "WORKDAY.INTL",
     "XLOOKUP",
     "XMATCH",
     "XOR",
@@ -2549,6 +2588,8 @@ mod tests {
             "=RANDARRAY(2)",
             "=LET(x,1,x)",
             "=LAMBDA(x,x)(1)",
+            "=REGEXEXTRACT(\"ab\",\"a\")",
+            "=TOCOL(A1:A2)",
         ] {
             let err = write_xlsx(
                 &tmp.0,
@@ -2564,6 +2605,80 @@ mod tests {
             );
             assert!(err.contains("XLOOKUP"), "{err}");
         }
+    }
+
+    #[test]
+    fn unprefixed_future_functions_stay_plain_and_missing_xlfn_names_are_prefixed() {
+        let tmp = Tmp::new();
+        let saved = write_xlsx(
+            &tmp.0,
+            &json!({
+                "filename": "将来関数",
+                "sheets": [{
+                    "name": "S",
+                    "rows": [[
+                        "=ISO.CEILING(1.2,1)",
+                        "=NETWORKDAYS.INTL(1,2)",
+                        "=WORKDAY.INTL(1,1)",
+                        "=CEILING.PRECISE(1.2)",
+                        "=FLOOR.PRECISE(1.2)",
+                        "=TEXTBEFORE(\"ab-cd\",\"-\")",
+                        "=TEXTAFTER(\"ab-cd\",\"-\")",
+                        "=ENCODEURL(\"a b\")",
+                        "=VALUETOTEXT(1)",
+                        "=ARRAYTOTEXT(A1)",
+                        "=REGEXTEST(\"ab\",\"a\")",
+                        "=REGEXREPLACE(\"ab\",\"a\",\"c\")"
+                    ]]
+                }]
+            }),
+        )
+        .unwrap();
+        let sheet = zip_text(Path::new(&saved.path), "xl/worksheets/sheet1.xml");
+        for plain in [
+            "ISO.CEILING(1.2,1)",
+            "NETWORKDAYS.INTL(1,2)",
+            "WORKDAY.INTL(1,1)",
+        ] {
+            assert!(
+                sheet.contains(&format!("<f>{plain}</f>")),
+                "{plain} in {sheet}"
+            );
+            assert!(!sheet.contains(&format!("_xlfn.{plain}")), "{plain}");
+        }
+        for prefixed in [
+            "_xlfn.CEILING.PRECISE(1.2)",
+            "_xlfn.FLOOR.PRECISE(1.2)",
+            "_xlfn.TEXTBEFORE(",
+            "_xlfn.TEXTAFTER(",
+            "_xlfn.ENCODEURL(",
+            "_xlfn.VALUETOTEXT(1)",
+            "_xlfn.ARRAYTOTEXT(A1)",
+            "_xlfn.REGEXTEST(",
+            "_xlfn.REGEXREPLACE(",
+        ] {
+            assert!(sheet.contains(prefixed), "{prefixed} missing from {sheet}");
+        }
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_before_the_shell_opens_a_file() {
+        assert_eq!(
+            strip_verbatim_text(r"\\?\C:\Users\a\AppData\Roaming\Argos\output\契約メモ.docx"),
+            r"C:\Users\a\AppData\Roaming\Argos\output\契約メモ.docx"
+        );
+        assert_eq!(
+            strip_verbatim_text(r"\\?\UNC\server\share\Argos\output\a.xlsx"),
+            r"\\server\share\Argos\output\a.xlsx"
+        );
+        assert_eq!(
+            strip_verbatim_text(r"\\?\unc\server\share\a.xlsx"),
+            r"\\server\share\a.xlsx"
+        );
+        assert_eq!(strip_verbatim_text(r"C:\ok.docx"), r"C:\ok.docx");
+        assert_eq!(strip_verbatim_text("/tmp/a.docx"), "/tmp/a.docx");
+        let wrapped = strip_verbatim_prefix(Path::new(r"\\?\D:\out\表.xlsx"));
+        assert_eq!(wrapped, PathBuf::from(r"D:\out\表.xlsx"));
     }
 
     #[test]

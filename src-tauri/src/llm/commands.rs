@@ -684,6 +684,7 @@ pub fn open_output_file(
     name: String,
 ) -> Result<(), String> {
     let path = crate::llm::create_office::output_file_path(&state.data_dir, &name)?;
+    let path = crate::llm::create_office::strip_verbatim_prefix(&path);
     let display = path.to_string_lossy().to_string();
     app.opener()
         .open_path(display.as_str(), None::<&str>)
