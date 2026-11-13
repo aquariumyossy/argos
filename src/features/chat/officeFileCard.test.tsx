@@ -49,7 +49,7 @@ let openError: Error | null = null;
 const { mockInvoke, focusHandlers, closeHandlers } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
   focusHandlers: [] as Array<(event: { payload: boolean }) => void>,
-  closeHandlers: [] as Array<() => void>,
+  closeHandlers: [] as Array<(event: { preventDefault: () => void }) => void>,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -69,7 +69,7 @@ vi.mock("@tauri-apps/api/window", () => ({
         if (index >= 0) focusHandlers.splice(index, 1);
       };
     },
-    onCloseRequested: async (cb: () => void) => {
+    onCloseRequested: async (cb: (event: { preventDefault: () => void }) => void) => {
       closeHandlers.push(cb);
       return () => {
         const index = closeHandlers.indexOf(cb);
@@ -444,10 +444,44 @@ describe("office file cards", () => {
 
     expect(closeHandlers.length).toBeGreaterThan(0);
     expect(focusHandlers.length).toBeGreaterThan(0);
+    const preventDefault = vi.fn();
     await act(async () => {
-      closeHandlers[0]!();
+      closeHandlers[0]!({ preventDefault });
       focusHandlers[0]!({ payload: true });
     });
+    expect(preventDefault).toHaveBeenCalled();
     expect(previewFrame("手数料.html").style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT}px`);
+  });
+
+  it("ends a preview drag on blur and on lost pointer capture", async () => {
+    rows = [
+      row("u", "user", "計算して"),
+      row(
+        "n1",
+        "assistant",
+        ["HTMLファイルを保存しました（Argos の出力フォルダ）", "[[argos-office]]\thtml\t手数料.html"].join(
+          "\n",
+        ),
+        { kind: "notice" },
+      ),
+      row("reply", "assistant", "できました。"),
+    ];
+    await renderChat();
+    await screen.findByRole("button", { name: "手数料.html を開く" });
+    setChatViewHeight(640);
+    const bar = screen.getByRole("separator", { name: "プレビューの高さを変更" });
+
+    fireEvent.pointerDown(bar, { pointerId: 1, clientY: 100 });
+    expect(document.querySelector("[data-preview-drag-overlay]")).toBeTruthy();
+    fireEvent.blur(window);
+    expect(document.querySelector("[data-preview-drag-overlay]")).toBeNull();
+
+    fireEvent.pointerDown(bar, { pointerId: 2, clientY: 100 });
+    const overlay = document.querySelector("[data-preview-drag-overlay]");
+    expect(overlay).toBeTruthy();
+    fireEvent.pointerMove(overlay!, { pointerId: 2, clientY: 160 });
+    expect(previewFrame("手数料.html").style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT + 60}px`);
+    fireEvent.lostPointerCapture(bar, { pointerId: 2 });
+    expect(document.querySelector("[data-preview-drag-overlay]")).toBeNull();
   });
 });

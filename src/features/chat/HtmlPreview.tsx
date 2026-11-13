@@ -97,6 +97,7 @@ function HtmlPreview({
     document.body.appendChild(overlay);
     if (mountedRef.current) setDragging(true);
 
+    const grab = event.currentTarget;
     const samePointer = (ev: PointerEvent) =>
       ev.pointerId == null || ev.pointerId === pointerId;
     let stopped = false;
@@ -106,6 +107,13 @@ function HtmlPreview({
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
+      window.removeEventListener("blur", onBlur);
+      grab.removeEventListener("lostpointercapture", onLostCapture);
+      try {
+        if (grab.hasPointerCapture?.(pointerId)) grab.releasePointerCapture(pointerId);
+      } catch {
+        /* capture already ended, for example after Alt+Tab */
+      }
       overlay.remove();
       if (dragRef.current === end) dragRef.current = null;
       if (mountedRef.current) setDragging(false);
@@ -118,10 +126,14 @@ function HtmlPreview({
       if (!samePointer(ev)) return;
       end();
     };
+    const onLostCapture = () => end();
+    const onBlur = () => end();
     dragRef.current = end;
+    grab.addEventListener("lostpointercapture", onLostCapture);
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
+    window.addEventListener("blur", onBlur);
   }
 
   return (

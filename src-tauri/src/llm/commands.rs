@@ -359,8 +359,13 @@ fn discard_refused_user_message(db: &crate::db::Db, message_id: &str) {
 }
 
 #[tauri::command]
-pub fn show_chat_window(app: AppHandle) {
-    crate::show_chat(&app);
+pub async fn show_chat_window(app: AppHandle) {
+    // Off the WebView2 IPC callback. Recreating the chat window on that
+    // thread deadlocks the UI the same way as the HTML preview.
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        crate::show_chat(&app);
+    })
+    .await;
 }
 
 #[tauri::command]
@@ -2479,7 +2484,7 @@ pub fn llm_set_source_grain(
 }
 
 #[tauri::command]
-pub fn llm_attach_sources(
+pub async fn llm_attach_sources(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     items: Vec<LlmAttachItem>,
@@ -2573,7 +2578,10 @@ pub fn llm_attach_sources(
         .map_err(|e| e.to_string())?
         .unwrap_or(thread);
 
-    crate::show_chat(&app);
+    let app_for_window = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::show_chat(&app_for_window))
+        .await
+        .map_err(|err| format!("チャットを開けません（{err}）。"))?;
     emit_sources_updated(&app, &thread.id);
 
     Ok(LlmAttachResult {
@@ -2856,7 +2864,7 @@ fn attach_scanned_pdf(
 }
 
 #[tauri::command]
-pub fn llm_attach_files(
+pub async fn llm_attach_files(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     paths: Vec<String>,
@@ -2934,6 +2942,7 @@ pub fn llm_attach_files(
         warnings,
         wants_ocr,
     )
+    .await
 }
 
 fn decode_pasted_image(data_base64: &str) -> Result<Vec<u8>, String> {
@@ -3017,7 +3026,7 @@ fn attach_pasted_image_bytes(
     }
 }
 
-fn finish_attach(
+async fn finish_attach(
     app: &AppHandle,
     state: &Arc<AppState>,
     thread: LlmThreadRow,
@@ -3037,7 +3046,10 @@ fn finish_attach(
         .get_llm_thread(&thread.id)
         .map_err(|e| e.to_string())?
         .unwrap_or(thread);
-    crate::show_chat(app);
+    let app_for_window = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::show_chat(&app_for_window))
+        .await
+        .map_err(|err| format!("チャットを開けません（{err}）。"))?;
     emit_sources_updated(app, &thread.id);
     let settings = state.settings.read().clone();
     let remote_ocr = wants_ocr && !llm::is_loopback_url(&settings.llm_base_url);
@@ -3059,7 +3071,7 @@ fn finish_attach(
 }
 
 #[tauri::command]
-pub fn llm_attach_pasted_image(
+pub async fn llm_attach_pasted_image(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     data_base64: String,
@@ -3110,6 +3122,7 @@ pub fn llm_attach_pasted_image(
         warnings,
         outcome.needs_ocr,
     )
+    .await
 }
 
 #[tauri::command]

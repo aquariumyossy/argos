@@ -828,7 +828,10 @@ export default function Chat() {
     let unlistenClose: (() => void) | undefined;
     let unlistenReady: (() => void) | undefined;
     let unlistenSettings: (() => void) | undefined;
-    void win.onCloseRequested(() => {
+    void win.onCloseRequested((event) => {
+      // Keep Rust's hide-on-close. Without this the webview destroys the
+      // window and the close promise rejects.
+      event.preventDefault();
       chatHiddenRef.current = true;
     }).then((fn) => {
       if (cancelled) fn();

@@ -735,12 +735,16 @@ pub fn hide_popup(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn show_popup_window(app: AppHandle) {
-    let _ = show_popup(&app);
+pub async fn show_popup_window(app: AppHandle) {
+    // Off the WebView2 IPC callback. Recreating the popup there deadlocks the UI.
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let _ = show_popup(&app);
+    })
+    .await;
 }
 
 #[tauri::command]
-pub fn show_preview_window(
+pub async fn show_preview_window(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     target: PreviewTarget,
@@ -748,8 +752,13 @@ pub fn show_preview_window(
     if target.path.trim().is_empty() {
         return Err("プレビューするパスがありません".into());
     }
-    *state.preview_target.write() = Some(target);
-    show_preview(&app);
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        *state.preview_target.write() = Some(target);
+        show_preview(&app);
+    })
+    .await
+    .map_err(|err| format!("プレビューを開けません（{err}）。"))?;
     Ok(())
 }
 
@@ -946,8 +955,11 @@ pub fn get_lan_ip_hint() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn show_settings_window(app: AppHandle) {
-    show_main(&app);
+pub async fn show_settings_window(app: AppHandle) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        show_main(&app);
+    })
+    .await;
 }
 
 #[tauri::command]
@@ -1311,8 +1323,11 @@ pub struct KeepToNoteResult {
 }
 
 #[tauri::command]
-pub fn show_notes_window(app: AppHandle) {
-    show_notes(&app);
+pub async fn show_notes_window(app: AppHandle) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        show_notes(&app);
+    })
+    .await;
 }
 
 #[tauri::command]
@@ -1678,7 +1693,7 @@ fn insert_keep_item(
 }
 
 #[tauri::command]
-pub fn keep_to_note(
+pub async fn keep_to_note(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     payload: KeepToNotePayload,
@@ -1686,7 +1701,10 @@ pub fn keep_to_note(
     let silent = payload.silent;
     let result = insert_keep_item(state.inner().as_ref(), payload)?;
     if !silent {
-        show_notes(&app);
+        let app_for_window = app.clone();
+        tauri::async_runtime::spawn_blocking(move || show_notes(&app_for_window))
+            .await
+            .map_err(|err| format!("ノートを開けません（{err}）。"))?;
     }
     emit_note_updated(&app, &result.note.id, "active");
     Ok(result)
