@@ -98,6 +98,11 @@ function invokeOnce(
   return pending;
 }
 
+/** Resolves when in-flight confirm commands started before this call have finished. */
+export function waitForNoteReviewCommands(): Promise<void> {
+  return Promise.all([...inflight.values()]).then(() => undefined);
+}
+
 export function ackNoteReview(review: NoteReview): Promise<NoteReview> {
   return invokeOnce(`ack:${review.noteId}:${review.memoLen}`, () =>
     invoke<NoteReview>("ack_note_review", {

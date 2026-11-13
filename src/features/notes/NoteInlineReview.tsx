@@ -5,6 +5,7 @@ import {
   type CompositionEvent,
   type KeyboardEvent,
 } from "react";
+import { flushSync } from "react-dom";
 import {
   ackNoteReview,
   buildInlineLines,
@@ -20,7 +21,10 @@ type ChangeProps = {
 };
 
 type DiffProps = ChangeProps & {
-  /** Confirmed memo is `baseMemo`. `extra` is text the user just typed. */
+  /**
+   * Open the note editor on `baseMemo` immediately.
+   * `extra` is pasted text only. Keystrokes and IME stay with the editor.
+   */
   onBeginEdit: (extra: string, baseMemo: string) => void;
 };
 
@@ -81,16 +85,12 @@ export function NoteReviewBar({ review, onChange, onError }: ChangeProps) {
   );
 }
 
-function editInsert(event: KeyboardEvent<HTMLDivElement>): string | null {
+function isEditKey(event: KeyboardEvent<HTMLDivElement>): boolean {
   const native = event.nativeEvent;
-  if (native.isComposing || event.key === "Process" || event.keyCode === 229) {
-    return null;
-  }
-  if (event.metaKey || event.ctrlKey || event.altKey) return null;
-  if (event.key === "Enter") return "\n";
-  if (event.key.length === 1) return event.key;
-  if (event.key === "Backspace" || event.key === "Delete") return "";
-  return null;
+  if (native.isComposing || event.key === "Process" || event.keyCode === 229) return true;
+  if (event.metaKey || event.ctrlKey || event.altKey) return false;
+  if (event.key === "Enter" || event.key === "Backspace" || event.key === "Delete") return true;
+  return event.key.length === 1;
 }
 
 export function NoteInlineDiff({
@@ -101,6 +101,7 @@ export function NoteInlineDiff({
 }: DiffProps) {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
+  const startedEditRef = useRef(false);
   const lines = buildInlineLines(review);
 
   async function occupy<T>(action: () => Promise<T>): Promise<T | undefined> {
@@ -124,32 +125,37 @@ export function NoteInlineDiff({
     });
   }
 
-  function beginEdit(extra: string) {
-    void occupy(async () => {
-      const next = await ackNoteReview(review);
-      onChange(next);
-      if (!next.hasReview) onBeginEdit(extra, review.memo);
+  function startEditing(extra: string) {
+    if (startedEditRef.current) return;
+    startedEditRef.current = true;
+    const snapshot = review;
+    // Mount and focus the textarea before this key or composition continues.
+    flushSync(() => {
+      onBeginEdit(extra, snapshot.memo);
     });
+    void ackNoteReview(snapshot).then(
+      (next) => onChange(next),
+      (error) => onError(formatInvokeError(error)),
+    );
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    const extra = editInsert(event);
-    if (extra == null) return;
-    event.preventDefault();
-    void beginEdit(extra);
+    if (event.target !== event.currentTarget) return;
+    if (!isEditKey(event)) return;
+    startEditing("");
   }
 
-  function onCompositionEnd(event: CompositionEvent<HTMLDivElement>) {
-    const text = event.data ?? "";
-    if (!text) return;
-    void beginEdit(text);
+  function onCompositionStart(event: CompositionEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget) return;
+    startEditing("");
   }
 
   function onPaste(event: ClipboardEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget) return;
     const text = event.clipboardData.getData("text");
     if (!text) return;
     event.preventDefault();
-    void beginEdit(text);
+    startEditing(text);
   }
 
   return (
@@ -158,8 +164,7 @@ export function NoteInlineDiff({
       tabIndex={0}
       aria-label="チャットが更新した本文"
       onKeyDown={onKeyDown}
-      onCompositionStart={() => beginEdit("")}
-      onCompositionEnd={onCompositionEnd}
+      onCompositionStart={onCompositionStart}
       onPaste={onPaste}
     >
       {lines.map((line, index) => {

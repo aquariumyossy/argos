@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NoteInlineDiff, NoteReviewBar } from "./NoteInlineReview";
 import { buildInlineLines, type NoteDiffHunk, type NoteReview } from "./noteReview";
@@ -80,13 +80,33 @@ function Host({
 }) {
   const [review, setReview] = useState(start);
   const [body, setBody] = useState(start.memo);
-  if (!review.hasReview) {
-    return <textarea aria-label="メモ" value={body} onChange={(e) => setBody(e.target.value)} />;
-  }
+  const [openEditor, setOpenEditor] = useState(false);
+  const areaRef = useRef<HTMLTextAreaElement>(null);
+  const placeCaret = useRef(false);
+
+  useLayoutEffect(() => {
+    const el = areaRef.current;
+    if (!placeCaret.current || !el) return;
+    placeCaret.current = false;
+    el.focus();
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
+  }, [openEditor, body]);
+
   const apply = (row: NoteReview) => {
     setReview(row);
     setBody(row.memo);
   };
+  if (!review.hasReview || openEditor) {
+    return (
+      <textarea
+        ref={areaRef}
+        aria-label="メモ"
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+      />
+    );
+  }
   return (
     <>
       <NoteReviewBar review={review} onChange={apply} onError={() => {}} />
@@ -96,7 +116,9 @@ function Host({
         onError={() => {}}
         onBeginEdit={(extra, baseMemo) => {
           onEdit?.(extra, baseMemo);
+          placeCaret.current = true;
           setBody(extra ? baseMemo + extra : baseMemo);
+          setOpenEditor(true);
         }}
       />
     </>
@@ -255,19 +277,90 @@ describe("inline note review", () => {
     fireEvent.keyDown(body, { key: "x", ctrlKey: true });
     expect(mockInvoke).not.toHaveBeenCalled();
     fireEvent.keyDown(body, { key: "x" });
-    await waitFor(() => {
-      expect((screen.getByRole("textbox", { name: "メモ" }) as HTMLTextAreaElement).value).toBe(
-        `${memo}x`,
-      );
-    });
-    expect(edits).toEqual(["x"]);
+    const area = await screen.findByRole("textbox", { name: "メモ" });
+    expect((area as HTMLTextAreaElement).value).toBe(memo);
+    expect(document.activeElement).toBe(area);
+    expect((area as HTMLTextAreaElement).selectionStart).toBe(memo.length);
+    expect(edits).toEqual([""]);
     expect(mockInvoke).toHaveBeenCalledWith("ack_note_review", {
       noteId: "n1",
       memoLen: initial.memoLen,
     });
     expect(document.querySelector(".notes-inline-add")).toBeNull();
     expect(document.querySelector(".notes-inline-del")).toBeNull();
-    expect(screen.queryByRole("button", { name: "チャットが更新" })).toBeNull();
     expect(screen.queryByText("チャットが更新")).toBeNull();
+  });
+
+  it("reverts a hunk when Enter or Space is pressed on 戻す", async () => {
+    async function press(key: string, label: string, hunkIndex: number) {
+      cleanup();
+      mockInvoke.mockReset();
+      mockInvoke.mockResolvedValue(afterFirst);
+      render(<Host />);
+      const button = revertButton(label);
+      button.focus();
+      let cancelled = false;
+      const mark = (event: Event) => {
+        if (event.defaultPrevented) cancelled = true;
+      };
+      document.addEventListener("keydown", mark);
+      document.addEventListener("keyup", mark);
+      fireEvent.keyDown(button, { key });
+      fireEvent.keyUp(button, { key });
+      document.removeEventListener("keydown", mark);
+      document.removeEventListener("keyup", mark);
+      expect(cancelled).toBe(false);
+      expect(mockInvoke).not.toHaveBeenCalled();
+      // jsdom does not click a button for Enter or Space. Browsers do when
+      // the key is not cancelled, and that click reverts the hunk.
+      fireEvent.click(button);
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("revert_note_hunk", {
+          noteId: "n1",
+          hunkIndex,
+          baseLen: initial.baseLen,
+          memoLen: initial.memoLen,
+        });
+      });
+      expect(mockInvoke).not.toHaveBeenCalledWith("ack_note_review", expect.anything());
+    }
+
+    await press("Enter", "甲A", 0);
+    await press(" ", "乙B", 1);
+  });
+
+  it("focuses the editor before IME composition is confirmed", async () => {
+    let resolveAck: (value: NoteReview) => void = () => {};
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd !== "ack_note_review") throw new Error(cmd);
+      return new Promise<NoteReview>((resolve) => {
+        resolveAck = resolve;
+      });
+    });
+    render(<Host />);
+    const diff = document.querySelector(".notes-inline-diff");
+    if (!diff) throw new Error("diff missing");
+    fireEvent.compositionStart(diff);
+    const area = screen.getByRole("textbox", { name: "メモ" }) as HTMLTextAreaElement;
+    expect(document.activeElement).toBe(area);
+    expect(area.value).toBe(memo);
+    expect(area.selectionStart).toBe(memo.length);
+    expect(area.selectionEnd).toBe(memo.length);
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledWith("ack_note_review", {
+      noteId: "n1",
+      memoLen: initial.memoLen,
+    });
+    const composed: string[] = [];
+    area.addEventListener("compositionend", (event) => {
+      composed.push((event as CompositionEvent).data);
+    });
+    fireEvent.compositionEnd(area, { data: "漢字" });
+    expect(composed).toEqual(["漢字"]);
+    expect(area.value).toBe(memo);
+    resolveAck(cleared(memo));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+    });
   });
 });

@@ -32,7 +32,7 @@ import MemoMdHelper from "./MemoMdHelper";
 import { applyMemoMdInsert, type MemoMdKind } from "./memoMdInsert";
 import NoteMemoView from "./NoteMemoView";
 import { NoteInlineDiff, NoteReviewBar } from "./NoteInlineReview";
-import { ackNoteReview, type NoteReview } from "./noteReview";
+import { ackNoteReview, waitForNoteReviewCommands, type NoteReview } from "./noteReview";
 import {
   memoHasOpenWork,
   parseNoteTasks,
@@ -527,6 +527,7 @@ export default function Notes() {
       clearTimeout(noteMemoTimer.current);
       noteMemoTimer.current = null;
     }
+    await waitForNoteReviewCommands().catch(() => undefined);
     const pending = pendingMemoRef.current;
     if (!pending) return;
     pendingMemoRef.current = null;
@@ -1083,6 +1084,13 @@ export default function Notes() {
   const applyReview = useCallback((row: NoteReview) => {
     noteReviewRef.current = row.hasReview ? row : null;
     setNoteReview(noteReviewRef.current);
+    const pending = pendingMemoRef.current;
+    const keepTyped =
+      !row.hasReview &&
+      pending?.id === row.noteId &&
+      pending.memo !== row.memo &&
+      pending.memo.startsWith(row.memo);
+    if (keepTyped) return;
     setActive((prev) => {
       if (!prev || prev.id !== row.noteId || prev.memo === row.memo) return prev;
       return { ...prev, memo: row.memo };
@@ -1092,7 +1100,6 @@ export default function Notes() {
         n.id === row.noteId && n.memo !== row.memo ? { ...n, memo: row.memo } : n,
       ),
     );
-    const pending = pendingMemoRef.current;
     if (pending?.id === row.noteId && pending.memo !== row.memo) {
       pendingMemoRef.current = null;
       memoDirtyRef.current = false;
@@ -1120,10 +1127,14 @@ export default function Notes() {
 
   const beginEditFromReview = useCallback(
     (extra: string, baseMemo: string) => {
+      // The diff calls this inside flushSync, so the textarea is mounted and
+      // focused before the key or IME composition continues.
       setMemoEdit(true);
       const next = extra ? baseMemo + extra : baseMemo;
       pendingMemoCaretRef.current = next.length;
       if (extra) applyMemoLocal(next);
+      noteReviewRef.current = null;
+      setNoteReview(null);
     },
     [applyMemoLocal],
   );
