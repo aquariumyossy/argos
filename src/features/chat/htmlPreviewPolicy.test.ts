@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PREVIEW_CSP, PREVIEW_SANDBOX, htmlPreviewSrc } from "./htmlPreview";
+import { PREVIEW_CSP, PREVIEW_SANDBOX, htmlPreviewSrc } from "./htmlPreviewPolicy";
 
 describe("html preview isolation", () => {
   it("allows inline script and style and nothing from the network", () => {

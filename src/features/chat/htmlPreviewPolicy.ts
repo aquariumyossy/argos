@@ -1,4 +1,6 @@
-/** Kept in step with `PREVIEW_CSP` / `PREVIEW_SANDBOX` in `src-tauri/src/html_preview.rs`. */
+/** Kept in step with `PREVIEW_CSP` / `PREVIEW_SANDBOX` in `src-tauri/src/html_preview.rs`.
+ * The basename must not match `HtmlPreview.tsx` on a case-insensitive volume.
+ */
 export const PREVIEW_CSP =
   "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; connect-src 'none'; form-action 'none'; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; worker-src 'none'; manifest-src 'none'; sandbox allow-scripts";
 

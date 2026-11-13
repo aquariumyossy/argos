@@ -1,5 +1,5 @@
 import type { OfficeCardFile } from "./officeCards";
-import { PREVIEW_CSP, PREVIEW_SANDBOX, htmlPreviewSrc } from "./htmlPreview";
+import { PREVIEW_CSP, PREVIEW_SANDBOX, htmlPreviewSrc } from "./htmlPreviewPolicy";
 
 export function HtmlPreviews({
   files,

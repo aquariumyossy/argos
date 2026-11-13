@@ -24,7 +24,7 @@ use crate::state::AppState;
 pub const WINDOW_LABEL: &str = "html-preview";
 pub const PREVIEW_SANDBOX: &str = "allow-scripts";
 
-/// Kept in step with `PREVIEW_CSP` in `src/features/chat/htmlPreview.ts`.
+/// Kept in step with `PREVIEW_CSP` in `src/features/chat/htmlPreviewPolicy.ts`.
 pub const PREVIEW_CSP: &str = concat!(
     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; ",
     "img-src data:; font-src data:; media-src data:; connect-src 'none'; ",
