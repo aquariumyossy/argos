@@ -23,6 +23,8 @@ import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
+import { OfficeFileCards } from "./OfficeFileCard";
+import { officeCardsByMessage } from "./officeCards";
 import { parseOfficeFileNotice } from "./officeFile";
 import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
 import {
@@ -979,6 +981,7 @@ export default function Chat() {
     if (showLive) return;
     listRef.current?.classList.remove("chat-log-no-anchor");
   }, [showLive]);
+  const officeCards = useMemo(() => officeCardsByMessage(messages), [messages]);
   const generatingThreadId = busy ? (live?.threadId ?? null) : null;
   const onGeneratingThread = !!generatingThreadId && active?.id === generatingThreadId;
   const inputLocked = shortcutInputLocked(attaching, onGeneratingThread);
@@ -2255,6 +2258,7 @@ export default function Chat() {
                 m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
               const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
+              const cards = officeCards.get(m.id) ?? [];
               const roleClass =
                 m.role === "user"
                   ? "chat-msg user"
@@ -2278,23 +2282,17 @@ export default function Chat() {
                         <summary>{(m.toolName ?? "").trim() || "操作"} の結果</summary>
                         <div className="chat-thinking-body">{m.content}</div>
                       </details>
-                      {office ? (
+                      {office && (cards.length > 0 || office.leftovers.length > 0) ? (
                         <div className="chat-office-out">
-                          <button
-                            type="button"
-                            className="chat-cite-badge clickable"
-                            title={office.name}
-                            aria-label={`${office.name} を開く`}
-                            onClick={() => void openSavedFile(office.name)}
-                          >
-                            {office.name}
-                          </button>
                           {office.leftovers.length > 0 ? (
                             <div className="chat-office-left">
                               {office.leftovers.map((line, index) => (
                                 <div key={`${index}:${line}`}>{line}</div>
                               ))}
                             </div>
+                          ) : null}
+                          {cards.length > 0 ? (
+                            <OfficeFileCards files={cards} onOpen={openSavedFile} />
                           ) : null}
                         </div>
                       ) : null}
@@ -2307,15 +2305,6 @@ export default function Chat() {
                       {officeFile ? (
                         <div className="chat-office-file">
                           <span>{officeFile.label}</span>
-                          <button
-                            type="button"
-                            className="chat-cite-badge clickable"
-                            title={officeFile.name}
-                            aria-label={`${officeFile.name} を開く`}
-                            onClick={() => void openSavedFile(officeFile.name)}
-                          >
-                            {officeFile.name}
-                          </button>
                         </div>
                       ) : m.content.trim() ? (
                         <AssistantBody
@@ -2329,6 +2318,9 @@ export default function Chat() {
                           choicesDisabled={blocked}
                           onLayout={scrollAfterLayout}
                         />
+                      ) : null}
+                      {cards.length > 0 ? (
+                        <OfficeFileCards files={cards} onOpen={openSavedFile} />
                       ) : null}
                     </>
                   ) : (

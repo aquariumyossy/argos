@@ -14,8 +14,40 @@ const saved = [
 describe("editOfficeFileLink", () => {
   it("opens an edit_office result by file name and keeps leftover lines", () => {
     expect(editOfficeFileLink("edit_office", saved)).toEqual({
+      kind: "docx",
       name: "契約書_編集済み（2026-11-12 09-30-00）.docx",
       leftovers: ["「山田太郎」が残っています。", "- フィールド（REF 山田太郎）"],
+    });
+  });
+
+  it("keeps a bare original file name and ignores a path", () => {
+    const withSource = [
+      "元ファイル: 契約書.docx",
+      saved,
+    ].join("\n");
+    expect(editOfficeFileLink("edit_office", withSource)).toMatchObject({
+      kind: "docx",
+      name: "契約書_編集済み（2026-11-12 09-30-00）.docx",
+      sourceName: "契約書.docx",
+      leftovers: ["「山田太郎」が残っています。", "- フィールド（REF 山田太郎）"],
+    });
+    expect(
+      editOfficeFileLink(
+        "edit_office",
+        [
+          saved,
+          String.raw`元ファイル: C:\Users\me\契約書.docx`,
+        ].join("\n"),
+      )?.sourceName,
+    ).toBeUndefined();
+    const xlsx = editOfficeFileLink(
+      "edit_office",
+      "[[argos-office]]\txlsx\t一覧_編集済み.xlsx\n元ファイル: 一覧.xlsx",
+    );
+    expect(xlsx).toMatchObject({
+      kind: "xlsx",
+      name: "一覧_編集済み.xlsx",
+      sourceName: "一覧.xlsx",
     });
   });
 
