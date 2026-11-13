@@ -2,6 +2,7 @@ pub mod commands;
 pub mod db;
 pub mod extract_host;
 pub mod extractor;
+pub mod html_preview;
 pub mod indexer;
 pub mod llm;
 pub mod mail;
@@ -139,10 +140,14 @@ where
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(html_preview::isolation_plugin())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::Builder::new().arg("--autostart").build())
+        .register_uri_scheme_protocol("htmlpreview", |ctx, request| {
+            html_preview::respond(ctx.app_handle(), request.uri())
+        })
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             OPEN_SETTINGS.store(true, Ordering::SeqCst);
             if SETUP_DONE.load(Ordering::SeqCst) {
@@ -503,6 +508,7 @@ pub fn run() {
             llm::commands::llm_set_source_grain,
             llm::commands::llm_send,
             llm::commands::open_output_file,
+            llm::commands::show_html_preview,
             llm::commands::llm_cancel,
             llm::commands::llm_test_connection,
             llm::commands::llm_thinking_budget,

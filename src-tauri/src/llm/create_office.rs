@@ -82,7 +82,7 @@ pub fn exec_xlsx(state: &AppState, args: &Value) -> OfficeToolResult {
 }
 
 pub fn tool_message(file: &SavedOfficeFile) -> String {
-    let what = if file.kind == "docx" { "Word" } else { "Excel" };
+    let what = office_kind_label(&file.kind);
     format!(
         "{what}ファイル『{}』を Argos の出力フォルダに保存しました。回答にはこのファイル名を書いてください。",
         file.name
@@ -90,16 +90,25 @@ pub fn tool_message(file: &SavedOfficeFile) -> String {
 }
 
 pub fn notice_body(file: &SavedOfficeFile) -> String {
-    let what = if file.kind == "docx" { "Word" } else { "Excel" };
+    let what = office_kind_label(&file.kind);
     format!(
         "{what}ファイルを保存しました（Argos の出力フォルダ）\n{}",
         marker_line(file)
     )
 }
 
+fn office_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "docx" => "Word",
+        "html" => "HTML",
+        _ => "Excel",
+    }
+}
+
 /// A saved-file notice only for the create tools. Text in other tool results is ignored.
 pub fn notice_for_tool(tool_name: &str, saved: Option<&SavedOfficeFile>) -> Option<String> {
-    if tool_name != TOOL_CREATE_DOCX && tool_name != TOOL_CREATE_XLSX {
+    if tool_name != TOOL_CREATE_DOCX && tool_name != TOOL_CREATE_XLSX && tool_name != "create_html"
+    {
         return None;
     }
     let file = saved?;
@@ -170,8 +179,8 @@ fn bare_output_name(raw: &str) -> Result<&str, String> {
         return Err("ファイル名だけを指定してください。".into());
     }
     let lower = name.to_ascii_lowercase();
-    if !lower.ends_with(".docx") && !lower.ends_with(".xlsx") {
-        return Err("Word か Excel のファイル名を指定してください。".into());
+    if !lower.ends_with(".docx") && !lower.ends_with(".xlsx") && !lower.ends_with(".html") {
+        return Err("Word、Excel、HTML のファイル名を指定してください。".into());
     }
     Ok(name)
 }
@@ -2113,7 +2122,7 @@ fn excel_number(n: f64) -> Option<String> {
     Some(s)
 }
 
-fn file_stem(args: &Value, fallback: &str) -> Result<String, String> {
+pub(crate) fn file_stem(args: &Value, fallback: &str) -> Result<String, String> {
     let raw = args.get("filename").and_then(|v| v.as_str()).unwrap_or("");
     let raw = raw.trim().trim_matches(|c| c == '"' || c == '\'');
     let raw = strip_known_ext(raw);
@@ -2151,7 +2160,7 @@ fn collapse_dots(mut stem: String) -> String {
 
 fn strip_known_ext(raw: &str) -> &str {
     let lower = raw.to_ascii_lowercase();
-    for ext in [".docx", ".xlsx", ".doc", ".xls"] {
+    for ext in [".docx", ".xlsx", ".doc", ".xls", ".html"] {
         if let Some(stem) = lower.strip_suffix(ext) {
             return &raw[..stem.len()];
         }
@@ -2187,7 +2196,7 @@ fn save_package(
     Ok(dest)
 }
 
-fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+pub(crate) fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let first = dir.join(format!("{stem}.{ext}"));
     if !first.exists() {
         return first;

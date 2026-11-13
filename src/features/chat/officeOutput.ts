@@ -1,10 +1,12 @@
+import { bareOfficeKind, type OfficeKind } from "./officeFile";
+
 /** Kept in step with `OFFICE_MARKER` in `office_edit`. The third field is a bare file name. */
 export const OFFICE_MARKER = "[[argos-office]]";
 /** Kept in step with `SOURCE_LINE` in `office_edit`. A bare file name, never a path. */
 export const SOURCE_LINE = "元ファイル: ";
 
 export type EditOfficeFile = {
-  kind: "docx" | "xlsx";
+  kind: OfficeKind;
   name: string;
   sourceName?: string;
   leftovers: string[];
@@ -18,7 +20,8 @@ export function editOfficeFileLink(
   toolName: string | undefined,
   content: string,
 ): EditOfficeFile | null {
-  if ((toolName ?? "").trim() !== "edit_office") return null;
+  const tool = (toolName ?? "").trim();
+  if (tool !== "edit_office" && tool !== "edit_html") return null;
   const lines = content.split(/\r?\n/);
   let name = "";
   let sourceName = "";
@@ -31,14 +34,14 @@ export function editOfficeFileLink(
       const parts = line.split("\t");
       if (parts.length < 3) return null;
       const candidate = parts[2]?.trim() ?? "";
-      if (!isBareOfficeName(candidate)) return null;
+      if (!bareOfficeKind(candidate)) return null;
       name = candidate;
       inLeftovers = false;
       continue;
     }
     if (line.startsWith(SOURCE_LINE)) {
       const candidate = line.slice(SOURCE_LINE.length).trim();
-      if (!sourceName && isBareOfficeName(candidate)) sourceName = candidate;
+      if (!sourceName && bareOfficeKind(candidate)) sourceName = candidate;
       continue;
     }
     if (line === "残存: あり") {
@@ -61,16 +64,9 @@ export function editOfficeFileLink(
     if (line) leftovers.push(line);
   }
   if (!name) return null;
-  const kind = name.toLowerCase().endsWith(".xlsx") ? "xlsx" : "docx";
+  const kind = bareOfficeKind(name);
+  if (!kind) return null;
   return sourceName
     ? { kind, name, sourceName, leftovers }
     : { kind, name, leftovers };
-}
-
-function isBareOfficeName(name: string): boolean {
-  if (!name || name.startsWith(".")) return false;
-  if (/[/\\:\0]/.test(name) || name.includes("..")) return false;
-  if ([...name].some((ch) => ch.charCodeAt(0) < 32)) return false;
-  const lower = name.toLowerCase();
-  return lower.endsWith(".docx") || lower.endsWith(".xlsx");
 }

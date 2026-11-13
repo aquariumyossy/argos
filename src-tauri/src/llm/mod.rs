@@ -3,6 +3,7 @@
 pub mod articles;
 pub mod commands;
 pub mod context;
+pub mod create_html;
 pub mod create_office;
 pub mod fetch_url;
 pub mod files;
@@ -203,6 +204,14 @@ pub fn system_for_request(settings: &Settings) -> String {
             s.push('\n');
         }
         s.push_str(crate::llm::create_office::LLM_OFFICE_HINT);
+    }
+    if !s.contains(crate::llm::create_html::LLM_HTML_SENTINEL)
+        && !s.contains(crate::llm::create_html::LLM_HTML_HINT)
+    {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(crate::llm::create_html::LLM_HTML_HINT);
     }
     if !s.contains(LLM_REREAD_SENTINEL) && !s.contains(LLM_REREAD_HINT) {
         if !s.is_empty() {

@@ -24,6 +24,27 @@ describe("parseOfficeFileNotice", () => {
     });
   });
 
+  it("reads an HTML file name from a saved-file notice", () => {
+    const notice = [
+      "HTMLファイルを保存しました（Argos の出力フォルダ）",
+      "[[argos-office]]\thtml\t手数料計算.html",
+    ].join("\n");
+    expect(parseOfficeFileNotice(notice)).toEqual({
+      kind: "html",
+      name: "手数料計算.html",
+      label: "HTMLファイルを保存しました（Argos の出力フォルダ）",
+    });
+    expect(
+      parseOfficeFileNotice("[[argos-office]]\thtml\t..\\手数料.html"),
+    ).toBeNull();
+    expect(
+      parseOfficeFileNotice("[[argos-office]]\thtml\tC:\\Windows\\a.html"),
+    ).toBeNull();
+    expect(
+      parseOfficeFileNotice("[[argos-office]]\tdocx\t手数料.html"),
+    ).toBeNull();
+  });
+
   it("ignores ordinary text and names that are not a single file", () => {
     expect(parseOfficeFileNotice("契約メモ.docx を作りました")).toBeNull();
     expect(

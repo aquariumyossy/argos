@@ -24,6 +24,7 @@ import PromptLibrary from "./PromptLibrary";
 import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
 import { OfficeFileCards } from "./OfficeFileCard";
+import { HtmlPreviews } from "./HtmlPreview";
 import { officeCardsByMessage } from "./officeCards";
 import { parseOfficeFileNotice } from "./officeFile";
 import { contextMeterLabel, fileGrainConfirmMessage } from "./contextEstimate";
@@ -1437,7 +1438,19 @@ export default function Chat() {
 
   async function openSavedFile(name: string) {
     try {
+      if (name.toLowerCase().endsWith(".html")) {
+        await invoke("show_html_preview", { name });
+        return;
+      }
       await invoke("open_output_file", { name });
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function openHtmlLarge(name: string) {
+    try {
+      await invoke("show_html_preview", { name });
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -2278,6 +2291,7 @@ export default function Chat() {
                           {cards.length > 0 ? (
                             <OfficeFileCards files={cards} onOpen={openSavedFile} />
                           ) : null}
+                          <HtmlPreviews files={cards} onExpand={(name) => void openHtmlLarge(name)} />
                         </div>
                       ) : null}
                     </>
@@ -2306,6 +2320,7 @@ export default function Chat() {
                       {cards.length > 0 ? (
                         <OfficeFileCards files={cards} onOpen={openSavedFile} />
                       ) : null}
+                      <HtmlPreviews files={cards} onExpand={(name) => void openHtmlLarge(name)} />
                     </>
                   ) : (
                     <div className="chat-msg-body">{m.content}</div>
