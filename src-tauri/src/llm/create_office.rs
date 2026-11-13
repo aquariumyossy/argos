@@ -16,7 +16,7 @@ use crate::state::AppState;
 pub const TOOL_CREATE_DOCX: &str = "create_docx";
 pub const TOOL_CREATE_XLSX: &str = "create_xlsx";
 pub const OUTPUT_DIR_NAME: &str = "output";
-/// Notice line the chat turns into a button. The third field is a bare file name.
+/// Notice line the chat turns into a card. The third field is a bare file name.
 pub const OFFICE_MARKER: &str = "[[argos-office]]";
 
 pub const LLM_OFFICE_SENTINEL: &str = "新しい Word と Excel を作るツールがあります";

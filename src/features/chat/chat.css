@@ -699,6 +699,79 @@ body.md-col-resizing {
   white-space: pre-wrap;
 }
 
+.chat-office-cards {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.chat-office-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  width: min(100%, 36em);
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.chat-msg.assistant.notice .chat-office-card {
+  font-size: calc(1em / 0.92);
+}
+
+.chat-msg.tool .chat-office-card {
+  font-size: calc(1em / 0.9);
+}
+
+.chat-office-icon {
+  flex: none;
+  display: block;
+}
+
+.chat-office-card-main {
+  flex: 1 1 12em;
+  min-width: 0;
+}
+
+.chat-office-card-name {
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.chat-office-card-source {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.86em;
+  font-weight: 400;
+  word-break: break-all;
+}
+
+.chat-office-open {
+  margin-left: auto;
+  flex: none;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 8px;
+  padding: 6px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-office-open:hover {
+  filter: brightness(1.08);
+}
+
+.chat-office-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .chat-summary {
   margin: 8px 0 12px;
   color: var(--muted);

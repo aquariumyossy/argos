@@ -1,13 +1,17 @@
 /** Kept in step with `OFFICE_MARKER` in `office_edit`. The third field is a bare file name. */
 export const OFFICE_MARKER = "[[argos-office]]";
+/** Kept in step with `SOURCE_LINE` in `office_edit`. A bare file name, never a path. */
+export const SOURCE_LINE = "元ファイル: ";
 
 export type EditOfficeFile = {
+  kind: "docx" | "xlsx";
   name: string;
+  sourceName?: string;
   leftovers: string[];
 };
 
 /**
- * Open button for an `edit_office` tool result only.
+ * Open card for an `edit_office` tool result only.
  * The name is the marker's file name. A path in the tool text is never returned.
  */
 export function editOfficeFileLink(
@@ -17,6 +21,7 @@ export function editOfficeFileLink(
   if ((toolName ?? "").trim() !== "edit_office") return null;
   const lines = content.split(/\r?\n/);
   let name = "";
+  let sourceName = "";
   const leftovers: string[] = [];
   let inLeftovers = false;
   for (const raw of lines) {
@@ -29,6 +34,11 @@ export function editOfficeFileLink(
       if (!isBareOfficeName(candidate)) return null;
       name = candidate;
       inLeftovers = false;
+      continue;
+    }
+    if (line.startsWith(SOURCE_LINE)) {
+      const candidate = line.slice(SOURCE_LINE.length).trim();
+      if (!sourceName && isBareOfficeName(candidate)) sourceName = candidate;
       continue;
     }
     if (line === "残存: あり") {
@@ -51,7 +61,10 @@ export function editOfficeFileLink(
     if (line) leftovers.push(line);
   }
   if (!name) return null;
-  return { name, leftovers };
+  const kind = name.toLowerCase().endsWith(".xlsx") ? "xlsx" : "docx";
+  return sourceName
+    ? { kind, name, sourceName, leftovers }
+    : { kind, name, leftovers };
 }
 
 function isBareOfficeName(name: string): boolean {

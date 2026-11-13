@@ -18,7 +18,9 @@ use crate::pathutil;
 pub const OUTPUT_DIR_NAME: &str = "output";
 pub const FILE_LINE: &str = "出力ファイル: ";
 pub const PATH_LINE: &str = "保存先: ";
-/// Third field is a bare file name. The chat button passes that name, never a path.
+/// Bare name of the attachment that was edited. The chat card shows this, never a path.
+pub const SOURCE_LINE: &str = "元ファイル: ";
+/// Third field is a bare file name. The chat card passes that name, never a path.
 pub const OFFICE_MARKER: &str = "[[argos-office]]";
 const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 80 * 1024 * 1024;
@@ -163,8 +165,19 @@ pub fn edit_path(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or(filename);
+    let source_name = src
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     Ok(EditOutcome {
-        report: format_report(&filename, &dest, &stats, &leftovers, truncated),
+        report: format_report(
+            &filename,
+            &source_name,
+            &dest,
+            &stats,
+            &leftovers,
+            truncated,
+        ),
         filename,
         path: dest,
     })
@@ -513,6 +526,7 @@ fn bare_output_name(raw: &str) -> Result<&str, String> {
 
 fn format_report(
     filename: &str,
+    source_name: &str,
     path: &Path,
     stats: &ChangeStats,
     leftovers: &[Leftover],
@@ -533,6 +547,13 @@ fn format_report(
     out.push('\t');
     out.push_str(filename);
     out.push('\n');
+    let source = one_line(source_name);
+    let source = source.trim();
+    if !source.is_empty() {
+        out.push_str(SOURCE_LINE);
+        out.push_str(source);
+        out.push('\n');
+    }
     out.push_str(PATH_LINE);
     out.push_str(&path.to_string_lossy());
     out.push('\n');

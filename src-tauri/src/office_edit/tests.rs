@@ -8,7 +8,7 @@ use zip::ZipWriter;
 
 use super::{
     edit_path, output_file_path, resolve_office_path, strip_verbatim_prefix, EditRequest,
-    FILE_LINE, OFFICE_MARKER, OUTPUT_DIR_NAME, PATH_LINE,
+    FILE_LINE, OFFICE_MARKER, OUTPUT_DIR_NAME, PATH_LINE, SOURCE_LINE,
 };
 use crate::db::LlmSourceRow;
 
@@ -183,6 +183,20 @@ fn docx_edits_split_runs_stories_and_reports_property_leftovers() {
     assert!(edited.report.starts_with(&format!(
         "{FILE_LINE}契約書_編集済み（2026-11-12 09-30-00）.docx\n{OFFICE_MARKER}\tdocx\t契約書_編集済み（2026-11-12 09-30-00）.docx\n"
     )));
+    assert!(
+        edited
+            .report
+            .contains(&format!("{SOURCE_LINE}契約書.docx\n")),
+        "{}",
+        edited.report
+    );
+    assert!(
+        !edited
+            .report
+            .contains(&format!("{SOURCE_LINE}{}", src.display())),
+        "{}",
+        edited.report
+    );
     assert!(edited
         .report
         .contains(&format!("{PATH_LINE}{}", edited.path.display())));
@@ -416,6 +430,11 @@ fn xlsx_edits_every_sheet_split_runs_and_sheet_names() {
     .unwrap();
     assert_eq!(fs::read(&src).unwrap(), before);
     assert_eq!(edited.filename, "一覧_編集済み（2026-11-12 10-00-00）.xlsx");
+    assert!(
+        edited.report.contains(&format!("{SOURCE_LINE}一覧.xlsx\n")),
+        "{}",
+        edited.report
+    );
     assert!(edited.report.contains("残存: あり"), "{}", edited.report);
     assert!(edited.report.contains("コメント"), "{}", edited.report);
     assert!(
