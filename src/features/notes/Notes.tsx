@@ -31,7 +31,8 @@ import { openPreview } from "../preview/openPreview";
 import MemoMdHelper from "./MemoMdHelper";
 import { applyMemoMdInsert, type MemoMdKind } from "./memoMdInsert";
 import NoteMemoView from "./NoteMemoView";
-import NoteReviewPanel, { type NoteReview } from "./NoteReviewPanel";
+import { NoteInlineDiff, NoteReviewBar } from "./NoteInlineReview";
+import { ackNoteReview, waitForNoteReviewCommands, type NoteReview } from "./noteReview";
 import {
   memoHasOpenWork,
   parseNoteTasks,
@@ -479,6 +480,8 @@ export default function Notes() {
   const [memoEdit, setMemoEdit] = useState(loadMemoEdit);
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>(loadSidebarFilter);
   const [noteReview, setNoteReview] = useState<NoteReview | null>(null);
+  const noteReviewRef = useRef<NoteReview | null>(null);
+  noteReviewRef.current = noteReview;
   const printMenuRef = useRef<HTMLDivElement | null>(null);
   const chatNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -524,6 +527,7 @@ export default function Notes() {
       clearTimeout(noteMemoTimer.current);
       noteMemoTimer.current = null;
     }
+    await waitForNoteReviewCommands().catch(() => undefined);
     const pending = pendingMemoRef.current;
     if (!pending) return;
     pendingMemoRef.current = null;
@@ -1047,21 +1051,92 @@ export default function Notes() {
     [refresh, renameDraft],
   );
 
-  const onNoteMemoChange = useCallback(
+  const applyMemoLocal = useCallback(
     (memo: string) => {
-      if (!active) return;
-      setActive({ ...active, memo });
-      setNotes((prev) =>
-        prev.map((n) => (n.id === active.id ? { ...n, memo } : n)),
-      );
+      const id = activeRef.current?.id;
+      if (!id) return;
+      setActive((prev) => (prev && prev.id === id ? { ...prev, memo } : prev));
+      setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, memo } : n)));
       memoDirtyRef.current = true;
-      pendingMemoRef.current = { id: active.id, memo };
+      pendingMemoRef.current = { id, memo };
       if (noteMemoTimer.current) clearTimeout(noteMemoTimer.current);
       noteMemoTimer.current = setTimeout(() => {
         void flushNoteMemo();
       }, 400);
     },
-    [active, flushNoteMemo],
+    [flushNoteMemo],
+  );
+
+  const confirmReview = useCallback(async (): Promise<boolean> => {
+    const review = noteReviewRef.current;
+    if (!review?.hasReview) return true;
+    try {
+      const next = await ackNoteReview(review);
+      noteReviewRef.current = next.hasReview ? next : null;
+      setNoteReview(noteReviewRef.current);
+      return !next.hasReview;
+    } catch (e) {
+      setError(formatInvokeError(e));
+      return false;
+    }
+  }, []);
+
+  const applyReview = useCallback((row: NoteReview) => {
+    noteReviewRef.current = row.hasReview ? row : null;
+    setNoteReview(noteReviewRef.current);
+    const pending = pendingMemoRef.current;
+    const keepTyped =
+      !row.hasReview &&
+      pending?.id === row.noteId &&
+      pending.memo !== row.memo &&
+      pending.memo.startsWith(row.memo);
+    if (keepTyped) return;
+    setActive((prev) => {
+      if (!prev || prev.id !== row.noteId || prev.memo === row.memo) return prev;
+      return { ...prev, memo: row.memo };
+    });
+    setNotes((prev) =>
+      prev.map((n) =>
+        n.id === row.noteId && n.memo !== row.memo ? { ...n, memo: row.memo } : n,
+      ),
+    );
+    if (pending?.id === row.noteId && pending.memo !== row.memo) {
+      pendingMemoRef.current = null;
+      memoDirtyRef.current = false;
+      if (noteMemoTimer.current) {
+        clearTimeout(noteMemoTimer.current);
+        noteMemoTimer.current = null;
+      }
+    }
+  }, []);
+
+  const onNoteMemoChange = useCallback(
+    (memo: string) => {
+      if (noteReviewRef.current?.hasReview) {
+        void (async () => {
+          const ok = await confirmReview();
+          if (!ok) return;
+          applyMemoLocal(memo);
+        })();
+        return;
+      }
+      applyMemoLocal(memo);
+    },
+    [applyMemoLocal, confirmReview],
+  );
+
+  const beginEditFromReview = useCallback(
+    (extra: string, baseMemo: string) => {
+      // The diff calls this inside flushSync, so the textarea is mounted and
+      // focused before the key or IME composition continues.
+      setMemoEdit(true);
+      const next = extra ? baseMemo + extra : baseMemo;
+      pendingMemoCaretRef.current = next.length;
+      if (extra) applyMemoLocal(next);
+      noteReviewRef.current = null;
+      setNoteReview(null);
+    },
+    [applyMemoLocal],
   );
 
   const captureMemoView = useCallback((el?: HTMLTextAreaElement | null) => {
@@ -1096,7 +1171,7 @@ export default function Notes() {
         });
       });
     }
-  }, [active?.memo, memoEdit]);
+  }, [active?.memo, memoEdit, noteReview?.hasReview]);
 
   const onInsertMemoMd = useCallback(
     (kind: MemoMdKind) => {
@@ -1896,11 +1971,9 @@ export default function Notes() {
             {error ? <p className="notes-error">{error}</p> : null}
             {chatNotice ? <p className="notes-chat-notice">{chatNotice}</p> : null}
             {noteReview?.hasReview ? (
-              <NoteReviewPanel
+              <NoteReviewBar
                 review={noteReview}
-                onChange={(row) =>
-                  setNoteReview(row.hasReview ? row : null)
-                }
+                onChange={applyReview}
                 onError={setError}
               />
             ) : null}
@@ -1937,7 +2010,19 @@ export default function Notes() {
                       <button
                         type="button"
                         className={memoEdit ? "active" : ""}
-                        onClick={() => setMemoEdit(true)}
+                        onClick={() => {
+                          if (!noteReviewRef.current?.hasReview) {
+                            setMemoEdit(true);
+                            return;
+                          }
+                          const memo = noteReviewRef.current.memo;
+                          void (async () => {
+                            const ok = await confirmReview();
+                            if (!ok) return;
+                            pendingMemoCaretRef.current = memo.length;
+                            setMemoEdit(true);
+                          })();
+                        }}
                       >
                         編集
                       </button>
@@ -1945,7 +2030,14 @@ export default function Notes() {
                   </div>
                 </div>
                 <div className="notes-pane-body">
-                  {memoEdit ? (
+                  {noteReview?.hasReview ? (
+                    <NoteInlineDiff
+                      review={noteReview}
+                      onChange={applyReview}
+                      onError={setError}
+                      onBeginEdit={beginEditFromReview}
+                    />
+                  ) : memoEdit ? (
                     <textarea
                       ref={memoTextareaRef}
                       value={active.memo}

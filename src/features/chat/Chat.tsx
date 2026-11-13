@@ -52,7 +52,7 @@ import {
   pastedImageTypeError,
 } from "./pasteImage";
 import NoteDestPicker from "../notes/NoteDestPicker";
-import type { NoteReview } from "../notes/NoteReviewPanel";
+import type { NoteReview } from "../notes/noteReview";
 import { openPreview } from "../preview/openPreview";
 import { highlightText } from "../search/highlightText";
 import {
@@ -1435,22 +1435,6 @@ export default function Chat() {
     }
   }
 
-  async function revertReviewedNote(review: NoteReview) {
-    try {
-      const next = await invoke<NoteReview>("revert_note_review", {
-        noteId: review.noteId,
-        memoLen: review.memoLen,
-      });
-      setNoteReviews((prev) => {
-        const rest = prev.filter((r) => r.noteId !== review.noteId);
-        if (next.hasReview) return [...rest, next];
-        return rest;
-      });
-    } catch (e) {
-      setError(formatInvokeError(e));
-    }
-  }
-
   async function openSavedFile(name: string) {
     try {
       await invoke("open_output_file", { name });
@@ -2466,14 +2450,6 @@ export default function Chat() {
               onClick={() => void openReviewedNote(r.noteId)}
             >
               ノートで開く
-            </button>
-            {" "}
-            <button
-              type="button"
-              className="chat-notice-undo"
-              onClick={() => void revertReviewedNote(r)}
-            >
-              すべて戻す
             </button>
           </p>
         ))}
