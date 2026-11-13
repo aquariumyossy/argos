@@ -1438,6 +1438,10 @@ export default function Chat() {
 
   async function openSavedFile(name: string) {
     try {
+      if (name.toLowerCase().endsWith(".html")) {
+        await invoke("show_html_preview", { name });
+        return;
+      }
       await invoke("open_output_file", { name });
     } catch (e) {
       setError(formatInvokeError(e));

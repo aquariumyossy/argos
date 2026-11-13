@@ -5,7 +5,7 @@ describe("html preview isolation", () => {
   it("allows inline script and style and nothing from the network", () => {
     expect(PREVIEW_SANDBOX).toBe("allow-scripts");
     expect(PREVIEW_CSP).toContain("default-src 'none'");
-    expect(PREVIEW_CSP).toContain("script-src 'unsafe-inline'");
+    expect(PREVIEW_CSP).toContain("script-src 'unsafe-inline' 'unsafe-eval'");
     expect(PREVIEW_CSP).toContain("style-src 'unsafe-inline'");
     expect(PREVIEW_CSP).toContain("connect-src 'none'");
     expect(PREVIEW_CSP).toContain("frame-src 'none'");

@@ -2,7 +2,7 @@
  * The basename must not match `HtmlPreview.tsx` on a case-insensitive volume.
  */
 export const PREVIEW_CSP =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; connect-src 'none'; form-action 'none'; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; worker-src 'none'; manifest-src 'none'; sandbox allow-scripts";
+  "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:; connect-src 'none'; form-action 'none'; frame-src 'none'; child-src 'none'; object-src 'none'; base-uri 'none'; worker-src 'none'; manifest-src 'none'; sandbox allow-scripts";
 
 /** Scripts run. Same-origin, popups, and top navigation stay off. */
 export const PREVIEW_SANDBOX = "allow-scripts";

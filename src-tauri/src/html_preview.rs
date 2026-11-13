@@ -26,7 +26,7 @@ pub const PREVIEW_SANDBOX: &str = "allow-scripts";
 
 /// Kept in step with `PREVIEW_CSP` in `src/features/chat/htmlPreviewPolicy.ts`.
 pub const PREVIEW_CSP: &str = concat!(
-    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; ",
+    "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; ",
     "img-src data:; font-src data:; media-src data:; connect-src 'none'; ",
     "form-action 'none'; frame-src 'none'; child-src 'none'; object-src 'none'; ",
     "base-uri 'none'; worker-src 'none'; manifest-src 'none'; sandbox allow-scripts"
@@ -61,6 +61,11 @@ function lockHtmlPreview() {
   lock(window, "Worker", deny);
   lock(window, "SharedWorker", deny);
   lock(window, "open", deny);
+  lock(window, "RTCPeerConnection", deny);
+  lock(window, "webkitRTCPeerConnection", deny);
+  lock(window, "RTCDataChannel", deny);
+  lock(window, "RTCSessionDescription", deny);
+  lock(window, "RTCIceCandidate", deny);
   try { lock(navigator, "sendBeacon", function () { return false; }); } catch (e) {}
   var deadView = { postMessage: noop, addEventListener: noop, removeEventListener: noop };
   try { lock(window, "chrome", { webview: deadView }); } catch (e) {}
@@ -118,6 +123,10 @@ try {{
 pub fn isolation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("html-preview-isolation")
         .js_init_script_on_all_frames(isolation_script())
+        // WebView2 NavigationStarting (and WebKit's navigation policy) fires for the
+        // top document and every child frame. Cancelling here stops the chat iframe
+        // from following location changes, link clicks, meta refresh, or data: URLs.
+        .on_navigation(|_webview, url| app_navigation_allowed(url))
         .build()
 }
 
@@ -173,6 +182,27 @@ fn hide_on_close(window: &WebviewWindow) {
             let _ = handle.hide();
         }
     });
+}
+
+const DEV_SERVER_PORT: u16 = 1420;
+
+/// Document navigations the app webviews may complete.
+///
+/// Allowed: the dev server, the production Tauri origin, the html preview
+/// protocol, and `about:blank` / `about:srcdoc`. Everything else, including
+/// `https:`, `data:`, and `file:`, is cancelled before a request is made.
+pub fn app_navigation_allowed(url: &url::Url) -> bool {
+    if preview_navigation_allowed(url) {
+        return true;
+    }
+    match (url.scheme(), url.host_str()) {
+        ("tauri", Some("localhost")) => true,
+        ("http" | "https", Some("tauri.localhost")) => url.port().is_none(),
+        ("http", Some("localhost" | "127.0.0.1" | "::1" | "[::1]")) => {
+            url.port() == Some(DEV_SERVER_PORT)
+        }
+        _ => false,
+    }
 }
 
 pub fn preview_navigation_allowed(url: &url::Url) -> bool {
@@ -542,7 +572,7 @@ mod tests {
     fn preview_policy_blocks_network_and_same_origin() {
         assert!(PREVIEW_CSP.contains("default-src 'none'"));
         assert!(PREVIEW_CSP.contains("connect-src 'none'"));
-        assert!(PREVIEW_CSP.contains("script-src 'unsafe-inline'"));
+        assert!(PREVIEW_CSP.contains("script-src 'unsafe-inline' 'unsafe-eval'"));
         assert!(PREVIEW_CSP.contains("style-src 'unsafe-inline'"));
         assert!(PREVIEW_CSP.contains("frame-src 'none'"));
         assert!(PREVIEW_CSP.contains("object-src 'none'"));
@@ -558,6 +588,63 @@ mod tests {
         assert!(script.contains("postMessage"));
         assert!(script.contains("__TAURI_INTERNALS__"));
         assert!(!LOCK_JS.contains("</script"));
+        for name in [
+            "RTCPeerConnection",
+            "webkitRTCPeerConnection",
+            "RTCDataChannel",
+            "RTCSessionDescription",
+            "RTCIceCandidate",
+        ] {
+            assert!(
+                LOCK_JS.contains(&format!("lock(window, \"{name}\", deny)")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_navigation_blocks_preview_escapes_and_keeps_the_app() {
+        for raw in [
+            "http://localhost:1420/",
+            "http://localhost:1420/index.html",
+            "http://127.0.0.1:1420/",
+            "http://[::1]:1420/",
+            "tauri://localhost/",
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/index.html",
+            "htmlpreview://localhost/preview?name=a.html",
+            "http://htmlpreview.localhost/preview?name=a.html",
+            "https://htmlpreview.localhost/shell?name=a.html",
+            "about:blank",
+        ] {
+            assert!(app_navigation_allowed(&raw.parse().unwrap()), "{raw}");
+        }
+        // location.href, location.assign, an <a> click, a script-injected meta
+        // refresh, and an entity-encoded refresh that the HTML guard does not
+        // strip all arrive as a navigation of the chat webview or its iframe.
+        for raw in [
+            "https://evil.test/steal",
+            "http://evil.test/",
+            "http://localhost/",
+            "http://localhost:1421/",
+            "https://localhost:1420/",
+            "http://tauri.localhost.evil.test/",
+            "http://htmlpreview.localhost.evil.test/",
+            "data:text/html,hello",
+            "javascript:alert(1)",
+            "file:///C:/Windows/system32/cmd.exe",
+            "blob:http://localhost:1420/11111111-1111-1111-1111-111111111111",
+        ] {
+            let url = raw.parse().unwrap();
+            assert!(!app_navigation_allowed(&url), "{raw}");
+        }
+        let encoded = "<meta http-equiv=\"&#114;efresh\" content=\"0;url=https://evil.test/x\">";
+        let guarded = guard_html(encoded);
+        assert!(guarded.contains("evil.test"), "{guarded}");
+        assert!(!app_navigation_allowed(
+            &"https://evil.test/x".parse().unwrap()
+        ));
     }
 
     #[test]

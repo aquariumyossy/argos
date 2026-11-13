@@ -286,11 +286,15 @@ describe("office file cards", () => {
     expect(screen.getAllByRole("button", { name: "大きく表示" })).toHaveLength(2);
 
     fireEvent.click(open);
-    expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: "手数料.html" });
+    expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: "手数料.html" });
+    expect(mockInvoke).not.toHaveBeenCalledWith("open_output_file", {
+      name: "手数料.html",
+    });
     fireEvent.click(screen.getAllByRole("button", { name: "大きく表示" })[1]!);
     expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: edited });
     fireEvent.click(openEdited);
-    expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: edited });
+    expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: edited });
+    expect(mockInvoke).not.toHaveBeenCalledWith("open_output_file", { name: edited });
   });
 
   it("shows the same open failure as before", async () => {
