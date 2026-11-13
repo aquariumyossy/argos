@@ -275,13 +275,12 @@ describe("office file cards", () => {
     const frames = reply?.querySelectorAll("iframe") ?? [];
     expect(frames).toHaveLength(2);
     for (const frame of frames) {
-      expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
-      expect(frame.getAttribute("csp")).toContain("connect-src 'none'");
-      expect(frame.getAttribute("csp")?.includes("allow-same-origin")).toBe(false);
+      expect(frame.getAttribute("sandbox")).toBeNull();
       expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
+      expect(frame.getAttribute("src")).toContain("/shell?name=");
     }
     expect(frames[0]?.getAttribute("src")).toContain(
-      "preview?name=%E6%89%8B%E6%95%B0%E6%96%99.html",
+      "shell?name=%E6%89%8B%E6%95%B0%E6%96%99.html",
     );
     expect(screen.getAllByRole("button", { name: "大きく表示" })).toHaveLength(2);
 

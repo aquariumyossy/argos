@@ -1,5 +1,5 @@
 import type { OfficeCardFile } from "./officeCards";
-import { PREVIEW_CSP, PREVIEW_SANDBOX, htmlPreviewSrc } from "./htmlPreviewPolicy";
+import { htmlPreviewSrc } from "./htmlPreviewPolicy";
 
 export function HtmlPreviews({
   files,
@@ -46,11 +46,10 @@ function HtmlPreview({
           大きく表示
         </button>
       </div>
+      {/* Unsandboxed so the shell keeps the htmlpreview origin. Its response CSP frame-src 'self' then limits the inner frame. */}
       <iframe
         className="chat-html-preview-frame"
         title={`${name} のプレビュー`}
-        sandbox={PREVIEW_SANDBOX}
-        csp={PREVIEW_CSP}
         referrerPolicy="no-referrer"
         src={src}
       />

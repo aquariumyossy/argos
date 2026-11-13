@@ -32,7 +32,9 @@ pub const PREVIEW_CSP: &str = concat!(
     "base-uri 'none'; worker-src 'none'; manifest-src 'none'; sandbox allow-scripts"
 );
 
-const SHELL_CSP: &str = concat!(
+/// Outer shell policy. `frame-src 'self'` is only the htmlpreview origin.
+/// Kept in step with `SHELL_CSP` in `src/features/chat/htmlPreviewPolicy.ts`.
+pub const SHELL_CSP: &str = concat!(
     "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; ",
     "frame-src 'self'; child-src 'self'; object-src 'none'; base-uri 'none'; ",
     "form-action 'none'; connect-src 'none'; img-src 'none'; font-src 'none'; ",
@@ -123,9 +125,11 @@ try {{
 pub fn isolation_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("html-preview-isolation")
         .js_init_script_on_all_frames(isolation_script())
-        // WebView2 NavigationStarting (and WebKit's navigation policy) fires for the
-        // top document and every child frame. Cancelling here stops the chat iframe
-        // from following location changes, link clicks, meta refresh, or data: URLs.
+        // Top-level navigations only. wry 0.55.1 registers WebView2
+        // NavigationStarting and does not hook FrameNavigationStarting, so this
+        // does not see the in-chat iframe. That frame loads /shell, whose
+        // frame-src 'self' blocks the inner document. This guard stays for the
+        // top-level document.
         .on_navigation(|_webview, url| app_navigation_allowed(url))
         .build()
 }
@@ -203,6 +207,12 @@ pub fn app_navigation_allowed(url: &url::Url) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether the shell's `frame-src 'self'` allows a nested navigation.
+/// `about:`, `data:`, external sites, and the app origin do not match.
+pub fn shell_nested_navigation_allowed(target: &url::Url) -> bool {
+    target.scheme() != "about" && preview_navigation_allowed(target)
 }
 
 pub fn preview_navigation_allowed(url: &url::Url) -> bool {
@@ -620,9 +630,7 @@ mod tests {
         ] {
             assert!(app_navigation_allowed(&raw.parse().unwrap()), "{raw}");
         }
-        // location.href, location.assign, an <a> click, a script-injected meta
-        // refresh, and an entity-encoded refresh that the HTML guard does not
-        // strip all arrive as a navigation of the chat webview or its iframe.
+        // Top-level guard only. Child-frame navigations are covered by the shell.
         for raw in [
             "https://evil.test/steal",
             "http://evil.test/",
@@ -644,6 +652,48 @@ mod tests {
         assert!(guarded.contains("evil.test"), "{guarded}");
         assert!(!app_navigation_allowed(
             &"https://evil.test/x".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn shell_frame_src_blocks_inner_escapes_including_the_app_origin() {
+        for raw in [
+            "http://htmlpreview.localhost/preview?name=a.html",
+            "https://htmlpreview.localhost/preview?name=a.html",
+            "htmlpreview://localhost/preview?name=a.html",
+        ] {
+            assert!(
+                shell_nested_navigation_allowed(&raw.parse().unwrap()),
+                "{raw}"
+            );
+        }
+        // location, <a>, meta refresh (including an entity-encoded one that
+        // survives the HTML guard), data:, and the app origin (fonts included).
+        for raw in [
+            "https://evil.test/steal",
+            "https://evil.test/x",
+            "https://fonts.googleapis.com/css2?family=Roboto",
+            "https://fonts.gstatic.com/s/roboto.woff2",
+            "data:text/html,hello",
+            "http://localhost:1420/",
+            "http://127.0.0.1:1420/",
+            "http://tauri.localhost/",
+            "https://tauri.localhost/index.html",
+            "tauri://localhost/",
+            "about:blank",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                !shell_nested_navigation_allowed(&raw.parse().unwrap()),
+                "{raw}"
+            );
+        }
+        let encoded =
+            "<meta http-equiv=\"&#114;efresh\" content=\"0;url=https://fonts.googleapis.com/\">";
+        assert!(guard_html(encoded).contains("fonts.googleapis.com"));
+        assert!(!shell_nested_navigation_allowed(
+            &"https://fonts.googleapis.com/".parse().unwrap()
         ));
     }
 
@@ -720,9 +770,13 @@ mod tests {
         assert_eq!(csp, PREVIEW_CSP);
         assert!(body.contains("<p>計算</p>"));
         assert!(body.contains("lockHtmlPreview"));
-        let (_csp, shell) = render(&tmp.0, "/shell?name=calc.html").unwrap();
+        let (shell_csp, shell) = render(&tmp.0, "/shell?name=calc.html").unwrap();
+        assert_eq!(shell_csp, SHELL_CSP);
         assert!(shell.contains("sandbox=\"allow-scripts\""));
         assert!(!shell.contains("allow-same-origin"));
+        assert!(!shell.contains("allow-top-navigation"));
+        assert!(shell.contains("frame-src 'self'"));
+        assert!(shell.contains(&format!("csp=\"{PREVIEW_CSP}\"")));
         assert!(shell.contains("/preview?name=calc.html"));
         assert!(render(&tmp.0, "/preview?name=..%2Fcalc.html").is_err());
         assert!(render(&tmp.0, "/preview?name=C:%5CWindows%5Ccalc.html").is_err());

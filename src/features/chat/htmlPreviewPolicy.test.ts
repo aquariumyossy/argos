@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { PREVIEW_CSP, PREVIEW_SANDBOX, htmlPreviewSrc } from "./htmlPreviewPolicy";
+import {
+  PREVIEW_CSP,
+  PREVIEW_SANDBOX,
+  SHELL_CSP,
+  htmlPreviewSrc,
+} from "./htmlPreviewPolicy";
 
 describe("html preview isolation", () => {
   it("allows inline script and style and nothing from the network", () => {
@@ -18,12 +23,18 @@ describe("html preview isolation", () => {
     expect(PREVIEW_CSP.includes("https:")).toBe(false);
   });
 
-  it("points the frame at the output file name on the preview origin", () => {
+  it("loads the chat preview through the shell, not the user document", () => {
     expect(htmlPreviewSrc("手数料.html", false)).toBe(
-      "htmlpreview://localhost/preview?name=%E6%89%8B%E6%95%B0%E6%96%99.html",
+      "htmlpreview://localhost/shell?name=%E6%89%8B%E6%95%B0%E6%96%99.html",
     );
     expect(htmlPreviewSrc("a&b.html", true)).toBe(
-      "http://htmlpreview.localhost/preview?name=a%26b.html",
+      "http://htmlpreview.localhost/shell?name=a%26b.html",
     );
+    expect(SHELL_CSP).toContain("frame-src 'self'");
+    expect(SHELL_CSP).toContain("script-src 'none'");
+    expect(SHELL_CSP).toContain("connect-src 'none'");
+    expect(SHELL_CSP.includes("tauri.localhost")).toBe(false);
+    expect(SHELL_CSP.includes("localhost:1420")).toBe(false);
+    expect(SHELL_CSP.includes("https:")).toBe(false);
   });
 });
