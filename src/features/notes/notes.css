@@ -667,38 +667,43 @@
   overflow: auto;
 }
 
-.notes-review-panel {
-  flex-shrink: 0;
-  margin: 0 0 8px;
-  padding: 8px;
-  border: 1px dashed var(--accent);
-  border-radius: 6px;
-  background: var(--accent-soft);
-  color: var(--ink);
-  max-height: 42vh;
-  overflow: auto;
-}
-
-.notes-review-head {
+.notes-review-bar {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
-}
-
-.notes-review-actions,
-.notes-review-hunk-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.notes-review-actions button,
-.notes-review-hunk-actions button {
-  font: inherit;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 2px 8px;
+  min-height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--ink);
   font-size: 0.85rem;
-  padding: 4px 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.notes-review-bar-label {
+  font-weight: 650;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notes-review-bar-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.notes-review-bar-actions button,
+.notes-inline-revert {
+  font: inherit;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  padding: 1px 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--bg);
@@ -708,51 +713,58 @@
 
 .notes-review-ack {
   background: var(--accent) !important;
-  color: var(--on-accent, #fff) !important;
+  color: #fff !important;
   border-color: transparent !important;
 }
 
-.notes-review-warn {
-  margin: 6px 0 0;
-  font-size: 0.85rem;
-  color: var(--danger, #b00020);
-}
-
-.notes-review-hunk {
-  margin-top: 8px;
-}
-
-.notes-review-gap {
-  margin: 0 0 4px;
-  font-size: 0.8rem;
-  color: var(--muted);
-}
-
-.notes-review-diff {
-  margin: 0;
-  padding: 6px 8px;
-  border-radius: 4px;
-  background: var(--bg);
-  font-size: 0.8rem;
-  line-height: 1.4;
-  overflow-x: auto;
+.notes-inline-diff {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--bg-elevated);
+  font-size: 0.88rem;
+  line-height: 1.55;
   white-space: pre-wrap;
+  word-break: break-word;
+  outline: none;
 }
 
-.notes-diff-add {
-  background: rgba(46, 160, 67, 0.18);
+.notes-inline-diff:focus {
+  border-color: var(--accent);
 }
 
-.notes-diff-del {
-  background: rgba(248, 81, 73, 0.18);
+.notes-inline-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-height: 1.55em;
 }
 
-.notes-diff-eq {
-  color: var(--muted);
+.notes-inline-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
-.notes-review-hunk-actions {
-  margin-top: 4px;
+.notes-inline-add {
+  background: rgba(46, 160, 67, 0.22);
+  color: #146c2e;
+  border-radius: 2px;
+}
+
+.notes-inline-del {
+  background: rgba(207, 34, 46, 0.12);
+  color: var(--danger);
+  text-decoration-line: line-through;
+  border-radius: 2px;
+}
+
+.notes-inline-revert {
+  flex: 0 0 auto;
 }
 
 .notes-task-list {
@@ -1187,7 +1199,8 @@
   .notes-main-head-actions,
   .notes-pane-head-actions,
   .notes-md-helper-menu,
-  .notes-review-panel,
+  .notes-review-bar,
+  .notes-inline-revert,
   .notes-drag-handle,
   .notes-item-actions,
   .notes-body-resize {
