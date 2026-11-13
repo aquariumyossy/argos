@@ -359,8 +359,13 @@ fn discard_refused_user_message(db: &crate::db::Db, message_id: &str) {
 }
 
 #[tauri::command]
-pub fn show_chat_window(app: AppHandle) {
-    crate::show_chat(&app);
+pub async fn show_chat_window(app: AppHandle) {
+    // Off the WebView2 IPC callback. Recreating the chat window on that
+    // thread deadlocks the UI the same way as the HTML preview.
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        crate::show_chat(&app);
+    })
+    .await;
 }
 
 #[tauri::command]
@@ -678,6 +683,8 @@ pub async fn llm_list_models(state: State<'_, Arc<AppState>>) -> Result<Vec<LlmM
     llm::list_models(&settings).await
 }
 
+/// Open a saved `.docx`, `.xlsx`, or `.html` with the OS association.
+/// HTML uses the same path as Word and Excel, so the browser opens it.
 #[tauri::command]
 pub fn open_output_file(
     app: AppHandle,
@@ -693,13 +700,45 @@ pub fn open_output_file(
     Ok(())
 }
 
+/// Open Argos's output folder in the file manager.
+/// The path is always `<data dir>/output`. The caller cannot choose another one.
+/// Directory creation and the shell call run off the UI thread.
 #[tauri::command]
-pub fn show_html_preview(
+pub async fn open_output_folder(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = crate::llm::create_office::prepare_output_dir(&data_dir)?;
+        let display = path.to_string_lossy().to_string();
+        app.opener()
+            .open_path(display.as_str(), None::<&str>)
+            .map_err(|err| format!("出力フォルダを開けません（{err}）。"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| format!("出力フォルダを開けません（{err}）。"))?
+}
+
+/// Open the large HTML preview.
+///
+/// Async so the body is not the WebView2 IPC callback. `spawn_blocking` then
+/// builds the window off the UI thread; wry posts creation to the event loop.
+/// A synchronous command deadlocks WebView2 on Windows: the window is blank,
+/// its close button does nothing, and the chat and tray quit freeze with it.
+#[tauri::command]
+pub async fn show_html_preview(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     name: String,
 ) -> Result<(), String> {
-    crate::html_preview::show_window(&app, &state.data_dir, &name)
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::html_preview::show_window(&app, &data_dir, &name)
+    })
+    .await
+    .map_err(|err| format!("プレビューを開けません（{err}）。"))?
 }
 
 #[tauri::command]
@@ -2445,7 +2484,7 @@ pub fn llm_set_source_grain(
 }
 
 #[tauri::command]
-pub fn llm_attach_sources(
+pub async fn llm_attach_sources(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     items: Vec<LlmAttachItem>,
@@ -2539,7 +2578,10 @@ pub fn llm_attach_sources(
         .map_err(|e| e.to_string())?
         .unwrap_or(thread);
 
-    crate::show_chat(&app);
+    let app_for_window = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::show_chat(&app_for_window))
+        .await
+        .map_err(|err| format!("チャットを開けません（{err}）。"))?;
     emit_sources_updated(&app, &thread.id);
 
     Ok(LlmAttachResult {
@@ -2822,7 +2864,7 @@ fn attach_scanned_pdf(
 }
 
 #[tauri::command]
-pub fn llm_attach_files(
+pub async fn llm_attach_files(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     paths: Vec<String>,
@@ -2900,6 +2942,7 @@ pub fn llm_attach_files(
         warnings,
         wants_ocr,
     )
+    .await
 }
 
 fn decode_pasted_image(data_base64: &str) -> Result<Vec<u8>, String> {
@@ -2983,7 +3026,7 @@ fn attach_pasted_image_bytes(
     }
 }
 
-fn finish_attach(
+async fn finish_attach(
     app: &AppHandle,
     state: &Arc<AppState>,
     thread: LlmThreadRow,
@@ -3003,7 +3046,10 @@ fn finish_attach(
         .get_llm_thread(&thread.id)
         .map_err(|e| e.to_string())?
         .unwrap_or(thread);
-    crate::show_chat(app);
+    let app_for_window = app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::show_chat(&app_for_window))
+        .await
+        .map_err(|err| format!("チャットを開けません（{err}）。"))?;
     emit_sources_updated(app, &thread.id);
     let settings = state.settings.read().clone();
     let remote_ocr = wants_ocr && !llm::is_loopback_url(&settings.llm_base_url);
@@ -3025,7 +3071,7 @@ fn finish_attach(
 }
 
 #[tauri::command]
-pub fn llm_attach_pasted_image(
+pub async fn llm_attach_pasted_image(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     data_base64: String,
@@ -3076,6 +3122,7 @@ pub fn llm_attach_pasted_image(
         warnings,
         outcome.needs_ocr,
     )
+    .await
 }
 
 #[tauri::command]

@@ -35,6 +35,7 @@ vi.mock("@tauri-apps/api/window", () => ({
         if (index >= 0) focusHandlers.splice(index, 1);
       };
     },
+    onCloseRequested: async () => () => {},
   }),
 }));
 

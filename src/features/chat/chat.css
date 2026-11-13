@@ -302,6 +302,14 @@
   min-height: 0;
 }
 
+.chat-main-bar {
+  display: flex;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
 .chat-log-wrap {
   position: relative;
   flex: 1;
@@ -822,6 +830,31 @@ body.md-col-resizing {
   height: 220px;
   border: 0;
   background: #fff;
+}
+
+.chat-html-preview.is-resizing .chat-html-preview-frame {
+  pointer-events: none;
+}
+
+.chat-html-preview-resize {
+  height: 8px;
+  cursor: ns-resize;
+  background: transparent;
+  border-top: 1px solid var(--line);
+  touch-action: none;
+}
+
+.chat-html-preview-resize:hover,
+.chat-html-preview.is-resizing .chat-html-preview-resize {
+  background: var(--accent-soft);
+}
+
+.chat-html-preview-drag-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  cursor: ns-resize;
+  user-select: none;
 }
 
 .chat-summary {

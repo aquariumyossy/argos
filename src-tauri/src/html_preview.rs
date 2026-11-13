@@ -12,6 +12,10 @@
 //! On Windows, WebView2 runs Tauri's IPC script in every frame. A document-start
 //! script therefore drops `chrome.webview.postMessage` in child frames and on
 //! this preview origin, before the page's own script runs.
+//!
+//! The large window must be created off the UI thread. A synchronous command
+//! runs inside WebView2's IPC callback; building a webview there deadlocks the
+//! UI thread, so the window stays blank and close, chat, and tray quit stop.
 
 use std::path::Path;
 
@@ -146,6 +150,13 @@ pub fn respond(app: &AppHandle, uri: &http::Uri) -> http::Response<Vec<u8>> {
     }
 }
 
+/// Show the large preview.
+///
+/// Must run off the UI thread. `WebviewWindowBuilder::build` posts creation to
+/// the event loop when called from another thread. On the UI thread, inside the
+/// IPC callback that invoked a synchronous command, WebView2 waits on itself:
+/// the HWND appears with the title set, the document never paints, and the
+/// event loop no longer runs.
 pub fn show_window(app: &AppHandle, data_dir: &Path, name: &str) -> Result<(), String> {
     let _ = read_html(data_dir, name)?;
     let url = shell_url(name)?;
@@ -183,7 +194,11 @@ fn hide_on_close(window: &WebviewWindow) {
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
-            let _ = handle.hide();
+            // Hide does not wait on the page. The UI thread stays free, so this
+            // still runs when the document never paints.
+            if let Err(err) = handle.hide() {
+                eprintln!("argos: hide html preview failed: {err}");
+            }
         }
     });
 }
@@ -695,6 +710,30 @@ mod tests {
         assert!(!shell_nested_navigation_allowed(
             &"https://fonts.googleapis.com/".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn large_window_shell_url_is_allowed_by_the_navigation_guard() {
+        // The blank window is not the guard rejecting its own URL. Both forms
+        // the large window can load, including the Japanese file from the report,
+        // stay on the preview origin. External sites still do not.
+        let shell = shell_url("弁護士報酬計算.html").unwrap();
+        assert!(
+            shell.path() == "/shell" && shell.query().unwrap_or("").contains("name="),
+            "{shell}"
+        );
+        assert!(preview_navigation_allowed(&shell), "{shell}");
+        assert!(app_navigation_allowed(&shell), "{shell}");
+        for raw in [
+            "http://htmlpreview.localhost/shell?name=%E5%BC%81%E8%AD%B7%E5%A3%AB%E5%A0%B1%E9%85%AC%E8%A8%88%E7%AE%97.html",
+            "https://htmlpreview.localhost/shell?name=%E5%BC%81%E8%AD%B7%E5%A3%AB%E5%A0%B1%E9%85%AC%E8%A8%88%E7%AE%97.html",
+            "htmlpreview://localhost/shell?name=%E5%BC%81%E8%AD%B7%E5%A3%AB%E5%A0%B1%E9%85%AC%E8%A8%88%E7%AE%97.html",
+        ] {
+            let url = raw.parse().unwrap();
+            assert!(preview_navigation_allowed(&url), "{raw}");
+            assert!(app_navigation_allowed(&url), "{raw}");
+            assert_eq!(url.path(), "/shell");
+        }
     }
 
     #[test]
