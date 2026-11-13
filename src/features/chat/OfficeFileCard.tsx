@@ -53,9 +53,9 @@ function OfficeFileCard({
   );
 }
 
-function OfficeKindIcon({ kind }: { kind: "docx" | "xlsx" }) {
+function OfficeKindIcon({ kind }: { kind: "docx" | "xlsx" | "html" }) {
   const word = kind === "docx";
-  const ink = word ? "#185ABD" : "#107C41";
+  const ink = kind === "docx" ? "#185ABD" : kind === "html" ? "#E44D26" : "#107C41";
   return (
     <svg
       className="chat-office-icon"
@@ -70,7 +70,16 @@ function OfficeKindIcon({ kind }: { kind: "docx" | "xlsx" }) {
         fill="#fff"
       />
       <path d="M18.1 7.6 23 12.2h-4.9V7.6Z" fill={ink} />
-      {word ? (
+      {kind === "html" ? (
+        <path
+          d="M12.2 16.6 10.2 19.1l2 2.5M17.4 16.6l2 2.5-2 2.5M15.4 16.2l-1.2 5.6"
+          fill="none"
+          stroke={ink}
+          strokeWidth="1.4"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+      ) : word ? (
         <path
           d="M11.2 16.4 13.2 22l1.8-3.4L16.8 22l2-5.6"
           fill="none"

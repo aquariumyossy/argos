@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::db::LlmSourceRow;
 use crate::llm::context::format_sources;
+pub use crate::llm::create_html::{TOOL_CREATE_HTML, TOOL_EDIT_HTML};
 pub use crate::llm::create_office::{TOOL_CREATE_DOCX, TOOL_CREATE_XLSX};
 use crate::search::{self, SearchHit};
 use crate::state::AppState;
@@ -434,6 +435,7 @@ cite_no は出典 [n]。添付が1件なら省略できる。filename か path �
         }
     }));
     tools.extend(crate::llm::create_office::tool_schemas());
+    tools.extend(crate::llm::create_html::tool_schemas());
     Value::Array(tools)
 }
 
@@ -485,7 +487,7 @@ pub struct ToolExec {
     pub content: String,
     pub consumed: Vec<(String, i64)>,
     pub wrote_note_id: Option<String>,
-    /// Set only by `create_docx` / `create_xlsx`. Never parsed out of tool text.
+    /// Set only by `create_docx` / `create_xlsx` / `create_html`. Never parsed out of tool text.
     pub saved_file: Option<crate::llm::create_office::SavedOfficeFile>,
 }
 
@@ -3079,6 +3081,12 @@ fn execute_tool_inner(
         ))),
         TOOL_CREATE_XLSX => Ok(office_tool_exec(crate::llm::create_office::exec_xlsx(
             state, &args,
+        ))),
+        TOOL_CREATE_HTML => Ok(office_tool_exec(crate::llm::create_html::exec_create(
+            &state.data_dir, &args,
+        ))),
+        TOOL_EDIT_HTML => Ok(ToolExec::text(crate::llm::create_html::exec_edit(
+            &state.data_dir, &args,
         ))),
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),

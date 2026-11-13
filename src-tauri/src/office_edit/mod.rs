@@ -612,7 +612,7 @@ fn one_line(text: &str) -> String {
     text.replace(['\n', '\r', '\t'], " ")
 }
 
-fn output_filename(src: &Path, stamp: &str, ext: &str) -> String {
+pub(crate) fn output_filename(src: &Path, stamp: &str, ext: &str) -> String {
     let stem = src
         .file_stem()
         .map(|name| name.to_string_lossy().into_owned())
@@ -635,7 +635,7 @@ fn output_filename(src: &Path, stamp: &str, ext: &str) -> String {
     format!("{safe}_編集済み（{stamp}）.{ext}")
 }
 
-fn unique_dest(dir: &Path, filename: &str, src: &Path) -> PathBuf {
+pub(crate) fn unique_dest(dir: &Path, filename: &str, src: &Path) -> PathBuf {
     let candidate = dir.join(filename);
     if dest_ok(&candidate, src) {
         return candidate;

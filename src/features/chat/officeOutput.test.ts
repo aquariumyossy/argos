@@ -51,6 +51,35 @@ describe("editOfficeFileLink", () => {
     });
   });
 
+  it("reads an edit_html result and keeps the original name", () => {
+    const name = "手数料_編集済み（2026-11-13 02-50-00）.html";
+    const report = [
+      `出力ファイル: ${name}`,
+      `[[argos-office]]\thtml\t${name}`,
+      "元ファイル: 手数料.html",
+      String.raw`保存先: C:\Users\me\AppData\Roaming\Argos\output\${name}`,
+    ].join("\n");
+    expect(editOfficeFileLink("edit_html", report)).toEqual({
+      kind: "html",
+      name,
+      sourceName: "手数料.html",
+      leftovers: [],
+    });
+    expect(
+      editOfficeFileLink(
+        "edit_html",
+        `[[argos-office]]\thtml\t${name}\n元ファイル: C:\\secret\\手数料.html`,
+      ),
+    ).toEqual({ kind: "html", name, leftovers: [] });
+    expect(editOfficeFileLink("edit_office", report)).toEqual({
+      kind: "html",
+      name,
+      sourceName: "手数料.html",
+      leftovers: [],
+    });
+    expect(editOfficeFileLink("search_index", report)).toBeNull();
+  });
+
   it("does not open another tool even when the text contains a path", () => {
     expect(editOfficeFileLink("search_index", saved)).toBeNull();
     expect(editOfficeFileLink("read_unit", saved)).toBeNull();

@@ -248,6 +248,51 @@ describe("office file cards", () => {
     expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: editName });
   });
 
+  it("shows an HTML card, a sandboxed preview, and opens the large view", async () => {
+    const edited = "手数料_編集済み（2026-11-13 02-50-00）.html";
+    const htmlNotice = [
+      "HTMLファイルを保存しました（Argos の出力フォルダ）",
+      "[[argos-office]]\thtml\t手数料.html",
+    ].join("\n");
+    const editReport = [
+      `出力ファイル: ${edited}`,
+      `[[argos-office]]\thtml\t${edited}`,
+      "元ファイル: 手数料.html",
+    ].join("\n");
+    rows = [
+      row("u", "user", "計算して"),
+      row("n1", "assistant", htmlNotice, { kind: "notice" }),
+      row("tool", "tool", editReport, { toolName: "edit_html" }),
+      row("reply", "assistant", "できました。"),
+    ];
+    await renderChat();
+    const open = await screen.findByRole("button", { name: "手数料.html を開く" });
+    const openEdited = screen.getByRole("button", { name: `${edited} を開く` });
+    const reply = screen.getByText("できました。").closest("article");
+    expect(reply?.querySelectorAll("[data-office-card]")).toHaveLength(2);
+    expect(reply?.querySelector("[data-office-kind='html']")).toBeTruthy();
+    expect(screen.getByText("元：手数料.html").closest("article")).toBe(reply);
+    const frames = reply?.querySelectorAll("iframe") ?? [];
+    expect(frames).toHaveLength(2);
+    for (const frame of frames) {
+      expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+      expect(frame.getAttribute("csp")).toContain("connect-src 'none'");
+      expect(frame.getAttribute("csp")?.includes("allow-same-origin")).toBe(false);
+      expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
+    }
+    expect(frames[0]?.getAttribute("src")).toContain(
+      "preview?name=%E6%89%8B%E6%95%B0%E6%96%99.html",
+    );
+    expect(screen.getAllByRole("button", { name: "大きく表示" })).toHaveLength(2);
+
+    fireEvent.click(open);
+    expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: "手数料.html" });
+    fireEvent.click(screen.getAllByRole("button", { name: "大きく表示" })[1]!);
+    expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: edited });
+    fireEvent.click(openEdited);
+    expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: edited });
+  });
+
   it("shows the same open failure as before", async () => {
     rows = [
       row("u", "user", "作って"),

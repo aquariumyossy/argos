@@ -117,6 +117,31 @@ describe("officeCardsByMessage", () => {
     ]);
   });
 
+  it("puts an HTML create and edit on the reply, with the original name", () => {
+    const edited = "手数料_編集済み（2026-11-13 02-50-00）.html";
+    const htmlNotice = [
+      "HTMLファイルを保存しました（Argos の出力フォルダ）",
+      "[[argos-office]]\thtml\t手数料.html",
+    ].join("\n");
+    const editReport = [
+      `出力ファイル: ${edited}`,
+      `[[argos-office]]\thtml\t${edited}`,
+      "元ファイル: 手数料.html",
+    ].join("\n");
+    const cards = officeCardsByMessage([
+      msg("u", "user", "計算して"),
+      msg("n1", "assistant", htmlNotice, { kind: "notice" }),
+      msg("tool", "tool", editReport, { toolName: "edit_html" }),
+      msg("reply", "assistant", "できました。"),
+    ]);
+    expect(cards.get("reply")).toEqual([
+      { kind: "html", name: "手数料.html" },
+      { kind: "html", name: edited, sourceName: "手数料.html" },
+    ]);
+    expect(cards.has("n1")).toBe(false);
+    expect(cards.has("tool")).toBe(false);
+  });
+
   it("ignores a path posing as the original name and text that is not a saved file", () => {
     const cards = officeCardsByMessage([
       msg("u", "user", "直して"),

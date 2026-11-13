@@ -3250,6 +3250,7 @@ mod tests {
         assert_eq!(env.indexer().stat_count.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg(windows)]
     #[test]
     fn symlink_file_is_indexed_and_kept() {
         let env = Env::new("symlink");

@@ -215,7 +215,8 @@ async fn execute_tool_off_runtime(
         Err(e) => ToolExec {
             content: format!("ツール実行に失敗しました: {e}"),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None,
+            saved_file: None,
+            wrote_note_id: None,
         },
     }
 }
@@ -690,6 +691,15 @@ pub fn open_output_file(
         .open_path(display.as_str(), None::<&str>)
         .map_err(|e| format!("ファイルを開けません（{e}）。"))?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn show_html_preview(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<(), String> {
+    crate::html_preview::show_window(&app, &state.data_dir, &name)
 }
 
 #[tauri::command]

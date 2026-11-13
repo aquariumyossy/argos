@@ -1,8 +1,8 @@
-import { parseOfficeFileNotice } from "./officeFile";
+import { parseOfficeFileNotice, type OfficeKind } from "./officeFile";
 import { editOfficeFileLink } from "./officeOutput";
 
 export type OfficeCardFile = {
-  kind: "docx" | "xlsx";
+  kind: OfficeKind;
   name: string;
   /** Bare name of the attachment an edit started from. */
   sourceName?: string;
