@@ -145,8 +145,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::Builder::new().arg("--autostart").build())
-        .register_uri_scheme_protocol("htmlpreview", |ctx, request| {
-            html_preview::respond(ctx.app_handle(), request.uri())
+        .register_asynchronous_uri_scheme_protocol("htmlpreview", |ctx, request, responder| {
+            // WebView2 raises this on the UI thread and has already taken a deferral.
+            // Reading the file here would block close, chat, and tray quit for the
+            // duration of the read. The response bytes are unchanged.
+            let app = ctx.app_handle().clone();
+            let uri = request.uri().clone();
+            std::thread::spawn(move || {
+                responder.respond(html_preview::respond(&app, &uri));
+            });
         })
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             OPEN_SETTINGS.store(true, Ordering::SeqCst);
@@ -508,6 +515,7 @@ pub fn run() {
             llm::commands::llm_set_source_grain,
             llm::commands::llm_send,
             llm::commands::open_output_file,
+            llm::commands::open_output_folder,
             llm::commands::show_html_preview,
             llm::commands::llm_cancel,
             llm::commands::llm_test_connection,

@@ -46,6 +46,25 @@ pub fn output_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(OUTPUT_DIR_NAME)
 }
 
+/// Create `<data_dir>/output` if needed and return the path to open.
+///
+/// There is no caller-supplied path. A symlink whose target is not that
+/// directory is refused, so Explorer cannot be sent somewhere else.
+pub fn prepare_output_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(data_dir).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
+    let dir = output_dir(data_dir);
+    fs::create_dir_all(&dir).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
+    let canon_data =
+        fs::canonicalize(data_dir).map_err(|err| format!("出力フォルダを開けません（{err}）。"))?;
+    let canon_dir =
+        fs::canonicalize(&dir).map_err(|err| format!("出力フォルダを開けません（{err}）。"))?;
+    let name_ok = canon_dir.file_name().and_then(|name| name.to_str()) == Some(OUTPUT_DIR_NAME);
+    if canon_dir.parent() != Some(canon_data.as_path()) || !name_ok {
+        return Err("出力フォルダの外は開けません。".into());
+    }
+    Ok(strip_verbatim_prefix(&canon_dir))
+}
+
 pub fn tool_schemas() -> Vec<Value> {
     vec![docx_schema(), xlsx_schema()]
 }
@@ -2723,6 +2742,35 @@ mod tests {
             resolved.file_name().and_then(|n| n.to_str()),
             Some(saved.name.as_str())
         );
+    }
+
+    #[test]
+    fn output_folder_is_created_under_the_data_dir() {
+        let tmp = Tmp::new();
+        assert!(!output_dir(&tmp.0).exists());
+        let opened = prepare_output_dir(&tmp.0).unwrap();
+        assert!(output_dir(&tmp.0).is_dir());
+        assert_eq!(
+            opened.file_name().and_then(|name| name.to_str()),
+            Some(OUTPUT_DIR_NAME)
+        );
+        let again = prepare_output_dir(&tmp.0).unwrap();
+        assert_eq!(opened, again);
+        fs::write(output_dir(&tmp.0).join("手数料.html"), "<p>x</p>").unwrap();
+        let resolved = output_file_path(&tmp.0, "手数料.html").unwrap();
+        assert!(resolved.starts_with(&fs::canonicalize(output_dir(&tmp.0)).unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_folder_symlink_is_not_opened() {
+        let tmp = Tmp::new();
+        fs::create_dir_all(&tmp.0).unwrap();
+        let outside = tmp.0.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, output_dir(&tmp.0)).unwrap();
+        let err = prepare_output_dir(&tmp.0).unwrap_err();
+        assert!(err.contains("外は開けません"), "{err}");
     }
 
     #[cfg(unix)]

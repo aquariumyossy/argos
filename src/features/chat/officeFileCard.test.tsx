@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Chat from "./Chat";
+import { HTML_PREVIEW_MIN_HEIGHT } from "./HtmlPreview";
 
 const thread = {
   id: "thread-a",
@@ -45,8 +46,10 @@ type Row = {
 let rows: Row[] = [];
 let openError: Error | null = null;
 
-const { mockInvoke } = vi.hoisted(() => ({
+const { mockInvoke, focusHandlers, closeHandlers } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
+  focusHandlers: [] as Array<(event: { payload: boolean }) => void>,
+  closeHandlers: [] as Array<() => void>,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -59,7 +62,20 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
-    onFocusChanged: async () => () => {},
+    onFocusChanged: async (cb: (event: { payload: boolean }) => void) => {
+      focusHandlers.push(cb);
+      return () => {
+        const index = focusHandlers.indexOf(cb);
+        if (index >= 0) focusHandlers.splice(index, 1);
+      };
+    },
+    onCloseRequested: async (cb: () => void) => {
+      closeHandlers.push(cb);
+      return () => {
+        const index = closeHandlers.indexOf(cb);
+        if (index >= 0) closeHandlers.splice(index, 1);
+      };
+    },
   }),
 }));
 
@@ -100,6 +116,9 @@ async function renderChat() {
 beforeEach(() => {
   rows = [];
   openError = null;
+  focusHandlers.length = 0;
+  closeHandlers.length = 0;
+  document.querySelectorAll("[data-preview-drag-overlay]").forEach((node) => node.remove());
   mockInvoke.mockReset();
   mockInvoke.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -137,7 +156,28 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  document.querySelectorAll("[data-preview-drag-overlay]").forEach((node) => node.remove());
 });
+
+function previewFrame(name: string): HTMLIFrameElement {
+  const root = document.querySelector(
+    `[data-html-preview="${CSS.escape(name)}"]`,
+  );
+  const frame = root?.querySelector("iframe");
+  if (!(frame instanceof HTMLIFrameElement)) {
+    throw new Error(`missing preview frame: ${name}`);
+  }
+  return frame;
+}
+
+function setChatViewHeight(px: number) {
+  const view = document.querySelector(".chat-log-wrap");
+  if (!view) throw new Error("missing chat view");
+  Object.defineProperty(view, "clientHeight", {
+    configurable: true,
+    get: () => px,
+  });
+}
 
 function openButtons() {
   return screen.getAllByRole("button", { name: /を開く$/ });
@@ -285,15 +325,21 @@ describe("office file cards", () => {
     expect(screen.getAllByRole("button", { name: "大きく表示" })).toHaveLength(2);
 
     fireEvent.click(open);
-    expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: "手数料.html" });
-    expect(mockInvoke).not.toHaveBeenCalledWith("open_output_file", {
+    expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: "手数料.html" });
+    expect(mockInvoke).not.toHaveBeenCalledWith("show_html_preview", {
       name: "手数料.html",
     });
     fireEvent.click(screen.getAllByRole("button", { name: "大きく表示" })[1]!);
     expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: edited });
     fireEvent.click(openEdited);
-    expect(mockInvoke).toHaveBeenCalledWith("show_html_preview", { name: edited });
-    expect(mockInvoke).not.toHaveBeenCalledWith("open_output_file", { name: edited });
+    expect(mockInvoke).toHaveBeenCalledWith("open_output_file", { name: edited });
+    const editedCalls = mockInvoke.mock.calls.filter(
+      (args) => args[1] && (args[1] as { name?: string }).name === edited,
+    );
+    expect(editedCalls.map((args) => args[0])).toEqual([
+      "show_html_preview",
+      "open_output_file",
+    ]);
   });
 
   it("shows the same open failure as before", async () => {
@@ -306,5 +352,102 @@ describe("office file cards", () => {
     await renderChat();
     fireEvent.click(await screen.findByRole("button", { name: "契約メモ.docx を開く" }));
     expect(await screen.findByText("ファイルが見つかりません。")).toBeTruthy();
+  });
+
+  it("opens the output folder from the top of the chat and does not take a path", async () => {
+    await renderChat();
+    const button = await screen.findByRole("button", { name: "出力フォルダ" });
+    expect(button.closest(".chat-main-bar")).toBeTruthy();
+    expect(button.closest(".chat-main")).toBeTruthy();
+    expect(button.closest("[data-office-card]")).toBeNull();
+    expect(button.closest("article")).toBeNull();
+    fireEvent.click(button);
+    expect(mockInvoke).toHaveBeenCalledWith("open_output_folder");
+    const call = mockInvoke.mock.calls.find((args) => args[0] === "open_output_folder");
+    expect(call).toEqual(["open_output_folder"]);
+  });
+
+  it("drags one html preview taller without changing its width or the other preview", async () => {
+    const edited = "手数料_編集済み（2026-11-13 02-50-00）.html";
+    rows = [
+      row("u", "user", "計算して"),
+      row(
+        "n1",
+        "assistant",
+        ["HTMLファイルを保存しました（Argos の出力フォルダ）", "[[argos-office]]\thtml\t手数料.html"].join(
+          "\n",
+        ),
+        { kind: "notice" },
+      ),
+      row(
+        "tool",
+        "tool",
+        [`出力ファイル: ${edited}`, `[[argos-office]]\thtml\t${edited}`, "元ファイル: 手数料.html"].join(
+          "\n",
+        ),
+        { toolName: "edit_html" },
+      ),
+      row("reply", "assistant", "できました。"),
+    ];
+    await renderChat();
+    await screen.findByRole("button", { name: "手数料.html を開く" });
+    setChatViewHeight(640);
+    const bars = screen.getAllByRole("separator", { name: "プレビューの高さを変更" });
+    expect(bars).toHaveLength(2);
+    const first = previewFrame("手数料.html");
+    const second = previewFrame(edited);
+    expect(first.style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT}px`);
+    expect(second.style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT}px`);
+    expect(first.style.width).toBe("");
+    expect(second.style.width).toBe("");
+
+    fireEvent.pointerDown(bars[1]!, { pointerId: 1, clientY: 100 });
+    const overlay = document.querySelector("[data-preview-drag-overlay]");
+    expect(overlay).toBeTruthy();
+    fireEvent.pointerMove(overlay!, { pointerId: 1, clientY: 40 });
+    expect(second.style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT}px`);
+    fireEvent.pointerMove(overlay!, { pointerId: 1, clientY: 180 });
+    expect(second.style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT + 80}px`);
+    expect(first.style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT}px`);
+    fireEvent.pointerMove(overlay!, { pointerId: 1, clientY: 4000 });
+    expect(second.style.height).toBe("640px");
+    expect(second.style.width).toBe("");
+    fireEvent.pointerUp(overlay!, { pointerId: 1, clientY: 4000 });
+    expect(document.querySelector("[data-preview-drag-overlay]")).toBeNull();
+    expect(first.getAttribute("sandbox")).toBeNull();
+    expect(second.getAttribute("sandbox")).toBeNull();
+  });
+
+  it("resets that preview height when the chat window is opened again", async () => {
+    rows = [
+      row("u", "user", "計算して"),
+      row(
+        "n1",
+        "assistant",
+        ["HTMLファイルを保存しました（Argos の出力フォルダ）", "[[argos-office]]\thtml\t手数料.html"].join(
+          "\n",
+        ),
+        { kind: "notice" },
+      ),
+      row("reply", "assistant", "できました。"),
+    ];
+    await renderChat();
+    await screen.findByRole("button", { name: "手数料.html を開く" });
+    setChatViewHeight(640);
+    const bar = screen.getByRole("separator", { name: "プレビューの高さを変更" });
+    fireEvent.pointerDown(bar, { pointerId: 1, clientY: 100 });
+    const overlay = document.querySelector("[data-preview-drag-overlay]");
+    expect(overlay).toBeTruthy();
+    fireEvent.pointerMove(overlay!, { pointerId: 1, clientY: 200 });
+    fireEvent.pointerUp(overlay!, { pointerId: 1, clientY: 200 });
+    expect(previewFrame("手数料.html").style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT + 100}px`);
+
+    expect(closeHandlers.length).toBeGreaterThan(0);
+    expect(focusHandlers.length).toBeGreaterThan(0);
+    await act(async () => {
+      closeHandlers[0]!();
+      focusHandlers[0]!({ payload: true });
+    });
+    expect(previewFrame("手数料.html").style.height).toBe(`${HTML_PREVIEW_MIN_HEIGHT}px`);
   });
 });

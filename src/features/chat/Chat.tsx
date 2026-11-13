@@ -613,6 +613,7 @@ export default function Chat() {
   const [threadDragId, setThreadDragId] = useState<string | null>(null);
   const [listQuery, setListQuery] = useState("");
   const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
+  const [previewEpoch, setPreviewEpoch] = useState(0);
   const listRef = useRef<HTMLDivElement | null>(null);
   const logContentRef = useRef<HTMLDivElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -624,6 +625,7 @@ export default function Chat() {
   const liveRef = useRef<LiveGeneration | null>(null);
   const pendingThreadId = useRef<string | null>(null);
   const contentEpoch = useRef(0);
+  const chatHiddenRef = useRef(false);
   const heldBanners = useRef(new Map<string, ThreadBanner>());
   const followRef = useRef(true);
   const showLiveRef = useRef(false);
@@ -823,10 +825,21 @@ export default function Chat() {
     const win = getCurrentWindow();
     let cancelled = false;
     let unlistenFocus: (() => void) | undefined;
+    let unlistenClose: (() => void) | undefined;
     let unlistenReady: (() => void) | undefined;
     let unlistenSettings: (() => void) | undefined;
+    void win.onCloseRequested(() => {
+      chatHiddenRef.current = true;
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlistenClose = fn;
+    });
     void win
       .onFocusChanged((event) => {
+        if (event.payload && chatHiddenRef.current) {
+          chatHiddenRef.current = false;
+          setPreviewEpoch((n) => n + 1);
+        }
         if (!event.payload) return;
         const idle =
           !busyRef.current && !ocrBusyRef.current && !attachingRef.current;
@@ -862,6 +875,7 @@ export default function Chat() {
     return () => {
       cancelled = true;
       unlistenFocus?.();
+      unlistenClose?.();
       unlistenReady?.();
       unlistenSettings?.();
     };
@@ -1438,11 +1452,15 @@ export default function Chat() {
 
   async function openSavedFile(name: string) {
     try {
-      if (name.toLowerCase().endsWith(".html")) {
-        await invoke("show_html_preview", { name });
-        return;
-      }
       await invoke("open_output_file", { name });
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
+
+  async function openOutputFolder() {
+    try {
+      await invoke("open_output_folder");
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -2226,6 +2244,16 @@ export default function Chat() {
       />
 
       <main className="chat-main">
+        <div className="chat-main-bar">
+          <button
+            type="button"
+            className="chat-btn"
+            title="Argos の出力フォルダを開く"
+            onClick={() => void openOutputFolder()}
+          >
+            出力フォルダ
+          </button>
+        </div>
         <div className="chat-log-wrap">
         <div
           className={detailsHold && showLive ? "chat-log chat-log-no-anchor" : "chat-log"}
@@ -2291,7 +2319,11 @@ export default function Chat() {
                           {cards.length > 0 ? (
                             <OfficeFileCards files={cards} onOpen={openSavedFile} />
                           ) : null}
-                          <HtmlPreviews files={cards} onExpand={(name) => void openHtmlLarge(name)} />
+                          <HtmlPreviews
+                            files={cards}
+                            resetKey={previewEpoch}
+                            onExpand={(name) => void openHtmlLarge(name)}
+                          />
                         </div>
                       ) : null}
                     </>
@@ -2320,7 +2352,11 @@ export default function Chat() {
                       {cards.length > 0 ? (
                         <OfficeFileCards files={cards} onOpen={openSavedFile} />
                       ) : null}
-                      <HtmlPreviews files={cards} onExpand={(name) => void openHtmlLarge(name)} />
+                      <HtmlPreviews
+                        files={cards}
+                        resetKey={previewEpoch}
+                        onExpand={(name) => void openHtmlLarge(name)}
+                      />
                     </>
                   ) : (
                     <div className="chat-msg-body">{m.content}</div>
