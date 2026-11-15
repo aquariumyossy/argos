@@ -12,6 +12,18 @@ use crate::statute::catalog::{self, normalize_alias};
 use crate::statute::refresh::parse_ymd;
 use crate::statute::xmlparse::{article_spans, ListedUpdate, ParsedArticle};
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_ALIAS_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Next shared-alias sync fails once. Tests use this to keep a bad list from
+/// turning the statute database off.
+#[cfg(test)]
+pub(crate) fn fail_next_alias_sync() {
+    FAIL_NEXT_ALIAS_SYNC.with(|flag| flag.set(true));
+}
+
 pub const BUNDLE_VERSION: &str = "2026-11-11b";
 const BUNDLE_VERSION_KEY: &str = "bundle_version";
 
@@ -160,14 +172,27 @@ impl StatuteDb {
         }
         // Runs when the bundled seed was just copied and when it was already
         // current, so an existing database picks up abbreviations without a new bundle.
-        let synced = self.sync_shared_aliases();
+        // A failure here leaves the seed (or the user's existing rows) in place.
+        if let Err(err) = self.sync_shared_aliases() {
+            eprintln!("argos: statute alias list was not applied: {err}");
+        }
         self.invalidate_aliases();
-        synced
+        Ok(())
     }
 
     /// Upsert the shared abbreviation list and split comma-joined e-Gov abbrevs.
     /// Safe to run more than once.
     fn sync_shared_aliases(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if FAIL_NEXT_ALIAS_SYNC.with(|flag| {
+            let fail = flag.get();
+            if fail {
+                flag.set(false);
+            }
+            fail
+        }) {
+            return Err("略称リストの取り込みに失敗しました".into());
+        }
         let list = catalog::alias_list()?;
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -1455,6 +1480,13 @@ mod tests {
             ("取適法", "331AC0000000120", "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律"),
             ("下請法", "331AC0000000120", "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律"),
             ("PL法", "406AC0000000085", "製造物責任法"),
+            ("自賠責法", "330AC0000000097", "自動車損害賠償保障法"),
+            ("安衛法", "347AC0000000057", "労働安全衛生法"),
+            ("労安衛法", "347AC0000000057", "労働安全衛生法"),
+            ("宅建法", "327AC1000000176", "宅地建物取引業法"),
+            ("証取法", "323AC0000000025", "金融商品取引法"),
+            ("人材派遣法", "360AC0000000088", "労働者派遣事業の適正な運営の確保及び派遣労働者の保護等に関する法律"),
+            ("雇対法", "341AC0000000132", "労働施策の総合的な推進並びに労働者の雇用の安定及び職業生活の充実等に関する法律"),
         ];
         for (alias, law_id, name) in expect {
             let law = db.resolve_name(alias).unwrap().expect(alias);
@@ -1473,6 +1505,9 @@ mod tests {
         assert!(db.resolve_name("労災法,労災保険法").unwrap().is_none());
         assert!(db.resolve_name("労働三法").unwrap().is_none());
         assert!(db.resolve_name("組織犯罪対策三法").unwrap().is_none());
+        assert!(db.resolve_name("保安四法").unwrap().is_none());
+        let pl = db.match_law_in_text("PL法第3条").unwrap().expect("PL法");
+        assert_eq!(pl.law_id, "406AC0000000085");
         let commas: i64 = db
             .conn
             .lock()
@@ -1517,6 +1552,11 @@ mod tests {
                 [],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO law_alias (alias, law_id) VALUES ('労安衛法,保安四法,安衛法', '347AC0000000057')",
+                [],
+            )
+            .unwrap();
         }
         let db = StatuteDb::open(&path).unwrap();
         assert_eq!(db.meta("bundle_version").unwrap(), BUNDLE_VERSION);
@@ -1537,5 +1577,14 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(db.resolve_name("労働三法").unwrap().is_none());
+        assert!(db.resolve_name("保安四法").unwrap().is_none());
+        assert_eq!(
+            db.resolve_name("労安衛法").unwrap().unwrap().law_id,
+            "347AC0000000057"
+        );
+        assert_eq!(
+            db.resolve_name("安衛法").unwrap().unwrap().law_id,
+            "347AC0000000057"
+        );
     }
 }

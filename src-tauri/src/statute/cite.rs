@@ -1,5 +1,8 @@
 //! Mark statute citations the chat did not verify.
 
+use std::sync::OnceLock;
+
+use crate::statute::catalog;
 use crate::statute::xmlparse::{article_spans, parse_article_query};
 
 const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
@@ -16,6 +19,8 @@ const DENY_LAW_NAME: &[&str] = &[
     "用法",
     "違法",
     "適法",
+    "不適法",
+    "非適法",
     "合法",
     "魔法",
     "司法",
@@ -312,31 +317,45 @@ pub fn mark_unverified(answer: &str, verified: &[VerifiedCite]) -> String {
     out
 }
 
-/// A deny word blocks a citation only when that word is the law name.
-/// Matching by suffix treated 取適法 as 適法. A trailing deny word still
-/// counts when a hiragana or punctuation boundary shows it stands alone
-/// (「な方法」「は適法」). Kanji glued on the left is a different name.
+/// Deny when the window ends with a non-law word such as 方法 or 適法.
+/// A known alias or official name wins when it is the tail, so 取適法 is
+/// kept and 支払方法 stays denied.
 fn denied_law_window(window: &str) -> bool {
-    DENY_LAW_NAME
-        .iter()
-        .any(|deny| deny_token_is_the_name(window, deny))
+    if let Some(tail) = longest_known_name_suffix(window) {
+        if !DENY_LAW_NAME.contains(&tail) {
+            return false;
+        }
+    }
+    DENY_LAW_NAME.iter().any(|deny| window.ends_with(deny))
 }
 
-fn deny_token_is_the_name(window: &str, deny: &str) -> bool {
-    if window == deny {
-        return true;
-    }
-    let Some(head) = window.strip_suffix(deny) else {
-        return false;
-    };
-    match head.chars().next_back() {
-        None => true,
-        Some(c) => !is_cjk_ideograph(c),
-    }
+fn longest_known_name_suffix(window: &str) -> Option<&'static str> {
+    known_law_names().iter().copied().find(|name| {
+        name.chars().count() >= 2 && (window == *name || window.ends_with(name))
+    })
 }
 
-fn is_cjk_ideograph(c: char) -> bool {
-    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '々')
+fn known_law_names() -> &'static [&'static str] {
+    static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let Ok(list) = catalog::alias_list() else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for entry in &list.entries {
+            names.push(entry.name.as_str());
+            names.extend(entry.aliases.iter().map(String::as_str));
+        }
+        names.sort_by(|left, right| {
+            right
+                .chars()
+                .count()
+                .cmp(&left.chars().count())
+                .then_with(|| left.cmp(right))
+        });
+        names.dedup();
+        names
+    })
 }
 
 fn longest_verified_suffix(window: &str, verified: &[VerifiedCite]) -> Option<String> {
@@ -383,6 +402,10 @@ fn is_law_char(c: char) -> bool {
             | '\u{3400}'..='\u{4DBF}'
             | '\u{3040}'..='\u{309F}'
             | '\u{30A0}'..='\u{30FF}'
+            | 'A'..='Z'
+            | 'a'..='z'
+            | '\u{FF21}'..='\u{FF3A}'
+            | '\u{FF41}'..='\u{FF5A}'
             | '々'
             | '、'
             | '，'
@@ -471,10 +494,58 @@ mod tests {
             "合法第4条",
             "適法な方法第1条",
             "これは適法第1条ではありません",
+            "支払方法第3条",
+            "不適法第1条",
+            "非適法第2条",
+            "刑事司法第3条",
+            "治療法第1条",
         ] {
             let marked = mark_unverified(sample, &[]);
             assert!(!marked.contains("要確認"), "{sample} -> {marked}");
         }
+        let toriteki = mark_unverified("取適法第3条は代金の支払時期です。", &[]);
+        assert!(toriteki.contains("取適法第3条（要確認）"), "{toriteki}");
+        let verified_three = vec![verified_cite(
+            &[
+                "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律",
+                "取適法",
+            ],
+            "3",
+        )];
+        let kept = mark_unverified("取適法第3条は代金の支払時期です。", &verified_three);
+        assert!(!kept.contains("要確認"), "{kept}");
+    }
+
+    #[test]
+    fn latin_letters_stay_inside_the_law_name() {
+        let unverified = mark_unverified("PL法第3条は欠陥の責任です。", &[]);
+        assert!(unverified.contains("PL法第3条（要確認）"), "{unverified}");
+        let fullwidth = mark_unverified("ＰＬ法第3条は欠陥の責任です。", &[]);
+        assert!(fullwidth.contains("ＰＬ法第3条（要確認）"), "{fullwidth}");
+        let isp = mark_unverified("ＩＳＰ責任法第2条は開示請求です。", &[]);
+        assert!(isp.contains("ＩＳＰ責任法第2条（要確認）"), "{isp}");
+        let unknown = mark_unverified("ＸＹＺ法第1条は存在しない法令です。", &[]);
+        assert!(unknown.contains("ＸＹＺ法第1条（要確認）"), "{unknown}");
+        let half_unknown = mark_unverified("XYZ法第1条は存在しない法令です。", &[]);
+        assert!(half_unknown.contains("XYZ法第1条（要確認）"), "{half_unknown}");
+
+        let articles = vec![ToolArticle {
+            names: vec!["製造物責任法".into(), "PL法".into(), "ＰＬ法".into()],
+            article_num: "第3条".into(),
+            heading: String::new(),
+            body: "本文".into(),
+            as_of: "2026-11-11".into(),
+            verified: true,
+            offline: false,
+            note: String::new(),
+            law_query: "PL法".into(),
+            article_query: "3".into(),
+        }];
+        let verified = verified_from_tool_output(&format_tool_result(&articles, 0));
+        let marked = mark_unverified("PL法第3条は欠陥の責任です。", &verified);
+        assert!(!marked.contains("要確認"), "{marked}");
+        let marked_full = mark_unverified("ＰＬ法第3条は欠陥の責任です。", &verified);
+        assert!(!marked_full.contains("要確認"), "{marked_full}");
     }
 
     #[test]

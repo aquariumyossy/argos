@@ -185,10 +185,8 @@ mod tests {
     fn shared_list_loads_without_group_labels_or_commas() {
         let list = alias_list().unwrap();
         assert!(list.group_labels.iter().any(|label| label == "労働三法"));
-        assert!(list
-            .group_labels
-            .iter()
-            .any(|label| label == "組織犯罪対策三法"));
+        assert!(list.group_labels.iter().any(|label| label == "組織犯罪対策三法"));
+        assert!(list.group_labels.iter().any(|label| label == "保安四法"));
         assert!(list.entries.len() >= 60, "{}", list.entries.len());
         let mut bundled = 0;
         for entry in &list.entries {
@@ -205,13 +203,15 @@ mod tests {
         }
         assert!(bundled >= 50, "bundled entries {bundled}");
         let pieces = split_alias(
-            "労組法,労働三法,訪問販売、通信販売、マルチ販売等法",
+            "労組法,労働三法,労安衛法,保安四法,安衛法,訪問販売、通信販売、マルチ販売等法",
             &list.group_labels,
         );
         assert_eq!(
             pieces,
             vec![
                 "労組法".to_string(),
+                "労安衛法".to_string(),
+                "安衛法".to_string(),
                 "訪問販売、通信販売、マルチ販売等法".to_string(),
             ]
         );
