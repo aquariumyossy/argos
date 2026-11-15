@@ -229,7 +229,7 @@ pub fn mark_unverified(answer: &str, verified: &[VerifiedCite]) -> String {
         } else if inherit || dou {
             current_law.clone()
         } else if let Some(window) = window.as_deref() {
-            if DENY_LAW_NAME.iter().any(|deny| window.ends_with(deny)) {
+            if denied_law_window(window) {
                 current_law = None;
                 previous_end = span.end;
                 if span.suppl && !already_marked(&chars, span.end) {
@@ -310,6 +310,33 @@ pub fn mark_unverified(answer: &str, verified: &[VerifiedCite]) -> String {
     }
     out.extend(chars[at..].iter());
     out
+}
+
+/// A deny word blocks a citation only when that word is the law name.
+/// Matching by suffix treated 取適法 as 適法. A trailing deny word still
+/// counts when a hiragana or punctuation boundary shows it stands alone
+/// (「な方法」「は適法」). Kanji glued on the left is a different name.
+fn denied_law_window(window: &str) -> bool {
+    DENY_LAW_NAME
+        .iter()
+        .any(|deny| deny_token_is_the_name(window, deny))
+}
+
+fn deny_token_is_the_name(window: &str, deny: &str) -> bool {
+    if window == deny {
+        return true;
+    }
+    let Some(head) = window.strip_suffix(deny) else {
+        return false;
+    };
+    match head.chars().next_back() {
+        None => true,
+        Some(c) => !is_cjk_ideograph(c),
+    }
+}
+
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '々')
 }
 
 fn longest_verified_suffix(window: &str, verified: &[VerifiedCite]) -> Option<String> {
@@ -404,6 +431,50 @@ mod tests {
         assert!(!marked.contains("契約書第5条（要確認）"), "{marked}");
         let again = mark_unverified(&marked, &verified);
         assert_eq!(again.matches("（要確認）").count(), 1, "{again}");
+    }
+
+    #[test]
+    fn toritekihou_is_a_citation_and_tekipo_alone_is_not() {
+        let unverified = mark_unverified("取適法第5条は中小受託取引のルールです。", &[]);
+        assert!(
+            unverified.contains("取適法第5条（要確認）"),
+            "{unverified}"
+        );
+        let articles = vec![ToolArticle {
+            names: vec![
+                "製造委託等に係る中小受託事業者に対する代金の支払の遅延等の防止に関する法律".into(),
+                "下請法".into(),
+                "取適法".into(),
+            ],
+            article_num: "第5条".into(),
+            heading: String::new(),
+            body: "本文".into(),
+            as_of: "2026-11-11".into(),
+            verified: true,
+            offline: false,
+            note: String::new(),
+            law_query: "取適法".into(),
+            article_query: "5".into(),
+        }];
+        let verified = verified_from_tool_output(&format_tool_result(&articles, 0));
+        assert_eq!(verified.len(), 1, "{verified:?}");
+        assert_eq!(verified[0].key, "5");
+        let marked = mark_unverified("取適法第5条は中小受託取引のルールです。", &verified);
+        assert!(!marked.contains("要確認"), "{marked}");
+
+        let ordinary = "その行為は適法です。手法は問いません。合法です。";
+        assert_eq!(mark_unverified(ordinary, &[]), ordinary);
+        for sample in [
+            "方法第1条",
+            "手法第2条",
+            "適法第3条",
+            "合法第4条",
+            "適法な方法第1条",
+            "これは適法第1条ではありません",
+        ] {
+            let marked = mark_unverified(sample, &[]);
+            assert!(!marked.contains("要確認"), "{sample} -> {marked}");
+        }
     }
 
     #[test]

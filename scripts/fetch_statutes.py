@@ -12,6 +12,7 @@ skip the table of contents, deleted articles, and articles inside AmendProvision
 from __future__ import annotations
 
 import gzip
+import json
 import sqlite3
 import sys
 import time
@@ -22,7 +23,7 @@ from pathlib import Path
 ORIGIN = "https://laws.e-gov.go.jp/api/1"
 UA = "Argos/1.18 (statute bundle; e-Gov law API v1)"
 ROOT = Path(__file__).resolve().parents[1]
-CATALOG = ROOT / "src-tauri" / "src" / "statute" / "catalog.rs"
+ALIASES = ROOT / "src-tauri" / "src" / "statute" / "statute_aliases.json"
 OUT = ROOT / "src-tauri" / "resources" / "statutes.db.gz"
 BUNDLE_VERSION = "2026-11-11b"
 
@@ -249,23 +250,46 @@ def fetch(url: str) -> str:
         return resp.read().decode("utf-8")
 
 
-def load_catalog() -> list[tuple[str, bool, list[str]]]:
-    text = CATALOG.read_text(encoding="utf-8")
-    entries: list[tuple[str, bool, list[str]]] = []
-    # entry("ID", true, &["a", "b"])
-    import re
+def normalize_alias(text: str) -> str:
+    return "".join(ch for ch in text if not ch.isspace() and ch != "\u3000")
 
-    for match in re.finditer(
-        r'entry\(\s*"([^"]+)"\s*,\s*(true|false)\s*,\s*&\[(.*?)\]\s*,?\s*\)',
-        text,
-        re.S,
-    ):
-        law_id, flag, alias_src = match.group(1), match.group(2) == "true", match.group(3)
-        aliases = re.findall(r'"([^"]+)"', alias_src)
-        entries.append((law_id, flag, aliases))
-    if len(entries) < 40:
-        raise SystemExit(f"catalog parse failed: {len(entries)} entries")
-    return entries
+
+def split_alias(text: str, groups: set[str]) -> list[str]:
+    """Split e-Gov Abbrev on ASCII commas. Keep Japanese '、' inside a name."""
+    out: list[str] = []
+    for part in text.split(","):
+        norm = normalize_alias(part)
+        if len(norm) < 2 or norm in groups or norm in out:
+            continue
+        out.append(norm)
+    return out
+
+
+def load_catalog() -> tuple[list[tuple[str, bool, str, list[str]]], set[str]]:
+    data = json.loads(ALIASES.read_text(encoding="utf-8"))
+    groups = {
+        normalize_alias(item)
+        for item in data.get("group_labels") or []
+        if normalize_alias(item)
+    }
+    entries: list[tuple[str, bool, str, list[str]]] = []
+    for entry in data["entries"]:
+        law_id = str(entry["law_id"]).strip()
+        bundle = bool(entry.get("bundle", False))
+        name = normalize_alias(str(entry.get("name") or ""))
+        aliases: list[str] = []
+        for raw in entry.get("aliases") or []:
+            for part in split_alias(str(raw), groups):
+                if part not in aliases:
+                    aliases.append(part)
+        if name and name not in aliases:
+            aliases.insert(0, name)
+        if not law_id or not name:
+            raise SystemExit(f"alias list entry missing law_id or name: {entry}")
+        entries.append((law_id, bundle, name, aliases))
+    if len(entries) < 50:
+        raise SystemExit(f"alias list parse failed: {len(entries)} entries")
+    return entries, groups
 
 
 def main() -> None:
@@ -299,10 +323,9 @@ def main() -> None:
         names,
     )
     print(f"names {len(names)}", flush=True)
-    catalog = load_catalog()
-    for law_id, bundle, aliases in catalog:
+    catalog, groups = load_catalog()
+    for law_id, bundle, name, aliases in catalog:
         if not bundle:
-            name = aliases[0] if aliases else law_id
             conn.execute(
                 "INSERT OR REPLACE INTO law (law_id, name, law_num, as_of, checked_on, source) VALUES (?, ?, '', '', '', 'alias')",
                 (law_id, name),
@@ -319,9 +342,17 @@ def main() -> None:
         if not parsed["articles"]:
             raise SystemExit(f"{law_id}: e-Gov response had no articles")
         use_id = parsed["law_id"] or law_id
-        name = parsed["name"] or (aliases[0] if aliases else use_id)
-        all_aliases = list(dict.fromkeys([*aliases, parsed["abbrev"], parsed["name"], name]))
-        all_aliases = [a for a in all_aliases if a and len(a) >= 2]
+        name = parsed["name"] or name
+        all_aliases = list(
+            dict.fromkeys(
+                [
+                    *aliases,
+                    *split_alias(parsed["abbrev"], groups),
+                    *split_alias(parsed["name"], groups),
+                    *split_alias(name, groups),
+                ]
+            )
+        )
         conn.execute("DELETE FROM article WHERE law_id = ?", (use_id,))
         conn.execute("DELETE FROM law_alias WHERE law_id = ?", (use_id,))
         conn.execute(

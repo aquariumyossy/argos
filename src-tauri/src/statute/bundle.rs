@@ -4,7 +4,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::statute::catalog::{aliases_for, CATALOG};
+use crate::statute::catalog::{aliases_for, catalog};
 use crate::statute::egov::{lawdata_url, lawlist_url, EgovSource, LiveEgov};
 use crate::statute::refresh::format_ymd;
 use crate::statute::store::{gzip_file, StatuteDb, BUNDLE_VERSION};
@@ -27,28 +27,21 @@ pub fn build_bundle(dest: &Path) -> Result<(), String> {
         .collect::<Vec<_>>();
     eprintln!("argos statute bundle: {} names", rows.len());
     db.upsert_names(&rows)?;
-    for entry in CATALOG {
+    for entry in catalog()? {
         if !entry.bundle {
-            let name = entry.aliases.first().copied().unwrap_or(entry.law_id);
-            db.ensure_law(entry.law_id, name, "", "alias")?;
-            let aliases = entry
-                .aliases
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect::<Vec<_>>();
-            // ensure_law stores the first name. Replace aliases without articles.
-            if db.article_count_for(entry.law_id)? == 0 {
-                db.replace_law(entry.law_id, name, "", "", "", "alias", &aliases, &[])?;
-            }
+            // Name only, same as 金融商品取引法. Do not call replace_law with an
+            // empty article list: that refuses to wipe existing text.
+            db.ensure_law(&entry.law_id, &entry.name, "", "alias")?;
+            db.add_aliases(&entry.law_id, &entry.name, &entry.aliases)?;
             continue;
         }
         eprintln!("argos statute bundle: {}", entry.law_id);
         thread::sleep(Duration::from_millis(350));
         let xml = client
-            .fetch(&lawdata_url(entry.law_id))
+            .fetch(&lawdata_url(&entry.law_id))
             .map_err(|e| format!("{}: {e:?}", entry.law_id))?;
         let parsed = xmlparse::parse_law_xml(&xml).map_err(|e| format!("{}: {e}", entry.law_id))?;
-        store_bundled(&db, &parsed, entry.law_id, &today)?;
+        store_bundled(&db, &parsed, &entry.law_id, &today)?;
     }
     db.set_meta("bundle_version", BUNDLE_VERSION)?;
     let articles = db.article_count()?;
@@ -74,10 +67,7 @@ fn store_bundled(
     } else {
         parsed.law_id.clone()
     };
-    let mut aliases = aliases_for(&id)
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect::<Vec<_>>();
+    let mut aliases = aliases_for(&id)?;
     if !parsed.abbrev.is_empty() {
         aliases.push(parsed.abbrev.clone());
     }
