@@ -311,6 +311,13 @@ fn fit_other_tool_results(turns: &mut [ChatTurn], budget: usize, originals: &[(u
             .sum();
         let avail = others.saturating_sub(later_floor);
         let cost = turn_tokens(&turns[idx]);
+        // A cut HTML source still says to pass it to edit_html, which would save
+        // the fragment as a finished file. Refuse the whole result instead.
+        if crate::llm::output_files::is_html_source_payload(&turns[idx].content) && cost > avail {
+            turns[idx].content = crate::llm::output_files::HTML_READ_REFUSAL.into();
+            others = others.saturating_sub(turn_tokens(&turns[idx]));
+            continue;
+        }
         if cost <= avail {
             others = others.saturating_sub(cost);
             continue;
@@ -412,9 +419,9 @@ fn is_read_note_turn(turn: &ChatTurn) -> bool {
 
 const READ_NOTE_OMITTED: &str = "（文脈の上限に達したため、ノート本文は省略しました。全文置換はせず、heading を指定して読み直してください）";
 
-const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
+pub(crate) const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
 
-const TOOL_RESULT_TRUNCATION_NOTE: &str = "\n…（長いので省略しました）";
+pub(crate) const TOOL_RESULT_TRUNCATION_NOTE: &str = "\n…（長いので省略しました）";
 
 fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     let max_chars = tokens_to_chars(max_tokens);
@@ -452,7 +459,11 @@ pub fn cap_tool_results(turns: &mut [ChatTurn], limit_tokens: usize) {
             break;
         }
         let before = turn_tokens(&turns[index]);
-        turns[index].content = truncate_to_tokens(&turns[index].content, 40);
+        if crate::llm::output_files::is_html_source_payload(&turns[index].content) {
+            turns[index].content = crate::llm::output_files::HTML_READ_REFUSAL.into();
+        } else {
+            turns[index].content = truncate_to_tokens(&turns[index].content, 40);
+        }
         let after = turn_tokens(&turns[index]);
         used = used.saturating_sub(before.saturating_sub(after));
     }
@@ -1651,9 +1662,13 @@ fn restore_recent_rereads(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
             break;
         };
         let before = char_len(&built[idx].turn.content);
-        let budget = tokens_of(built).saturating_sub(max_tokens).max(1);
-        let keep = turn_tokens(&built[idx].turn).saturating_sub(budget).max(1);
-        built[idx].turn.content = truncate_to_tokens(&built[idx].turn.content, keep);
+        if crate::llm::output_files::is_html_source_payload(&built[idx].turn.content) {
+            built[idx].turn.content = crate::llm::output_files::HTML_READ_REFUSAL.into();
+        } else {
+            let budget = tokens_of(built).saturating_sub(max_tokens).max(1);
+            let keep = turn_tokens(&built[idx].turn).saturating_sub(budget).max(1);
+            built[idx].turn.content = truncate_to_tokens(&built[idx].turn.content, keep);
+        }
         if char_len(&built[idx].turn.content) >= before {
             break;
         }
@@ -2299,6 +2314,9 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
                         crate::llm::summary::clip_injected_summary(&row.turn.content, next);
                     return char_len(&clipped) < len;
                 }
+                if crate::llm::output_files::is_html_source_payload(&row.turn.content) {
+                    return true;
+                }
                 len > 40 && (len / 2).max(40) < len
             })
             .max_by_key(|(_, row)| char_len(&row.turn.content))
@@ -2315,6 +2333,11 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
                 break;
             }
             built[idx].turn.content = clipped;
+            changed = true;
+            continue;
+        }
+        if crate::llm::output_files::is_html_source_payload(&built[idx].turn.content) {
+            built[idx].turn.content = crate::llm::output_files::HTML_READ_REFUSAL.into();
             changed = true;
             continue;
         }

@@ -1,4 +1,5 @@
-//! Edit an attached .docx or .xlsx into a new file. The source is only opened for reading.
+//! Edit an attached .docx or .xlsx, or one already in the output folder, into a new file.
+//! The source is only opened for reading. Search-folder files stay closed.
 
 mod docx;
 mod text;
@@ -100,7 +101,7 @@ fn edit_from_tool_inner(
         .db
         .list_llm_sources(thread_id)
         .map_err(|err| format!("添付を読めません（{err}）。"))?;
-    let path = resolve_office_path(&sources, args)?;
+    let path = resolve_edit_source(&sources, &state.data_dir, args)?;
     let request = EditRequest::from_args(args)?;
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
     edit_path(
@@ -269,6 +270,78 @@ pub fn resolve_office_path(sources: &[LlmSourceRow], args: &Value) -> Result<Str
         return Err("同じ名前の添付が複数あります。cite_no で指定してください。".into());
     }
     Ok(matched[0].path.clone())
+}
+
+/// An explicit file name inside the output folder wins over `cite_no` and over
+/// an attachment of the same name. `cite_no` alone still means that attachment.
+/// A name and a cite that point at different files are an error. Search-folder
+/// files stay closed, and paths that leave the output folder are refused.
+pub fn resolve_edit_source(
+    sources: &[LlmSourceRow],
+    data_dir: &Path,
+    args: &Value,
+) -> Result<PathBuf, String> {
+    let cite = arg_i64(args.get("cite_no")).filter(|value| *value > 0);
+    let wanted = first_text(args, &["filename", "file", "path"]);
+    if wanted.is_empty() {
+        return resolve_office_path(sources, args).map(PathBuf::from);
+    }
+    if let Ok(path) = output_file_path(data_dir, &wanted) {
+        return Ok(path);
+    }
+    if let Some(cite_no) = cite {
+        let cite_args = serde_json::json!({ "cite_no": cite_no });
+        return match resolve_office_path(sources, &cite_args) {
+            Ok(path) if names_agree(&path, &wanted) => Ok(PathBuf::from(path)),
+            Ok(path) => Err(format!(
+                "filename「{}」と cite_no [{cite_no}]（{}）は別のファイルです。出力フォルダのファイルは filename だけ、添付は cite_no だけを指定してください。",
+                one_line_name(&wanted),
+                file_name_of(&path)
+            )),
+            Err(err) => Err(err),
+        };
+    }
+    match resolve_office_path(sources, args) {
+        Ok(path) => Ok(PathBuf::from(path)),
+        Err(attach_err) => match output_file_path(data_dir, &wanted) {
+            Ok(path) => Ok(path),
+            Err(output_err) => Err(prefer_attachment_or_output_error(attach_err, output_err)),
+        },
+    }
+}
+
+fn names_agree(path: &str, wanted: &str) -> bool {
+    let wanted_name = file_name_of(wanted);
+    if wanted_name.is_empty() {
+        return false;
+    }
+    pathutil::normalize_for_compare(path)
+        .eq_ignore_ascii_case(&pathutil::normalize_for_compare(wanted))
+        || file_name_of(path).eq_ignore_ascii_case(&wanted_name)
+}
+
+fn one_line_name(text: &str) -> String {
+    text.replace(['\n', '\r', '\t'], " ")
+}
+
+fn prefer_attachment_or_output_error(attach_err: String, output_err: String) -> String {
+    if attach_err.contains("検索で見つかった")
+        && (output_err.contains("見つかりません") || output_err.contains("出力フォルダがありません"))
+    {
+        return attach_err;
+    }
+    if output_error_is_final(&output_err) {
+        return output_err;
+    }
+    attach_err
+}
+
+fn output_error_is_final(message: &str) -> bool {
+    message.contains("ファイル名だけ")
+        || message.contains("外は開けません")
+        || message.contains("Word か Excel")
+        || message.contains("見つかりません")
+        || message.contains("出力フォルダがありません")
 }
 
 impl EditRequest {
@@ -459,28 +532,13 @@ fn not_attached_message() -> String {
         .into()
 }
 
-/// Resolve a bare file name inside `data_dir/output`.
-/// Rejects separators, `..`, drive letters, and UNC names, then checks the
-/// canonical path stays inside that folder.
+/// Resolve a bare `.docx` or `.xlsx` name inside `data_dir/output`.
+///
+/// The containment rules, including a symlinked output folder, live in
+/// `create_office::output_file_path`.
 pub fn output_file_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
-    let name = bare_output_name(name)?;
-    let dir = data_dir.join(OUTPUT_DIR_NAME);
-    if !dir.is_dir() {
-        return Err("出力フォルダがありません。".into());
-    }
-    let joined = dir.join(name);
-    if joined.parent() != Some(dir.as_path())
-        || joined.file_name().and_then(|n| n.to_str()) != Some(name)
-    {
-        return Err("ファイル名だけを指定してください。".into());
-    }
-    let canon_dir = fs::canonicalize(&dir).map_err(|_| "出力フォルダがありません。".to_string())?;
-    let canon_file =
-        fs::canonicalize(&joined).map_err(|_| "ファイルが見つかりません。".to_string())?;
-    if !canon_file.starts_with(&canon_dir) {
-        return Err("出力フォルダの外は開けません。".into());
-    }
-    Ok(canon_file)
+    bare_output_name(name)?;
+    crate::llm::create_office::output_file_path(data_dir, name)
 }
 
 /// `canonicalize` on Windows returns `\\?\C:\...` or `\\?\UNC\server\...`.

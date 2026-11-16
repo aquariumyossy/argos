@@ -8,6 +8,7 @@ use crate::db::LlmSourceRow;
 use crate::llm::context::format_sources;
 pub use crate::llm::create_html::{TOOL_CREATE_HTML, TOOL_EDIT_HTML};
 pub use crate::llm::create_office::{TOOL_CREATE_DOCX, TOOL_CREATE_XLSX};
+pub use crate::llm::output_files::{TOOL_LIST_OUTPUT, TOOL_READ_OUTPUT};
 use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
@@ -396,16 +397,16 @@ pub fn tools_schema(
         "type": "function",
         "function": {
             "name": TOOL_EDIT_OFFICE,
-            "description": "添付の .docx / .xlsx を編集し、元ファイルは変えず新しいファイルを保存する。確認は取らない。書式・表・フォントは残し文字だけ変える。1回の呼び出しに編集をすべて入れる（元の添付から作り、前回の出力には重ねない）。.doc と .xls は対象外。\
+            "description": "添付の .docx / .xlsx、または出力フォルダにある .docx / .xlsx を編集し、元ファイルは変えず新しいファイルを保存する。確認は取らない。書式・表・フォントは残し文字だけ変える。1回の呼び出しに編集をすべて入れる。添付を直すときは元の添付から作り、前回の出力には重ねない。出力フォルダのファイルを直すときは、選んだそのファイルを編集する。.doc と .xls は対象外。\
 replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・コメント・変更履歴の文字（複数のランに分かれた名前を含む）。履歴としては記録しない。Excel は全シートのセルとシート名。\
 paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
-cite_no は出典 [n]。添付が1件なら省略できる。filename か path でも指定できる。検索でヒットしたファイルは編集できない。添付だけ。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
+cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダのファイルは filename にファイル名だけを渡す（例: 売上集計.xlsx）。filename があるときは、同じ名前の添付や別の cite_no よりそのファイルを優先する。filename と cite_no が別のファイルなら編集しない。パスは渡さない。候補が複数あるときはこのツールを呼ばず、名前・種類・更新日時を挙げて利用者に聞く。検索フォルダのファイルは編集できない。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "cite_no": { "type": "integer", "description": "添付の出典番号 [n]。添付が1件なら省略できる。" },
-                    "filename": { "type": "string", "description": "添付ファイル名。.docx か .xlsx。" },
-                    "path": { "type": "string", "description": "出典に書かれたフルパス。この会話の添付だけ。" },
+                    "filename": { "type": "string", "description": "添付のファイル名、または出力フォルダのファイル名。.docx か .xlsx。パスは渡さない。" },
+                    "path": { "type": "string", "description": "出典に書かれたフルパス。この会話の添付だけ。出力フォルダのファイルには使わない。" },
                     "replacements": {
                         "type": "array",
                         "description": "文字列置換。find を replace にすべて置き換える。",
@@ -434,6 +435,7 @@ cite_no は出典 [n]。添付が1件なら省略できる。filename か path �
             }
         }
     }));
+    tools.extend(crate::llm::output_files::tool_schemas());
     tools.extend(crate::llm::create_office::tool_schemas());
     tools.extend(crate::llm::create_html::tool_schemas());
     Value::Array(tools)
@@ -3073,6 +3075,18 @@ fn execute_tool_inner(
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
         TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
+        TOOL_LIST_OUTPUT => Ok(ToolExec::text(crate::llm::output_files::list_for_tool(
+            &state.data_dir,
+            &args,
+        ))),
+        TOOL_READ_OUTPUT => {
+            let limit = state.settings.read().llm_max_context_tokens as usize;
+            Ok(ToolExec::text(crate::llm::output_files::read_for_tool(
+                &state.data_dir,
+                &args,
+                limit,
+            )))
+        }
         TOOL_EDIT_OFFICE => Ok(ToolExec::text(crate::office_edit::edit_from_tool(
             state, thread_id, &args,
         ))),
