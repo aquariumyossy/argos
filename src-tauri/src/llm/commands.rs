@@ -3710,23 +3710,21 @@ async fn rewrite_incomplete_answer<R: Runtime>(
         Ok(out) if !out.content.trim().is_empty() => out,
         _ => return kept_original(content, reasoning, empty_reply, false),
     };
-    // A prose answer rewritten from the same opening is not a continuation.
-    // Keep the first answer, including later rows and [n], and do not append.
-    if continue_answer && llm::completeness::opening_is_rewritten(&content, &out.content) {
-        return kept_original(content, reasoning, empty_reply, false);
-    }
-    // The joined body is what gets saved. A continuation that itself stops on
-    // length, and still does not finish a sentence, stays joined and is marked
-    // incomplete. A length cap that lands on a sentence end is not another cut.
+    // A restart is only the continuation. A mid-way tail is appended.
+    // length / max_tokens, or a body that still stops midway, is incomplete.
     let merged = if continue_answer {
         Some(llm::completeness::join_continuation(&content, &out.content))
     } else {
         None
     };
     let checked = merged.as_deref().unwrap_or(out.content.as_str());
-    if continue_answer
-        && llm::completeness::joined_answer_cut_by_length(checked, &out.finish_reason)
-    {
+    let problem = llm::completeness::assess_answer(
+        question,
+        checked,
+        &out.reasoning,
+        &out.finish_reason,
+    );
+    if continue_answer && problem == Some(llm::completeness::AnswerProblem::Truncated) {
         return Rewrite::Done(RewrittenAnswer {
             cited_body: content,
             content: merged.unwrap_or(out.content),
@@ -3736,13 +3734,7 @@ async fn rewrite_incomplete_answer<R: Runtime>(
             cancelled: false,
         });
     }
-    let finish = if continue_answer {
-        llm::completeness::continuation_assess_finish(checked, &out.finish_reason)
-    } else {
-        out.finish_reason.as_str()
-    };
-    let second_bad =
-        llm::completeness::assess_answer(question, checked, &out.reasoning, finish).is_some();
+    let second_bad = problem.is_some();
     if second_bad || gate.observe(second_bad) != llm::completeness::CompletenessStep::Keep {
         return kept_original(content, reasoning, empty_reply, false);
     }
@@ -6410,18 +6402,21 @@ mod tests {
         let answer = final_answer(&messages);
         assert!(answer.content.contains(&first), "{}", answer.content);
         assert!(answer.content.contains(finished), "{}", answer.content);
-        assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn llm_send_keeps_the_original_when_the_continuation_rewrites_the_opening() {
+    async fn llm_send_keeps_only_a_continuation_that_restarts_from_the_opening() {
         let question = substantive_question();
         let opening = "契約を解除するには、相手方の債務不履行が契約及び取引上の社会通念に照らして軽微でないことが必要です。";
         let first = format!("{opening}根拠は第541条です。通知は、");
         let rewrite = format!("{opening}催告をしたうえで解除できます。");
-        assert!(llm::completeness::opening_is_rewritten(&first, &rewrite));
+        assert_eq!(
+            llm::completeness::join_continuation(&first, &rewrite),
+            rewrite
+        );
         let (dir, db, thread, result, requests) = send_question(
             "opening-rewrite",
             8,
@@ -6434,9 +6429,9 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let messages = db.list_llm_messages(&thread.id).unwrap();
         let answer = final_answer(&messages);
-        assert_eq!(answer.content, first);
-        assert!(!answer.content.contains("催告をしたうえで"));
-        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        assert_eq!(answer.content, rewrite);
+        assert!(!answer.content.contains("第541条"));
+        assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }

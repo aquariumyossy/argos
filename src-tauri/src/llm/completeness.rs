@@ -156,12 +156,12 @@ const OVERLAP_MIN_CHARS: usize = 8;
 const OPENING_REWRITE_MIN: usize = 16;
 /// A shared opening this long is a rewrite even when the original is much longer.
 const OPENING_REWRITE_CHARS: usize = 40;
+/// 「整理します。」 and then the same table still counts as starting over.
+const SHORT_PREAMBLE_CHARS: usize = 80;
 
-/// Continue a cut-off answer. The first answer stays unless the continuation
-/// already contains all of it. A long shared opening is not appended: the
-/// caller keeps the original. A partial table row is dropped only when the
-/// continuation starts a new `|` row. A repeated header, separator, and data
-/// row are removed. A finished table followed by prose gets a blank line.
+/// Continue a cut-off answer. A restart from the top replaces the first answer.
+/// A mid-way tail is appended: a cut table cell is completed, a lone newline
+/// before the next table row is dropped, and a blank line before prose stays.
 pub fn join_continuation(original: &str, continuation: &str) -> String {
     let continuation = continuation.trim_end_matches([' ', '\t', '\u{3000}', '\n', '\r']);
     let (mut lead, continuation) = split_leading_newlines(continuation);
@@ -170,11 +170,8 @@ pub fn join_continuation(original: &str, continuation: &str) -> String {
         return trim_trailing_spaces(original).trim().to_string();
     }
     let kept = trim_trailing_spaces(original);
-    if continuation_replaces(kept, continuation) {
-        return normalize_replaced_table_junction(kept, continuation);
-    }
-    if opening_is_rewritten(kept, continuation) {
-        return kept.trim().to_string();
+    if restarts_from_the_top(kept, continuation) {
+        return continuation.trim().to_string();
     }
     let mut base = kept;
     if starts_with_table_row(continuation) {
@@ -182,12 +179,6 @@ pub fn join_continuation(original: &str, continuation: &str) -> String {
     }
     if base.trim().is_empty() {
         return continuation.to_string();
-    }
-    let stripped = strip_repeated_table_header(base, continuation);
-    let deduped = skip_existing_table_rows(base, &stripped);
-    let continuation = deduped.as_str();
-    if continuation.trim().is_empty() {
-        return base.trim().to_string();
     }
     let (tail, overlapped) = strip_overlapping_head(base, continuation);
     if overlapped {
@@ -199,31 +190,62 @@ pub fn join_continuation(original: &str, continuation: &str) -> String {
         let end = base_owned.trim_end_matches(['\n', '\r', ' ', '\t', '\u{3000}']);
         base_owned.truncate(end.len());
     }
-    // Overlap or a skipped row can leave only a newline in front of the next
-    // table row. Drop it so the table stays one block.
-    drop_newline_before_table_row(&mut base_owned, &mut tail);
+    drop_lone_newline_before_table_row(&mut base_owned, &mut tail);
     let separator = separator_between(&base_owned, &tail, lead);
     format!("{base_owned}{separator}{tail}")
 }
 
-/// The continuation starts again from the same prose opening, with different
-/// wording after that. Do not append it. Full containment is not this case:
-/// that still replaces the original.
-pub fn opening_is_rewritten(original: &str, continuation: &str) -> bool {
+/// The model started the answer again: the same opening, the whole first
+/// answer inside the new text, or the same table after a short preamble.
+fn restarts_from_the_top(original: &str, continuation: &str) -> bool {
     let original = original.trim();
     let continuation = continuation.trim();
     if original.is_empty() || continuation.is_empty() {
         return false;
     }
-    if starts_with_table_row(original) || starts_with_table_row(continuation) {
-        return false;
-    }
-    if continuation_replaces(original, continuation) {
-        return false;
+    if continuation.contains(original) {
+        return true;
     }
     let prefix = shared_prefix_chars(original, continuation);
     let half = chars(original) / 2;
-    prefix >= OPENING_REWRITE_CHARS || (prefix >= half && prefix >= OPENING_REWRITE_MIN)
+    if prefix >= OPENING_REWRITE_CHARS || (prefix >= half && prefix >= OPENING_REWRITE_MIN) {
+        return true;
+    }
+    repeats_opening_table(original, continuation)
+}
+
+fn repeats_opening_table(original: &str, continuation: &str) -> bool {
+    let Some(original_header) = first_table_header(original) else {
+        return false;
+    };
+    let Some((preamble, continuation_header)) = first_table_header_after_preamble(continuation)
+    else {
+        return false;
+    };
+    chars(preamble.trim()) <= SHORT_PREAMBLE_CHARS
+        && header_key(original_header) == header_key(continuation_header)
+}
+
+fn header_key(line: &str) -> String {
+    line.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn first_table_header(text: &str) -> Option<&str> {
+    first_table_header_after_preamble(text).map(|(_, header)| header)
+}
+
+fn first_table_header_after_preamble(text: &str) -> Option<(&str, &str)> {
+    let mut offset = 0usize;
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    for index in 0..lines.len().saturating_sub(1) {
+        let header = lines[index].trim_end_matches(['\n', '\r']).trim();
+        let separator = lines[index + 1].trim_end_matches(['\n', '\r']).trim();
+        if header.starts_with('|') && header.ends_with('|') && is_separator_row(separator) {
+            return Some((&text[..offset], header));
+        }
+        offset += lines[index].len();
+    }
+    None
 }
 
 fn shared_prefix_chars(a: &str, b: &str) -> usize {
@@ -260,14 +282,6 @@ fn split_last_line(text: &str) -> Option<(&str, &str)> {
 fn is_partial_table_row(line: &str) -> bool {
     let line = line.trim();
     line.starts_with('|') && !line.ends_with('|')
-}
-
-/// The continuation already has every character of the first answer.
-/// A shared opening is not enough: later rows, facts, and `[n]` stay.
-fn continuation_replaces(original: &str, continuation: &str) -> bool {
-    let original = original.trim();
-    let continuation = continuation.trim();
-    !original.is_empty() && continuation.contains(original)
 }
 
 fn split_leading_newlines(text: &str) -> (&str, &str) {
@@ -314,17 +328,25 @@ fn dangling_newline_splits_sentence(base: &str, tail: &str) -> bool {
         .ends_with(['\n', '\r'])
 }
 
-fn drop_newline_before_table_row(base: &mut String, tail: &mut String) {
+/// One extra newline before the next row of the same table is noise.
+/// A blank line that already ends the table, or a blank line before prose, stays.
+fn drop_lone_newline_before_table_row(base: &mut String, tail: &mut String) {
     if !starts_with_table_row(tail) || !ends_with_table_line(base) {
+        return;
+    }
+    if trailing_newlines(base) >= 2 {
+        return;
+    }
+    if tail.starts_with("\n\n") || tail.starts_with("\r\n\r\n") {
         return;
     }
     let tail_body = tail.trim_start_matches(['\n', '\r']);
     if tail_body.len() != tail.len() {
         *tail = tail_body.to_string();
     }
-    let base_body = base.trim_end_matches(['\n', '\r']);
-    if base_body.len() != base.len() {
-        base.truncate(base_body.len());
+    if trailing_newlines(base) == 1 {
+        let end = base.trim_end_matches(['\n', '\r']);
+        base.truncate(end.len());
     }
 }
 
@@ -398,220 +420,12 @@ fn starts_with_block(text: &str) -> bool {
     rest != line && (rest.starts_with(". ") || rest.starts_with(") ") || rest.starts_with('．'))
 }
 
-fn skip_existing_table_rows(original: &str, continuation: &str) -> String {
-    let existing = last_table_data_rows(original);
-    if existing.is_empty() || continuation.is_empty() {
-        return continuation.to_string();
-    }
-    let lines: Vec<&str> = continuation.split_inclusive('\n').collect();
-    let mut out = String::new();
-    let mut skipped = false;
-    let mut in_table = true;
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        let trimmed = line.trim_end_matches(['\n', '\r']).trim();
-        if in_table && trimmed.is_empty() && skipped && next_line_is_table_row(&lines[index + 1..])
-        {
-            index += 1;
-            continue;
-        }
-        if in_table
-            && is_complete_table_row(trimmed)
-            && !is_separator_row(trimmed)
-            && existing.iter().any(|row| same_data_row(row, trimmed))
-        {
-            skipped = true;
-            index += 1;
-            continue;
-        }
-        if in_table && !trimmed.is_empty() && !trimmed.starts_with('|') {
-            in_table = false;
-        }
-        out.push_str(line);
-        index += 1;
-    }
-    if starts_with_table_row(&out) {
-        out.trim_start_matches(['\n', '\r']).to_string()
-    } else {
-        out
-    }
-}
-
-fn next_line_is_table_row(lines: &[&str]) -> bool {
-    lines
-        .iter()
-        .map(|line| line.trim_end_matches(['\n', '\r']).trim())
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| line.starts_with('|'))
-}
-
-fn last_table_data_rows(original: &str) -> Vec<String> {
-    let lines: Vec<&str> = original.lines().collect();
-    let mut end = lines.len();
-    while end > 0 && lines[end - 1].trim().is_empty() {
-        end -= 1;
-    }
-    if end == 0 || !lines[end - 1].trim().starts_with('|') {
-        return Vec::new();
-    }
-    let mut start = end;
-    while start > 0 && lines[start - 1].trim().starts_with('|') {
-        start -= 1;
-    }
-    lines[start..end]
-        .iter()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            let line = line.trim();
-            if index == 0 || is_separator_row(line) || !is_complete_table_row(line) {
-                None
-            } else {
-                Some(line.to_string())
-            }
-        })
-        .collect()
-}
-
-fn is_complete_table_row(line: &str) -> bool {
-    let line = line.trim();
-    line.starts_with('|')
-        && line.ends_with('|')
-        && line.chars().filter(|c| *c == '|').count() >= 2
-}
-
-fn strip_repeated_table_header(original: &str, continuation: &str) -> String {
-    let Some((header, separator)) = last_table_header(original) else {
-        return continuation.to_string();
-    };
-    let mut offset = 0usize;
-    let mut matched = 0usize;
-    for line in continuation.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\n', '\r']);
-        if body.trim().is_empty() && matched == 0 {
-            offset += line.len();
-            continue;
-        }
-        let expected = if matched == 0 { header } else { separator };
-        if !same_table_line(body, expected) {
-            return continuation.to_string();
-        }
-        matched += 1;
-        offset += line.len();
-        if matched == 2 {
-            return continuation[offset..]
-                .trim_start_matches(['\n', '\r'])
-                .to_string();
-        }
-    }
-    continuation.to_string()
-}
-
-fn last_table_header(original: &str) -> Option<(&str, &str)> {
-    let lines: Vec<&str> = original.lines().collect();
-    let mut end = lines.len();
-    while end > 0 && lines[end - 1].trim().is_empty() {
-        end -= 1;
-    }
-    if end == 0 || !lines[end - 1].trim().starts_with('|') {
-        return None;
-    }
-    let mut start = end;
-    while start > 0 && lines[start - 1].trim().starts_with('|') {
-        start -= 1;
-    }
-    if end - start < 2 {
-        return None;
-    }
-    let header = lines[start].trim();
-    let separator = lines[start + 1].trim();
-    if !is_separator_row(separator) {
-        return None;
-    }
-    Some((header, separator))
-}
-
 fn is_separator_row(line: &str) -> bool {
     let inner: String = line
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '|')
         .collect();
     !inner.is_empty() && inner.chars().all(|c| c == '-' || c == ':')
-}
-
-/// Data rows match when each cell is the same after trimming the edges.
-/// Spaces inside a cell, and '-' versus ':', stay different. Header and
-/// separator rows keep [`same_table_line`].
-fn same_data_row(a: &str, b: &str) -> bool {
-    table_cells(a) == table_cells(b)
-}
-
-fn table_cells(line: &str) -> Vec<String> {
-    let mut cells: Vec<String> = line
-        .trim()
-        .split('|')
-        .map(trim_cell)
-        .collect();
-    if cells.first().is_some_and(|cell| cell.is_empty()) {
-        cells.remove(0);
-    }
-    if cells.last().is_some_and(|cell| cell.is_empty()) {
-        cells.pop();
-    }
-    cells
-}
-
-fn trim_cell(cell: &str) -> String {
-    cell.trim_matches(|c: char| {
-        c.is_whitespace() || c == '\u{00a0}' || c == '\u{3000}'
-    })
-    .to_string()
-}
-
-/// The continuation already contains the first answer. A blank line between
-/// that answer's last table row and the next table row would end the table.
-/// A blank line before prose stays.
-fn normalize_replaced_table_junction(original: &str, continuation: &str) -> String {
-    let original = original.trim();
-    let continuation = continuation.trim();
-    let Some(at) = continuation.find(original) else {
-        return continuation.to_string();
-    };
-    if !ends_with_complete_table_row(original) {
-        return continuation.to_string();
-    }
-    let junction = at + original.len();
-    let rest = &continuation[junction..];
-    let body = rest.trim_start_matches(['\n', '\r']);
-    if rest.len() == body.len() || !starts_with_table_row(body) {
-        return continuation.to_string();
-    }
-    let head = continuation[..junction].trim_end_matches(['\n', '\r']);
-    format!("{head}\n{body}")
-}
-
-fn same_table_line(a: &str, b: &str) -> bool {
-    normalize_table_line(a) == normalize_table_line(b)
-}
-
-fn normalize_table_line(line: &str) -> String {
-    let mut out = String::new();
-    let mut dash = false;
-    for c in line.chars() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if c == '-' || c == ':' {
-            if !dash {
-                out.push('-');
-                dash = true;
-            }
-            continue;
-        }
-        dash = false;
-        out.push(c);
-    }
-    out
 }
 
 pub fn is_conclusion_prompt(text: &str) -> bool {
@@ -756,22 +570,6 @@ fn looks_cut_off(body: &str, finish_reason: &str) -> bool {
 fn stopped_for_length(finish_reason: &str) -> bool {
     let reason = finish_reason.trim().to_ascii_lowercase();
     reason == "length" || reason == "max_tokens"
-}
-
-/// The continuation hit the length cap and the joined body still does not
-/// finish a sentence. Keep that joined text and mark it incomplete.
-pub fn joined_answer_cut_by_length(joined: &str, finish_reason: &str) -> bool {
-    stopped_for_length(finish_reason) && !ends_with_sentence_end(joined)
-}
-
-/// A length cap on a continuation that already ends a sentence is not another cut.
-/// Any other finish reason is left as the model sent it.
-pub fn continuation_assess_finish<'a>(joined: &str, finish_reason: &'a str) -> &'a str {
-    if stopped_for_length(finish_reason) && ends_with_sentence_end(joined) {
-        "stop"
-    } else {
-        finish_reason
-    }
 }
 
 fn unclosed_fence(text: &str) -> bool {
@@ -1171,184 +969,69 @@ mod tests {
     }
 
     #[test]
-    fn join_continuation_uses_a_rewrite_only_when_it_contains_the_whole_original() {
-        let original = "解除できるのは相手の債務不履行が重大なときで、通知は";
-        let rewrite = "解除できるのは相手の債務不履行が重大なときです。通知のうえ解除できます。";
-        assert!(
-            opening_is_rewritten(original, rewrite),
-            "a long shared opening is a rewrite, not a tail to append"
-        );
-        assert_eq!(
-            join_continuation(original, rewrite),
-            original,
-            "do not join a from-the-start rewrite"
-        );
-
-        let cut = "ここまでの分析です。解除は重大な不履行のときに限ります";
-        let restarted = format!("前置きを補います。{cut}。以上です。");
-        assert!(!opening_is_rewritten(cut, &restarted));
-        assert_eq!(join_continuation(cut, &restarted), restarted);
-    }
-
-    #[test]
-    fn a_prose_rewrite_with_changed_wording_keeps_the_original() {
-        let original = "契約を解除するには、相手方の債務不履行が契約及び取引上の社会通念に照らして軽微でないことが必要です。根拠は [1] です。催告は";
-        let continuation = "契約を解除するには、相手方の債務不履行が契約及び取引上の社会通念に照らして軽微でないことが必要です。催告をしたうえで解除できます。";
-        assert!(opening_is_rewritten(original, continuation));
-        let joined = join_continuation(original, continuation);
-        assert_eq!(joined, original);
-        assert!(joined.contains("[1]"), "{joined}");
-        assert!(!joined.contains("催告をしたうえで"), "{joined}");
-
-        let short_original = "通知の期限は一週間で、その後";
-        let short_continuation = "通知の期限は一週間です。催告が必要です。";
-        assert!(
-            !opening_is_rewritten(short_original, short_continuation),
-            "a short echo is still a continuation"
-        );
-        let joined = join_continuation(short_original, short_continuation);
-        assert!(joined.starts_with(short_original), "{joined}");
-        assert!(joined.contains("催告が必要です。"), "{joined}");
-    }
-
-    #[test]
-    fn join_continuation_keeps_later_rows_when_the_header_is_repeated() {
-        let original = "\
-| 項目 | 内容 |
-| --- | --- |
-| 契約 | 根拠は [1] です。 |
-| 損害 | 賠償を";
-        let continuation = "\
-| 項目 | 内容 |
-| --- | --- |
-| 損害 | 賠償を請求できます。 |";
-        let joined = join_continuation(original, continuation);
-        assert!(joined.contains("| 契約 | 根拠は [1] です。 |"), "{joined}");
-        assert!(joined.contains("[1]"), "{joined}");
-        assert_eq!(joined.matches("| 項目 | 内容 |").count(), 1, "{joined}");
-        assert!(
-            joined.contains("| 損害 | 賠償を請求できます。 |"),
-            "{joined}"
-        );
-        assert!(!joined.contains("\n\n"), "{joined}");
-    }
-
-    #[test]
-    fn join_continuation_keeps_a_fixed_opening_and_a_later_cite() {
-        let original = "解除できるのは、相手の債務不履行が重大なときです。根拠は [1] です。通知は";
-        let continuation =
-            "解除できるのは、相手の債務不履行が重大なときです。通知のうえ解除できます。";
-        assert!(opening_is_rewritten(original, continuation));
-        let joined = join_continuation(original, continuation);
-        assert_eq!(joined, original);
-        assert!(joined.contains("[1]"), "{joined}");
-        assert!(!joined.contains("通知のうえ解除できます。"), "{joined}");
-    }
-
-    #[test]
-    fn join_continuation_skips_table_rows_already_in_the_original() {
-        let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n| 解除 | 通知は";
-        let continuation = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n| 解除 | 内容証明で通知します。 |\n| 期間 | 相当の期間です。 |";
-        let joined = join_continuation(original, continuation);
-        assert_eq!(joined.matches("[1]").count(), 1, "{joined}");
-        assert_eq!(
-            joined.matches("| 契約 | 根拠は [1] です。 |").count(),
-            1,
-            "{joined}"
-        );
-        assert_eq!(
-            joined.matches("| 損害 | 賠償を請求できます。 |").count(),
-            1,
-            "{joined}"
-        );
-        assert!(
-            joined.contains("| 解除 | 内容証明で通知します。 |"),
-            "{joined}"
-        );
-        assert!(joined.contains("| 期間 | 相当の期間です。 |"), "{joined}");
-        assert!(!joined.contains("\n\n"), "{joined}");
-        assert!(!opening_is_rewritten(original, continuation));
-    }
-
-    #[test]
-    fn join_continuation_skips_a_row_that_differs_only_by_spaces() {
+    fn a_short_preamble_and_rewritten_table_replaces_the_original() {
         let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を";
-        let spaced = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。|\n| 解除 | 通知でできます。 |";
-        let tight = "| 項目 | 内容 |\n| --- | --- |\n|契約|根拠は [1] です。|\n| 解除 | 通知でできます。 |";
-        for continuation in [spaced, tight] {
-            let joined = join_continuation(original, continuation);
-            assert_eq!(joined.matches("[1]").count(), 1, "{joined}");
-            assert_eq!(
-                joined.matches("| 契約 | 根拠は [1] です。 |").count(),
-                1,
-                "{joined}"
-            );
-            assert!(joined.contains("| 解除 | 通知でできます。 |"), "{joined}");
-            assert!(!joined.contains("\n\n"), "{joined}");
-        }
+        let continuation = "整理します。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 更新後です。 |\n| 損害 | 賠償を請求できます。 |";
+        assert_eq!(join_continuation(original, continuation), continuation);
+        assert!(!join_continuation(original, continuation).contains("[1]"));
     }
 
     #[test]
-    fn join_continuation_keeps_a_corrected_data_row() {
-        let dates = "| 項目 | 内容 |\n| --- | --- |\n| 期間 | 2024-01-01 |\n| メモ | あり |";
-        let corrected_date =
-            "| 項目 | 内容 |\n| --- | --- |\n| 期間 | 2024:01:01 |\n| 解除 | 通知でできます。 |";
-        let joined = join_continuation(dates, corrected_date);
-        assert!(joined.contains("| 期間 | 2024-01-01 |"), "{joined}");
-        assert!(joined.contains("| 期間 | 2024:01:01 |"), "{joined}");
-
-        let cite = "| 項目 | 内容 |\n| --- | --- |\n| 根拠 | 第1 2条 [1] |\n| メモ | あり |";
-        let corrected_cite =
-            "| 項目 | 内容 |\n| --- | --- |\n| 根拠 | 第12条 [1] |\n| 解除 | 通知でできます。 |";
-        let joined = join_continuation(cite, corrected_cite);
-        assert!(joined.contains("| 根拠 | 第1 2条 [1] |"), "{joined}");
-        assert!(joined.contains("| 根拠 | 第12条 [1] |"), "{joined}");
-        assert_eq!(joined.matches("[1]").count(), 2, "{joined}");
-    }
-
-    #[test]
-    fn join_continuation_closes_a_blank_line_inside_a_replaced_table() {
-        let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |";
-        let continuation =
-            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n\n| 解除 | 通知でできます。 |";
-        assert!(continuation.contains(original));
-        assert_eq!(
-            join_continuation(original, continuation),
-            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 解除 | 通知でできます。 |"
-        );
-        let prose = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n\n補足です。";
-        assert_eq!(join_continuation(original, prose), prose);
-    }
-
-    #[test]
-    fn join_continuation_keeps_the_blank_line_before_prose_after_a_skipped_row() {
-        let original = "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |";
-        let continuation = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n\n補足です。根拠は [1] です。";
-        assert_eq!(
-            join_continuation(original, continuation),
-            "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n\n補足です。根拠は [1] です。"
-        );
-    }
-
-    #[test]
-    fn join_continuation_appends_the_new_row_after_one_existing_row() {
-        let original = "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |";
-        let continuation =
-            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 解除 | 通知でできます。 |";
+    fn a_blank_line_after_a_finished_table_does_not_merge_the_next_table() {
+        let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n\n";
+        let continuation = "| 別表 | 内容 |\n| --- | --- |\n| 解除 | 通知でできます。 |";
+        let joined = join_continuation(original, continuation);
         assert!(
-            !continuation.contains(original),
-            "this continuation repeats one row; it does not contain the first answer"
+            joined.contains("| 契約 | 有効です。 |\n\n| 別表 | 内容 |"),
+            "{joined}"
+        );
+        assert!(joined.contains("| 解除 | 通知でできます。 |"), "{joined}");
+    }
+
+    #[test]
+    fn a_repeated_table_after_cut_prose_does_not_duplicate_the_table_or_cite() {
+        let original = "説明です。根拠は [1] です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n通知は、";
+        let continuation = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 損害 | 賠償を請求できます。 |";
+        let joined = join_continuation(original, continuation);
+        assert_eq!(joined, continuation);
+        assert_eq!(joined.matches("| 項目 | 内容 |").count(), 1, "{joined}");
+        assert_eq!(joined.matches("[1]").count(), 0, "{joined}");
+        assert!(!joined.contains("通知は、"), "{joined}");
+    }
+
+    #[test]
+    fn a_continuation_of_only_the_existing_rows_is_the_continuation_itself() {
+        let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を";
+        let continuation = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |";
+        let joined = join_continuation(original, continuation);
+        assert_eq!(joined, continuation);
+        assert!(!joined.contains("| 損害 | 賠償を"), "{joined}");
+        assert_eq!(joined.matches("[1]").count(), 1, "{joined}");
+        let question = long_question();
+        assert_ne!(
+            assess_answer(&question, continuation, "", "stop"),
+            Some(AnswerProblem::Truncated),
+            "a finished table is not a cut, so the label is continued"
         );
         assert_eq!(
-            join_continuation(original, continuation),
-            "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 解除 | 通知でできます。 |"
+            assess_answer(&question, continuation, "", "length"),
+            Some(AnswerProblem::Truncated),
+            "a length cap on that same table is incomplete"
         );
-        let with_blank =
-            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n\n| 解除 | 通知でできます。 |";
+    }
+
+    #[test]
+    fn a_midway_continuation_is_appended() {
         assert_eq!(
-            join_continuation(original, with_blank),
-            "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 解除 | 通知でできます。 |",
-            "a newline left in front of the next row does not split the table"
+            join_continuation("通知の期限は一週間で、その後", "催告が必要です。"),
+            "通知の期限は一週間で、その後催告が必要です。"
+        );
+        assert_eq!(
+            join_continuation(
+                "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |",
+                "| 解除 | 通知でできます。 |",
+            ),
+            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 解除 | 通知でできます。 |"
         );
     }
 
@@ -1464,15 +1147,17 @@ mod tests {
     }
 
     #[test]
-    fn a_joined_continuation_cut_by_length_stays_incomplete() {
-        let cut = format!("{}、通知の期限は", "あ".repeat(40));
-        assert!(joined_answer_cut_by_length(&cut, "length"));
-        assert!(joined_answer_cut_by_length(&cut, "max_tokens"));
-        assert!(!joined_answer_cut_by_length(&cut, "stop"));
+    fn a_continuation_that_stops_on_length_is_truncated() {
+        let question = long_question();
         let finished = format!("{}。", "あ".repeat(80));
-        assert!(!joined_answer_cut_by_length(&finished, "length"));
-        assert_eq!(continuation_assess_finish(&finished, "length"), "stop");
-        assert_eq!(continuation_assess_finish(&cut, "length"), "length");
-        assert_eq!(continuation_assess_finish(&finished, "stop"), "stop");
+        assert_eq!(
+            assess_answer(&question, &finished, "", "length"),
+            Some(AnswerProblem::Truncated)
+        );
+        assert_eq!(
+            assess_answer(&question, &finished, "", "max_tokens"),
+            Some(AnswerProblem::Truncated)
+        );
+        assert_eq!(assess_answer(&question, &finished, "", "stop"), None);
     }
 }
