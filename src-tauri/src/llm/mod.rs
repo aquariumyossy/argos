@@ -9,6 +9,7 @@ pub mod fetch_url;
 pub mod files;
 pub mod grain;
 pub mod http_error;
+pub mod output_files;
 pub mod pdf_win;
 pub mod searxng;
 pub mod summary;
@@ -212,6 +213,14 @@ pub fn system_for_request(settings: &Settings) -> String {
             s.push('\n');
         }
         s.push_str(crate::llm::create_html::LLM_HTML_HINT);
+    }
+    if !s.contains(crate::llm::output_files::LLM_OUTPUT_SENTINEL)
+        && !s.contains(crate::llm::output_files::LLM_OUTPUT_HINT)
+    {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(crate::llm::output_files::LLM_OUTPUT_HINT);
     }
     if !s.contains(LLM_REREAD_SENTINEL) && !s.contains(LLM_REREAD_HINT) {
         if !s.is_empty() {

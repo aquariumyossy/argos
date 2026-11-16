@@ -209,7 +209,7 @@ fn edit_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_EDIT_HTML,
-            "description": "出力フォルダにある HTML を編集し、元ファイルは残して新しいファイルを保存する。filename は保存済みのファイル名（例: 手数料計算.html）。パスは渡さない。html は編集後の完全な文書。結果のファイル名を回答に書く。",
+            "description": "出力フォルダにある HTML を編集し、元ファイルは残して新しいファイルを保存する。filename は list_output_files で見たファイル名（例: 手数料計算.html）。パスは渡さない。html は編集後の完全な文書。候補が複数あるときは呼ばず、名前・種類・更新日時を挙げて利用者に聞く。結果のファイル名を回答に書く。",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -21,7 +21,7 @@ pub const OFFICE_MARKER: &str = "[[argos-office]]";
 
 pub const LLM_OFFICE_SENTINEL: &str = "新しい Word と Excel を作るツールがあります";
 pub const LLM_OFFICE_HINT: &str = "\
-新しい Word と Excel を作るツールがあります。ユーザーがファイルの作成を求めたときだけ使い、保存したファイル名を回答に書いてください。既存ファイルの編集やひな型はしません。";
+新しい Word と Excel を作るツールがあります。ユーザーがファイルの作成を求めたときだけ create_docx と create_xlsx を使い、保存したファイル名を回答に書いてください。これらのツールは既存ファイルを編集しません。";
 
 const MAX_DOCX_BLOCKS: usize = 80;
 const MAX_TABLE_ROWS: usize = 40;
@@ -137,22 +137,38 @@ pub fn notice_for_tool(tool_name: &str, saved: Option<&SavedOfficeFile>) -> Opti
     Some(notice_body(file))
 }
 
-/// Resolve a bare file name inside the Argos output folder.
-/// Rejects separators, `..`, drive letters, and UNC names, then checks the
-/// canonical path stays inside that folder.
-pub fn output_file_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
-    let name = bare_output_name(name)?;
+/// Canonical `data_dir/output`, or an error when that directory is missing
+/// or is a symlink whose target is not exactly that folder.
+pub fn contained_output_dir(data_dir: &Path) -> Result<PathBuf, String> {
     let dir = output_dir(data_dir);
     if !dir.is_dir() {
         return Err("出力フォルダがありません。".into());
     }
+    let canon_dir = fs::canonicalize(&dir).map_err(|_| "出力フォルダがありません。".to_string())?;
+    let canon_data =
+        fs::canonicalize(data_dir).map_err(|_| "出力フォルダがありません。".to_string())?;
+    let name_ok = canon_dir.file_name().and_then(|name| name.to_str()) == Some(OUTPUT_DIR_NAME);
+    if canon_dir.parent() != Some(canon_data.as_path()) || !name_ok {
+        return Err("出力フォルダの外は開けません。".into());
+    }
+    Ok(canon_dir)
+}
+
+/// Resolve a bare file name inside the Argos output folder.
+///
+/// Rejects separators, `..`, drive letters, and UNC names. The output directory
+/// itself must be `data_dir/output` (a symlink pointing elsewhere is refused),
+/// and the canonical file must stay inside that directory.
+pub fn output_file_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = bare_output_name(name)?;
+    let canon_dir = contained_output_dir(data_dir)?;
+    let dir = output_dir(data_dir);
     let joined = dir.join(name);
     if joined.parent() != Some(dir.as_path())
         || joined.file_name().and_then(|n| n.to_str()) != Some(name)
     {
         return Err("ファイル名だけを指定してください。".into());
     }
-    let canon_dir = fs::canonicalize(&dir).map_err(|_| "出力フォルダがありません。".to_string())?;
     let canon_file =
         fs::canonicalize(&joined).map_err(|_| "ファイルが見つかりません。".to_string())?;
     if !canon_file.starts_with(&canon_dir) {

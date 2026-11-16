@@ -7,8 +7,8 @@ use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 use super::{
-    edit_path, output_file_path, resolve_office_path, strip_verbatim_prefix, EditRequest,
-    FILE_LINE, OFFICE_MARKER, OUTPUT_DIR_NAME, PATH_LINE, SOURCE_LINE,
+    edit_path, output_file_path, resolve_edit_source, resolve_office_path, strip_verbatim_prefix,
+    EditRequest, FILE_LINE, OFFICE_MARKER, OUTPUT_DIR_NAME, PATH_LINE, SOURCE_LINE,
 };
 use crate::db::LlmSourceRow;
 
@@ -688,5 +688,171 @@ fn docx_leftover_check_reports_fields_and_hyperlinks_without_rewriting_them() {
         "{}",
         edited.report
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn output_folder_edit_writes_a_new_file_and_leaves_the_original() {
+    let dir = temp_dir("keep");
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let src = out.join("売上表.docx");
+    let other = out.join("別紙.docx");
+    write_zip(&src, &[("word/document.xml", &word_document())]);
+    write_zip(&other, &[("word/document.xml", &word_document())]);
+    let before = fs::read(&src).unwrap();
+    let other_before = fs::read(&other).unwrap();
+    let err = resolve_edit_source(&[], &dir, &json!({})).unwrap_err();
+    assert!(err.contains("添付"), "{err}");
+    let path = resolve_edit_source(&[], &dir, &json!({"filename": "売上表.docx"})).unwrap();
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("売上表.docx")
+    );
+    let edited = edit_path(
+        &path,
+        &out,
+        "2026-11-10 09-00-00",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert_eq!(fs::read(&other).unwrap(), other_before);
+    assert_ne!(edited.filename, "売上表.docx");
+    assert!(edited.filename.contains("編集済み"), "{}", edited.filename);
+    assert!(edited.path.exists());
+    assert_ne!(
+        fs::canonicalize(&edited.path).unwrap(),
+        fs::canonicalize(&src).unwrap()
+    );
+    assert!(edited
+        .report
+        .contains(&format!("{OFFICE_MARKER}\tdocx\t{}", edited.filename)));
+    assert!(edited
+        .report
+        .contains(&format!("{SOURCE_LINE}売上表.docx\n")));
+    let original = read_entry(&src, "word/document.xml");
+    assert!(original.contains("山田太郎"), "{original}");
+    assert!(!original.contains("佐藤花子"), "{original}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn output_xlsx_edit_keeps_the_original_bytes() {
+    let dir = temp_dir("xlsx-keep");
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let src = out.join("売上表.xlsx");
+    let files = xlsx_package();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    write_zip(&src, &borrowed);
+    let before = fs::read(&src).unwrap();
+    let path = resolve_edit_source(&[], &dir, &json!({"filename": "売上表.xlsx"})).unwrap();
+    let edited = edit_path(
+        &path,
+        &out,
+        "2026-11-10 09-00-00",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert_ne!(edited.filename, "売上表.xlsx");
+    assert!(edited
+        .report
+        .contains(&format!("{OFFICE_MARKER}\txlsx\t{}", edited.filename)));
+    assert!(!read_entry(&src, "xl/sharedStrings.xml").contains("佐藤花子"));
+    assert!(read_entry(&edited.path, "xl/sharedStrings.xml").contains("佐藤花子"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_attachment_still_wins_over_an_output_file_of_the_same_name() {
+    let dir = temp_dir("attach-wins");
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("契約書.docx"), b"output").unwrap();
+    let attached = dir.join("契約書.docx");
+    fs::write(&attached, b"attached").unwrap();
+    let row = source(&attached.to_string_lossy(), 1);
+    let path = resolve_edit_source(
+        std::slice::from_ref(&row),
+        &dir,
+        &json!({"filename": "契約書.docx"}),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"attached");
+    assert_eq!(fs::read(out.join("契約書.docx")).unwrap(), b"output");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_search_folder_path_is_not_opened_for_edit() {
+    let dir = temp_dir("search");
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("契約書.docx"), b"output").unwrap();
+    let mut hit = source(r"C:\cases\契約書.docx", 3);
+    hit.origin = "tool".into();
+    let by_path = resolve_edit_source(
+        std::slice::from_ref(&hit),
+        &dir,
+        &json!({"path": r"C:\cases\契約書.docx"}),
+    )
+    .unwrap_err();
+    assert!(
+        by_path.contains("ファイル名") || by_path.contains("検索") || by_path.contains("添付"),
+        "{by_path}"
+    );
+    let by_cite =
+        resolve_edit_source(std::slice::from_ref(&hit), &dir, &json!({"cite_no": 3})).unwrap_err();
+    assert!(
+        by_cite.contains("検索") || by_cite.contains("添付"),
+        "{by_cite}"
+    );
+    let chosen = resolve_edit_source(
+        std::slice::from_ref(&hit),
+        &dir,
+        &json!({"filename": "契約書.docx"}),
+    )
+    .unwrap();
+    assert!(chosen.starts_with(fs::canonicalize(&out).unwrap()));
+    assert_eq!(fs::read(&chosen).unwrap(), b"output");
+    let traversal =
+        resolve_edit_source(&[], &dir, &json!({"filename": r"..\..\契約書.docx"})).unwrap_err();
+    assert!(
+        traversal.contains("ファイル名") || traversal.contains("外"),
+        "{traversal}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn editing_through_a_symlink_outside_the_output_folder_is_rejected() {
+    let dir = temp_dir("edit-link");
+    let outside = dir.join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("売上表.docx");
+    fs::write(&secret, b"secret").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join(OUTPUT_DIR_NAME)).unwrap();
+    let err = resolve_edit_source(&[], &dir, &json!({"filename": "売上表.docx"})).unwrap_err();
+    assert!(err.contains("外"), "{err}");
+    assert_eq!(fs::read(&secret).unwrap(), b"secret");
+
+    let _ = fs::remove_file(dir.join(OUTPUT_DIR_NAME));
+    let out = dir.join(OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let file = dir.join("outside.docx");
+    fs::write(&file, b"secret").unwrap();
+    std::os::unix::fs::symlink(&file, out.join("link.docx")).unwrap();
+    let err = resolve_edit_source(&[], &dir, &json!({"filename": "link.docx"})).unwrap_err();
+    assert!(err.contains("外"), "{err}");
+    assert_eq!(fs::read(&file).unwrap(), b"secret");
+    assert!(!out
+        .join("link_編集済み（2026-11-10 09-00-00）.docx")
+        .exists());
     let _ = fs::remove_dir_all(&dir);
 }
