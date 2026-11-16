@@ -1664,6 +1664,14 @@ async fn llm_send_inner<R: Runtime>(
                         }
                         let content = if tc.name == tools::TOOL_READ_NOTE {
                             content
+                        } else if tc.name == crate::llm::output_files::TOOL_READ_OUTPUT
+                            && crate::llm::output_files::is_html_source_payload(&content)
+                        {
+                            crate::llm::output_files::deliver_html_read(
+                                content,
+                                tool_budget,
+                                tool_used,
+                            )
                         } else {
                             fit_tool_text(content, tool_budget, tool_used)
                         };

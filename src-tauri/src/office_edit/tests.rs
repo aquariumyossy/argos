@@ -769,22 +769,40 @@ fn output_xlsx_edit_keeps_the_original_bytes() {
 }
 
 #[test]
-fn an_attachment_still_wins_over_an_output_file_of_the_same_name() {
-    let dir = temp_dir("attach-wins");
+fn explicit_filename_prefers_the_output_file_over_cite_and_attachment() {
+    let dir = temp_dir("name-wins");
     let out = dir.join(OUTPUT_DIR_NAME);
     fs::create_dir_all(&out).unwrap();
     fs::write(out.join("契約書.docx"), b"output").unwrap();
+    fs::write(out.join("売上表.docx"), b"sheet").unwrap();
     let attached = dir.join("契約書.docx");
     fs::write(&attached, b"attached").unwrap();
     let row = source(&attached.to_string_lossy(), 1);
-    let path = resolve_edit_source(
-        std::slice::from_ref(&row),
+    let rows = std::slice::from_ref(&row);
+    let by_name = resolve_edit_source(rows, &dir, &json!({"filename": "契約書.docx"})).unwrap();
+    assert_eq!(fs::read(&by_name).unwrap(), b"output");
+    let by_cite = resolve_edit_source(rows, &dir, &json!({"cite_no": 1})).unwrap();
+    assert_eq!(fs::read(&by_cite).unwrap(), b"attached");
+    let filename_over_cite = resolve_edit_source(
+        rows,
         &dir,
-        &json!({"filename": "契約書.docx"}),
+        &json!({"cite_no": 1, "filename": "売上表.docx"}),
     )
     .unwrap();
-    assert_eq!(fs::read(&path).unwrap(), b"attached");
-    assert_eq!(fs::read(out.join("契約書.docx")).unwrap(), b"output");
+    assert_eq!(fs::read(&filename_over_cite).unwrap(), b"sheet");
+    let disagree = resolve_edit_source(
+        rows,
+        &dir,
+        &json!({"cite_no": 1, "filename": "ない.docx"}),
+    )
+    .unwrap_err();
+    assert!(disagree.contains("別のファイル"), "{disagree}");
+    assert_eq!(fs::read(&attached).unwrap(), b"attached");
+    fs::remove_file(out.join("契約書.docx")).unwrap();
+    let cite_and_same_name =
+        resolve_edit_source(rows, &dir, &json!({"cite_no": 1, "filename": "契約書.docx"}))
+            .unwrap();
+    assert_eq!(fs::read(&cite_and_same_name).unwrap(), b"attached");
     let _ = fs::remove_dir_all(&dir);
 }
 

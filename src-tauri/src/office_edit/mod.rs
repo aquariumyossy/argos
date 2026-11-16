@@ -272,42 +272,61 @@ pub fn resolve_office_path(sources: &[LlmSourceRow], args: &Value) -> Result<Str
     Ok(matched[0].path.clone())
 }
 
-/// Attachment resolution, or a bare file name that already exists in the output folder.
-///
-/// `cite_no` stays attachment-only, so a search hit is never opened. A bare name
-/// is opened only when [`output_file_path`] accepts it. Paths, `..`, and links
-/// that leave the output folder are refused.
+/// An explicit file name inside the output folder wins over `cite_no` and over
+/// an attachment of the same name. `cite_no` alone still means that attachment.
+/// A name and a cite that point at different files are an error. Search-folder
+/// files stay closed, and paths that leave the output folder are refused.
 pub fn resolve_edit_source(
     sources: &[LlmSourceRow],
     data_dir: &Path,
     args: &Value,
 ) -> Result<PathBuf, String> {
-    if arg_i64(args.get("cite_no"))
-        .filter(|value| *value > 0)
-        .is_some()
-    {
-        return resolve_office_path(sources, args).map(PathBuf::from);
-    }
-    let wanted = first_text(args, &["path", "filename", "file"]);
+    let cite = arg_i64(args.get("cite_no")).filter(|value| *value > 0);
+    let wanted = first_text(args, &["filename", "file", "path"]);
     if wanted.is_empty() {
         return resolve_office_path(sources, args).map(PathBuf::from);
     }
-    if let Ok(path) = resolve_office_path(sources, args) {
-        return Ok(PathBuf::from(path));
+    if let Ok(path) = output_file_path(data_dir, &wanted) {
+        return Ok(path);
     }
-    match output_file_path(data_dir, &wanted) {
-        Ok(path) => Ok(path),
-        Err(output_err) => Err(edit_source_error(sources, args, output_err)),
+    if let Some(cite_no) = cite {
+        let cite_args = serde_json::json!({ "cite_no": cite_no });
+        return match resolve_office_path(sources, &cite_args) {
+            Ok(path) if names_agree(&path, &wanted) => Ok(PathBuf::from(path)),
+            Ok(path) => Err(format!(
+                "filename「{}」と cite_no [{cite_no}]（{}）は別のファイルです。出力フォルダのファイルは filename だけ、添付は cite_no だけを指定してください。",
+                one_line_name(&wanted),
+                file_name_of(&path)
+            )),
+            Err(err) => Err(err),
+        };
+    }
+    match resolve_office_path(sources, args) {
+        Ok(path) => Ok(PathBuf::from(path)),
+        Err(attach_err) => match output_file_path(data_dir, &wanted) {
+            Ok(path) => Ok(path),
+            Err(output_err) => Err(prefer_attachment_or_output_error(attach_err, output_err)),
+        },
     }
 }
 
-fn edit_source_error(sources: &[LlmSourceRow], args: &Value, output_err: String) -> String {
-    let Err(attach_err) = resolve_office_path(sources, args) else {
-        return output_err;
-    };
+fn names_agree(path: &str, wanted: &str) -> bool {
+    let wanted_name = file_name_of(wanted);
+    if wanted_name.is_empty() {
+        return false;
+    }
+    pathutil::normalize_for_compare(path)
+        .eq_ignore_ascii_case(&pathutil::normalize_for_compare(wanted))
+        || file_name_of(path).eq_ignore_ascii_case(&wanted_name)
+}
+
+fn one_line_name(text: &str) -> String {
+    text.replace(['\n', '\r', '\t'], " ")
+}
+
+fn prefer_attachment_or_output_error(attach_err: String, output_err: String) -> String {
     if attach_err.contains("検索で見つかった")
-        && (output_err.contains("見つかりません")
-            || output_err.contains("出力フォルダがありません"))
+        && (output_err.contains("見つかりません") || output_err.contains("出力フォルダがありません"))
     {
         return attach_err;
     }

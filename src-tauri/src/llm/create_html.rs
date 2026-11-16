@@ -82,7 +82,14 @@ pub fn edit_html_at(data_dir: &Path, args: &Value, stamp: &str) -> Result<HtmlEd
         .filter(|name| name.to_ascii_lowercase().ends_with(".html"))
         .ok_or_else(|| "編集できるのは出力フォルダの .html だけです。".to_string())?
         .to_string();
+    let original_bytes = fs::read(&src).map_err(|_| "ファイルを読めませんでした。".to_string())?;
+    let original = crate::extractor::decode_html_bytes(&original_bytes);
     let html = require_html(args)?;
+    if submission_is_truncated(&original, &html) {
+        return Err(
+            "途中で切れた HTML は保存しません。元のファイルはそのままです。".into(),
+        );
+    }
     let dir = output_dir(data_dir);
     fs::create_dir_all(&dir).map_err(|err| format!("出力フォルダを作れませんでした（{err}）。"))?;
     let filename = output_filename(&src, stamp, "html");
@@ -122,6 +129,29 @@ fn source_name(args: &Value) -> Result<&str, String> {
         return Err("編集する HTML のファイル名を指定してください。".into());
     }
     Ok(name)
+}
+
+/// A tool-result prefix, or a copy that lost a closing tag the file already had,
+/// must not be written back as a finished document.
+fn submission_is_truncated(original: &str, submitted: &str) -> bool {
+    if submitted.contains("…（長いので省略しました）")
+        || submitted.contains("（文脈の上限に達したため")
+        || submitted.contains("（以降は省略しました")
+    {
+        return true;
+    }
+    let original_lower = original.to_ascii_lowercase();
+    let submitted_lower = submitted.to_ascii_lowercase();
+    for tag in ["</html>", "</body>"] {
+        if original_lower.contains(tag) && !submitted_lower.contains(tag) {
+            return true;
+        }
+    }
+    let original_trim = original.trim();
+    let submitted_trim = submitted.trim();
+    !submitted_trim.is_empty()
+        && submitted_trim.len() < original_trim.len()
+        && original_trim.starts_with(submitted_trim)
 }
 
 fn require_html(args: &Value) -> Result<String, String> {
@@ -209,7 +239,7 @@ fn edit_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_EDIT_HTML,
-            "description": "出力フォルダにある HTML を編集し、元ファイルは残して新しいファイルを保存する。filename は list_output_files で見たファイル名（例: 手数料計算.html）。パスは渡さない。html は編集後の完全な文書。候補が複数あるときは呼ばず、名前・種類・更新日時を挙げて利用者に聞く。結果のファイル名を回答に書く。",
+            "description": "出力フォルダにある HTML を編集し、元ファイルは残して新しいファイルを保存する。filename は list_output_files で見たファイル名（例: 手数料計算.html）。パスは渡さない。html は編集後の完全な文書。途中で切れたソースや、元のファイルにある </html> や </body> を欠いた本文は保存しない。候補が複数あるときは呼ばず、名前・種類・更新日時を挙げて利用者に聞く。結果のファイル名を回答に書く。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -346,6 +376,52 @@ mod tests {
         assert_eq!(
             again.saved.name,
             "手数料_編集済み（2026-11-13 02-50-00）（2）.html"
+        );
+    }
+
+    #[test]
+    fn edit_refuses_a_truncated_source_and_keeps_the_original() {
+        let tmp = Tmp::new();
+        let original = page("<p>旧の本文</p>");
+        let created = write_html(&tmp.0, &json!({"filename": "手数料", "html": original})).unwrap();
+        let before = fs::read(&created.path).unwrap();
+        let cut = "<!DOCTYPE html><html><body><p>旧の本文</p>";
+        let missing_close = edit_html_at(
+            &tmp.0,
+            &json!({"filename": created.name, "html": cut}),
+            "2026-11-13 02-50-00",
+        )
+        .unwrap_err();
+        assert!(missing_close.contains("切れた"), "{missing_close}");
+        let marked = format!("{original}\n…（長いので省略しました）");
+        let with_marker = edit_html_at(
+            &tmp.0,
+            &json!({"filename": created.name, "html": marked}),
+            "2026-11-13 02-50-00",
+        )
+        .unwrap_err();
+        assert!(with_marker.contains("切れた"), "{with_marker}");
+        let prefix = &original[..original.len() - 8];
+        let prefix_err = edit_html_at(
+            &tmp.0,
+            &json!({"filename": created.name, "html": prefix}),
+            "2026-11-13 02-50-00",
+        )
+        .unwrap_err();
+        assert!(prefix_err.contains("切れた"), "{prefix_err}");
+        assert_eq!(fs::read(&created.path).unwrap(), before);
+        assert_eq!(
+            fs::read_dir(tmp.0.join(OUTPUT_DIR_NAME))
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .ok()
+                        .and_then(|entry| entry.path().extension().map(|ext| ext == "html"))
+                        .unwrap_or(false)
+                })
+                .count(),
+            1
         );
     }
 

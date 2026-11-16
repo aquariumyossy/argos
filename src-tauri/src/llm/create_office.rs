@@ -214,7 +214,11 @@ fn bare_output_name(raw: &str) -> Result<&str, String> {
         return Err("ファイル名だけを指定してください。".into());
     }
     let lower = name.to_ascii_lowercase();
-    if !lower.ends_with(".docx") && !lower.ends_with(".xlsx") && !lower.ends_with(".html") {
+    if !lower.ends_with(".docx")
+        && !lower.ends_with(".xlsx")
+        && !lower.ends_with(".html")
+        && !lower.ends_with(".htm")
+    {
         return Err("Word、Excel、HTML のファイル名を指定してください。".into());
     }
     Ok(name)

@@ -400,7 +400,7 @@ pub fn tools_schema(
             "description": "添付の .docx / .xlsx、または出力フォルダにある .docx / .xlsx を編集し、元ファイルは変えず新しいファイルを保存する。確認は取らない。書式・表・フォントは残し文字だけ変える。1回の呼び出しに編集をすべて入れる。添付を直すときは元の添付から作り、前回の出力には重ねない。出力フォルダのファイルを直すときは、選んだそのファイルを編集する。.doc と .xls は対象外。\
 replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・コメント・変更履歴の文字（複数のランに分かれた名前を含む）。履歴としては記録しない。Excel は全シートのセルとシート名。\
 paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
-cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダのファイルは filename にファイル名だけを渡す（例: 売上集計.xlsx）。パスは渡さない。候補が複数あるときはこのツールを呼ばず、名前・種類・更新日時を挙げて利用者に聞く。検索フォルダのファイルは編集できない。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
+cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダのファイルは filename にファイル名だけを渡す（例: 売上集計.xlsx）。filename があるときは、同じ名前の添付や別の cite_no よりそのファイルを優先する。filename と cite_no が別のファイルなら編集しない。パスは渡さない。候補が複数あるときはこのツールを呼ばず、名前・種類・更新日時を挙げて利用者に聞く。検索フォルダのファイルは編集できない。残った旧文字列は結果に場所が付く。保存したファイル名を答えに書く。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3077,11 +3077,16 @@ fn execute_tool_inner(
         TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
         TOOL_LIST_OUTPUT => Ok(ToolExec::text(crate::llm::output_files::list_for_tool(
             &state.data_dir,
-        ))),
-        TOOL_READ_OUTPUT => Ok(ToolExec::text(crate::llm::output_files::read_for_tool(
-            &state.data_dir,
             &args,
         ))),
+        TOOL_READ_OUTPUT => {
+            let limit = state.settings.read().llm_max_context_tokens as usize;
+            Ok(ToolExec::text(crate::llm::output_files::read_for_tool(
+                &state.data_dir,
+                &args,
+                limit,
+            )))
+        }
         TOOL_EDIT_OFFICE => Ok(ToolExec::text(crate::office_edit::edit_from_tool(
             state, thread_id, &args,
         ))),

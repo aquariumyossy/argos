@@ -24,6 +24,11 @@ const MAX_HTML_BYTES: usize = 512 * 1024;
 const MAX_OFFICE_BYTES: u64 = 40 * 1024 * 1024;
 const EMPTY_LIST: &str = "出力フォルダにファイルはありません。";
 const ASK_LINE: &str = "依頼に合うファイルが一つなら、そのファイル名で read_output_file を呼んでください。複数あるなら、候補の名前・種類・更新日時を挙げてどれか聞いてください。";
+/// Present only when the tool result contains the complete HTML source.
+pub const HTML_SOURCE_NOTE: &str =
+    "以下は HTML のソースです。edit_html の html には、このソースだけを渡してください。";
+/// Returned instead of a source that `fit_tool_text` would cut.
+pub const HTML_READ_REFUSAL: &str = "この HTML は文脈に入りきらないため、ソースは返していません。切れた本文を edit_html に渡さないでください。ファイルは保存されていません。";
 
 struct ListedFile {
     name: String,
@@ -35,29 +40,47 @@ pub fn tool_schemas() -> Vec<Value> {
     vec![list_schema(), read_schema()]
 }
 
-pub fn list_for_tool(data_dir: &Path) -> String {
-    match list_output_files(data_dir) {
+pub fn list_for_tool(data_dir: &Path, args: &Value) -> String {
+    match list_output_files(data_dir, &name_filter(args)) {
         Ok(text) => text,
         Err(message) => message,
     }
 }
 
-pub fn read_for_tool(data_dir: &Path, args: &Value) -> String {
-    match read_output_file(data_dir, args) {
+pub fn read_for_tool(data_dir: &Path, args: &Value, context_tokens: usize) -> String {
+    match read_output_file(data_dir, args, context_tokens) {
         Ok(text) => text,
         Err(message) => message,
     }
 }
 
-fn list_output_files(data_dir: &Path) -> Result<String, String> {
+pub fn is_html_source_payload(content: &str) -> bool {
+    content.contains(HTML_SOURCE_NOTE)
+}
+
+/// Keep a complete HTML source. If `fit_tool_text` would shorten it, return an
+/// error that does not contain the source and does not ask for `edit_html`.
+pub fn deliver_html_read(content: String, budget_tokens: usize, used_tokens: usize) -> String {
+    if !is_html_source_payload(&content) {
+        return content;
+    }
+    let fitted = crate::llm::context::fit_tool_text(content.clone(), budget_tokens, used_tokens);
+    if fitted == content {
+        content
+    } else {
+        HTML_READ_REFUSAL.into()
+    }
+}
+
+fn list_output_files(data_dir: &Path, filter: &str) -> Result<String, String> {
     let dir = output_dir(data_dir);
     if !dir.exists() {
-        return Ok(EMPTY_LIST.into());
+        return Ok(empty_list(filter));
     }
     let canon_dir = match contained_output_dir(data_dir) {
         Ok(path) => path,
         Err(message) if message.contains('外') => return Err(message),
-        Err(_) => return Ok(EMPTY_LIST.into()),
+        Err(_) => return Ok(empty_list(filter)),
     };
     let mut rows = Vec::new();
     let entries = fs::read_dir(&dir).map_err(|_| "出力フォルダを読めませんでした。".to_string())?;
@@ -71,6 +94,9 @@ fn list_output_files(data_dir: &Path) -> Result<String, String> {
         let Some(kind) = kind_label(&name) else {
             continue;
         };
+        if !name_matches(&name, filter) {
+            continue;
+        }
         let Ok(path) = output_file_path(data_dir, &name) else {
             continue;
         };
@@ -90,7 +116,7 @@ fn list_output_files(data_dir: &Path) -> Result<String, String> {
         });
     }
     if rows.is_empty() {
-        return Ok(EMPTY_LIST.into());
+        return Ok(empty_list(filter));
     }
     rows.sort_by(|left, right| {
         right
@@ -121,7 +147,7 @@ fn list_output_files(data_dir: &Path) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn read_output_file(data_dir: &Path, args: &Value) -> Result<String, String> {
+fn read_output_file(data_dir: &Path, args: &Value, context_tokens: usize) -> Result<String, String> {
     let name = requested_name(args)?;
     let path = output_file_path(data_dir, name)?;
     let meta = fs::metadata(&path).map_err(|_| "ファイルが見つかりません。".to_string())?;
@@ -130,7 +156,7 @@ fn read_output_file(data_dir: &Path, args: &Value) -> Result<String, String> {
     }
     let kind = kind_label(name)
         .ok_or_else(|| "Word、Excel、HTML のファイル名を指定してください。".to_string())?;
-    let html = name.to_ascii_lowercase().ends_with(".html");
+    let html = is_html_name(name);
     let body = if html {
         read_html(&path, meta.len())?
     } else {
@@ -149,11 +175,14 @@ fn read_output_file(data_dir: &Path, args: &Value) -> Result<String, String> {
         one_line(name)
     );
     if html {
-        out.push_str(
-            "以下は HTML のソースです。edit_html の html には、このソースだけを渡してください。\n",
-        );
+        out.push_str(HTML_SOURCE_NOTE);
+        out.push('\n');
     }
     out.push_str(&body);
+    if html {
+        let allowance = crate::llm::context::tool_result_allowance_tokens(context_tokens);
+        return Ok(deliver_html_read(out, allowance, 0));
+    }
     Ok(out)
 }
 
@@ -207,10 +236,38 @@ fn kind_label(name: &str) -> Option<&'static str> {
         Some("Word")
     } else if lower.ends_with(".xlsx") {
         Some("Excel")
-    } else if lower.ends_with(".html") {
+    } else if is_html_name(name) {
         Some("HTML")
     } else {
         None
+    }
+}
+
+fn is_html_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".html") || lower.ends_with(".htm")
+}
+
+fn name_filter(args: &Value) -> String {
+    args.get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn name_matches(name: &str, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    name.to_lowercase().contains(&filter.to_lowercase())
+}
+
+fn empty_list(filter: &str) -> String {
+    if filter.is_empty() {
+        EMPTY_LIST.into()
+    } else {
+        format!("「{}」を含むファイルはありません。", one_line(filter))
     }
 }
 
@@ -237,8 +294,13 @@ fn list_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_LIST_OUTPUT,
-            "description": "Argos の出力フォルダにある Word・Excel・HTML を、名前・種類・更新日時（新しい順）で返す。本文は返さない。利用者が「先週の○○の表を直して」のように過去のファイルを指したときは、まずこれを呼ぶ。名前・種類・更新日時が合うファイルが一つなら、そのファイル名で read_output_file を呼ぶ。候補が複数あるときは、それらの名前・種類・更新日時を挙げてどれかを利用者に聞いて、答えがあるまで読んだり編集したりしない。検索フォルダや出力フォルダの外は見ない。",
-            "parameters": { "type": "object", "properties": {} }
+            "description": "Argos の出力フォルダにある Word・Excel・HTML（.html と .htm）を、名前・種類・更新日時（新しい順）で返す。本文は返さない。name を渡すと、その文字列を含むファイルだけを、新しい200件より古いものも含めて返す。利用者が「先週の○○の表を直して」のように過去のファイルを指したときは、まずこれを呼ぶ。名前・種類・更新日時が合うファイルが一つなら、そのファイル名で read_output_file を呼ぶ。候補が複数あるときは、それらの名前・種類・更新日時を挙げてどれかを利用者に聞いて、答えがあるまで読んだり編集したりしない。検索フォルダや出力フォルダの外は見ない。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "ファイル名の一部。空なら新しい順に最大200件。指定すると、それより古いファイルもこの語を含むものだけ返す。" }
+                }
+            }
         }
     })
 }
@@ -248,7 +310,7 @@ fn read_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_READ_OUTPUT,
-            "description": "出力フォルダにある Word・Excel・HTML の中身を、添付なしで読む。filename は list_output_files で見たファイル名だけ。パスは渡さない。Word と Excel は本文、HTML はソースを返す。出力フォルダの外、シンボリックリンクで外へ出るパス、検索フォルダのファイルは読めない。対象が一つに決まってから、編集の前に呼ぶ。",
+            "description": "出力フォルダにある Word・Excel・HTML（.html と .htm）の中身を、添付なしで読む。filename は list_output_files で見たファイル名だけ。パスは渡さない。Word と Excel は本文、HTML はソースを返す。HTML が文脈に入りきらないときはソースを返さず、edit_html には渡させない。出力フォルダの外、シンボリックリンクで外へ出るパス、検索フォルダのファイルは読めない。対象が一つに決まってから、編集の前に呼ぶ。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -267,6 +329,8 @@ mod tests {
     use crate::llm::create_office::{output_dir, write_docx, write_xlsx};
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
+
+    const CONTEXT: usize = crate::db::DEFAULT_LLM_MAX_CONTEXT_TOKENS as usize;
 
     struct Tmp(PathBuf);
 
@@ -306,7 +370,7 @@ mod tests {
     #[test]
     fn listing_shows_name_kind_and_modified_time_newest_first() {
         let tmp = Tmp::new();
-        assert_eq!(list_for_tool(&tmp.0), EMPTY_LIST);
+        assert_eq!(list_for_tool(&tmp.0, &json!({})), EMPTY_LIST);
         assert!(!output_dir(&tmp.0).exists());
 
         let dir = output_dir(&tmp.0);
@@ -322,7 +386,7 @@ mod tests {
         fs::write(dir.join("子").join("内.docx"), b"x").unwrap();
         fs::write(tmp.0.join("親.docx"), b"outside").unwrap();
 
-        let text = list_for_tool(&tmp.0);
+        let text = list_for_tool(&tmp.0, &json!({}));
         let old_at = format_mtime(UNIX_EPOCH + Duration::from_secs(old));
         let mid_at = format_mtime(UNIX_EPOCH + Duration::from_secs(mid));
         let new_at = format_mtime(UNIX_EPOCH + Duration::from_secs(new));
@@ -363,7 +427,7 @@ mod tests {
                 1_700_000_000 + index as u64,
             );
         }
-        let text = list_for_tool(&tmp.0);
+        let text = list_for_tool(&tmp.0, &json!({}));
         assert!(text.contains(&format!("表{MAX_LISTED}.xlsx")), "{text}");
         assert!(!text.contains("表0.xlsx\t"), "{text}");
         assert!(text.contains("ほかに 1 件あります"), "{text}");
@@ -402,19 +466,19 @@ mod tests {
             fs::read(&html.path).unwrap(),
         ];
 
-        let word = read_for_tool(&tmp.0, &json!({"filename": docx.name}));
+        let word = read_for_tool(&tmp.0, &json!({"filename": docx.name}), CONTEXT);
         assert!(word.contains("りんごが120個"), "{word}");
         assert!(word.contains("種類: Word"), "{word}");
         assert!(word.contains(&docx.name), "{word}");
         assert!(!word.contains(tmp.0.to_str().unwrap()), "{word}");
 
-        let sheet = read_for_tool(&tmp.0, &json!({"filename": xlsx.name}));
+        let sheet = read_for_tool(&tmp.0, &json!({"filename": xlsx.name}), CONTEXT);
         assert!(sheet.contains("一覧"), "{sheet}");
         assert!(sheet.contains("りんご"), "{sheet}");
         assert!(sheet.contains("300"), "{sheet}");
         assert!(sheet.contains("種類: Excel"), "{sheet}");
 
-        let page = read_for_tool(&tmp.0, &json!({"filename": html.name}));
+        let page = read_for_tool(&tmp.0, &json!({"filename": html.name}), CONTEXT);
         assert!(page.contains("<p>手数料 1200</p>"), "{page}");
         assert!(page.contains("種類: HTML"), "{page}");
         assert!(page.contains("edit_html"), "{page}");
@@ -452,7 +516,7 @@ mod tests {
             "notes.txt",
             "",
         ] {
-            let err = read_for_tool(&tmp.0, &json!({"filename": name}));
+            let err = read_for_tool(&tmp.0, &json!({"filename": name}), CONTEXT);
             assert!(
                 err.contains("ファイル名")
                     || err.contains("Word")
@@ -481,7 +545,7 @@ mod tests {
         let path = dir.join("大きい.html");
         fs::write(&path, &body).unwrap();
         let before = fs::read(&path).unwrap();
-        let err = read_for_tool(&tmp.0, &json!({"filename": "大きい.html"}));
+        let err = read_for_tool(&tmp.0, &json!({"filename": "大きい.html"}), CONTEXT);
         assert!(err.contains("大きすぎ"), "{err}");
         assert!(!err.contains('あ'), "{err}");
         assert_eq!(fs::read(&path).unwrap(), before);
@@ -508,11 +572,11 @@ mod tests {
         fs::write(&secret, "外の本文").unwrap();
         std::os::unix::fs::symlink(&outside_dir, output_dir(&tmp.0)).unwrap();
 
-        let listed = list_for_tool(&tmp.0);
+        let listed = list_for_tool(&tmp.0, &json!({}));
         assert!(listed.contains('外'), "{listed}");
         assert!(!listed.contains("秘密.docx"), "{listed}");
         assert!(!listed.contains("外の本文"), "{listed}");
-        let read = read_for_tool(&tmp.0, &json!({"filename": "秘密.docx"}));
+        let read = read_for_tool(&tmp.0, &json!({"filename": "秘密.docx"}), CONTEXT);
         assert!(read.contains('外'), "{read}");
         assert!(!read.contains("外の本文"), "{read}");
         assert_eq!(fs::read_to_string(&secret).unwrap(), "外の本文");
@@ -524,11 +588,11 @@ mod tests {
         fs::write(&file, "外の本文").unwrap();
         std::os::unix::fs::symlink(&file, dir.join("link.docx")).unwrap();
         fs::write(dir.join("残す.docx"), b"keep").unwrap();
-        let listed = list_for_tool(&tmp.0);
+        let listed = list_for_tool(&tmp.0, &json!({}));
         assert!(listed.contains("残す.docx"), "{listed}");
         assert!(!listed.contains("link.docx"), "{listed}");
         assert!(!listed.contains("外の本文"), "{listed}");
-        let read = read_for_tool(&tmp.0, &json!({"filename": "link.docx"}));
+        let read = read_for_tool(&tmp.0, &json!({"filename": "link.docx"}), CONTEXT);
         assert!(read.contains('外'), "{read}");
         assert!(!read.contains("外の本文"), "{read}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "外の本文");
@@ -561,5 +625,112 @@ mod tests {
         assert!(crate::llm::tools::counts_toward_tool_round(&[
             TOOL_READ_OUTPUT
         ]));
+        assert!(schema.contains("ファイル名の一部"), "{schema}");
+    }
+
+    #[test]
+    fn name_filter_finds_a_file_older_than_the_newest_slice() {
+        let tmp = Tmp::new();
+        let dir = output_dir(&tmp.0);
+        fs::create_dir_all(&dir).unwrap();
+        let old = 1_700_000_000u64;
+        touch(&dir, "古い売上表.xlsx", old);
+        for index in 1..=MAX_LISTED {
+            touch(
+                &dir,
+                &format!("表{index}.xlsx"),
+                old + index as u64,
+            );
+        }
+        let all = list_for_tool(&tmp.0, &json!({}));
+        assert!(!all.contains("古い売上表.xlsx"), "{all}");
+        let found = list_for_tool(&tmp.0, &json!({"name": "古い売上"}));
+        let when = format_mtime(UNIX_EPOCH + Duration::from_secs(old));
+        assert!(
+            found.contains(&format!("古い売上表.xlsx\tExcel\t{when}")),
+            "{found}"
+        );
+        assert!(!found.contains("表1.xlsx"), "{found}");
+        let none = list_for_tool(&tmp.0, &json!({"name": "存在しない"}));
+        assert!(none.contains("存在しない"), "{none}");
+        assert!(!none.contains("古い売上表.xlsx"), "{none}");
+    }
+
+    #[test]
+    fn htm_is_listed_and_read_as_html() {
+        let tmp = Tmp::new();
+        let dir = output_dir(&tmp.0);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("手数料.htm");
+        fs::write(&path, "<html><body><p>htm本文</p></body></html>").unwrap();
+        let listed = list_for_tool(&tmp.0, &json!({}));
+        assert!(listed.contains("手数料.htm\tHTML\t"), "{listed}");
+        let read = read_for_tool(&tmp.0, &json!({"filename": "手数料.htm"}), CONTEXT);
+        assert!(read.contains("htm本文"), "{read}");
+        assert!(read.contains("種類: HTML"), "{read}");
+        assert!(read.contains(HTML_SOURCE_NOTE), "{read}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "<html><body><p>htm本文</p></body></html>"
+        );
+    }
+
+    #[test]
+    fn html_that_does_not_fit_the_tool_budget_is_refused_without_a_source() {
+        let tmp = Tmp::new();
+        let dir = output_dir(&tmp.0);
+        fs::create_dir_all(&dir).unwrap();
+        let html = format!(
+            "<html><body><p>{}</p></body></html>",
+            "あ".repeat(20_000)
+        );
+        let path = dir.join("大きい計算.html");
+        fs::write(&path, &html).unwrap();
+        let before = fs::read(&path).unwrap();
+        let min_ctx = crate::db::MIN_LLM_CONTEXT_TOKENS as usize;
+        let refused = read_for_tool(&tmp.0, &json!({"filename": "大きい計算.html"}), min_ctx);
+        assert_eq!(refused, HTML_READ_REFUSAL);
+        assert!(!refused.contains('あ'), "{refused}");
+        assert!(!refused.contains("edit_html の html には"), "{refused}");
+        let full = read_for_tool(&tmp.0, &json!({"filename": "大きい計算.html"}), CONTEXT);
+        assert!(full.contains(HTML_SOURCE_NOTE), "{full}");
+        assert!(full.contains("</html>"), "{full}");
+        assert!(full.contains(&"あ".repeat(100)), "{full}");
+        assert_eq!(
+            deliver_html_read(full, 100, 0),
+            HTML_READ_REFUSAL
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_followup_does_not_leave_a_truncated_html_source() {
+        let source = format!("<html><body>{}</body></html>", "あ".repeat(4_000));
+        let payload = format!(
+            "ファイル: ページ.html\n種類: HTML\n更新日時: 2026-11-01 00:00\n\n{HTML_SOURCE_NOTE}\n{source}"
+        );
+        let mut tool = crate::llm::context::ChatTurn::text("tool", payload);
+        tool.name = Some(TOOL_READ_OUTPUT.into());
+        let mut turns = vec![
+            crate::llm::context::ChatTurn::text("user", "直して"),
+            tool,
+        ];
+        crate::llm::context::fit_followup_request(&mut turns, 400);
+        assert_eq!(turns[1].content, HTML_READ_REFUSAL);
+        assert!(!turns[1].content.contains('あ'));
+        assert!(!turns[1].content.contains("edit_html の html には"));
+
+        let small = format!(
+            "ファイル: ページ.html\n種類: HTML\n更新日時: 2026-11-01 00:00\n\n{HTML_SOURCE_NOTE}\n<html><body><p>短い</p></body></html>"
+        );
+        let mut kept = crate::llm::context::ChatTurn::text("tool", small);
+        kept.name = Some(TOOL_READ_OUTPUT.into());
+        let mut turns = vec![
+            crate::llm::context::ChatTurn::text("user", "直して"),
+            kept,
+        ];
+        crate::llm::context::fit_followup_request(&mut turns, 8_000);
+        assert!(turns[1].content.contains("<p>短い</p>"), "{}", turns[1].content);
+        assert!(turns[1].content.contains(HTML_SOURCE_NOTE));
     }
 }
