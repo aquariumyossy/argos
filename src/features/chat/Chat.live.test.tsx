@@ -418,7 +418,8 @@ describe("background generation", () => {
     });
     expect(screen.queryByText("完成した回答")).toBeNull();
     expect(screen.getByText("別スレッドの発言")).toBeTruthy();
-    expect(screen.getByText(meterB)).toBeTruthy();
+    // The meter waits 200ms after a thread switch. A fixed 50ms pause loses that race.
+    expect(await screen.findByText(meterB)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "契約の相談" }));
     await screen.findByText("完成した回答");

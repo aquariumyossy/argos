@@ -36,6 +36,7 @@ import {
   shouldFollowScrollToBottom,
   type LiveGeneration,
 } from "./chatLive";
+import { answerCompletenessLabel } from "./answerCompleteness";
 import { noticeFromSend, SummaryAfterMessage } from "./conversationSummary";
 import {
   composerFocusLanded,
@@ -105,7 +106,8 @@ type LlmMessageRow = {
   toolCalls?: string;
   toolCallId?: string;
   toolName?: string;
-  /** "notice" is shown in the chat and left out of the token estimate. */
+  /** "notice" is shown in the chat and left out of the token estimate.
+   *  "retried" / "continued" / "incomplete" stay in the transcript and carry a small label. */
   kind?: string;
 };
 
@@ -2285,6 +2287,8 @@ export default function Chat() {
               const office =
                 m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
+              const completeness =
+                m.role === "assistant" && !isNotice ? answerCompletenessLabel(m.kind) : "";
               const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
               const cards = officeCards.get(m.id) ?? [];
               const roleClass =
@@ -2332,6 +2336,9 @@ export default function Chat() {
                     </>
                   ) : m.role === "assistant" ? (
                     <>
+                      {completeness ? (
+                        <p className="chat-answer-flag">{completeness}</p>
+                      ) : null}
                       {calls.length > 0 ? (
                         <p className="chat-tool-hint">{calls.join("、")}</p>
                       ) : null}

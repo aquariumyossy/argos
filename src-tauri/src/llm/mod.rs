@@ -2,6 +2,7 @@
 
 pub mod articles;
 pub mod commands;
+pub mod completeness;
 pub mod context;
 pub mod create_html;
 pub mod create_office;
@@ -629,7 +630,12 @@ pub async fn stream_chat(
                 .json(&body),
             &settings.llm_api_key,
         );
-        let resp = req.send().await.map_err(|e| map_reqwest_error(&e))?;
+        let resp = req.send().await.map_err(|e| {
+            if cancel.load(Ordering::SeqCst) {
+                return "cancelled".into();
+            }
+            map_reqwest_error(&e)
+        })?;
         if resp.status() == reqwest::StatusCode::BAD_REQUEST && include_thinking {
             // Servers that do not understand the thinking fields reject them.
             let _ = resp.text().await;
@@ -675,15 +681,26 @@ pub async fn stream_chat(
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200).min(remaining)) => {}
             chunk = stream.next() => {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err("cancelled".into());
+                }
                 let Some(chunk) = chunk else {
                     break;
                 };
-                let bytes = chunk.map_err(|e| map_reqwest_error(&e))?;
+                let bytes = chunk.map_err(|e| {
+                    if cancel.load(Ordering::SeqCst) {
+                        return "cancelled".into();
+                    }
+                    map_reqwest_error(&e)
+                })?;
                 buf.push_str(&String::from_utf8_lossy(&bytes));
                 drain_sse_lines(&mut buf, &mut parse, runaway_chars, &mut on_delta)?;
                 last = Instant::now();
             }
         }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
     }
     if !buf.trim().is_empty() {
         let rest = buf.trim();

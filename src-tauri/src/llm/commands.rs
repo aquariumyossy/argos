@@ -1143,6 +1143,8 @@ async fn llm_send_inner<R: Runtime>(
     let mut phantom_retried = false;
     let mut rounds = 0usize;
     let mut model_rounds = 0usize;
+    // A tool round, a saved file, or a note write. A short report is then a finished answer.
+    let mut produced_work = false;
     let mut law_calls = 0usize;
     let mut verified_cites: Vec<crate::statute::VerifiedCite> = Vec::new();
     let max_rounds = tools::max_tool_rounds(settings.llm_max_tool_rounds);
@@ -1157,6 +1159,7 @@ async fn llm_send_inner<R: Runtime>(
     // return the same text and do not send the pixels again.
     let mut vision_blocked = false;
     let mut final_reasoning = String::new();
+    let mut final_finish_reason = String::new();
     let mut round_limit_final = false;
     let mut round_limit_aside: Option<String> = None;
     let mut empty_reply = false;
@@ -1437,6 +1440,7 @@ async fn llm_send_inner<R: Runtime>(
                         let finished = tools::round_limit_answer(Some(answer_body), max_rounds);
                         if finished.notice.is_some() {
                             final_reasoning = out.reasoning;
+                            final_finish_reason = out.finish_reason.clone();
                         }
                         result_text = finished.text;
                         round_limit_aside = finished.notice;
@@ -1452,6 +1456,7 @@ async fn llm_send_inner<R: Runtime>(
                     } else {
                         empty_reply = true;
                         final_reasoning = out.reasoning;
+                        final_finish_reason = out.finish_reason.clone();
                         result_text = silent_end_notice(&out.finish_reason);
                     }
                     break;
@@ -1463,6 +1468,7 @@ async fn llm_send_inner<R: Runtime>(
                     let _ = llm::refresh_thinking_budget(&settings, Some(&out.request_id)).await;
                 }
                 if use_tools && !out.tool_calls.is_empty() {
+                    produced_work = true;
                     let names: Vec<&str> = out
                         .tool_calls
                         .iter()
@@ -1826,11 +1832,13 @@ async fn llm_send_inner<R: Runtime>(
                         } else {
                             empty_reply = true;
                             final_reasoning = out.reasoning;
+                            final_finish_reason = out.finish_reason.clone();
                             result_text = silent_end_notice(&out.finish_reason);
                         }
                     }
                     PhantomRetryAnswer::Retry => {
                         final_reasoning = out.reasoning;
+                        final_finish_reason = out.finish_reason.clone();
                         result_text = out.content;
                     }
                 }
@@ -1839,12 +1847,57 @@ async fn llm_send_inner<R: Runtime>(
         }
     }
 
+    let app_notice = (round_limit_final && round_limit_aside.is_none()) || empty_reply;
+    let rewritten = rewrite_incomplete_answer(
+        app,
+        &settings,
+        &mut current_turns,
+        inject_budget,
+        cancel.clone(),
+        &request_id,
+        &thread.id,
+        &content,
+        result_text,
+        final_reasoning,
+        final_finish_reason,
+        app_notice,
+        empty_reply,
+        produced_work,
+    )
+    .await;
+    let answer_flag;
+    let send_cancelled;
+    let cited_body;
+    (
+        result_text,
+        final_reasoning,
+        empty_reply,
+        answer_flag,
+        send_cancelled,
+        cited_body,
+    ) = match rewritten {
+        Rewrite::Done(next) => (
+            next.content,
+            next.reasoning,
+            next.empty_reply,
+            next.flag,
+            next.cancelled,
+            next.cited_body,
+        ),
+    };
+
     result_text = crate::statute::mark_unverified(&result_text, &verified_cites);
 
     busy.finish();
     kick_pending_ocr(&app, state_arc.clone());
 
-    let result_kind = if (round_limit_final && round_limit_aside.is_none()) || empty_reply {
+    let result_kind = if answer_flag == llm::completeness::KIND_RETRIED
+        || answer_flag == llm::completeness::KIND_CONTINUED
+    {
+        answer_flag
+    } else if answer_flag == llm::completeness::KIND_INCOMPLETE && !empty_reply {
+        llm::completeness::KIND_INCOMPLETE
+    } else if (round_limit_final && round_limit_aside.is_none()) || empty_reply {
         crate::db::LLM_MESSAGE_NOTICE
     } else {
         ""
@@ -1863,6 +1916,11 @@ async fn llm_send_inner<R: Runtime>(
     if let Some(notice) = round_limit_aside.as_deref() {
         let _ = state.db.insert_llm_notice(&thread.id, notice);
     }
+    if answer_flag == llm::completeness::KIND_INCOMPLETE && empty_reply {
+        let _ = state
+            .db
+            .insert_llm_notice(&thread.id, llm::completeness::INCOMPLETE_MARK);
+    }
     if let Some(notice) =
         cut_hold.notice(result_kind == crate::db::LLM_MESSAGE_NOTICE, &result_text)
     {
@@ -1879,7 +1937,12 @@ async fn llm_send_inner<R: Runtime>(
         let _ = state.db.insert_llm_notice(&thread.id, &unset_notice);
     }
     if let Some(assistant) = assistant_message.as_ref() {
-        let cited = citations_for_saved_answer(&consumed, &result_text, kept_source_ids.as_ref());
+        let cited = citations_kept_for_answer(
+            &consumed,
+            &result_text,
+            &cited_body,
+            kept_source_ids.as_ref(),
+        );
         if !cited.is_empty() {
             state
                 .db
@@ -1898,7 +1961,7 @@ async fn llm_send_inner<R: Runtime>(
         thread,
         user_message,
         assistant_message,
-        cancelled: false,
+        cancelled: send_cancelled,
         error: None,
         truncated,
         context_tokens,
@@ -3481,6 +3544,217 @@ fn citations_for_saved_answer(
     cited
 }
 
+/// Cites in the saved text, plus cites that only the pre-retry body still names.
+fn citations_kept_for_answer(
+    consumed: &[(String, i64)],
+    saved: &str,
+    earlier: &str,
+    existed: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, i64)> {
+    let mut cited = citations_for_saved_answer(consumed, saved, existed);
+    if earlier.trim().is_empty() {
+        return cited;
+    }
+    for extra in citations_for_saved_answer(consumed, earlier, existed) {
+        if !cited.iter().any(|(id, _)| id == &extra.0) {
+            cited.push(extra);
+        }
+    }
+    cited
+}
+
+struct RewrittenAnswer {
+    content: String,
+    reasoning: String,
+    empty_reply: bool,
+    /// Empty, [`llm::completeness::KIND_RETRIED`], [`llm::completeness::KIND_CONTINUED`],
+    /// or [`llm::completeness::KIND_INCOMPLETE`].
+    flag: &'static str,
+    cancelled: bool,
+    /// Text whose `[n]` must stay bound even when `content` replaced it.
+    cited_body: String,
+}
+
+enum Rewrite {
+    Done(RewrittenAnswer),
+}
+
+fn kept_original(
+    content: String,
+    reasoning: String,
+    empty_reply: bool,
+    cancelled: bool,
+) -> Rewrite {
+    let flag = if content.trim().is_empty() && empty_reply {
+        ""
+    } else {
+        llm::completeness::KIND_INCOMPLETE
+    };
+    Rewrite::Done(RewrittenAnswer {
+        cited_body: content.clone(),
+        content,
+        reasoning,
+        empty_reply,
+        flag,
+        cancelled,
+    })
+}
+
+/// One extra completion when the finished body fails the completeness check.
+/// Thinking and tools stay off. A cut-off answer is continued; anything else is
+/// rewritten. A failed or cancelled second call keeps the first answer.
+async fn rewrite_incomplete_answer<R: Runtime>(
+    app: &AppHandle<R>,
+    settings: &crate::db::Settings,
+    turns: &mut Vec<ChatTurn>,
+    inject_budget: usize,
+    cancel: Arc<AtomicBool>,
+    request_id: &str,
+    thread_id: &str,
+    question: &str,
+    content: String,
+    reasoning: String,
+    finish_reason: String,
+    app_notice: bool,
+    empty_reply: bool,
+    produced_work: bool,
+) -> Rewrite {
+    let problem = llm::completeness::finished_answer_problem(
+        question,
+        &content,
+        &reasoning,
+        &finish_reason,
+        app_notice,
+        empty_reply,
+        produced_work,
+    );
+    let mut gate = llm::completeness::CompletenessRetry::new();
+    if problem.is_none() || gate.observe(true) != llm::completeness::CompletenessStep::RetryOnce {
+        return Rewrite::Done(RewrittenAnswer {
+            content,
+            reasoning,
+            empty_reply,
+            flag: "",
+            cancelled: false,
+            cited_body: String::new(),
+        });
+    }
+    let continue_answer = problem == Some(llm::completeness::AnswerProblem::Truncated);
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return kept_original(content, reasoning, empty_reply, true);
+    }
+
+    let prompt = if continue_answer {
+        llm::completeness::continuation_retry_prompt(&reasoning)
+    } else {
+        llm::completeness::conclusion_retry_prompt(&reasoning)
+    };
+    if !empty_reply && !content.trim().is_empty() {
+        turns.push(ChatTurn::text("assistant", content.clone()));
+    }
+    turns.push(ChatTurn::text("user", prompt));
+    crate::llm::context::fit_followup_request(turns, inject_budget);
+    emit_chat_reset(app, request_id, thread_id);
+    let _ = app.emit(
+        "llm-chat-delta",
+        LlmChatDelta {
+            request_id: request_id.to_string(),
+            thread_id: thread_id.to_string(),
+            text: if continue_answer {
+                llm::completeness::CONTINUE_STATUS
+            } else {
+                llm::completeness::RETRY_STATUS
+            }
+            .into(),
+            kind: "status".into(),
+        },
+    );
+
+    // Thinking off on every completeness retry. Leaving it on repeats a runaway
+    // think and then throws the first answer away.
+    let mut thinking_off = settings.clone();
+    thinking_off.llm_thinking = "off".into();
+    let app2 = app.clone();
+    let req = request_id.to_string();
+    let tid = thread_id.to_string();
+    let streamed = llm::stream_chat(
+        &thinking_off,
+        turns,
+        cancel,
+        None,
+        llm::runaway_chars_for(&settings.llm_base_url),
+        Some(false),
+        None,
+        move |kind, delta| {
+            let _ = app2.emit(
+                "llm-chat-delta",
+                LlmChatDelta {
+                    request_id: req.clone(),
+                    thread_id: tid.clone(),
+                    text: delta.to_string(),
+                    kind: kind.to_string(),
+                },
+            );
+        },
+    )
+    .await;
+    if let Err(error) = &streamed {
+        return kept_original(
+            content,
+            reasoning,
+            empty_reply,
+            llm::is_cancelled_error(error),
+        );
+    }
+    let out = match streamed {
+        Ok(out) if !out.content.trim().is_empty() => out,
+        _ => return kept_original(content, reasoning, empty_reply, false),
+    };
+    // A cut-off answer stays as written. The continuation is appended under it.
+    // length / max_tokens, or a continuation that still stops midway, is incomplete.
+    if continue_answer {
+        let appended = llm::completeness::append_continuation(&content, &out.content);
+        // The saved text closes an open fence and may open it again. Judge the
+        // cut on that combined body, not on the continuation's fence lines alone.
+        let unfinished = llm::completeness::assess_answer(
+            question,
+            &appended,
+            &out.reasoning,
+            &out.finish_reason,
+        ) == Some(llm::completeness::AnswerProblem::Truncated);
+        return Rewrite::Done(RewrittenAnswer {
+            cited_body: content,
+            content: appended,
+            reasoning,
+            empty_reply: false,
+            flag: if unfinished {
+                llm::completeness::KIND_INCOMPLETE
+            } else {
+                llm::completeness::KIND_CONTINUED
+            },
+            cancelled: false,
+        });
+    }
+    let problem = llm::completeness::assess_answer(
+        question,
+        &out.content,
+        &out.reasoning,
+        &out.finish_reason,
+    );
+    let second_bad = problem.is_some();
+    if second_bad || gate.observe(second_bad) != llm::completeness::CompletenessStep::Keep {
+        return kept_original(content, reasoning, empty_reply, false);
+    }
+    Rewrite::Done(RewrittenAnswer {
+        cited_body: content,
+        content: out.content,
+        reasoning: out.reasoning,
+        empty_reply: false,
+        flag: llm::completeness::KIND_RETRIED,
+        cancelled: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4964,9 +5238,11 @@ mod tests {
         .into_bytes()
     }
 
-    fn serve_script(script: Vec<Vec<u8>>) -> u16 {
+    fn serve_script(script: Vec<Vec<u8>>) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
         std::thread::spawn(move || {
             for response in script {
                 let Ok((mut sock, _)) = listener.accept() else {
@@ -5005,11 +5281,97 @@ mod tests {
                         Err(_) => break,
                     }
                 }
+                if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[header_end + 4..]).into_owned());
+                }
                 let _ = std::io::Write::write_all(&mut sock, &response);
                 let _ = std::io::Write::flush(&mut sock);
             }
         });
-        port
+        (port, seen)
+    }
+
+    fn read_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(20)));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match std::io::Read::read(sock, &mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    value.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() - (header_end + 4) >= len {
+                            break;
+                        }
+                    }
+                    if buf.len() > 4_000_000 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    /// Scripted replies, then one more connection that is accepted and not answered.
+    /// `held` flips once that last request has been read, so the test can cancel it.
+    fn serve_script_hold_last(
+        script: Vec<Vec<u8>>,
+        on_last: impl FnOnce() + Send + 'static,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for response in script {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let buf = read_http_request(&mut sock);
+                if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[header_end + 4..]).into_owned());
+                }
+                let _ = std::io::Write::write_all(&mut sock, &response);
+                let _ = std::io::Write::flush(&mut sock);
+            }
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let buf = read_http_request(&mut sock);
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                record
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[header_end + 4..]).into_owned());
+            }
+            // The client is now blocked in the stream. Stop it, and keep the
+            // socket up long enough for that stop to win over a dropped connection.
+            on_last();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            drop(sock);
+        });
+        (port, seen)
     }
 
     fn reasoning_over_cap() -> Vec<u8> {
@@ -5020,8 +5382,12 @@ mod tests {
     }
 
     fn content_stop(text: &str) -> Vec<u8> {
+        content_finish(text, "stop")
+    }
+
+    fn content_finish(text: &str, finish: &str) -> Vec<u8> {
         sse_message(serde_json::json!({
-            "choices": [{ "delta": { "content": text }, "finish_reason": "stop" }]
+            "choices": [{ "delta": { "content": text }, "finish_reason": finish }]
         }))
     }
 
@@ -5132,6 +5498,24 @@ mod tests {
         crate::db::LlmThreadRow,
         LlmSendResult,
     ) {
+        let (dir, db, thread, result, _) =
+            send_question(label, max_rounds, script, index, "調べて").await;
+        (dir, db, thread, result)
+    }
+
+    async fn send_question(
+        label: &str,
+        max_rounds: u32,
+        script: Vec<Vec<u8>>,
+        index: bool,
+        question: &str,
+    ) -> (
+        std::path::PathBuf,
+        crate::db::Db,
+        crate::db::LlmThreadRow,
+        LlmSendResult,
+        Vec<String>,
+    ) {
         let dir = std::env::temp_dir().join(format!(
             "argos-send-{label}-{}",
             std::time::SystemTime::now()
@@ -5140,7 +5524,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let port = serve_script(script);
+        let (port, seen) = serve_script(script);
         let state = test_state(&dir, port, max_rounds);
         if index {
             let path = dir.join("contract.txt");
@@ -5161,11 +5545,18 @@ mod tests {
                 .unwrap();
         }
         let app = tauri::test::mock_app();
-        let result = llm_send_inner(app.handle(), &state, None, "調べて".into(), Some(false))
-            .await
-            .expect("llm_send");
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            None,
+            question.to_string(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
         let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
-        (dir, db, result.thread.clone(), result)
+        let requests = seen.lock().unwrap().clone();
+        (dir, db, result.thread.clone(), result, requests)
     }
 
     fn content_and_law() -> Vec<u8> {
@@ -5695,6 +6086,440 @@ mod tests {
                 .all(|source| source.cited_assistant_message_id != answer.id),
             "a source fetched during the retry must not bind to the kept answer: {sources:?}"
         );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn substantive_question() -> String {
+        format!(
+            "賃貸借契約の解除について説明してください。{}\n通知の期限と損害賠償の有無も書いてください。",
+            "要点を落とさず、根拠を分けて書いてください。".repeat(3)
+        )
+    }
+
+    fn rewritten_body() -> String {
+        let sentence = "解除できるのは、相手の債務不履行が契約の目的を達せないほど重大な場合です。事前に通知したうえで解除し、生じた損害は賠償を請求できます。軽微な不履行だけでは解除できません。";
+        format!("{sentence}{sentence}")
+    }
+
+    fn assert_one_user_turn(messages: &[crate::db::LlmMessageRow], question: &str) {
+        let users: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect();
+        assert_eq!(users.len(), 1, "the retry instruction is not stored");
+        assert_eq!(users[0].content, question);
+    }
+
+    #[tokio::test]
+    async fn llm_send_retries_a_short_answer_once_and_keeps_the_rewrite() {
+        let question = substantive_question();
+        let rewritten = rewritten_body();
+        assert_eq!(
+            llm::completeness::assess_answer(&question, "解除は", "", "stop"),
+            Some(llm::completeness::AnswerProblem::ShortBody)
+        );
+        assert_eq!(
+            llm::completeness::assess_answer(&question, &rewritten, "", "stop"),
+            None
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "short-retry",
+            8,
+            vec![content_stop("解除は"), content_stop(&rewritten)],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(!result.cancelled);
+        assert_eq!(
+            requests.len(),
+            2,
+            "a short answer is retried once: {requests:?}"
+        );
+        assert!(!requests[0].contains(llm::completeness::CONCLUSION_HINT));
+        assert!(requests[1].contains(llm::completeness::CONCLUSION_HINT));
+        assert!(
+            requests[1].contains("\"enable_thinking\":false"),
+            "the completeness retry thinks off"
+        );
+        assert!(requests[0].contains("\"tools\""));
+        assert!(
+            !requests[1].contains("\"tools\""),
+            "the retry asks for the conclusion and does not open another tool round"
+        );
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_one_user_turn(&messages, &question);
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, rewritten);
+        assert_eq!(answer.kind, llm::completeness::KIND_RETRIED);
+        assert_eq!(
+            result
+                .assistant_message
+                .as_ref()
+                .map(|message| message.kind.as_str()),
+            Some(llm::completeness::KIND_RETRIED)
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_marks_incomplete_when_the_single_retry_is_still_short() {
+        let question = substantive_question();
+        assert_eq!(
+            llm::completeness::assess_answer(&question, "まだ", "", "stop"),
+            Some(llm::completeness::AnswerProblem::ShortBody)
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "short-still",
+            8,
+            vec![content_stop("解除は"), content_stop("まだ")],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            requests.len(),
+            2,
+            "the second failure must not send a third time"
+        );
+        assert!(requests[1].contains(llm::completeness::CONCLUSION_HINT));
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert_one_user_turn(&messages, &question);
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, "解除は", "a failed retry keeps the first answer");
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.kind == crate::db::LLM_MESSAGE_NOTICE
+                    && message.content == llm::completeness::INCOMPLETE_MARK),
+            "a saved model answer carries the mark on itself"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_does_not_retry_a_short_greeting() {
+        let (dir, db, thread, result, requests) = send_question(
+            "greeting",
+            8,
+            vec![content_stop("こんにちは！")],
+            false,
+            "こんにちは",
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            requests.len(),
+            1,
+            "a greeting must not be retried: {requests:?}"
+        );
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, "こんにちは！");
+        assert_eq!(answer.kind, "");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_retries_once_when_the_body_is_empty_and_reasoning_holds_it() {
+        let question = substantive_question();
+        let rewritten = rewritten_body();
+        let reasoning = "考".repeat(4_000);
+        assert_eq!(
+            llm::completeness::finished_answer_problem(
+                &question,
+                "モデルが本文も操作も返さずに終わりました。",
+                &reasoning,
+                "stop",
+                true,
+                true,
+                false,
+            ),
+            Some(llm::completeness::AnswerProblem::ReasoningHeavy)
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "reason-empty",
+            8,
+            vec![
+                content_with_reasoning("", &reasoning),
+                content_stop(&rewritten),
+            ],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(llm::completeness::CONCLUSION_HINT));
+        assert!(
+            requests[1].contains('考'),
+            "the retry instruction includes the reasoning tail"
+        );
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("本文も操作も返さず")),
+            "a recovered body replaces the empty-reply notice"
+        );
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, rewritten);
+        assert_eq!(answer.kind, llm::completeness::KIND_RETRIED);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_a_short_report_after_tool_work() {
+        let question = substantive_question();
+        let report = "作成しました";
+        assert_eq!(
+            llm::completeness::finished_answer_problem(
+                &question, report, "", "stop", false, false, true
+            ),
+            None
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "tool-report",
+            8,
+            vec![
+                content_and_search("", "OrionContract"),
+                content_stop(report),
+            ],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2, "tool work must not add a shortness retry");
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, report);
+        assert_eq!(answer.kind, "");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_appends_a_continuation_and_keeps_the_first_when_it_fails() {
+        let question = substantive_question();
+        let first = format!("{}、", "分析".repeat(40));
+        let tail = "以上が結論です。解除できます。";
+        assert_eq!(
+            llm::completeness::assess_answer(&question, &first, "", "stop"),
+            Some(llm::completeness::AnswerProblem::Truncated)
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "trunc-append",
+            8,
+            vec![content_stop(&first), content_stop(tail)],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(llm::completeness::CONTINUE_HINT));
+        assert!(requests[1].contains("\"enable_thinking\":false"));
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, tail)
+        );
+        assert!(answer.content.starts_with(&first));
+        assert!(answer.content.contains("\n\n（続き）\n"));
+        assert!(answer.content.ends_with(tail));
+        assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (dir, db, thread, result, requests) = send_question(
+            "trunc-keep",
+            8,
+            vec![
+                content_stop(&first),
+                http_status(500, "Internal Server Error", r#"{"error":"failed"}"#),
+            ],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(!result.cancelled);
+        assert_eq!(requests.len(), 2);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, first);
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_saves_the_joined_body_when_the_continuation_hits_length() {
+        let question = substantive_question();
+        let first = format!("{}、", "分析".repeat(40));
+        let cut_tail = "通知の期限は";
+        let (dir, db, thread, result, requests) = send_question(
+            "trunc-length",
+            8,
+            vec![
+                content_stop(&first),
+                content_finish(cut_tail, "length"),
+            ],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, cut_tail)
+        );
+        assert!(answer.content.starts_with(&first));
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let finished = "以上が結論です。解除できます。";
+        let (dir, db, thread, result, _) = send_question(
+            "trunc-length-done",
+            8,
+            vec![content_stop(&first), content_finish(finished, "max_tokens")],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, finished)
+        );
+        assert!(answer.content.starts_with(&first));
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_appends_a_rewrite_under_the_original() {
+        let question = substantive_question();
+        let opening = "契約を解除するには、相手方の債務不履行が契約及び取引上の社会通念に照らして軽微でないことが必要です。";
+        let first = format!("{opening}根拠は第541条です。通知は、");
+        let rewrite = format!("{opening}催告をしたうえで解除できます。");
+        assert_eq!(
+            llm::completeness::append_continuation(&first, &rewrite),
+            format!("{first}\n\n（続き）\n\n{rewrite}")
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "opening-rewrite",
+            8,
+            vec![content_stop(&first), content_stop(&rewrite)],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, &rewrite)
+        );
+        assert!(answer.content.starts_with(&first));
+        assert!(answer.content.contains("第541条"));
+        assert!(answer.content.contains("催告をしたうえで"));
+        assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_cites_from_a_body_the_retry_replaced() {
+        let question = substantive_question();
+        let first = "根拠は [1] です";
+        let reasoning = "考".repeat(4_000);
+        let rewritten = rewritten_body();
+        assert!(
+            !rewritten.contains("[1]"),
+            "the replacement must not repeat the discarded cite"
+        );
+        let (dir, db, thread, result, requests) = send_question(
+            "cite-keep",
+            8,
+            vec![
+                content_and_search("", "OrionContract"),
+                content_with_reasoning(first, &reasoning),
+                content_stop(&rewritten),
+            ],
+            true,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 3);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, rewritten);
+        assert_eq!(answer.kind, llm::completeness::KIND_RETRIED);
+        let sources = db.list_llm_sources(&thread.id).unwrap();
+        assert!(
+            sources.iter().any(|source| source.cited_assistant_message_id == answer.id),
+            "a cite only in the replaced body must stay: {sources:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_cancel_during_the_retry_saves_the_first_answer() {
+        let question = substantive_question();
+        let first = format!("{}、", "分析".repeat(40));
+        let dir = std::env::temp_dir().join(format!(
+            "argos-send-cancel-retry-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let slot: std::sync::Arc<
+            std::sync::Mutex<Option<std::sync::Arc<crate::state::AppState>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot_for_server = std::sync::Arc::clone(&slot);
+        let (port, _seen) = serve_script_hold_last(vec![content_stop(&first)], move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(state) = slot_for_server.lock().unwrap().clone() {
+                state.cancel_llm();
+            }
+        });
+        let state = test_state(&dir, port, 8);
+        *slot.lock().unwrap() = Some(std::sync::Arc::clone(&state));
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(app.handle(), &state, None, question.clone(), Some(false))
+            .await
+            .expect("llm_send");
+        assert!(result.cancelled, "{:?}", result.error);
+        assert!(result.assistant_message.is_some());
+        let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+        let messages = db.list_llm_messages(&result.thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, first);
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
