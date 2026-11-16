@@ -23,7 +23,18 @@ struct Hit {
     location: String,
 }
 
-pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<ChangeStats, String> {
+pub fn edit(
+    entries: &mut Vec<(String, Vec<u8>)>,
+    req: &EditRequest,
+) -> Result<ChangeStats, String> {
+    let mut owned = req.clone();
+    if owned.revision_author.trim().is_empty() {
+        owned.revision_author = super::office_revision_author("");
+    }
+    if owned.revision_date.trim().is_empty() {
+        owned.revision_date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
+    let req = &owned;
     let mut stories = Vec::new();
     for (index, (name, bytes)) in entries.iter().enumerate() {
         if !is_word_story(name) {
@@ -110,24 +121,97 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
         }
     }
 
+    let markup = req.track_changes
+        || req
+            .replacements
+            .iter()
+            .any(|item| !item.comment.trim().is_empty());
+    let mut next_id = super::revise::max_revision_id(entries).saturating_add(1);
+    let mut made_comments = Vec::new();
+    let mut comment_stories = Vec::new();
+    let mut shape_direct = false;
+    let mut tracked_hits = 0usize;
     for story in &mut stories {
-        for group in story.groups.clone() {
-            let visible = editable_indexes(&story.nodes, &group.visible);
-            let deleted = editable_indexes(&story.nodes, &group.deleted);
-            for (index, item) in req.replacements.iter().enumerate() {
-                let in_visible =
-                    replace_in_group(&mut story.nodes, &visible, &item.find, &item.replace);
-                let in_deleted =
-                    replace_in_group(&mut story.nodes, &deleted, &item.find, &item.replace);
-                if !group.fallback {
-                    super::record_hit(&mut stats, index, in_visible);
-                    super::record_hit(&mut stats, index, in_deleted);
+        if markup {
+            if story.nodes.iter().any(|node| node.dirty) {
+                story.xml = render_nodes(&story.xml, &story.nodes);
+                let (nodes, groups) = scan_story(&story.xml);
+                story.nodes = nodes;
+                story.groups = groups;
+            }
+            let revised = super::revise::revise_story(
+                &story.xml,
+                &story.nodes,
+                &story.groups,
+                req,
+                &mut next_id,
+            );
+            for hit in revised.hits {
+                if hit.record {
+                    super::record_hit(
+                        &mut stats,
+                        hit.index,
+                        super::text::ReplaceHit {
+                            count: hit.count,
+                            exact: hit.exact,
+                            sources: hit.sources,
+                        },
+                    );
+                    if hit.tracked {
+                        tracked_hits += hit.count;
+                    }
                 }
             }
+            if !revised.comments.is_empty() {
+                comment_stories.push(entries[story.entry].0.clone());
+                made_comments.extend(revised.comments);
+            }
+            shape_direct |= revised.shape_direct;
+            story.xml = revised.xml;
+        } else {
+            for group in story.groups.clone() {
+                let visible = editable_indexes(&story.nodes, &group.visible);
+                let deleted = editable_indexes(&story.nodes, &group.deleted);
+                for (index, item) in req.replacements.iter().enumerate() {
+                    let in_visible =
+                        replace_in_group(&mut story.nodes, &visible, &item.find, &item.replace);
+                    let in_deleted =
+                        replace_in_group(&mut story.nodes, &deleted, &item.find, &item.replace);
+                    if !group.fallback {
+                        super::record_hit(&mut stats, index, in_visible);
+                        super::record_hit(&mut stats, index, in_deleted);
+                    }
+                }
+            }
+            story.xml = render_nodes(&story.xml, &story.nodes);
         }
-        story.xml = render_nodes(&story.xml, &story.nodes);
         story.xml = rewrite_story_attrs(&story.xml, req, &mut stats);
         entries[story.entry].1 = std::mem::take(&mut story.xml).into_bytes();
+    }
+    if !made_comments.is_empty() {
+        super::revise::install_comments(
+            entries,
+            &made_comments,
+            &req.revision_author,
+            &req.revision_date,
+            &comment_stories,
+        );
+    }
+    if tracked_hits > 0 {
+        stats.notes.push(format!(
+            "変更履歴: 作成者「{}」で記録しました。",
+            req.revision_author
+        ));
+    }
+    if !made_comments.is_empty() {
+        stats
+            .notes
+            .push(format!("コメント: {} 件", made_comments.len()));
+    }
+    if shape_direct && req.track_changes {
+        stats
+            .notes
+            .push("図形の文字は変更履歴にできないため、文字だけ置換しました。".into());
     }
     super::edit_doc_props(entries, req, &mut stats);
     fill_near_misses(entries, &mut stats);
@@ -270,7 +354,11 @@ fn paragraph_locations(label: &str, groups: &[ParaGroup], nodes: &[TextNode]) ->
         .collect()
 }
 
-pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>, bool) {
+pub fn check(
+    entries: &[(String, Vec<u8>)],
+    probes: &[Probe],
+    own_revision: Option<(&str, &str)>,
+) -> (Vec<Leftover>, bool) {
     let mut leftovers = Vec::new();
     let mut truncated = false;
     for (name, bytes) in entries {
@@ -286,7 +374,21 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                     continue;
                 }
                 let visible = editable_joined(&nodes, &group.visible);
-                let deleted = editable_joined(&nodes, &group.deleted);
+                let own_ranges = own_revision
+                    .map(|(author, date)| super::revise::own_del_ranges(&xml, author, date))
+                    .unwrap_or_default();
+                let deleted_ids: Vec<usize> = group
+                    .deleted
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        nodes[index].locked.is_none()
+                            && !own_ranges.iter().any(|(start, end)| {
+                                *start <= nodes[index].open_start && nodes[index].open_start < *end
+                            })
+                    })
+                    .collect();
+                let deleted = joined(&nodes, &deleted_ids);
                 let location = if group.local == "rt" {
                     format!("{label}のルビ")
                 } else if is_body_paragraph(group) {

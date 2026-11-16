@@ -64,6 +64,7 @@ type SettingsData = {
   searxngUrl: string;
   searxngTimeoutMs: number;
   llmWebSearchTopK: number;
+  officeRevisionAuthor: string;
 };
 
 type FolderRow = {
@@ -417,6 +418,7 @@ function normalizeSettings(s: SettingsData): SettingsData {
   } else {
     s.llmWebSearchTopK = Math.min(8, Math.max(1, Math.round(s.llmWebSearchTopK)));
   }
+  if (typeof s.officeRevisionAuthor !== "string") s.officeRevisionAuthor = "";
   return s;
 }
 
@@ -3164,6 +3166,23 @@ export default function Settings() {
               </label>
               <p className="field-hint">
                 モデルが検索などの操作を繰り返せる回数です。上限に達するとチャットに知らせて止まります。
+              </p>
+              <label>
+                <span className="field-label">変更履歴の作成者</span>
+                <span className="field-leader" aria-hidden="true" />
+                <input
+                  value={settings.officeRevisionAuthor}
+                  onChange={(e) =>
+                    setSettings({
+                      ...settings,
+                      officeRevisionAuthor: e.target.value,
+                    })
+                  }
+                  placeholder="Argos"
+                />
+              </label>
+              <p className="field-hint">
+                Word を変更履歴として直すときと、そのコメントに付く名前です。空なら Argos。
               </p>
               <label>
                 <span className="field-label">コンテキスト上限（トークン）</span>

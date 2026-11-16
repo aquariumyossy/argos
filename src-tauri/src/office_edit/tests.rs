@@ -2104,3 +2104,380 @@ fn paragraph_rewrite_of_a_text_box_updates_the_fallback_without_counting_twice()
     assert!(document.contains("残す段落。"), "{document}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn tracked(items: &[(&str, &str, &str)], author: &str) -> EditRequest {
+    let mut req = EditRequest::from_args(&json!({
+        "tracked": true,
+        "replacements": items.iter().map(|(find, replace, comment)| json!({
+            "find": find,
+            "replace": replace,
+            "comment": comment,
+        })).collect::<Vec<_>>(),
+    }))
+    .unwrap();
+    if !author.is_empty() {
+        req.revision_author = author.into();
+    }
+    req.revision_date = "2026-11-16T00:00:00Z".into();
+    req
+}
+
+#[test]
+fn blank_revision_author_is_argos() {
+    assert_eq!(super::office_revision_author(""), "Argos");
+    assert_eq!(super::office_revision_author(" 　 "), "Argos");
+    assert_eq!(super::office_revision_author(" 山田 "), "山田");
+}
+
+#[test]
+fn tracked_replacement_records_deletion_and_insertion() {
+    let dir = temp_dir("track");
+    let src = dir.join("契約書.docx");
+    let document =
+        word_body(r#"<w:p><w:r><w:t>山</w:t></w:r><w:r><w:t>田太郎である。</w:t></w:r></w:p>"#);
+    let core = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:creator>山田太郎</dc:creator>
+</cp:coreProperties>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("docProps/core.xml", core),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-00-00",
+        &tracked(&[("山田太郎", "佐藤花子", "")], ""),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("<w:del "), "{document}");
+    assert!(document.contains("<w:ins "), "{document}");
+    assert!(document.contains("w:author=\"Argos\""), "{document}");
+    assert!(
+        document.contains("w:date=\"2026-11-16T00:00:00Z\""),
+        "{document}"
+    );
+    assert!(document.contains("<w:delText>山</w:delText>"), "{document}");
+    assert!(
+        document.contains("<w:delText>田太郎</w:delText>"),
+        "{document}"
+    );
+    assert!(document.contains("<w:t>佐藤花子</w:t>"), "{document}");
+    assert!(document.contains("である。"), "{document}");
+    assert!(
+        edited
+            .report
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("変更履歴: 作成者「Argos」で記録しました。"),
+        "{}",
+        edited.report
+    );
+    assert!(edited.report.contains("残存: なし"), "{}", edited.report);
+    let core = read_entry(&edited.path, "docProps/core.xml");
+    assert!(core.contains("佐藤花子"), "{core}");
+    assert!(!core.contains("山田太郎"), "{core}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tracked_replacement_keeps_siblings_in_the_same_run() {
+    let dir = temp_dir("track-br");
+    let src = dir.join("契約書.docx");
+    let document = word_body(
+        r#"<w:p><w:r><w:tab/><w:t>山田太郎</w:t><w:br/></w:r><w:r><w:t>である。</w:t></w:r></w:p>"#,
+    );
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-05-00",
+        &tracked(&[("山田太郎", "佐藤花子", "")], ""),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("<w:tab"), "{document}");
+    assert!(document.contains("<w:br"), "{document}");
+    assert!(
+        document.contains("<w:delText>山田太郎</w:delText>"),
+        "{document}"
+    );
+    assert!(document.contains("<w:t>佐藤花子</w:t>"), "{document}");
+    assert!(document.contains("である。"), "{document}");
+    let tab = document.find("<w:tab").expect(&document);
+    let deleted = document.find("<w:del ").expect(&document);
+    let inserted = document.find("<w:ins ").expect(&document);
+    let br = document.find("<w:br").expect(&document);
+    assert!(tab < deleted && inserted < br, "{document}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tracked_comment_is_anchored_and_uses_the_setting_author() {
+    let dir = temp_dir("track-cmt");
+    let src = dir.join("契約書.docx");
+    let document = word_body(r#"<w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>"#);
+    let header = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="{W}"><w:p><w:r><w:t>ヘッダーの山田太郎</w:t></w:r></w:p></w:hdr>"#
+    );
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>"#;
+    let types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/header1.xml", header.as_str()),
+            ("word/_rels/document.xml.rels", rels),
+            ("[Content_Types].xml", types),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-10-00",
+        &tracked(&[("山田太郎", "佐藤花子", "当事者名を改めた")], "審査太郎"),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("w:author=\"審査太郎\""), "{document}");
+    assert!(document.contains("<w:commentRangeStart "), "{document}");
+    assert!(document.contains("<w:commentReference "), "{document}");
+    let prefix = document.find("<w:t>本文の</w:t>").expect(&document);
+    let anchor = document.find("<w:commentRangeStart ").expect(&document);
+    assert!(prefix < anchor, "{document}");
+    let span = &document[anchor..document.find("<w:commentReference ").expect(&document)];
+    assert!(span.contains("<w:delText>山田太郎</w:delText>"), "{span}");
+    assert!(span.contains("<w:t>佐藤花子</w:t>"), "{span}");
+    let header = read_entry(&edited.path, "word/header1.xml");
+    assert!(
+        header.contains("<w:delText>ヘッダーの山田太郎</w:delText>")
+            || header.contains("ヘッダーの"),
+        "{header}"
+    );
+    assert!(header.contains("佐藤花子"), "{header}");
+    assert!(header.contains("<w:ins "), "{header}");
+    let comments = read_entry(&edited.path, "word/comments.xml");
+    assert!(comments.contains("当事者名を改めた"), "{comments}");
+    assert!(comments.contains("w:author=\"審査太郎\""), "{comments}");
+    let rels = read_entry(&edited.path, "word/_rels/document.xml.rels");
+    assert!(rels.contains("comments.xml"), "{rels}");
+    assert!(rels.contains("header1.xml"), "{rels}");
+    let header_rels = read_entry(&edited.path, "word/_rels/header1.xml.rels");
+    assert!(header_rels.contains("comments.xml"), "{header_rels}");
+    let types = read_entry(&edited.path, "[Content_Types].xml");
+    assert!(types.contains("/word/comments.xml"), "{types}");
+    assert!(types.contains("/word/document.xml"), "{types}");
+    assert!(
+        edited.report.contains("コメント: 2 件"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所"),
+        "{}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn comment_without_tracked_changes_does_not_wrap_a_deletion() {
+    let dir = temp_dir("cmt-plain");
+    let src = dir.join("メモ.docx");
+    let document = word_body(r#"<w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>"#);
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let mut req = EditRequest::from_args(&json!({
+        "replacements": [{"find": "山田太郎", "replace": "佐藤花子", "comment": "確認"}]
+    }))
+    .unwrap();
+    req.revision_date = "2026-11-16T00:00:00Z".into();
+    let edited = edit_path(&src, &dir.join("out"), "2026-11-16 18-20-00", &req).unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("佐藤花子"), "{document}");
+    assert!(!document.contains("<w:del "), "{document}");
+    assert!(document.contains("<w:commentRangeStart "), "{document}");
+    assert!(read_entry(&edited.path, "word/comments.xml").contains("確認"));
+    assert!(
+        edited.report.contains("コメント: 1 件"),
+        "{}",
+        edited.report
+    );
+    assert!(!edited.report.contains("変更履歴:"), "{}", edited.report);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tracked_whitespace_in_a_text_box_keeps_the_source_bytes() {
+    let dir = temp_dir("track-ws");
+    let src = dir.join("枠.docx");
+    let document = story_part(
+        "w:document",
+        &format!(
+            r#"<w:body><w:p><w:r>{}</w:r></w:p></w:body>"#,
+            alt_box("山田　太郎")
+        ),
+    );
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-30-00",
+        &tracked(&[("山田 太郎", "佐藤花子", "")], ""),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("山田　太郎"), "{document}");
+    assert!(document.contains("<w:delText"), "{document}");
+    assert!(document.contains("佐藤花子"), "{document}");
+    assert_eq!(document.matches("<w:ins ").count(), 2, "{document}");
+    assert!(edited.report.contains("空白の違い 1"), "{}", edited.report);
+    assert!(
+        edited.report.contains("『山田　太郎』"),
+        "{}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_says_tracked_changes_and_comments_do_not_apply() {
+    let dir = temp_dir("track-xlsx");
+    let src = dir.join("一覧.xlsx");
+    let shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>山田太郎</t></si></sst>"#;
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>
+</worksheet>"#;
+    write_zip(
+        &src,
+        &[
+            ("xl/sharedStrings.xml", shared),
+            ("xl/worksheets/sheet1.xml", sheet),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-40-00",
+        &tracked(&[("山田太郎", "佐藤花子", "メモ")], ""),
+    )
+    .unwrap();
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(shared.contains("佐藤花子"), "{shared}");
+    assert!(!shared.contains("山田太郎"), "{shared}");
+    assert!(
+        edited.report.contains(
+            "変更履歴としての記録とコメントは Excel では使えません。文字だけ置換しました。"
+        ),
+        "{}",
+        edited.report
+    );
+    let missed = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-41-00",
+        &tracked(&[("存在しない語", "別の語", "メモ")], ""),
+    )
+    .unwrap_err();
+    assert!(missed.contains("見つかりませんでした"), "{missed}");
+    assert!(
+        missed.contains(
+            "変更履歴としての記録とコメントは Excel では使えません。文字だけ置換しました。"
+        ),
+        "{missed}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tracked_shape_text_stays_a_direct_replacement() {
+    let dir = temp_dir("track-shape");
+    let src = dir.join("図.docx");
+    let document = story_part(
+        "w:document",
+        r#"<w:body>
+    <w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>
+    <w:p><w:r><w:drawing><a:txBody><a:p><a:r><a:t>図形の山田太郎</a:t></a:r></a:p></a:txBody></w:drawing></w:r></w:p>
+  </w:body>"#,
+    );
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 18-50-00",
+        &tracked(&[("山田太郎", "佐藤花子", "")], ""),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("<w:t>本文の</w:t>"), "{document}");
+    assert!(
+        document.contains("<w:delText>山田太郎</w:delText>"),
+        "{document}"
+    );
+    assert!(document.contains("<w:ins "), "{document}");
+    assert!(document.contains("<a:t>図形の佐藤花子</a:t>"), "{document}");
+    assert!(
+        !document.contains("<a:t>図形の山田太郎</a:t>"),
+        "{document}"
+    );
+    assert!(
+        edited
+            .report
+            .contains("図形の文字は変更履歴にできないため、文字だけ置換しました。"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所"),
+        "{}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tracked_output_accepts_a_follow_up_edit() {
+    let dir = temp_dir("track-chain");
+    let src = dir.join("契約書.docx");
+    let document =
+        word_body(r#"<w:p><w:r><w:t>山</w:t></w:r><w:r><w:t>田太郎である。</w:t></w:r></w:p>"#);
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let first = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 19-00-00",
+        &tracked(&[("山田太郎", "佐藤花子", "")], ""),
+    )
+    .unwrap();
+    let mut again = request(&[("佐藤花子", "鈴木一郎")], &[]);
+    again.revision_date = "2026-11-16T01:00:00Z".into();
+    let second = edit_path(&first.path, &dir.join("out"), "2026-11-16 19-10-00", &again).unwrap();
+    let document = read_entry(&second.path, "word/document.xml");
+    assert!(document.contains("鈴木一郎"), "{document}");
+    assert!(document.contains("である。"), "{document}");
+    assert!(document.contains("<w:delText>山</w:delText>"), "{document}");
+    assert!(
+        document.contains("<w:delText>田太郎</w:delText>"),
+        "{document}"
+    );
+    assert!(!document.contains("佐藤花子である。"), "{document}");
+    assert!(second.report.contains("残存: なし"), "{}", second.report);
+    let _ = fs::remove_dir_all(&dir);
+}

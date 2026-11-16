@@ -398,7 +398,7 @@ pub fn tools_schema(
         "function": {
             "name": TOOL_EDIT_OFFICE,
             "description": "添付の .docx / .xlsx、または出力フォルダにある .docx / .xlsx を編集し、元ファイルは変えず新しいファイルを保存する。確認は取らない。書式・表・フォントは残し文字だけ変える。1回の呼び出しに編集をすべて入れる。前回の編集でファイルが保存されて残った箇所を直すときは、元の添付からやり直さず、この会話の前回の出力ファイル名を filename に渡して続きを編集する。結果が「見つかりませんでした」でファイルが保存されていないときは、直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。まだ編集していない添付は、その添付から作る。出力フォルダのファイルを直すときは、選んだそのファイルを編集する。.doc と .xls は対象外。\
-replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・テキストボックス・図形・コメント・変更履歴の文字（複数のランに分かれた名前を含む。テキストボックスと図形は本文・ヘッダー・フッター・脚注・文末脚注の中）。履歴としては記録しない。グラフと SmartArt（図）は「このツールでは変更できない場所」のまま。Excel は全シートのセルとシート名。\
+replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・テキストボックス・図形・コメント・変更履歴の文字（複数のランに分かれた名前を含む。テキストボックスと図形は本文・ヘッダー・フッター・脚注・文末脚注の中）。tracked を true にすると、Word の置換は直接書き換えず変更履歴（削除と挿入）として残す。各 replacement の comment があれば、その置換箇所にコメントを付ける。作成者は設定の名前で、空なら Argos。Excel では tracked と comment は使えず、文字だけ置換したと結果に書く。グラフと SmartArt（図）は「このツールでは変更できない場所」のまま。Excel は全シートのセルとシート名。\
 paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
 cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダのファイルは filename にファイル名だけを渡す（例: 売上集計.xlsx）。filename があるときは、同じ名前の添付や別の cite_no よりそのファイルを優先する。filename と cite_no が別のファイルなら編集しない。パスは渡さない。候補が複数あるときはこのツールを呼ばず、名前・種類・更新日時を挙げて利用者に聞く。検索フォルダのファイルは編集できない。残った旧文字列は結果に場所が付く。結果に出た別表記は、同じ語・名前の表記だと判断したものだけを、その文字列のまま別の find にする。署名欄の「甲　　　乙」や、日付と語にまたがる「日　本」のように別の文脈だと分かるものは送らない。「このツールでは変更できない場所」とあるものも送らない。直前の呼び出しでファイルが保存されていれば前回の出力を filename にし、保存されていなければ直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。保存したファイル名を答えに書く。",
             "parameters": {
@@ -407,14 +407,16 @@ cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダ�
                     "cite_no": { "type": "integer", "description": "添付の出典番号 [n]。添付が1件なら省略できる。" },
                     "filename": { "type": "string", "description": "添付のファイル名、または出力フォルダのファイル名。.docx か .xlsx。パスは渡さない。" },
                     "path": { "type": "string", "description": "出典に書かれたフルパス。この会話の添付だけ。出力フォルダのファイルには使わない。" },
+                    "tracked": { "type": "boolean", "description": "true のとき Word の置換を変更履歴（削除と挿入）として記録する。Excel では使えない。" },
                     "replacements": {
                         "type": "array",
-                        "description": "文字列置換。find を replace にすべて置き換える。",
+                        "description": "文字列置換。find を replace にすべて置き換える。comment があればその箇所にコメントを付ける。",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "find": { "type": "string" },
-                                "replace": { "type": "string" }
+                                "replace": { "type": "string" },
+                                "comment": { "type": "string", "description": "任意。この置換箇所に付けるコメント。Excel では使えない。" }
                             },
                             "required": ["find", "replace"]
                         }
@@ -5149,6 +5151,10 @@ mod tests {
             .contains(TOOL_EDIT_OFFICE));
         assert!(schema.contains("確認は取らない"), "{schema}");
         assert!(schema.contains("変更履歴"), "{schema}");
+        assert!(schema.contains("tracked"), "{schema}");
+        assert!(schema.contains("comment"), "{schema}");
+        assert!(schema.contains("Argos"), "{schema}");
+        assert!(schema.contains("Excel では tracked と comment は使えず"), "{schema}");
         assert!(
             schema.contains("前回の出力ファイル名を filename に渡して続きを編集する"),
             "{schema}"

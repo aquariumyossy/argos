@@ -46,6 +46,11 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
     let workbook_entry = find_entry(entries, |name| file_name(name) == "workbook.xml");
     let rel_entry = find_entry(entries, |name| file_name(name) == "workbook.xml.rels");
     let mut stats = ChangeStats::from_request(req);
+    if req.track_changes || req.replacements.iter().any(|item| !item.comment.is_empty()) {
+        stats.notes.push(
+            "変更履歴としての記録とコメントは Excel では使えません。文字だけ置換しました。".into(),
+        );
+    }
 
     let mut shared = shared_entry.and_then(|index| load_story(&entries[index].1, shared_scan()));
     let mut sheets = Vec::new();
