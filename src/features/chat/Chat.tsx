@@ -107,7 +107,7 @@ type LlmMessageRow = {
   toolCallId?: string;
   toolName?: string;
   /** "notice" is shown in the chat and left out of the token estimate.
-   *  "retried" / "incomplete" stay in the transcript and carry a small label. */
+   *  "retried" / "continued" / "incomplete" stay in the transcript and carry a small label. */
   kind?: string;
 };
 

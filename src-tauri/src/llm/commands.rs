@@ -1891,8 +1891,10 @@ async fn llm_send_inner<R: Runtime>(
     busy.finish();
     kick_pending_ocr(&app, state_arc.clone());
 
-    let result_kind = if answer_flag == llm::completeness::KIND_RETRIED {
-        llm::completeness::KIND_RETRIED
+    let result_kind = if answer_flag == llm::completeness::KIND_RETRIED
+        || answer_flag == llm::completeness::KIND_CONTINUED
+    {
+        answer_flag
     } else if answer_flag == llm::completeness::KIND_INCOMPLETE && !empty_reply {
         llm::completeness::KIND_INCOMPLETE
     } else if (round_limit_final && round_limit_aside.is_none()) || empty_reply {
@@ -3565,7 +3567,8 @@ struct RewrittenAnswer {
     content: String,
     reasoning: String,
     empty_reply: bool,
-    /// Empty, [`llm::completeness::KIND_RETRIED`], or [`llm::completeness::KIND_INCOMPLETE`].
+    /// Empty, [`llm::completeness::KIND_RETRIED`], [`llm::completeness::KIND_CONTINUED`],
+    /// or [`llm::completeness::KIND_INCOMPLETE`].
     flag: &'static str,
     cancelled: bool,
     /// Text whose `[n]` must stay bound even when `content` replaced it.
@@ -3707,16 +3710,29 @@ async fn rewrite_incomplete_answer<R: Runtime>(
         Ok(out) if !out.content.trim().is_empty() => out,
         _ => return kept_original(content, reasoning, empty_reply, false),
     };
-    // A cut-off retry is one answer again. 「解除できます。」 is short alone, and the
-    // stream may still say `length`, but the joined body is what gets saved.
+    // The joined body is what gets saved. A continuation that itself stops on
+    // length, and still does not finish a sentence, stays joined and is marked
+    // incomplete. A length cap that lands on a sentence end is not another cut.
     let merged = if continue_answer {
         Some(llm::completeness::join_continuation(&content, &out.content))
     } else {
         None
     };
     let checked = merged.as_deref().unwrap_or(out.content.as_str());
+    if continue_answer
+        && llm::completeness::joined_answer_cut_by_length(checked, &out.finish_reason)
+    {
+        return Rewrite::Done(RewrittenAnswer {
+            cited_body: content,
+            content: merged.unwrap_or(out.content),
+            reasoning,
+            empty_reply: false,
+            flag: llm::completeness::KIND_INCOMPLETE,
+            cancelled: false,
+        });
+    }
     let finish = if continue_answer {
-        "stop"
+        llm::completeness::continuation_assess_finish(checked, &out.finish_reason)
     } else {
         out.finish_reason.as_str()
     };
@@ -3736,7 +3752,11 @@ async fn rewrite_incomplete_answer<R: Runtime>(
         content: next_body,
         reasoning: next_reasoning,
         empty_reply: false,
-        flag: llm::completeness::KIND_RETRIED,
+        flag: if continue_answer {
+            llm::completeness::KIND_CONTINUED
+        } else {
+            llm::completeness::KIND_RETRIED
+        },
         cancelled: false,
     })
 }
@@ -5368,8 +5388,12 @@ mod tests {
     }
 
     fn content_stop(text: &str) -> Vec<u8> {
+        content_finish(text, "stop")
+    }
+
+    fn content_finish(text: &str, finish: &str) -> Vec<u8> {
         sse_message(serde_json::json!({
-            "choices": [{ "delta": { "content": text }, "finish_reason": "stop" }]
+            "choices": [{ "delta": { "content": text }, "finish_reason": finish }]
         }))
     }
 
@@ -6314,7 +6338,7 @@ mod tests {
         let answer = final_answer(&messages);
         assert!(answer.content.contains(&first), "{}", answer.content);
         assert!(answer.content.contains(tail), "{}", answer.content);
-        assert_eq!(answer.kind, llm::completeness::KIND_RETRIED);
+        assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
 
@@ -6336,6 +6360,52 @@ mod tests {
         let answer = final_answer(&messages);
         assert_eq!(answer.content, first);
         assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_saves_the_joined_body_when_the_continuation_hits_length() {
+        let question = substantive_question();
+        let first = format!("{}、", "分析".repeat(40));
+        let cut_tail = "通知の期限は";
+        let (dir, db, thread, result, requests) = send_question(
+            "trunc-length",
+            8,
+            vec![
+                content_stop(&first),
+                content_finish(cut_tail, "length"),
+            ],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert!(answer.content.contains(&first), "{}", answer.content);
+        assert!(answer.content.contains(cut_tail), "{}", answer.content);
+        assert_ne!(answer.content, first);
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let finished = "以上が結論です。解除できます。";
+        let (dir, db, thread, result, _) = send_question(
+            "trunc-length-done",
+            8,
+            vec![content_stop(&first), content_finish(finished, "max_tokens")],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert!(answer.content.contains(&first), "{}", answer.content);
+        assert!(answer.content.contains(finished), "{}", answer.content);
+        assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
