@@ -713,19 +713,23 @@ fn format_report(
             out.push_str("- ");
             out.push_str(&item.location);
             if item.pasteable {
+                // The quoted line is only the source string, so it can be copied into find.
+                out.push('\n');
                 out.push('「');
                 out.push_str(&item.snippet);
-                out.push('」');
+                out.push_str("」\n");
                 if !item.ws_note.is_empty() {
-                    out.push_str(" ※");
+                    out.push('※');
                     out.push_str(&item.ws_note);
+                    out.push('\n');
                 }
             } else if !item.snippet.is_empty() {
                 out.push('（');
                 out.push_str(&one_line(&item.snippet));
-                out.push('）');
+                out.push_str("）\n");
+            } else {
+                out.push('\n');
             }
-            out.push('\n');
         }
         if truncated {
             out.push_str("ほかにも残っています。\n");
@@ -794,14 +798,14 @@ fn format_replacement_lines(stats: &ChangeStats) -> String {
             ));
             if let Some(misses) = stats.near_misses.get(index) {
                 for miss in misses.iter().take(text::NEAR_MISS_LIMIT) {
-                    out.push_str("近い文字列: 「");
+                    out.push_str("近い文字列:\n「");
                     out.push_str(&miss.exact);
-                    out.push('」');
+                    out.push_str("」\n");
                     if !miss.note.is_empty() {
-                        out.push_str(" ※");
+                        out.push('※');
                         out.push_str(&miss.note);
+                        out.push('\n');
                     }
-                    out.push('\n');
                 }
             }
         } else {
@@ -936,9 +940,10 @@ pub(crate) fn note_unreachable_misses(entries: &[(String, Vec<u8>)], stats: &mut
         }
         for (place, slice) in unreachable_variants(entries, &find, &explain) {
             let note = text::variant_note(&find, &slice);
-            let mut line = format!("「{}」は{place}にあります。「{slice}」", one_line(&find));
+            let mut line = format!("「{}」は{place}にあります。\n「{slice}」", one_line(&find));
             if !note.is_empty() {
-                line.push_str(" ※");
+                line.push('\n');
+                line.push('※');
                 line.push_str(&note);
             }
             stats.notes.push(line);

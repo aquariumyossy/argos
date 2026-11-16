@@ -936,14 +936,33 @@ fn word_body(inner: &str) -> String {
     )
 }
 
-fn pasteable_near<'a>(report: &'a str, marker: &str) -> &'a str {
-    let line = report
-        .lines()
-        .find(|line| line.starts_with("近い文字列:") && line.contains(marker))
-        .unwrap_or_else(|| panic!("no near miss containing {marker:?} in {report}"));
-    let open = line.find('「').expect(line) + '「'.len_utf8();
-    let close = line[open..].find('」').expect(line) + open;
+fn inside_quotes(line: &str) -> &str {
+    let open = line.find('「').unwrap_or_else(|| panic!("{line}")) + '「'.len_utf8();
+    let close = line[open..].find('」').unwrap_or_else(|| panic!("{line}")) + open;
     &line[open..close]
+}
+
+fn pasteable_near<'a>(report: &'a str, marker: &str) -> &'a str {
+    let lines: Vec<&str> = report.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.starts_with("近い文字列") {
+            continue;
+        }
+        let quoted = if line.contains('「') {
+            *line
+        } else {
+            lines.get(index + 1).copied().unwrap_or("")
+        };
+        if quoted.contains(marker) {
+            let exact = inside_quotes(quoted);
+            assert!(
+                !quoted.contains('※'),
+                "pasteable line must not carry the note: {quoted}"
+            );
+            return exact;
+        }
+    }
+    panic!("no near miss containing {marker:?} in {report}");
 }
 
 #[test]
@@ -1065,10 +1084,13 @@ fn a_miss_reports_byte_exact_near_misses_and_an_unreachable_chart() {
     assert_eq!(em, "山田\u{2003}太郎");
     assert!(!em.contains("U+"));
     assert!(!em.contains('※'));
-    assert!(edited.report.contains("※U+2003"), "{}", edited.report);
+    assert_eq!(whitespace_note_follows(&edited.report, em), "※U+2003");
     let missing = pasteable_near(&edited.report, "鈴木一郎");
     assert_eq!(missing, "鈴木一郎");
-    assert!(edited.report.contains("※空白なし"), "{}", edited.report);
+    assert_eq!(
+        whitespace_note_follows(&edited.report, missing),
+        "※空白なし"
+    );
     assert!(
         edited
             .report
@@ -1109,7 +1131,7 @@ fn a_total_miss_names_the_exact_string_in_an_unreachable_part() {
     assert_eq!(fs::read(&src).unwrap(), before);
     assert!(err.contains("見つかりませんでした"), "{err}");
     assert_eq!(pasteable_near(&err, "\u{2003}"), "山田\u{2003}太郎");
-    assert!(err.contains("※U+2003"), "{err}");
+    assert_eq!(whitespace_note_follows(&err, "山田\u{2003}太郎"), "※U+2003");
     // The chart's exact "山田太郎" is a compact match of the spaced find too.
     assert_eq!(pasteable_near(&err, "山田太郎"), "山田太郎");
     let _ = fs::remove_dir_all(&dir);
@@ -1492,13 +1514,34 @@ fn a_follow_up_edit_does_not_stack_the_suffix_or_overwrite() {
 }
 
 fn pasteable_at<'a>(report: &'a str, location: &str) -> &'a str {
-    let line = report
-        .lines()
-        .find(|line| line.starts_with("- ") && line.contains(location))
+    let lines: Vec<&str> = report.lines().collect();
+    let index = lines
+        .iter()
+        .position(|line| line.starts_with("- ") && line.contains(location))
         .unwrap_or_else(|| panic!("no leftover at {location} in {report}"));
-    let open = line.find('「').unwrap_or_else(|| panic!("{line}")) + '「'.len_utf8();
-    let close = line[open..].find('」').unwrap_or_else(|| panic!("{line}")) + open;
-    &line[open..close]
+    let quoted = lines
+        .get(index + 1)
+        .copied()
+        .filter(|line| line.contains('「'))
+        .unwrap_or(lines[index]);
+    assert!(
+        quoted.starts_with('「') && quoted.ends_with('」') && !quoted.contains('※'),
+        "pasteable line should be only the quoted source: {quoted}\n{report}"
+    );
+    inside_quotes(quoted)
+}
+
+fn whitespace_note_follows<'a>(report: &'a str, exact: &str) -> &'a str {
+    let lines: Vec<&str> = report.lines().collect();
+    let quoted = format!("「{exact}」");
+    let index = lines
+        .iter()
+        .position(|line| *line == quoted)
+        .unwrap_or_else(|| panic!("no lone pasteable line {quoted} in {report}"));
+    lines
+        .get(index + 1)
+        .copied()
+        .unwrap_or_else(|| panic!("no note after {quoted} in {report}"))
 }
 
 #[test]
@@ -1532,8 +1575,16 @@ fn a_spaceless_find_leaves_spaced_spellings_and_reports_them() {
         "山\u{3000}田\u{3000}太\u{3000}郎"
     );
     assert_eq!(
+        whitespace_note_follows(&edited.report, "山\u{3000}田\u{3000}太\u{3000}郎"),
+        "※全角空白"
+    );
+    assert_eq!(
         pasteable_at(&edited.report, "本文の3段落目"),
         "山田\u{3000}太郎"
+    );
+    assert_eq!(
+        whitespace_note_follows(&edited.report, "山田\u{3000}太郎"),
+        "※全角空白"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1584,7 +1635,10 @@ fn a_missed_spaceless_find_reports_a_spread_spelling() {
         pasteable_near(&err, "\u{3000}"),
         "山\u{3000}田\u{3000}太\u{3000}郎"
     );
-    assert!(err.contains("※全角空白"), "{err}");
+    assert_eq!(
+        whitespace_note_follows(&err, "山\u{3000}田\u{3000}太\u{3000}郎"),
+        "※全角空白"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1634,26 +1688,19 @@ fn a_body_hit_still_reports_chart_and_hyperlink_whitespace_leftovers() {
     );
     let chart_text = pasteable_at(&edited.report, "グラフ（このツールでは変更できない場所）");
     assert_eq!(chart_text, "山田\u{3000}太郎");
-    assert!(
-        edited.report.lines().any(
-            |line| line.contains("グラフ（このツールでは変更できない場所）")
-                && line.contains("※全角空白")
-                && !chart_text.contains("全角")
-        ),
-        "{}",
-        edited.report
+    assert!(!chart_text.contains("全角"));
+    assert_eq!(
+        whitespace_note_follows(&edited.report, chart_text),
+        "※全角空白"
     );
     let link_text = pasteable_at(
         &edited.report,
         "ハイパーリンク（このツールでは変更できない場所）",
     );
     assert_eq!(link_text, "山田 太郎");
-    assert!(
-        edited.report.lines().any(|line| line
-            .contains("ハイパーリンク（このツールでは変更できない場所）")
-            && line.contains("※半角空白")),
-        "{}",
-        edited.report
+    assert_eq!(
+        whitespace_note_follows(&edited.report, link_text),
+        "※半角空白"
     );
     let field_text = pasteable_at(
         &edited.report,
