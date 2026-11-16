@@ -3,12 +3,19 @@
 //! in the answer. A second failure is kept and marked incomplete.
 //! Statute-article checks are intentionally not part of this.
 
-/// Added on the single retry. The model must land the conclusion in the body.
+/// Added when the body is short or the reasoning hid the conclusion.
 pub const CONCLUSION_HINT: &str =
     "結論を回答本文に最後まで書いてください。思考の中だけで述べず、本文が途中で切れないようにしてください。";
 
-/// Live status while that retry streams. The saved row uses a shorter label.
+/// Added when the body stopped midway. The first answer stays; this asks for the rest.
+pub const CONTINUE_HINT: &str =
+    "回答本文が途中で切れています。すでに書いた本文はそのまま残し、その続きだけを回答本文に書いてください。最初から書き直さないでください。";
+
+/// Live status while a short or reasoning-heavy answer is rewritten.
 pub const RETRY_STATUS: &str = "結論を本文に書き直しています";
+
+/// Live status while a cut-off answer is continued.
+pub const CONTINUE_STATUS: &str = "切れた回答の続きを書いています";
 
 /// Shown on an answer that was rewritten and then passed the check.
 pub const RETRY_LABEL: &str = "結論を本文に書き直しました";
@@ -119,6 +126,8 @@ pub fn finished_answer_problem(
     finish_reason: &str,
     app_notice: bool,
     empty_model_body: bool,
+    // Tools ran, or this send wrote a file or a note. A short report is then enough.
+    produced_work: bool,
 ) -> Option<AnswerProblem> {
     if app_notice && !empty_model_body {
         return None;
@@ -130,24 +139,56 @@ pub fn finished_answer_problem(
     if body.trim().is_empty() {
         return None;
     }
-    assess_answer(question, body, reasoning, finish_reason)
+    match assess_answer(question, body, reasoning, finish_reason) {
+        Some(AnswerProblem::ShortBody) if produced_work => None,
+        other => other,
+    }
+}
+
+/// Keep `original` and add only the new tail. A second copy of the whole answer is not glued on.
+pub fn join_continuation(original: &str, continuation: &str) -> String {
+    let original_trim = original.trim();
+    let continuation = continuation.trim();
+    if continuation.is_empty() {
+        return original_trim.to_string();
+    }
+    if original_trim.is_empty() {
+        return continuation.to_string();
+    }
+    if continuation.starts_with(original_trim) {
+        return continuation.to_string();
+    }
+    format!("{}\n\n{continuation}", original.trim_end())
 }
 
 pub fn is_conclusion_prompt(text: &str) -> bool {
-    text.trim().starts_with(CONCLUSION_HINT)
+    let text = text.trim();
+    text.starts_with(CONCLUSION_HINT) || text.starts_with(CONTINUE_HINT)
 }
 
 /// The retry instruction. A long reasoning tail is attached so the conclusion
 /// can be copied out without another full thinking pass.
 pub fn conclusion_retry_prompt(reasoning: &str) -> String {
+    prompt_with_tail(CONCLUSION_HINT, reasoning)
+}
+
+pub fn continuation_retry_prompt(reasoning: &str) -> String {
+    prompt_with_tail(CONTINUE_HINT, reasoning)
+}
+
+fn prompt_with_tail(hint: &str, reasoning: &str) -> String {
     let tail = last_chars(reasoning.trim(), HINT_REASONING_TAIL);
     if tail.is_empty() {
-        return CONCLUSION_HINT.to_string();
+        return hint.to_string();
     }
-    format!("{CONCLUSION_HINT}\n\nさきほどの思考の末尾を、回答本文の結論に使ってください。思考の末尾:\n{tail}")
+    format!("{hint}\n\nさきほどの思考の末尾を、回答本文の結論に使ってください。思考の末尾:\n{tail}")
 }
 
 fn body_is_extremely_short(question: &str, body: &str) -> bool {
+    // A finished sentence is a real answer, even when the question was long.
+    if ends_with_sentence_end(body) {
+        return false;
+    }
     chars(body) < short_body_limit(question)
 }
 
@@ -276,16 +317,11 @@ fn unclosed_bracket(text: &str) -> bool {
     if ends_with_sentence_end(text) {
         return false;
     }
-    let mut round = 0i32;
-    let mut paren = 0i32;
+    // Parentheses are left open in titles and asides ("(内容証明"). That is not a cut-off answer.
     let mut corner = 0i32;
     let mut lent = 0i32;
     for ch in text.chars() {
         match ch {
-            '(' => round += 1,
-            ')' => round = (round - 1).max(0),
-            '（' => paren += 1,
-            '）' => paren = (paren - 1).max(0),
             '「' => corner += 1,
             '」' => corner = (corner - 1).max(0),
             '『' => lent += 1,
@@ -293,7 +329,7 @@ fn unclosed_bracket(text: &str) -> bool {
             _ => {}
         }
     }
-    round > 0 || paren > 0 || corner > 0 || lent > 0
+    corner > 0 || lent > 0
 }
 
 fn ends_on_heading(text: &str) -> bool {
@@ -313,6 +349,13 @@ fn ends_mid_clause(text: &str) -> bool {
     if ends_with_sentence_end(text) {
         return false;
     }
+    let Some(last) = last_nonempty_line(text) else {
+        return false;
+    };
+    // A bullet is its own item. " - 通知の時期について" is not a sentence that stopped early.
+    if is_bullet_line(last) {
+        return false;
+    }
     let t = text.trim_end();
     if t.chars()
         .last()
@@ -323,22 +366,23 @@ fn ends_mid_clause(text: &str) -> bool {
     if chars(t) < 12 {
         return false;
     }
-    const TAILS: &[&str] = &[
-        "ので",
-        "ですが",
-        "しかし",
-        "また",
-        "および",
-        "について",
-        "により",
-        "として",
-        "けれど",
-        "だから",
-        "そして",
-        "または",
-        "けど",
-    ];
+    // Connectives that leave the clause unfinished. Topic markers such as について
+    // close a heading or a one-line answer and are not a cut.
+    const TAILS: &[&str] = &["ので", "ですが", "けれど", "けど"];
     TAILS.iter().any(|tail| t.ends_with(tail))
+}
+
+fn last_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().rev().find(|line| !line.trim().is_empty())
+}
+
+fn is_bullet_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") || t.starts_with('・') {
+        return true;
+    }
+    let rest = t.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest != t && (rest.starts_with(". ") || rest.starts_with(") ") || rest.starts_with('．'))
 }
 
 fn ends_with_sentence_end(text: &str) -> bool {
@@ -396,10 +440,45 @@ mod tests {
         let question = long_question();
         assert!(chars(&question) > BRIEF_QUESTION_CHARS);
         assert_eq!(
-            assess_answer(&question, "はい。", "", "stop"),
+            assess_answer(&question, "はい", "", "stop"),
             Some(AnswerProblem::ShortBody)
         );
+        assert_eq!(
+            assess_answer(&question, "はい。", "", "stop"),
+            None,
+            "a finished sentence is not a short fragment"
+        );
+        assert_eq!(
+            assess_answer(&question, "有効です。公序良俗に反しません。", "", "stop"),
+            None
+        );
+        assert_eq!(
+            assess_answer(
+                &question,
+                "解除できません。根拠は民法第541条です。[1]",
+                "",
+                "stop"
+            ),
+            None
+        );
+        assert_eq!(
+            assess_answer(&question, "契約書のWordファイルを作成しました。", "", "stop"),
+            None
+        );
+        assert_eq!(
+            assess_answer(&question, "ノートに追記しました。", "", "stop"),
+            None
+        );
         assert_eq!(assess_answer(&question, &full_answer(), "", "stop"), None);
+        assert_eq!(
+            finished_answer_problem(&question, "作成しました", "", "stop", false, false, true),
+            None,
+            "a short report after tool work is not retried for length"
+        );
+        assert_eq!(
+            finished_answer_problem(&question, "作成しました", "", "stop", false, false, false),
+            Some(AnswerProblem::ShortBody)
+        );
     }
 
     #[test]
@@ -452,8 +531,27 @@ mod tests {
         );
         let closed = format!("{finished}\n```\nflowchart LR\nA-->B\n```");
         assert_eq!(assess_answer(&question, &closed, "", "stop"), None);
+        let open_paren = format!("{}(内容証明", "あ".repeat(80));
+        assert_eq!(assess_answer(&question, &open_paren, "", "stop"), None);
         assert_eq!(
             assess_answer(&question, "前置きです。続きは（", "", "stop"),
+            Some(AnswerProblem::ShortBody),
+            "an open parenthesis is not a cut-off answer"
+        );
+        let bullet = format!("{}\n- 通知の時期について", "あ".repeat(80));
+        assert_eq!(assess_answer(&question, &bullet, "", "stop"), None);
+        let bullet_clause = format!("{}\n- 契約が重大なので", "あ".repeat(80));
+        assert_eq!(
+            assess_answer(&question, &bullet_clause, "", "stop"),
+            None,
+            "the last bullet is not a dangling clause"
+        );
+        assert_eq!(
+            assess_answer("解除できる？", "解除の可否と損害賠償の範囲について", "", "stop"),
+            None
+        );
+        assert_ne!(
+            assess_answer(&question, "解除の可否と損害賠償の範囲について", "", "stop"),
             Some(AnswerProblem::Truncated)
         );
     }
@@ -484,10 +582,11 @@ mod tests {
         assert_eq!(assess_answer(&one_line, "はい。", "", "stop"), None);
         let longer_line = "あ".repeat(90);
         assert_eq!(
-            assess_answer(&longer_line, "はい。", "", "stop"),
+            assess_answer(&longer_line, "はい", "", "stop"),
             Some(AnswerProblem::ShortBody),
             "a long single line is no longer a one-line question"
         );
+        assert_eq!(assess_answer(&longer_line, "はい。", "", "stop"), None);
     }
 
     #[test]
@@ -499,18 +598,19 @@ mod tests {
                 "",
                 "stop",
                 true,
-                true
+                true,
+                false
             ),
             None
         );
         assert_eq!(
-            finished_answer_problem(&long_question(), "", "", "stop", false, false),
+            finished_answer_problem(&long_question(), "", "", "stop", false, false, false),
             None,
             "a blank save is the existing empty path"
         );
         let notice = "ツール往復が上限の 8 回に達したため、残りの操作はしていません。";
         assert_eq!(
-            finished_answer_problem(&long_question(), notice, "", "stop", true, false),
+            finished_answer_problem(&long_question(), notice, "", "stop", true, false, false),
             None
         );
         assert_eq!(
@@ -520,7 +620,8 @@ mod tests {
                 &"考".repeat(4_000),
                 "stop",
                 true,
-                true
+                true,
+                false
             ),
             Some(AnswerProblem::ReasoningHeavy)
         );
@@ -565,7 +666,15 @@ mod tests {
         assert!(prompt.contains("尾"));
         assert!(!prompt.contains('頭'));
         assert!(is_conclusion_prompt(&prompt));
+        assert!(is_conclusion_prompt(CONTINUE_HINT));
         assert!(!is_conclusion_prompt("契約を説明してください。"));
+        let continued = join_continuation("前半です、", "後半です。");
+        assert!(continued.contains("前半です、"));
+        assert!(continued.contains("後半です。"));
+        assert_eq!(
+            join_continuation("前半です、", "前半です、\n後半です。"),
+            "前半です、\n後半です。"
+        );
         assert_eq!(INCOMPLETE_MARK, "不完全な可能性");
         assert_ne!(KIND_RETRIED, "notice");
         assert_ne!(KIND_INCOMPLETE, "notice");
