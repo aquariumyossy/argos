@@ -13,6 +13,10 @@ pub struct TextNode {
     pub deleted: bool,
     pub local: String,
     pub dirty: bool,
+    /// Inside `mc:Fallback` when the same `mc:AlternateContent` already has choice text.
+    pub fallback: bool,
+    /// Chart or SmartArt text this tool must not rewrite. `グラフ` or `図`.
+    pub locked: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +25,8 @@ pub struct ParaGroup {
     pub visible: Vec<usize>,
     pub deleted: Vec<usize>,
     pub first: usize,
+    pub fallback: bool,
+    pub locked: Option<&'static str>,
 }
 
 pub struct ScanOpt {
@@ -98,6 +104,8 @@ pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
                     deleted,
                     local: tag.local.clone(),
                     dirty: false,
+                    fallback: false,
+                    locked: None,
                 });
                 pos = close_end;
                 continue;
@@ -117,32 +125,41 @@ pub fn group_nodes(nodes: &[TextNode]) -> Vec<ParaGroup> {
     let mut index_of: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for (index, node) in nodes.iter().enumerate() {
         if node.para == 0 {
-            let mut group = ParaGroup {
-                local: node.para_local.clone(),
-                visible: Vec::new(),
-                deleted: Vec::new(),
-                first: index,
-            };
+            let mut group = new_group(node, index);
             push_node(&mut group, index, node.deleted);
             grouped.push(group);
             continue;
         }
         if let Some(&slot) = index_of.get(&node.para) {
+            absorb(&mut grouped[slot], node);
             push_node(&mut grouped[slot], index, node.deleted);
             continue;
         }
-        let mut group = ParaGroup {
-            local: node.para_local.clone(),
-            visible: Vec::new(),
-            deleted: Vec::new(),
-            first: index,
-        };
+        let mut group = new_group(node, index);
         push_node(&mut group, index, node.deleted);
         index_of.insert(node.para, grouped.len());
         grouped.push(group);
     }
     grouped.sort_by_key(|group| group.first);
     grouped
+}
+
+fn new_group(node: &TextNode, first: usize) -> ParaGroup {
+    ParaGroup {
+        local: node.para_local.clone(),
+        visible: Vec::new(),
+        deleted: Vec::new(),
+        first,
+        fallback: node.fallback,
+        locked: node.locked,
+    }
+}
+
+fn absorb(group: &mut ParaGroup, node: &TextNode) {
+    group.fallback &= node.fallback;
+    if node.locked.is_some() {
+        group.locked = node.locked;
+    }
 }
 
 fn push_node(group: &mut ParaGroup, index: usize, deleted: bool) {
@@ -197,6 +214,10 @@ pub fn rewrite_group(nodes: &mut [TextNode], group: &ParaGroup, new_text: &str) 
     } else {
         group.visible.clone()
     };
+    let primary: Vec<usize> = primary
+        .into_iter()
+        .filter(|&index| nodes[index].locked.is_none())
+        .collect();
     if primary.is_empty() {
         return;
     }
@@ -213,10 +234,11 @@ pub fn rewrite_group(nodes: &mut [TextNode], group: &ParaGroup, new_text: &str) 
     }
     if !group.visible.is_empty() {
         for &index in &group.deleted {
-            if !nodes[index].text.is_empty() {
-                nodes[index].text.clear();
-                nodes[index].dirty = true;
+            if nodes[index].locked.is_some() || nodes[index].text.is_empty() {
+                continue;
             }
+            nodes[index].text.clear();
+            nodes[index].dirty = true;
         }
     }
 }
@@ -288,24 +310,11 @@ fn ensure_preserve(open: &str, text: &str) -> String {
     out
 }
 
-pub fn map_attr_local(xml: &str, local: &str, mut edit: impl FnMut(&str) -> String) -> String {
-    let mut out = String::with_capacity(xml.len());
-    let mut pos = 0usize;
-    while let Some(tag) = next_tag(xml, pos) {
-        out.push_str(&xml[pos..tag.start]);
-        let raw = &xml[tag.start..tag.end];
-        if tag.is_end {
-            out.push_str(raw);
-        } else {
-            out.push_str(&rewrite_attr_local(raw, local, &mut edit));
-        }
-        pos = tag.end;
-    }
-    out.push_str(&xml[pos..]);
-    out
-}
-
-fn rewrite_attr_local(tag: &str, local: &str, edit: &mut impl FnMut(&str) -> String) -> String {
+pub(crate) fn rewrite_attr_local(
+    tag: &str,
+    local: &str,
+    edit: &mut impl FnMut(&str) -> String,
+) -> String {
     let attrs = attributes(tag);
     let Some(attr) = attrs
         .iter()
@@ -660,4 +669,134 @@ fn is_xml_char(ch: char) -> bool {
 pub fn decode_xml_bytes(bytes: &[u8]) -> Option<String> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// `mc:Fallback` spans whose `mc:AlternateContent` also has text in `mc:Choice`.
+///
+/// The primary drawing is the one that counts. The fallback stays in the file so
+/// older Word still shows the same words, but it is not a second hit.
+pub fn duplicate_fallback_ranges(xml: &str) -> Vec<(usize, usize)> {
+    let mut ac_ids: Vec<usize> = Vec::new();
+    let mut choice_depth: Vec<i32> = Vec::new();
+    let mut choice_has_text: Vec<bool> = Vec::new();
+    let mut fallbacks: Vec<(usize, usize)> = Vec::new();
+    let mut open_fallbacks: Vec<(usize, usize)> = Vec::new();
+    let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(tag) = next_tag(xml, pos) {
+        let in_fallback = !open_fallbacks.is_empty();
+        if !in_fallback {
+            let gap = &xml[pos..tag.start];
+            if gap.chars().any(|ch| !ch.is_whitespace()) {
+                for &id in &ac_ids {
+                    if choice_depth[id] > 0 {
+                        choice_has_text[id] = true;
+                    }
+                }
+            }
+        }
+        if tag.local == "AlternateContent" && !tag.is_end && !tag.is_self {
+            ac_ids.push(choice_depth.len());
+            choice_depth.push(0);
+            choice_has_text.push(false);
+        } else if tag.local == "AlternateContent" && tag.is_end {
+            ac_ids.pop();
+        } else if tag.local == "Choice" && !tag.is_end && !tag.is_self {
+            if let Some(&id) = ac_ids.last() {
+                choice_depth[id] += 1;
+            }
+        } else if tag.local == "Choice" && tag.is_end {
+            if let Some(&id) = ac_ids.last() {
+                choice_depth[id] = choice_depth[id].saturating_sub(1);
+            }
+        } else if tag.local == "Fallback" && !tag.is_end && !tag.is_self {
+            if let Some(&id) = ac_ids.last() {
+                open_fallbacks.push((tag.start, id));
+            }
+        } else if tag.local == "Fallback" && tag.is_end {
+            if let Some((start, id)) = open_fallbacks.pop() {
+                pending.push((start, tag.end, id));
+            }
+        }
+        pos = tag.end;
+    }
+    for (start, end, id) in pending {
+        if choice_has_text.get(id).copied().unwrap_or(false) {
+            fallbacks.push((start, end));
+        }
+    }
+    fallbacks
+}
+
+/// Chart and SmartArt subtrees. Text inside stays readable and is not rewritten.
+pub fn locked_story_ranges(xml: &str) -> Vec<(usize, usize, &'static str)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(&'static str, usize, String)> = Vec::new();
+    let mut pos = 0usize;
+    while let Some(tag) = next_tag(xml, pos) {
+        if tag.is_end {
+            if let Some(index) = stack.iter().rposition(|(_, _, qname)| qname == &tag.qname) {
+                let (kind, start, _) = stack.remove(index);
+                out.push((start, tag.end, kind));
+            }
+            pos = tag.end;
+            continue;
+        }
+        if !tag.is_self {
+            if let Some(kind) = lock_kind(&tag, xml) {
+                stack.push((kind, tag.start, tag.qname.clone()));
+            }
+        }
+        pos = tag.end;
+    }
+    out
+}
+
+fn lock_kind(tag: &Tag, xml: &str) -> Option<&'static str> {
+    match tag.local.as_str() {
+        "chart" | "chartSpace" | "chartsheet" => Some("グラフ"),
+        "relIds" | "dataModel" => Some("図"),
+        "graphicData" => {
+            let raw = &xml[tag.start..tag.end];
+            let uri = attr_local_value(raw, "uri")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if uri.contains("chart") {
+                Some("グラフ")
+            } else if uri.contains("diagram") {
+                Some("図")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn apply_word_regions(xml: &str, nodes: &mut [TextNode]) {
+    let fallbacks = duplicate_fallback_ranges(xml);
+    let locks = locked_story_ranges(xml);
+    for node in nodes {
+        let at = node.inner_start;
+        node.fallback = fallbacks
+            .iter()
+            .any(|(start, end)| at >= *start && at < *end);
+        node.locked = locks
+            .iter()
+            .filter(|(start, end, _)| at >= *start && at < *end)
+            .min_by_key(|(start, end, _)| end.saturating_sub(*start))
+            .map(|(_, _, kind)| *kind);
+    }
+}
+
+pub fn range_contains(ranges: &[(usize, usize)], at: usize) -> bool {
+    ranges.iter().any(|(start, end)| at >= *start && at < *end)
+}
+
+pub fn lock_at(ranges: &[(usize, usize, &'static str)], at: usize) -> Option<&'static str> {
+    ranges
+        .iter()
+        .filter(|(start, end, _)| at >= *start && at < *end)
+        .min_by_key(|(start, end, _)| end.saturating_sub(*start))
+        .map(|(_, _, kind)| *kind)
 }

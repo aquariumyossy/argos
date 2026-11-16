@@ -1,9 +1,10 @@
 //! Edit WordprocessingML text without touching paragraph or run properties.
 
 use super::xmlscan::{
-    attr_local_value, collect_attr_local, decode_xml_bytes, group_nodes, joined, leaf_texts,
-    map_attr_local, next_tag, render_nodes, replace_in_group, rewrite_group, scan_text_nodes,
-    ParaGroup, ScanOpt, TextNode,
+    apply_word_regions, attr_local_value, collect_attr_local, decode_xml_bytes,
+    duplicate_fallback_ranges, group_nodes, joined, leaf_texts, lock_at, locked_story_ranges,
+    next_tag, range_contains, render_nodes, replace_in_group, rewrite_attr_local, rewrite_group,
+    scan_text_nodes, ParaGroup, ScanOpt, TextNode,
 };
 use super::{push_leftover, ChangeStats, EditRequest, Leftover, Probe, MAX_LEFTOVERS};
 
@@ -30,8 +31,7 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
         }
         let xml =
             decode_xml_bytes(bytes).ok_or_else(|| format!("{name} を文字列として読めません。"))?;
-        let nodes = scan_text_nodes(&xml, &word_scan());
-        let groups = group_nodes(&nodes);
+        let (nodes, groups) = scan_story(&xml);
         stories.push(Story {
             entry: index,
             label: word_label(name),
@@ -88,7 +88,20 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
             .find(|story| story.entry == hit.entry)
             .unwrap();
         let group = story.groups[hit.group].clone();
+        let mirrors: Vec<ParaGroup> = story
+            .groups
+            .iter()
+            .filter(|other| {
+                other.fallback
+                    && other.locked.is_none()
+                    && editable_joined(&story.nodes, &other.visible) == hit.old
+            })
+            .cloned()
+            .collect();
         rewrite_group(&mut story.nodes, &group, &edit.text);
+        for mirror in &mirrors {
+            rewrite_group(&mut story.nodes, mirror, &edit.text);
+        }
         stats.paragraphs += 1;
         if hit.old.chars().count() >= 8 && hit.old != edit.text {
             stats
@@ -99,26 +112,21 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
 
     for story in &mut stories {
         for group in story.groups.clone() {
+            let visible = editable_indexes(&story.nodes, &group.visible);
+            let deleted = editable_indexes(&story.nodes, &group.deleted);
             for (index, item) in req.replacements.iter().enumerate() {
-                super::record_hit(
-                    &mut stats,
-                    index,
-                    replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace),
-                );
-                super::record_hit(
-                    &mut stats,
-                    index,
-                    replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace),
-                );
+                let in_visible =
+                    replace_in_group(&mut story.nodes, &visible, &item.find, &item.replace);
+                let in_deleted =
+                    replace_in_group(&mut story.nodes, &deleted, &item.find, &item.replace);
+                if !group.fallback {
+                    super::record_hit(&mut stats, index, in_visible);
+                    super::record_hit(&mut stats, index, in_deleted);
+                }
             }
         }
         story.xml = render_nodes(&story.xml, &story.nodes);
-        story.xml = map_attr_local(&story.xml, "author", |value| {
-            super::replace_value(value, req, &mut stats)
-        });
-        story.xml = map_attr_local(&story.xml, "initials", |value| {
-            super::replace_value(value, req, &mut stats)
-        });
+        story.xml = rewrite_story_attrs(&story.xml, req, &mut stats);
         entries[story.entry].1 = std::mem::take(&mut story.xml).into_bytes();
     }
     super::edit_doc_props(entries, req, &mut stats);
@@ -152,17 +160,25 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
             continue;
         };
         if is_word_story(name) {
-            let nodes = scan_text_nodes(&xml, &word_scan());
-            let groups = group_nodes(&nodes);
+            let (nodes, groups) = scan_story(&xml);
             for group in &groups {
-                push_text(&mut texts, joined(&nodes, &group.visible), "");
-                push_text(&mut texts, joined(&nodes, &group.deleted), "");
+                if group.fallback {
+                    continue;
+                }
+                push_text(&mut texts, editable_joined(&nodes, &group.visible), "");
+                push_text(&mut texts, editable_joined(&nodes, &group.deleted), "");
+                if let Some((kind, text)) = locked_joined(&nodes, &group.visible) {
+                    push_text(&mut texts, text, &super::unreachable_location(kind));
+                }
+                if let Some((kind, text)) = locked_joined(&nodes, &group.deleted) {
+                    push_text(&mut texts, text, &super::unreachable_location(kind));
+                }
             }
-            for author in collect_attr_local(&xml, "author") {
-                push_text(&mut texts, author, "");
+            for (text, place) in story_attr_texts(&xml, "author") {
+                push_text(&mut texts, text, &place);
             }
-            for initials in collect_attr_local(&xml, "initials") {
-                push_text(&mut texts, initials, "");
+            for (text, place) in story_attr_texts(&xml, "initials") {
+                push_text(&mut texts, text, &place);
             }
             let field = super::unreachable_location("フィールド");
             for (local, text) in leaf_texts(&xml) {
@@ -209,10 +225,10 @@ fn find_paragraphs(stories: &[Story], needle: &str) -> Vec<Hit> {
     for story in stories {
         let locations = paragraph_locations(&story.label, &story.groups, &story.nodes);
         for (index, group) in story.groups.iter().enumerate() {
-            if !is_body_paragraph(group) {
+            if group.fallback || !is_body_paragraph(group) {
                 continue;
             }
-            let visible = joined(&story.nodes, &group.visible);
+            let visible = editable_joined(&story.nodes, &group.visible);
             if !super::text::contains_match(&visible, needle) {
                 continue;
             }
@@ -240,11 +256,11 @@ fn paragraph_locations(label: &str, groups: &[ParaGroup], nodes: &[TextNode]) ->
     groups
         .iter()
         .map(|group| {
-            if !is_body_paragraph(group) {
+            if group.fallback || !is_body_paragraph(group) {
                 return String::new();
             }
-            let visible = joined(nodes, &group.visible);
-            let deleted = joined(nodes, &group.deleted);
+            let visible = editable_joined(nodes, &group.visible);
+            let deleted = editable_joined(nodes, &group.deleted);
             if visible.trim().is_empty() && deleted.trim().is_empty() {
                 return String::new();
             }
@@ -263,12 +279,14 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
         };
         if is_word_story(name) {
             let label = word_label(name);
-            let nodes = scan_text_nodes(&xml, &word_scan());
-            let groups = group_nodes(&nodes);
+            let (nodes, groups) = scan_story(&xml);
             let locations = paragraph_locations(&label, &groups, &nodes);
             for (index, group) in groups.iter().enumerate() {
-                let visible = joined(&nodes, &group.visible);
-                let deleted = joined(&nodes, &group.deleted);
+                if group.fallback {
+                    continue;
+                }
+                let visible = editable_joined(&nodes, &group.visible);
+                let deleted = editable_joined(&nodes, &group.deleted);
                 let location = if group.local == "rt" {
                     format!("{label}のルビ")
                 } else if is_body_paragraph(group) {
@@ -291,28 +309,44 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                             &format!("{location}（変更履歴の削除）"),
                         );
                     }
+                    if let Some((kind, text)) = locked_joined(&nodes, &group.visible) {
+                        consider(
+                            &mut leftovers,
+                            &mut truncated,
+                            probe,
+                            &text,
+                            &super::unreachable_location(kind),
+                        );
+                    }
+                    if let Some((kind, text)) = locked_joined(&nodes, &group.deleted) {
+                        consider(
+                            &mut leftovers,
+                            &mut truncated,
+                            probe,
+                            &text,
+                            &super::unreachable_location(kind),
+                        );
+                    }
                 }
             }
-            for author in collect_attr_local(&xml, "author") {
+            for (author, place) in story_attr_texts(&xml, "author") {
+                let location = if place.is_empty() {
+                    format!("作成者（{label}）")
+                } else {
+                    place
+                };
                 for probe in probes {
-                    consider(
-                        &mut leftovers,
-                        &mut truncated,
-                        probe,
-                        &author,
-                        &format!("作成者（{label}）"),
-                    );
+                    consider(&mut leftovers, &mut truncated, probe, &author, &location);
                 }
             }
-            for initials in collect_attr_local(&xml, "initials") {
+            for (initials, place) in story_attr_texts(&xml, "initials") {
+                let location = if place.is_empty() {
+                    format!("イニシャル（{label}）")
+                } else {
+                    place
+                };
                 for probe in probes {
-                    consider(
-                        &mut leftovers,
-                        &mut truncated,
-                        probe,
-                        &initials,
-                        &format!("イニシャル（{label}）"),
-                    );
+                    consider(&mut leftovers, &mut truncated, probe, &initials, &location);
                 }
             }
             for (local, text) in leaf_texts(&xml) {
@@ -390,6 +424,131 @@ fn consider(
     push_leftover(leftovers, truncated, probe, text, location, MAX_LEFTOVERS);
 }
 
+fn scan_story(xml: &str) -> (Vec<TextNode>, Vec<ParaGroup>) {
+    let mut nodes = scan_text_nodes(xml, &word_scan());
+    apply_word_regions(xml, &mut nodes);
+    let groups = group_nodes(&nodes);
+    (nodes, groups)
+}
+
+fn editable_indexes(nodes: &[TextNode], indexes: &[usize]) -> Vec<usize> {
+    indexes
+        .iter()
+        .copied()
+        .filter(|&index| nodes[index].locked.is_none())
+        .collect()
+}
+
+fn editable_joined(nodes: &[TextNode], indexes: &[usize]) -> String {
+    joined(nodes, &editable_indexes(nodes, indexes))
+}
+
+fn locked_joined(nodes: &[TextNode], indexes: &[usize]) -> Option<(&'static str, String)> {
+    let mut kind = None;
+    let mut text = String::new();
+    for &index in indexes {
+        let Some(lock) = nodes[index].locked else {
+            continue;
+        };
+        if kind.is_none() {
+            kind = Some(lock);
+        }
+        text.push_str(&nodes[index].text);
+    }
+    let kind = kind?;
+    if text.is_empty() {
+        None
+    } else {
+        Some((kind, text))
+    }
+}
+
+/// Locked chart / SmartArt text inside a story part, for the unreachable report.
+pub(crate) fn locked_group_texts(xml: &str) -> Vec<(&'static str, String)> {
+    let (nodes, groups) = scan_story(xml);
+    let mut out = Vec::new();
+    for group in &groups {
+        if group.fallback {
+            continue;
+        }
+        if let Some((kind, text)) = locked_joined(&nodes, &group.visible) {
+            out.push((kind, text));
+        }
+        if let Some((kind, text)) = locked_joined(&nodes, &group.deleted) {
+            out.push((kind, text));
+        }
+    }
+    out
+}
+
+fn story_attr_texts(xml: &str, local: &str) -> Vec<(String, String)> {
+    let fallbacks = duplicate_fallback_ranges(xml);
+    let locks = locked_story_ranges(xml);
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some(tag) = next_tag(xml, pos) {
+        if !tag.is_end {
+            if range_contains(&fallbacks, tag.start) {
+                pos = tag.end;
+                continue;
+            }
+            if let Some(value) = attr_local_value(&xml[tag.start..tag.end], local) {
+                if !value.is_empty() {
+                    let place = lock_at(&locks, tag.start)
+                        .map(super::unreachable_location)
+                        .unwrap_or_default();
+                    out.push((value, place));
+                }
+            }
+        }
+        pos = tag.end;
+    }
+    out
+}
+
+fn rewrite_story_attrs(
+    xml: &str,
+    req: &super::EditRequest,
+    stats: &mut super::ChangeStats,
+) -> String {
+    let fallbacks = duplicate_fallback_ranges(xml);
+    let locks = locked_story_ranges(xml);
+    let mut out = String::with_capacity(xml.len());
+    let mut pos = 0usize;
+    while let Some(tag) = next_tag(xml, pos) {
+        out.push_str(&xml[pos..tag.start]);
+        let raw = &xml[tag.start..tag.end];
+        if tag.is_end || lock_at(&locks, tag.start).is_some() {
+            out.push_str(raw);
+        } else if range_contains(&fallbacks, tag.start) {
+            out.push_str(&rewrite_names(raw, |value| quiet_replace(value, req)));
+        } else {
+            out.push_str(&rewrite_names(raw, |value| {
+                super::replace_value(value, req, stats)
+            }));
+        }
+        pos = tag.end;
+    }
+    out.push_str(&xml[pos..]);
+    out
+}
+
+fn rewrite_names(tag: &str, mut edit: impl FnMut(&str) -> String) -> String {
+    let mut piece = tag.to_string();
+    for local in ["author", "initials"] {
+        piece = rewrite_attr_local(&piece, local, &mut edit);
+    }
+    piece
+}
+
+fn quiet_replace(text: &str, req: &super::EditRequest) -> String {
+    let mut pieces = vec![text.to_string()];
+    for item in &req.replacements {
+        let _ = super::text::replace_pieces_flex(&mut pieces, &item.find, &item.replace);
+    }
+    pieces.remove(0)
+}
+
 fn word_scan() -> ScanOpt {
     ScanOpt {
         para_locals: &["p", "rt"],
@@ -417,14 +576,14 @@ fn word_label(name: &str) -> String {
     let file = file_name(name);
     if file == "document.xml" {
         "本文".into()
-    } else if file.starts_with("header") {
-        format!("ヘッダー（{file}）")
-    } else if file.starts_with("footer") {
-        format!("フッター（{file}）")
     } else if file == "footnotes.xml" {
         "脚注".into()
     } else if file == "endnotes.xml" {
         "文末脚注".into()
+    } else if file.starts_with("header") {
+        format!("ヘッダー（{file}）")
+    } else if file.starts_with("footer") {
+        format!("フッター（{file}）")
     } else if file == "comments.xml" {
         "コメント".into()
     } else {

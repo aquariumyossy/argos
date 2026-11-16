@@ -24,15 +24,18 @@ pub struct SearchUnit {
 }
 
 /// Segment extracted pages into search units (blank-line first, then min/max rules).
+///
+/// Docx location lines (`〔ヘッダー〕` and the other story labels) are for chat.
+/// Indexing drops those labels and keeps each story line as its own unit, so a
+/// short header or chart title cannot join a `第N条` paragraph.
 pub fn segment_pages(pages: &[String]) -> Vec<SearchUnit> {
-    let mut raw: Vec<(String, Option<u32>)> = Vec::new();
+    let mut raw: Vec<IndexBlock> = Vec::new();
     for (page_idx, page) in pages.iter().enumerate() {
         let page_num = Some((page_idx as u32) + 1);
         for block in split_blank_line_blocks(page) {
-            if !block.chars().any(|c| !c.is_whitespace()) {
-                continue;
+            if let Some(prepared) = prepare_index_block(block, page_num) {
+                raw.push(prepared);
             }
-            raw.push((block, page_num));
         }
     }
 
@@ -43,12 +46,12 @@ pub fn segment_pages(pages: &[String]) -> Vec<SearchUnit> {
     let merged = merge_short_blocks(raw, UNIT_MIN_CHARS);
     let mut units = Vec::new();
     let mut unit_id = 0u32;
-    for (text, page) in merged {
-        let label = unit_label(&text, unit_id);
-        if text.chars().count() <= UNIT_MAX_CHARS {
+    for block in merged {
+        let label = unit_label(&block.text, unit_id);
+        if block.text.chars().count() <= UNIT_MAX_CHARS {
             units.push(SearchUnit {
-                text,
-                page,
+                text: block.text,
+                page: block.page,
                 unit_id,
                 label,
                 kind: "paragraph".into(),
@@ -56,7 +59,14 @@ pub fn segment_pages(pages: &[String]) -> Vec<SearchUnit> {
             unit_id += 1;
             continue;
         }
-        push_windowed_chunks(&mut units, &mut unit_id, &text, page, &label, UNIT_MAX_CHARS);
+        push_windowed_chunks(
+            &mut units,
+            &mut unit_id,
+            &block.text,
+            block.page,
+            &label,
+            UNIT_MAX_CHARS,
+        );
     }
     units
 }
@@ -146,25 +156,88 @@ fn split_blank_line_blocks(text: &str) -> Vec<String> {
     blocks
 }
 
-fn merge_short_blocks(
-    blocks: Vec<(String, Option<u32>)>,
-    min_chars: usize,
-) -> Vec<(String, Option<u32>)> {
-    let mut out: Vec<(String, Option<u32>)> = Vec::new();
-    for (text, page) in blocks {
-        let len = text.chars().count();
+struct IndexBlock {
+    text: String,
+    page: Option<u32>,
+    /// Header, footer, note, chart, diagram, or text box. Not merged into body.
+    story: bool,
+}
+
+/// Location prefixes the docx extractor adds for chat. Longest first.
+const STORY_LABELS: &[&str] = &[
+    "〔テキストボックス/図形〕",
+    "〔文末脚注〕",
+    "〔ヘッダー〕",
+    "〔フッター〕",
+    "〔グラフ〕",
+    "〔脚注〕",
+    "〔図〕",
+];
+
+fn prepare_index_block(text: String, page: Option<u32>) -> Option<IndexBlock> {
+    if !text.chars().any(|c| !c.is_whitespace()) {
+        return None;
+    }
+    if let Some(body) = strip_story_labels(&text) {
+        if !body.chars().any(|c| !c.is_whitespace()) {
+            return None;
+        }
+        return Some(IndexBlock {
+            text: body,
+            page,
+            story: true,
+        });
+    }
+    Some(IndexBlock {
+        text,
+        page,
+        story: false,
+    })
+}
+
+/// `Some` when `text` starts with one or more story labels. The labels are removed.
+fn strip_story_labels(text: &str) -> Option<String> {
+    let mut rest = text.trim_start();
+    let mut stripped = false;
+    loop {
+        let next = STORY_LABELS
+            .iter()
+            .find_map(|label| rest.strip_prefix(label));
+        let Some(next) = next else {
+            break;
+        };
+        rest = next.trim_start();
+        stripped = true;
+    }
+    if stripped {
+        Some(rest.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn merge_short_blocks(blocks: Vec<IndexBlock>, min_chars: usize) -> Vec<IndexBlock> {
+    let mut out: Vec<IndexBlock> = Vec::new();
+    for block in blocks {
+        if block.story {
+            out.push(block);
+            continue;
+        }
         if let Some(last) = out.last_mut() {
-            let last_len = last.0.chars().count();
-            if last_len < min_chars || len < min_chars {
-                last.0.push_str("\n\n");
-                last.0.push_str(&text);
-                if last.1.is_none() {
-                    last.1 = page;
+            if !last.story {
+                let last_len = last.text.chars().count();
+                let len = block.text.chars().count();
+                if last_len < min_chars || len < min_chars {
+                    last.text.push_str("\n\n");
+                    last.text.push_str(&block.text);
+                    if last.page.is_none() {
+                        last.page = block.page;
+                    }
+                    continue;
                 }
-                continue;
             }
         }
-        out.push((text, page));
+        out.push(block);
     }
     out
 }
@@ -254,22 +327,23 @@ fn is_article_numeral(c: char) -> bool {
     c.is_ascii_digit()
         || matches!(
             c,
-            '０'..='９'
-                | '〇'
-                | '零'
-                | '一'
-                | '二'
-                | '三'
-                | '四'
-                | '五'
-                | '六'
-                | '七'
-                | '八'
-                | '九'
-                | '十'
-                | '百'
-                | '千'
-                | '万'
+            '０'
+                ..='９'
+                    | '〇'
+                    | '零'
+                    | '一'
+                    | '二'
+                    | '三'
+                    | '四'
+                    | '五'
+                    | '六'
+                    | '七'
+                    | '八'
+                    | '九'
+                    | '十'
+                    | '百'
+                    | '千'
+                    | '万'
         )
 }
 
@@ -287,7 +361,12 @@ mod tests {
 - ****: この法律は個人の尊厳を旨として解釈する。
 ";
         let units = segment_pages(&[text.into()]);
-        assert!(units.len() >= 2, "got {} units: {:?}", units.len(), units.iter().map(|u| &u.label).collect::<Vec<_>>());
+        assert!(
+            units.len() >= 2,
+            "got {} units: {:?}",
+            units.len(),
+            units.iter().map(|u| &u.label).collect::<Vec<_>>()
+        );
         assert!(
             units[0].label.contains("第一条"),
             "label={}",
@@ -310,7 +389,9 @@ mod tests {
     #[test]
     fn long_block_splits() {
         // Varied content so adjacent windows are not identical strings.
-        let text: String = (0..2500).map(|i| char::from_u32(0x3042 + (i % 20) as u32).unwrap()).collect();
+        let text: String = (0..2500)
+            .map(|i| char::from_u32(0x3042 + (i % 20) as u32).unwrap())
+            .collect();
         let units = segment_pages(&[text]);
         assert!(units.len() >= 2);
         assert!(units.iter().all(|u| u.kind == "chunk"));
@@ -361,5 +442,82 @@ mod tests {
     #[test]
     fn mail_whitespace_only_is_empty() {
         assert!(segment_mail_body("  \n\n  ").is_empty());
+    }
+
+    #[test]
+    fn docx_story_lines_do_not_merge_into_articles() {
+        let body1 = "この契約は当事者間の取引条件を定めることを目的として締結されるものであり、十分な長さの本文を持つ。";
+        let body2 = "本契約において用いる用語の定義は次のとおりとし、こちらも十分な長さの段落本文とするものである。";
+        assert!(
+            body1.chars().count() >= UNIT_MIN_CHARS,
+            "{}",
+            body1.chars().count()
+        );
+        assert!(
+            body2.chars().count() >= UNIT_MIN_CHARS,
+            "{}",
+            body2.chars().count()
+        );
+        let text = format!(
+            "〔ヘッダー〕甲株式会社\n\n\
+             第一条（目的）\n\n\
+             {body1}\n\n\
+             〔テキストボックス/図形〕枠内の文言\n\n\
+             第二条（定義）\n\n\
+             {body2}\n\n\
+             〔フッター〕機密\n\n\
+             〔脚注〕注記\n\n\
+             〔文末脚注〕末注\n\n\
+             〔グラフ〕売上\n\n\
+             〔図〕組織"
+        );
+        let units = segment_pages(&[text]);
+        let article1_unit = units
+            .iter()
+            .find(|unit| unit.label.contains("第一条"))
+            .expect("第一条 unit");
+        let article2_unit = units
+            .iter()
+            .find(|unit| unit.label.contains("第二条"))
+            .expect("第二条 unit");
+        assert!(
+            article1_unit.text.starts_with("第一条"),
+            "{}",
+            article1_unit.text
+        );
+        assert!(
+            article2_unit.text.starts_with("第二条"),
+            "{}",
+            article2_unit.text
+        );
+        for unit in [article1_unit, article2_unit] {
+            assert!(!unit.text.contains("甲株式会社"), "{}", unit.text);
+            assert!(!unit.text.contains("枠内の文言"), "{}", unit.text);
+            assert!(!unit.text.contains("機密"), "{}", unit.text);
+            assert!(!unit.text.contains("注記"), "{}", unit.text);
+            assert!(!unit.text.contains("末注"), "{}", unit.text);
+            assert!(!unit.text.contains("売上"), "{}", unit.text);
+            assert!(!unit.text.contains("組織"), "{}", unit.text);
+            assert!(!unit.text.contains('〔'), "{}", unit.text);
+            assert!(!unit.text.contains("グラフ"), "{}", unit.text);
+        }
+        assert_eq!(
+            units
+                .iter()
+                .filter(|unit| unit.text == "甲株式会社")
+                .count(),
+            1
+        );
+        for story in ["枠内の文言", "機密", "注記", "末注", "売上", "組織"] {
+            assert!(
+                units.iter().any(|unit| unit.text == story),
+                "missing {story}: {:?}",
+                units
+                    .iter()
+                    .map(|unit| unit.text.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(units.iter().all(|unit| !unit.text.contains('〔')));
     }
 }

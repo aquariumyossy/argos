@@ -970,6 +970,11 @@ fn unreachable_places(entries: &[(String, Vec<u8>)], find: &str) -> Vec<String> 
                     push_place(&mut places, &unreachable_location("フィールド"));
                 }
             }
+            for (kind, text) in docx::locked_group_texts(&xml) {
+                if text.contains(find) {
+                    push_place(&mut places, &unreachable_location(kind));
+                }
+            }
             continue;
         }
         if docx::is_rels(name) {
@@ -1015,6 +1020,9 @@ fn unreachable_variants(
                 if matches!(local.as_str(), "instrText" | "delInstrText") {
                     take(&unreachable_location("フィールド"), &text);
                 }
+            }
+            for (kind, text) in docx::locked_group_texts(&xml) {
+                take(&unreachable_location(kind), &text);
             }
             continue;
         }
