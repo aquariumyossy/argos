@@ -145,7 +145,7 @@ fn fill_near_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
     }
 }
 
-fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
+fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
     let mut texts = Vec::new();
     for (name, bytes) in entries {
         let Some(xml) = decode_xml_bytes(bytes) else {
@@ -155,32 +155,52 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
             let nodes = scan_text_nodes(&xml, &word_scan());
             let groups = group_nodes(&nodes);
             for group in &groups {
-                push_text(&mut texts, joined(&nodes, &group.visible));
-                push_text(&mut texts, joined(&nodes, &group.deleted));
+                push_text(&mut texts, joined(&nodes, &group.visible), "");
+                push_text(&mut texts, joined(&nodes, &group.deleted), "");
             }
-            texts.extend(collect_attr_local(&xml, "author"));
-            texts.extend(collect_attr_local(&xml, "initials"));
+            for author in collect_attr_local(&xml, "author") {
+                push_text(&mut texts, author, "");
+            }
+            for initials in collect_attr_local(&xml, "initials") {
+                push_text(&mut texts, initials, "");
+            }
+            let field = super::unreachable_location("フィールド");
+            for (local, text) in leaf_texts(&xml) {
+                if matches!(local.as_str(), "instrText" | "delInstrText") {
+                    push_text(&mut texts, text, &field);
+                }
+            }
             continue;
         }
         if is_rels(name) {
-            texts.extend(hyperlink_targets(&xml));
+            let link = super::unreachable_location("ハイパーリンク");
+            for target in hyperlink_targets(&xml) {
+                push_text(&mut texts, target, &link);
+            }
             continue;
         }
         if !is_xml_name(name) {
             continue;
         }
+        let place = super::unreachable_kind(name)
+            .map(super::unreachable_location)
+            .unwrap_or_default();
         for (_, text) in leaf_texts(&xml) {
-            push_text(&mut texts, text);
+            push_text(&mut texts, text, &place);
         }
-        texts.extend(collect_attr_local(&xml, "author"));
-        texts.extend(collect_attr_local(&xml, "initials"));
+        for author in collect_attr_local(&xml, "author") {
+            push_text(&mut texts, author, &place);
+        }
+        for initials in collect_attr_local(&xml, "initials") {
+            push_text(&mut texts, initials, &place);
+        }
     }
     texts
 }
 
-fn push_text(texts: &mut Vec<String>, text: String) {
+fn push_text(texts: &mut Vec<(String, String)>, text: String, location: &str) {
     if !text.is_empty() {
-        texts.push(text);
+        texts.push((text, location.to_string()));
     }
 }
 

@@ -20,6 +20,8 @@ pub struct ReplaceHit {
 pub struct NearMiss {
     pub exact: String,
     pub note: String,
+    /// Empty when the spelling sits in a part this tool can edit.
+    pub location: String,
 }
 
 /// ASCII space, ideographic space, NBSP, or tab.
@@ -292,7 +294,10 @@ pub fn whitespace_note(text: &str) -> String {
 
 /// Source slices whose non-whitespace characters equal `find`, but the slice
 /// itself is not `find`. At most `limit` distinct strings, in appearance order.
-pub fn near_misses(texts: &[String], find: &str, limit: usize) -> Vec<NearMiss> {
+/// `texts` is `(source text, location)`. An empty location means an editable part.
+///
+/// The same spelling in an editable part is not labelled unreachable.
+pub fn near_misses(texts: &[(String, String)], find: &str, limit: usize) -> Vec<NearMiss> {
     if limit == 0 || find.is_empty() {
         return Vec::new();
     }
@@ -300,21 +305,28 @@ pub fn near_misses(texts: &[String], find: &str, limit: usize) -> Vec<NearMiss> 
     if target.is_empty() {
         return Vec::new();
     }
-    let mut found = Vec::new();
-    for text in texts {
-        collect_compact(text, find, &target, &mut found, limit);
-        if found.len() >= limit {
-            break;
+    let mut found: Vec<NearMiss> = Vec::new();
+    for (text, location) in texts {
+        let mut slices = Vec::new();
+        collect_compact(text, find, &target, &mut slices, limit);
+        for exact in slices {
+            if let Some(existing) = found.iter_mut().find(|item| item.exact == exact) {
+                if location.is_empty() {
+                    existing.location.clear();
+                }
+                continue;
+            }
+            if found.len() >= limit {
+                continue;
+            }
+            found.push(NearMiss {
+                note: variant_note(find, &exact),
+                location: location.clone(),
+                exact,
+            });
         }
     }
-    found.truncate(limit);
     found
-        .into_iter()
-        .map(|exact| NearMiss {
-            note: variant_note(find, &exact),
-            exact,
-        })
-        .collect()
 }
 
 /// Pasteable source slices that compact-match `find` but are not `find` itself.
@@ -602,37 +614,58 @@ mod tests {
         assert_eq!(pieces, vec!["山田太郎".to_string()]);
     }
 
+    fn spot(text: &str) -> (String, String) {
+        (text.to_string(), String::new())
+    }
+
     #[test]
     fn near_miss_keeps_the_source_bytes_and_annotates_beside_them() {
-        let texts = vec![
-            "前文山田\u{2003}太郎。".to_string(),
-            "鈴木一郎です".to_string(),
-        ];
+        let texts = vec![spot("前文山田\u{2003}太郎。"), spot("鈴木一郎です")];
         let misses = near_misses(&texts, "山田 太郎", 3);
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].exact, "山田\u{2003}太郎");
         assert_eq!(misses[0].note, "U+2003");
+        assert!(misses[0].location.is_empty());
         assert!(!misses[0].exact.contains("U+"));
         assert!(!misses[0].exact.contains('※'));
 
-        let missing = near_misses(&["鈴木一郎です".to_string()], "鈴木 一郎", 3);
+        let missing = near_misses(&[spot("鈴木一郎です")], "鈴木 一郎", 3);
         assert_eq!(missing[0].exact, "鈴木一郎");
         assert_eq!(missing[0].note, "空白なし");
 
-        let fullwidth = near_misses(&["名前は山田　太郎。".to_string()], "山田太郎", 3);
+        let fullwidth = near_misses(&[spot("名前は山田　太郎。")], "山田太郎", 3);
         assert_eq!(fullwidth[0].exact, "山田　太郎");
         assert_eq!(fullwidth[0].note, "全角空白");
         assert_eq!(fullwidth[0].exact.chars().nth(2), Some('\u{3000}'));
     }
 
     #[test]
-    fn near_miss_stops_at_a_few_distinct_strings() {
-        let texts = vec![
-            "AA".to_string(),
-            "A\tA".to_string(),
-            "A　A".to_string(),
-            "A\u{00A0}A".to_string(),
+    fn a_spelling_only_in_an_unreachable_part_keeps_that_label() {
+        let texts = vec![(
+            "図の山田　太郎".to_string(),
+            "グラフ（このツールでは変更できない場所）".to_string(),
+        )];
+        let misses = near_misses(&texts, "山田太郎", 3);
+        assert_eq!(misses[0].exact, "山田　太郎");
+        assert_eq!(
+            misses[0].location,
+            "グラフ（このツールでは変更できない場所）"
+        );
+
+        let both = vec![
+            (
+                "図の山田　太郎".to_string(),
+                "グラフ（このツールでは変更できない場所）".to_string(),
+            ),
+            spot("本文の山田　太郎"),
         ];
+        let misses = near_misses(&both, "山田太郎", 3);
+        assert!(misses[0].location.is_empty());
+    }
+
+    #[test]
+    fn near_miss_stops_at_a_few_distinct_strings() {
+        let texts = vec![spot("AA"), spot("A\tA"), spot("A　A"), spot("A\u{00A0}A")];
         let misses = near_misses(&texts, "A A", 3);
         assert_eq!(misses.len(), 3);
         assert_eq!(misses[0].exact, "AA");

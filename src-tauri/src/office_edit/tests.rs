@@ -945,7 +945,8 @@ fn inside_quotes(line: &str) -> &str {
 fn pasteable_near<'a>(report: &'a str, marker: &str) -> &'a str {
     let lines: Vec<&str> = report.lines().collect();
     for (index, line) in lines.iter().enumerate() {
-        if !line.starts_with("近い文字列") {
+        let candidate = line.starts_with("近い文字列") || line.starts_with("- ");
+        if !candidate {
             continue;
         }
         let quoted = if line.contains('「') {
@@ -1134,6 +1135,109 @@ fn a_total_miss_names_the_exact_string_in_an_unreachable_part() {
     assert_eq!(whitespace_note_follows(&err, "山田\u{2003}太郎"), "※U+2003");
     // The chart's exact "山田太郎" is a compact match of the spaced find too.
     assert_eq!(pasteable_near(&err, "山田太郎"), "山田太郎");
+    assert!(
+        err.lines().any(|line| {
+            line.starts_with("- ")
+                && line.contains("グラフ（このツールでは変更できない場所）")
+                && !line.contains('「')
+        }),
+        "{err}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_zero_hit_near_miss_in_an_unreachable_part_names_that_place() {
+    let dir = temp_dir("near-place");
+    let src = dir.join("訴状.docx");
+    let document = word_body(
+        "<w:p><w:r><w:t>関係ない本文</w:t></w:r></w:p>\
+<w:p><w:r><w:instrText xml:space=\"preserve\"> REF 山 田 太 郎 \\h </w:instrText></w:r></w:p>",
+    );
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/山田　太郎" TargetMode="External"/>
+</Relationships>"#;
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山　田　太　郎</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/_rels/document.xml.rels", rels),
+            ("word/charts/chart1.xml", chart),
+        ],
+    );
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 14-00-00",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap_err();
+    assert!(!dir.join("out").exists());
+    assert_eq!(
+        pasteable_at(&err, "グラフ（このツールでは変更できない場所）"),
+        "山\u{3000}田\u{3000}太\u{3000}郎"
+    );
+    assert_eq!(
+        whitespace_note_follows(&err, "山\u{3000}田\u{3000}太\u{3000}郎"),
+        "※全角空白"
+    );
+    assert_eq!(
+        pasteable_at(&err, "ハイパーリンク（このツールでは変更できない場所）"),
+        "山田\u{3000}太郎"
+    );
+    assert_eq!(
+        pasteable_at(&err, "フィールド（このツールでは変更できない場所）"),
+        "山 田 太 郎"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_xlsx_zero_hit_near_miss_in_a_chart_names_that_place() {
+    let dir = temp_dir("xlsx-near-place");
+    let src = dir.join("一覧.xlsx");
+    let shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>関係ない</t></si></sst>"#;
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>
+</worksheet>"#;
+    let chart = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山{sp}田{sp}太{sp}郎</a:t></c:tx>
+</c:chartSpace>"#,
+        sp = "\u{3000}"
+    );
+    write_zip(
+        &src,
+        &[
+            ("xl/sharedStrings.xml", shared),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("xl/charts/chart1.xml", chart.as_str()),
+        ],
+    );
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 14-00-01",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap_err();
+    assert!(!dir.join("out").exists());
+    assert_eq!(
+        pasteable_at(&err, "グラフ（このツールでは変更できない場所）"),
+        "山\u{3000}田\u{3000}太\u{3000}郎"
+    );
+    assert_eq!(
+        whitespace_note_follows(&err, "山\u{3000}田\u{3000}太\u{3000}郎"),
+        "※全角空白"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 

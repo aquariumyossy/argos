@@ -798,7 +798,14 @@ fn format_replacement_lines(stats: &ChangeStats) -> String {
             ));
             if let Some(misses) = stats.near_misses.get(index) {
                 for miss in misses.iter().take(text::NEAR_MISS_LIMIT) {
-                    out.push_str("近い文字列:\n「");
+                    if miss.location.is_empty() {
+                        out.push_str("近い文字列:\n");
+                    } else {
+                        out.push_str("- ");
+                        out.push_str(&miss.location);
+                        out.push('\n');
+                    }
+                    out.push('「');
                     out.push_str(&miss.exact);
                     out.push_str("」\n");
                     if !miss.note.is_empty() {

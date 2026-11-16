@@ -191,12 +191,19 @@ fn fill_near_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
     }
 }
 
-fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
+fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
     let mut texts = Vec::new();
     for (name, bytes) in entries {
         let Some(xml) = decode_xml_bytes(bytes) else {
             continue;
         };
+        if super::docx::is_rels(name) {
+            let link = super::unreachable_location("ハイパーリンク");
+            for target in super::docx::hyperlink_targets(&xml) {
+                push_text(&mut texts, target, &link);
+            }
+            continue;
+        }
         if file_name(name) == "sharedstrings.xml" || is_worksheet(name) {
             let opt = if is_worksheet(name) {
                 sheet_scan()
@@ -206,8 +213,8 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
             let nodes = scan_text_nodes(&xml, &opt);
             let groups = group_nodes(&nodes);
             for group in &groups {
-                push_text(&mut texts, joined(&nodes, &group.visible));
-                push_text(&mut texts, joined(&nodes, &group.deleted));
+                push_text(&mut texts, joined(&nodes, &group.visible), "");
+                push_text(&mut texts, joined(&nodes, &group.deleted), "");
             }
             if is_worksheet(name) {
                 for (local, text) in leaf_texts(&xml) {
@@ -221,7 +228,7 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
                             | "firstFooter"
                             | "f"
                     ) {
-                        push_text(&mut texts, text);
+                        push_text(&mut texts, text, "");
                     }
                 }
             }
@@ -229,27 +236,30 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
         }
         if file_name(name) == "workbook.xml" {
             for (sheet_name, _) in read_sheet_names(&xml) {
-                push_text(&mut texts, sheet_name);
+                push_text(&mut texts, sheet_name, "");
             }
             for (_, text) in leaf_texts(&xml) {
-                push_text(&mut texts, text);
+                push_text(&mut texts, text, "");
             }
             continue;
         }
         let lower = name.to_ascii_lowercase();
-        if !lower.ends_with(".xml") && !lower.ends_with(".rels") {
+        if !lower.ends_with(".xml") {
             continue;
         }
+        let place = super::unreachable_kind(name)
+            .map(super::unreachable_location)
+            .unwrap_or_default();
         for (_, text) in leaf_texts(&xml) {
-            push_text(&mut texts, text);
+            push_text(&mut texts, text, &place);
         }
     }
     texts
 }
 
-fn push_text(texts: &mut Vec<String>, text: String) {
+fn push_text(texts: &mut Vec<(String, String)>, text: String, location: &str) {
     if !text.is_empty() {
-        texts.push(text);
+        texts.push((text, location.to_string()));
     }
 }
 
