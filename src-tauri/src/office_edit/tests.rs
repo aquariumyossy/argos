@@ -1502,14 +1502,16 @@ fn pasteable_at<'a>(report: &'a str, location: &str) -> &'a str {
 }
 
 #[test]
-fn a_spaceless_find_replaces_every_whitespace_variant_in_each_paragraph() {
+fn a_spaceless_find_leaves_spaced_spellings_and_reports_them() {
     let dir = temp_dir("opus");
     let src = dir.join("訴状.docx");
-    let document = word_body(&format!(
-        "<w:p><w:r><w:t>原告山田 太郎（以下「山田\u{3000}太郎」という。）</w:t></w:r></w:p>\
-<w:p><w:r><w:t>当事者目録\u{3000}原告\u{3000}山田</w:t></w:r><w:r><w:t>\u{3000}太郎</w:t></w:r></w:p>"
-    ));
+    let document = word_body(
+        "<w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>\
+<w:p><w:r><w:t>山\u{3000}田\u{3000}太\u{3000}郎</w:t></w:r></w:p>\
+<w:p><w:r><w:t>山田\u{3000}太郎</w:t></w:r></w:p>",
+    );
     write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let before = fs::read(&src).unwrap();
     let edited = edit_path(
         &src,
         &dir.join("out"),
@@ -1517,32 +1519,72 @@ fn a_spaceless_find_replaces_every_whitespace_variant_in_each_paragraph() {
         &request(&[("山田太郎", "佐藤花子")], &[]),
     )
     .unwrap();
+    assert_eq!(fs::read(&src).unwrap(), before);
     let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("本文の佐藤花子"), "{document}");
     assert!(
-        document.contains("原告佐藤花子（以下「佐藤花子」という。）"),
+        document.contains("山\u{3000}田\u{3000}太\u{3000}郎"),
         "{document}"
     );
-    assert!(
-        document.contains("当事者目録\u{3000}原告\u{3000}佐藤花子"),
-        "{document}"
+    assert!(document.contains("山田\u{3000}太郎"), "{document}");
+    assert_eq!(
+        pasteable_at(&edited.report, "本文の2段落目"),
+        "山\u{3000}田\u{3000}太\u{3000}郎"
     );
-    assert!(!document.contains("山田"), "{document}");
-    assert!(
-        edited.report.contains("完全一致 0、空白の違い 3"),
-        "{}",
-        edited.report
+    assert_eq!(
+        pasteable_at(&edited.report, "本文の3段落目"),
+        "山田\u{3000}太郎"
     );
-    assert!(
-        edited.report.contains("『山田 太郎』（半角空白）"),
-        "{}",
-        edited.report
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn shorter_finds_do_not_rewrite_spaced_spellings() {
+    let dir = temp_dir("short-find");
+    let src = dir.join("署名.docx");
+    let document = word_body(
+        "<w:p><w:r><w:t>署名\u{3000}甲\u{3000}乙</w:t></w:r></w:p>\
+<w:p><w:r><w:t>山\u{3000}田\u{3000}太\u{3000}郎</w:t></w:r></w:p>",
     );
-    assert!(
-        edited.report.contains("『山田\u{3000}太郎』（全角空白）"),
-        "{}",
-        edited.report
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let before = fs::read(&src).unwrap();
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 13-00-04",
+        &request(&[("甲乙", "丙丁"), ("山田", "鈴木")], &[]),
+    )
+    .unwrap_err();
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert!(!dir.join("out").exists());
+    assert!(!err.contains("丙丁"), "{err}");
+    assert!(!err.contains("鈴木"), "{err}");
+    assert_eq!(pasteable_near(&err, "甲\u{3000}乙"), "甲\u{3000}乙");
+    assert_eq!(pasteable_near(&err, "山\u{3000}田"), "山\u{3000}田");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_missed_spaceless_find_reports_a_spread_spelling() {
+    let dir = temp_dir("spread-miss");
+    let src = dir.join("訴状.docx");
+    let document = word_body("<w:p><w:r><w:t>山\u{3000}田\u{3000}太\u{3000}郎</w:t></w:r></w:p>");
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let before = fs::read(&src).unwrap();
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 13-00-03",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap_err();
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert!(!dir.join("out").exists());
+    assert_eq!(
+        pasteable_near(&err, "\u{3000}"),
+        "山\u{3000}田\u{3000}太\u{3000}郎"
     );
-    assert!(edited.report.contains("残存: なし"), "{}", edited.report);
+    assert!(err.contains("※全角空白"), "{err}");
     let _ = fs::remove_dir_all(&dir);
 }
 
