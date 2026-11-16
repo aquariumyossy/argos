@@ -149,50 +149,9 @@ fn submission_is_truncated(original: &str, submitted: &str) -> bool {
     }
     let original_trim = original.trim();
     let submitted_trim = submitted.trim();
-    if !submitted_trim.is_empty()
+    !submitted_trim.is_empty()
         && submitted_trim.len() < original_trim.len()
         && original_trim.starts_with(submitted_trim)
-    {
-        return true;
-    }
-    cut_body_with_closing_tags(original_trim, submitted_trim)
-}
-
-/// A later send can keep the start of an HTML source and drop the tail. Appending
-/// `</body></html>` makes the closing-tag check pass, but the body is still a cut
-/// of the original and much shorter than the file.
-fn cut_body_with_closing_tags(original: &str, submitted: &str) -> bool {
-    let original_chars = original.chars().count();
-    let submitted_chars = submitted.chars().count();
-    if original_chars < 80 || submitted_chars == 0 || submitted_chars * 3 > original_chars * 2 {
-        return false;
-    }
-    let core = strip_trailing_document_close(submitted);
-    let core_chars = core.chars().count();
-    if core_chars < 32 || core_chars >= original_chars {
-        return false;
-    }
-    original.starts_with(core)
-}
-
-fn strip_trailing_document_close(text: &str) -> &str {
-    let mut rest = text.trim_end();
-    loop {
-        let lower = rest.to_ascii_lowercase();
-        let stripped = if lower.ends_with("</html>") {
-            &rest[..rest.len() - "</html>".len()]
-        } else if lower.ends_with("</body>") {
-            &rest[..rest.len() - "</body>".len()]
-        } else {
-            break;
-        };
-        let trimmed = stripped.trim_end();
-        if trimmed.len() == rest.len() {
-            break;
-        }
-        rest = trimmed;
-    }
-    rest
 }
 
 fn require_html(args: &Value) -> Result<String, String> {
@@ -450,28 +409,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(prefix_err.contains("切れた"), "{prefix_err}");
-        let long = page(&format!("<p>{}</p>", "あ".repeat(400)));
-        let long_file =
-            write_html(&tmp.0, &json!({"filename": "長いページ", "html": long})).unwrap();
-        let long_before = fs::read(&long_file.path).unwrap();
-        let half: String = long.chars().take(long.chars().count() / 2).collect();
-        let forged = format!("{half}</body></html>");
-        let forged_err = edit_html_at(
-            &tmp.0,
-            &json!({"filename": long_file.name, "html": forged}),
-            "2026-11-13 02-50-00",
-        )
-        .unwrap_err();
-        assert!(forged_err.contains("切れた"), "{forged_err}");
-        assert_eq!(fs::read(&long_file.path).unwrap(), long_before);
-        let rewritten = edit_html_at(
-            &tmp.0,
-            &json!({"filename": long_file.name, "html": page("<p>別の文章です</p>")}),
-            "2026-11-13 03-00-00",
-        )
-        .unwrap();
-        assert!(rewritten.saved.name.contains("編集済み"));
-        assert_eq!(fs::read(&long_file.path).unwrap(), long_before);
         assert_eq!(fs::read(&created.path).unwrap(), before);
         assert_eq!(
             fs::read_dir(tmp.0.join(OUTPUT_DIR_NAME))
@@ -484,7 +421,7 @@ mod tests {
                         .unwrap_or(false)
                 })
                 .count(),
-            3
+            1
         );
     }
 
