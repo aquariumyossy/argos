@@ -244,8 +244,7 @@ fn kind_label(name: &str) -> Option<&'static str> {
 }
 
 fn is_html_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".html") || lower.ends_with(".htm")
+    name.to_ascii_lowercase().ends_with(".html")
 }
 
 fn name_filter(args: &Value) -> String {
@@ -294,7 +293,7 @@ fn list_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_LIST_OUTPUT,
-            "description": "Argos の出力フォルダにある Word・Excel・HTML（.html と .htm）を、名前・種類・更新日時（新しい順）で返す。本文は返さない。name を渡すと、その文字列を含むファイルだけを、新しい200件より古いものも含めて返す。利用者が「先週の○○の表を直して」のように過去のファイルを指したときは、まずこれを呼ぶ。名前・種類・更新日時が合うファイルが一つなら、そのファイル名で read_output_file を呼ぶ。候補が複数あるときは、それらの名前・種類・更新日時を挙げてどれかを利用者に聞いて、答えがあるまで読んだり編集したりしない。検索フォルダや出力フォルダの外は見ない。",
+            "description": "Argos の出力フォルダにある Word・Excel・HTML を、名前・種類・更新日時（新しい順）で返す。本文は返さない。name を渡すと、その文字列を含むファイルだけを、新しい200件より古いものも含めて返す。利用者が「先週の○○の表を直して」のように過去のファイルを指したときは、まずこれを呼ぶ。名前・種類・更新日時が合うファイルが一つなら、そのファイル名で read_output_file を呼ぶ。候補が複数あるときは、それらの名前・種類・更新日時を挙げてどれかを利用者に聞いて、答えがあるまで読んだり編集したりしない。検索フォルダや出力フォルダの外は見ない。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -310,7 +309,7 @@ fn read_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_READ_OUTPUT,
-            "description": "出力フォルダにある Word・Excel・HTML（.html と .htm）の中身を、添付なしで読む。filename は list_output_files で見たファイル名だけ。パスは渡さない。Word と Excel は本文、HTML はソースを返す。HTML が文脈に入りきらないときはソースを返さず、edit_html には渡させない。出力フォルダの外、シンボリックリンクで外へ出るパス、検索フォルダのファイルは読めない。対象が一つに決まってから、編集の前に呼ぶ。",
+            "description": "出力フォルダにある Word・Excel・HTML の中身を、添付なしで読む。filename は list_output_files で見たファイル名だけ。パスは渡さない。Word と Excel は本文、HTML はソースを返す。HTML が文脈に入りきらないときはソースを返さず、edit_html には渡させない。出力フォルダの外、シンボリックリンクで外へ出るパス、検索フォルダのファイルは読めない。対象が一つに決まってから、編集の前に呼ぶ。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -331,6 +330,22 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     const CONTEXT: usize = crate::db::DEFAULT_LLM_MAX_CONTEXT_TOKENS as usize;
+
+    fn llm_message(id: &str, role: &str, content: &str) -> crate::db::LlmMessageRow {
+        crate::db::LlmMessageRow {
+            id: id.into(),
+            thread_id: "t".into(),
+            role: role.into(),
+            content: content.into(),
+            created_at: 0,
+            reasoning: String::new(),
+            tool_calls: String::new(),
+            tool_call_id: String::new(),
+            tool_name: String::new(),
+            kind: String::new(),
+            carries_summary: false,
+        }
+    }
 
     struct Tmp(PathBuf);
 
@@ -657,22 +672,46 @@ mod tests {
     }
 
     #[test]
-    fn htm_is_listed_and_read_as_html() {
+    fn htm_is_not_listed_or_read() {
         let tmp = Tmp::new();
         let dir = output_dir(&tmp.0);
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("手数料.htm");
-        fs::write(&path, "<html><body><p>htm本文</p></body></html>").unwrap();
+        fs::write(dir.join("手数料.htm"), "<html><body><p>htm本文</p></body></html>").unwrap();
+        fs::write(dir.join("手数料.html"), "<html><body><p>html本文</p></body></html>").unwrap();
         let listed = list_for_tool(&tmp.0, &json!({}));
-        assert!(listed.contains("手数料.htm\tHTML\t"), "{listed}");
-        let read = read_for_tool(&tmp.0, &json!({"filename": "手数料.htm"}), CONTEXT);
-        assert!(read.contains("htm本文"), "{read}");
-        assert!(read.contains("種類: HTML"), "{read}");
-        assert!(read.contains(HTML_SOURCE_NOTE), "{read}");
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "<html><body><p>htm本文</p></body></html>"
+        assert!(listed.contains("手数料.html\tHTML\t"), "{listed}");
+        assert!(
+            listed.lines().all(|line| !line.starts_with("手数料.htm\t")),
+            "{listed}"
         );
+        assert!(!listed.contains("htm本文"), "{listed}");
+        let read = read_for_tool(&tmp.0, &json!({"filename": "手数料.htm"}), CONTEXT);
+        assert!(
+            read.contains("ファイル名") || read.contains("Word"),
+            "{read}"
+        );
+        assert!(!read.contains("htm本文"), "{read}");
+        let html = read_for_tool(&tmp.0, &json!({"filename": "手数料.html"}), CONTEXT);
+        assert!(html.contains("html本文"), "{html}");
+    }
+
+    #[test]
+    fn a_later_send_does_not_halve_an_html_source() {
+        let source = format!("<html><body><p>{}</p></body></html>", "あ".repeat(4_000));
+        let payload = format!(
+            "ファイル: ページ.html\n種類: HTML\n更新日時: 2026-11-01 00:00\n\n{HTML_SOURCE_NOTE}\n{source}"
+        );
+        let mut tool = llm_message("t1", "tool", &payload);
+        tool.tool_name = TOOL_READ_OUTPUT.into();
+        let history = vec![llm_message("u1", "user", "直して"), tool];
+        let (turns, _) = crate::llm::context::assemble_turns("役割", &[], &history, 400);
+        let tool_turn = turns
+            .iter()
+            .find(|turn| turn.role == "tool")
+            .expect("html tool result stays in the request");
+        assert_eq!(tool_turn.content, HTML_READ_REFUSAL);
+        assert!(!tool_turn.content.contains(HTML_SOURCE_NOTE));
+        assert!(!tool_turn.content.contains('あ'));
     }
 
     #[test]

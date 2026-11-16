@@ -1662,9 +1662,13 @@ fn restore_recent_rereads(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
             break;
         };
         let before = char_len(&built[idx].turn.content);
-        let budget = tokens_of(built).saturating_sub(max_tokens).max(1);
-        let keep = turn_tokens(&built[idx].turn).saturating_sub(budget).max(1);
-        built[idx].turn.content = truncate_to_tokens(&built[idx].turn.content, keep);
+        if crate::llm::output_files::is_html_source_payload(&built[idx].turn.content) {
+            built[idx].turn.content = crate::llm::output_files::HTML_READ_REFUSAL.into();
+        } else {
+            let budget = tokens_of(built).saturating_sub(max_tokens).max(1);
+            let keep = turn_tokens(&built[idx].turn).saturating_sub(budget).max(1);
+            built[idx].turn.content = truncate_to_tokens(&built[idx].turn.content, keep);
+        }
         if char_len(&built[idx].turn.content) >= before {
             break;
         }
@@ -2310,6 +2314,9 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
                         crate::llm::summary::clip_injected_summary(&row.turn.content, next);
                     return char_len(&clipped) < len;
                 }
+                if crate::llm::output_files::is_html_source_payload(&row.turn.content) {
+                    return true;
+                }
                 len > 40 && (len / 2).max(40) < len
             })
             .max_by_key(|(_, row)| char_len(&row.turn.content))
@@ -2326,6 +2333,11 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
                 break;
             }
             built[idx].turn.content = clipped;
+            changed = true;
+            continue;
+        }
+        if crate::llm::output_files::is_html_source_payload(&built[idx].turn.content) {
+            built[idx].turn.content = crate::llm::output_files::HTML_READ_REFUSAL.into();
             changed = true;
             continue;
         }
