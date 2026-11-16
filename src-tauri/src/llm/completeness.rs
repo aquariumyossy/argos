@@ -403,32 +403,47 @@ fn skip_existing_table_rows(original: &str, continuation: &str) -> String {
     if existing.is_empty() || continuation.is_empty() {
         return continuation.to_string();
     }
+    let lines: Vec<&str> = continuation.split_inclusive('\n').collect();
     let mut out = String::new();
     let mut skipped = false;
     let mut in_table = true;
-    for line in continuation.split_inclusive('\n') {
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
         let trimmed = line.trim_end_matches(['\n', '\r']).trim();
-        if in_table && trimmed.is_empty() && skipped {
+        if in_table && trimmed.is_empty() && skipped && next_line_is_table_row(&lines[index + 1..])
+        {
+            index += 1;
             continue;
         }
         if in_table
             && is_complete_table_row(trimmed)
             && !is_separator_row(trimmed)
-            && existing.iter().any(|row| row == trimmed)
+            && existing.iter().any(|row| same_table_line(row, trimmed))
         {
             skipped = true;
+            index += 1;
             continue;
         }
         if in_table && !trimmed.is_empty() && !trimmed.starts_with('|') {
             in_table = false;
         }
         out.push_str(line);
+        index += 1;
     }
     if starts_with_table_row(&out) {
         out.trim_start_matches(['\n', '\r']).to_string()
     } else {
         out
     }
+}
+
+fn next_line_is_table_row(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .map(|line| line.trim_end_matches(['\n', '\r']).trim())
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.starts_with('|'))
 }
 
 fn last_table_data_rows(original: &str) -> Vec<String> {
@@ -1202,6 +1217,34 @@ mod tests {
         assert!(joined.contains("| 期間 | 相当の期間です。 |"), "{joined}");
         assert!(!joined.contains("\n\n"), "{joined}");
         assert!(!opening_is_rewritten(original, continuation));
+    }
+
+    #[test]
+    fn join_continuation_skips_a_row_that_differs_only_by_spaces() {
+        let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を";
+        let spaced = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。|\n| 解除 | 通知でできます。 |";
+        let tight = "| 項目 | 内容 |\n| --- | --- |\n|契約|根拠は [1] です。|\n| 解除 | 通知でできます。 |";
+        for continuation in [spaced, tight] {
+            let joined = join_continuation(original, continuation);
+            assert_eq!(joined.matches("[1]").count(), 1, "{joined}");
+            assert_eq!(
+                joined.matches("| 契約 | 根拠は [1] です。 |").count(),
+                1,
+                "{joined}"
+            );
+            assert!(joined.contains("| 解除 | 通知でできます。 |"), "{joined}");
+            assert!(!joined.contains("\n\n"), "{joined}");
+        }
+    }
+
+    #[test]
+    fn join_continuation_keeps_the_blank_line_before_prose_after_a_skipped_row() {
+        let original = "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |";
+        let continuation = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n\n補足です。根拠は [1] です。";
+        assert_eq!(
+            join_continuation(original, continuation),
+            "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n\n補足です。根拠は [1] です。"
+        );
     }
 
     #[test]
