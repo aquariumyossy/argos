@@ -215,15 +215,73 @@ fn restarts_from_the_top(original: &str, continuation: &str) -> bool {
 }
 
 fn repeats_opening_table(original: &str, continuation: &str) -> bool {
-    let Some(original_header) = first_table_header(original) else {
-        return false;
-    };
-    let Some((preamble, continuation_header)) = first_table_header_after_preamble(continuation)
-    else {
-        return false;
-    };
-    chars(preamble.trim()) <= SHORT_PREAMBLE_CHARS
-        && header_key(original_header) == header_key(continuation_header)
+    if let (Some(original_header), Some((preamble, continuation_header))) = (
+        first_table_header(original),
+        first_table_header_after_preamble(continuation),
+    ) {
+        if chars(preamble.trim()) <= SHORT_PREAMBLE_CHARS
+            && header_key(original_header) == header_key(continuation_header)
+        {
+            return true;
+        }
+    }
+    // A table with no separator row still restarts when its first row is repeated.
+    match (
+        first_headerless_row(original, false),
+        first_headerless_row(continuation, true),
+    ) {
+        (Some(original_row), Some(continuation_row)) => {
+            same_pipe_row(original_row, continuation_row)
+        }
+        _ => false,
+    }
+}
+
+fn same_pipe_row(a: &str, b: &str) -> bool {
+    pipe_cells(a) == pipe_cells(b)
+}
+
+fn pipe_cells(line: &str) -> Vec<String> {
+    let mut cells: Vec<String> = line.trim().split('|').map(trim_cell).collect();
+    if cells.first().is_some_and(|cell| cell.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|cell| cell.is_empty()) {
+        cells.pop();
+    }
+    cells
+}
+
+fn trim_cell(cell: &str) -> String {
+    cell.trim_matches(|c: char| c.is_whitespace() || c == '\u{00a0}' || c == '\u{3000}')
+        .to_string()
+}
+
+/// First `| ... |` row that is not a header sitting above a separator.
+fn first_headerless_row(text: &str, limit_preamble: bool) -> Option<&str> {
+    let mut skipped = 0usize;
+    let lines: Vec<&str> = text.lines().collect();
+    for index in 0..lines.len() {
+        let trimmed = lines[index].trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let next = lines.get(index + 1).map(|line| line.trim()).unwrap_or("");
+            if is_separator_row(next) || is_separator_row(trimmed) {
+                return None;
+            }
+            return Some(trimmed);
+        }
+        if !limit_preamble {
+            continue;
+        }
+        skipped += chars(trimmed);
+        if skipped > SHORT_PREAMBLE_CHARS {
+            return None;
+        }
+    }
+    None
 }
 
 fn header_key(line: &str) -> String {
@@ -313,7 +371,24 @@ fn strip_overlapping_head(original: &str, continuation: &str) -> (String, bool) 
         .nth(overlap)
         .map(|(i, _)| i)
         .unwrap_or(continuation.len());
+    // Do not cut a table row in half. The rest of that row would fall outside the table.
+    if first_line_is_table_row(continuation) && !overlap_ends_at_line_break(continuation, byte) {
+        return (continuation.to_string(), false);
+    }
     (continuation[byte..].to_string(), true)
+}
+
+fn first_line_is_table_row(text: &str) -> bool {
+    text.lines().next().is_some_and(|line| {
+        let line = line.trim();
+        line.starts_with('|') && line.ends_with('|')
+    })
+}
+
+fn overlap_ends_at_line_break(text: &str, byte: usize) -> bool {
+    byte >= text.len()
+        || text[byte..].starts_with('\n')
+        || text[byte..].starts_with('\r')
 }
 
 fn dangling_newline_splits_sentence(base: &str, tail: &str) -> bool {
@@ -1017,6 +1092,34 @@ mod tests {
             assess_answer(&question, continuation, "", "length"),
             Some(AnswerProblem::Truncated),
             "a length cap on that same table is incomplete"
+        );
+    }
+
+    #[test]
+    fn a_new_row_after_a_repeated_row_is_not_trimmed_as_overlap() {
+        let original = "前文です。\n| 項目 | 内容 |\n| --- | --- |\n| 契約 | 通知でできます。 |";
+        let continuation = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 通知でできます。 |\n| 通知でできます。 | 追加の行 [9] です。 |";
+        let joined = join_continuation(original, continuation);
+        assert_eq!(joined, continuation);
+        assert!(
+            joined.contains("| 通知でできます。 | 追加の行 [9] です。 |"),
+            "{joined}"
+        );
+        assert!(!joined.contains("\n 追加の行 [9] です。 |"), "{joined}");
+        assert_eq!(joined.matches("[9]").count(), 1, "{joined}");
+    }
+
+    #[test]
+    fn a_headerless_table_repeated_from_the_first_row_is_not_duplicated() {
+        let original = "| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を";
+        let continuation = "| 契約 | 根拠は [1] です。 |\n| 損害 | 賠償を請求できます。 |\n| 解除 | 通知でできます。 |";
+        let joined = join_continuation(original, continuation);
+        assert_eq!(joined, continuation);
+        assert_eq!(joined.matches("[1]").count(), 1, "{joined}");
+        assert_eq!(
+            joined.matches("| 契約 | 根拠は [1] です。 |").count(),
+            1,
+            "{joined}"
         );
     }
 
