@@ -1853,3 +1853,254 @@ fn an_xlsx_body_hit_still_reports_a_chart_whitespace_leftover() {
     assert!(edited.report.contains("※全角空白"), "{}", edited.report);
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn alt_box(text: &str) -> String {
+    format!(
+        r#"<mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><w:txbxContent><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:txbxContent></w:drawing></mc:Choice><mc:Fallback><w:pict><v:textbox><w:txbxContent><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback></mc:AlternateContent>"#
+    )
+}
+
+fn story_part(root: &str, inner: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<{root} xmlns:w="{W}" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{inner}</{root}>"#
+    )
+}
+
+#[test]
+fn replacements_reach_text_boxes_and_shapes_but_not_charts_or_diagrams() {
+    let dir = temp_dir("shapes");
+    let src = dir.join("契約書.docx");
+    let document = story_part(
+        "w:document",
+        &format!(
+            r#"<w:body>
+    <w:p><w:r><w:t>前文</w:t></w:r><w:r>{}</w:r><w:r><w:t>後文</w:t></w:r></w:p>
+    <w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>
+    <w:p><w:r><w:drawing><a:txBody><a:p><a:r><a:t>図形の山田太郎</a:t></a:r></a:p></a:txBody></w:drawing></w:r></w:p>
+    <w:p><w:r><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><a:t>図表の山田太郎</a:t></a:graphicData></w:r></w:p>
+  </w:body>"#,
+            alt_box("枠の山田太郎")
+        ),
+    );
+    let header = story_part(
+        "w:hdr",
+        &format!(
+            r#"<w:p><w:r><w:t>ヘッダーの山田太郎</w:t></w:r></w:p><w:p><w:r>{}</w:r></w:p>"#,
+            alt_box("ヘッダー枠の山田太郎")
+        ),
+    );
+    let footer = story_part(
+        "w:ftr",
+        &format!(
+            r#"<w:p><w:r>{}</w:r></w:p>"#,
+            alt_box("フッター枠の山田太郎")
+        ),
+    );
+    let footnotes = story_part(
+        "w:footnotes",
+        &format!(
+            r#"<w:footnote w:id="1"><w:p><w:r>{}</w:r></w:p></w:footnote>"#,
+            alt_box("脚注枠の山田太郎")
+        ),
+    );
+    let endnotes = story_part(
+        "w:endnotes",
+        &format!(
+            r#"<w:endnote w:id="1"><w:p><w:r>{}</w:r></w:p></w:endnote>"#,
+            alt_box("文末脚注枠の山田太郎")
+        ),
+    );
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>グラフの山田太郎</a:t></c:tx>
+</c:chartSpace>"#;
+    let diagram = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <a:t>図の山田太郎</a:t>
+</dgm:dataModel>"#;
+    let drawing = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:drawing xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>別図形の山田太郎</a:t></w:drawing>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/header1.xml", header.as_str()),
+            ("word/footer1.xml", footer.as_str()),
+            ("word/footnotes.xml", footnotes.as_str()),
+            ("word/endnotes.xml", endnotes.as_str()),
+            ("word/charts/chart1.xml", chart),
+            ("word/diagrams/data1.xml", diagram),
+            ("word/drawings/drawing1.xml", drawing),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 16-00-00",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    assert!(
+        edited
+            .report
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 8 箇所\n"),
+        "{}",
+        edited.report
+    );
+    for (name, needle) in [
+        ("word/document.xml", "本文の佐藤花子"),
+        ("word/document.xml", "枠の佐藤花子"),
+        ("word/document.xml", "図形の佐藤花子"),
+        ("word/document.xml", "前文"),
+        ("word/document.xml", "後文"),
+        ("word/header1.xml", "ヘッダーの佐藤花子"),
+        ("word/header1.xml", "ヘッダー枠の佐藤花子"),
+        ("word/footer1.xml", "フッター枠の佐藤花子"),
+        ("word/footnotes.xml", "脚注枠の佐藤花子"),
+        ("word/endnotes.xml", "文末脚注枠の佐藤花子"),
+    ] {
+        let xml = read_entry(&edited.path, name);
+        assert!(xml.contains(needle), "{name} missing {needle}: {xml}");
+    }
+    for name in [
+        "word/header1.xml",
+        "word/footer1.xml",
+        "word/footnotes.xml",
+        "word/endnotes.xml",
+    ] {
+        let xml = read_entry(&edited.path, name);
+        assert!(!xml.contains("山田太郎"), "{name}: {xml}");
+    }
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert_eq!(document.matches("枠の佐藤花子").count(), 2, "{document}");
+    assert!(document.contains("図表の山田太郎"), "{document}");
+    assert!(
+        edited
+            .report
+            .contains("グラフ（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("図（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("図形（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    assert!(!edited
+        .report
+        .contains("ヘッダー（このツールでは変更できない場所）"));
+    assert!(!edited
+        .report
+        .contains("フッター（このツールでは変更できない場所）"));
+    assert!(!edited
+        .report
+        .contains("脚注（このツールでは変更できない場所）"));
+    assert!(!edited
+        .report
+        .contains("文末脚注（このツールでは変更できない場所）"));
+    assert!(read_entry(&edited.path, "word/charts/chart1.xml").contains("グラフの山田太郎"));
+    assert!(read_entry(&edited.path, "word/diagrams/data1.xml").contains("図の山田太郎"));
+    assert!(read_entry(&edited.path, "word/drawings/drawing1.xml").contains("別図形の山田太郎"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn text_box_whitespace_follows_body_rules_and_reports_the_source_bytes() {
+    let dir = temp_dir("shape-ws");
+    let src = dir.join("名簿.docx");
+    let document = story_part(
+        "w:document",
+        &format!(
+            r#"<w:body>
+    <w:p><w:r><w:t>本文の対象</w:t></w:r></w:p>
+    <w:p><w:r>{}</w:r></w:p>
+    <w:p><w:r><w:txbxContent><w:p><w:r><w:t>鈴木　一郎</w:t></w:r></w:p></w:txbxContent></w:r></w:p>
+  </w:body>"#,
+            alt_box("山田　太郎")
+        ),
+    );
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 16-10-00",
+        &request(&[("山田 太郎", "佐藤花子"), ("鈴木一郎", "高橋")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert_eq!(document.matches("佐藤花子").count(), 2, "{document}");
+    assert!(document.contains("鈴木　一郎"), "{document}");
+    assert!(!document.contains("高橋"), "{document}");
+    assert!(
+        edited
+            .report
+            .contains("「山田 太郎」→「佐藤花子」を 1 箇所（完全一致 0、空白の違い 1）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("『山田 太郎』→ 原文は『山田　太郎』（全角空白）で一致"),
+        "{}",
+        edited.report
+    );
+    assert_eq!(
+        pasteable_at(&edited.report, "本文の3段落目"),
+        "鈴木\u{3000}一郎"
+    );
+    assert_eq!(
+        whitespace_note_follows(&edited.report, "鈴木\u{3000}一郎"),
+        "※全角空白"
+    );
+    assert!(!edited.report.contains("このツールでは変更できない場所"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn paragraph_rewrite_of_a_text_box_updates_the_fallback_without_counting_twice() {
+    let dir = temp_dir("shape-para");
+    let src = dir.join("契約書.docx");
+    let document = story_part(
+        "w:document",
+        &format!(
+            r#"<w:body><w:p><w:r><w:t>残す段落。</w:t></w:r></w:p><w:p><w:r>{}</w:r></w:p></w:body>"#,
+            alt_box("この枠だけを新しい文にする。")
+        ),
+    );
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 16-20-00",
+        &request(
+            &[],
+            &[("この枠だけを新しい文にする。", "書き換えた枠です。")],
+        ),
+    )
+    .unwrap();
+    assert!(
+        edited.report.contains("段落の書き換え: 1 件"),
+        "{}",
+        edited.report
+    );
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert_eq!(
+        document.matches("書き換えた枠です。").count(),
+        2,
+        "{document}"
+    );
+    assert!(!document.contains("この枠だけ"), "{document}");
+    assert!(document.contains("残す段落。"), "{document}");
+    let _ = fs::remove_dir_all(&dir);
+}
