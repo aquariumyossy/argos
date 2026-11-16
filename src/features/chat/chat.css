@@ -913,6 +913,12 @@ body.md-col-resizing {
   color: var(--muted);
 }
 
+.chat-answer-flag {
+  margin: 0 0 6px;
+  font-size: 0.8em;
+  color: var(--muted);
+}
+
 @keyframes chat-caret-blink {
   50% {
     opacity: 0;

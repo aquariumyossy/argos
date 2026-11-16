@@ -242,6 +242,7 @@ pub struct LlmMessageRow {
     #[serde(default)]
     pub tool_name: String,
     /// Empty for a normal turn. "notice" is an app message: shown in the chat, not sent to the model.
+    /// "retried" and "incomplete" are normal answers with a completeness flag. They are sent again.
     #[serde(default)]
     pub kind: String,
     /// Set by `prepare_model_history` on the injected summary. Not stored.

@@ -1473,6 +1473,9 @@ pub fn fit_injected_turn(turns: &mut [ChatTurn], budget: usize) {
 }
 
 fn split_injected_hints(content: &str) -> (String, String) {
+    if crate::llm::completeness::is_conclusion_prompt(content) {
+        return (String::new(), content.to_string());
+    }
     let mut cut = content.len();
     for hint in [FINAL_CITE_HINT, STOP_TOOLS_HINT] {
         if let Some(pos) = content.find(hint) {
@@ -2350,12 +2353,14 @@ fn force_under_budget(built: &mut [BuiltTurn], max_tokens: usize) -> bool {
     changed
 }
 
-/// A user turn added after the real question: a 出典 block, the stop-tools line, or a cite hint.
+/// A user turn added after the real question: a 出典 block, a cite hint, or the
+/// one-shot instruction that asks for the conclusion in the answer body.
 pub fn is_synthetic_user_turn(content: &str) -> bool {
     let text = content.trim();
     text == STOP_TOOLS_HINT
         || text == PHANTOM_CITE_HINT
         || text == PHANTOM_CITE_HINT_NO_TOOLS
+        || crate::llm::completeness::is_conclusion_prompt(text)
         || (text.contains("【出典】") && !text.contains("【質問】"))
 }
 

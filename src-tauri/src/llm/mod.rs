@@ -2,6 +2,7 @@
 
 pub mod articles;
 pub mod commands;
+pub mod completeness;
 pub mod context;
 pub mod create_html;
 pub mod create_office;
