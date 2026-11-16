@@ -994,7 +994,6 @@ async fn llm_send_inner<R: Runtime>(
     let mut summary_now = thread.summary.clone();
     let mut through_now = thread.summary_through_id.clone();
     let mut attempt = SummaryAttempt::NotRun;
-    let mut calls = SendCallBudget::new(MAX_LLM_CALLS_PER_SEND);
     if summary_trigger_reached(usage, settings.llm_max_context_tokens as usize) {
         let chunk_budget =
             summary::summary_request_budget(settings.llm_max_context_tokens as usize);
@@ -1032,10 +1031,6 @@ async fn llm_send_inner<R: Runtime>(
             }
             // Thinking off and tools off. The closure drops summary tokens.
             let call = summary::summary_call(&chunk.transcript);
-            if !calls.take() {
-                attempt = SummaryAttempt::Failed;
-                break;
-            }
             let summarized = llm::stream_chat(
                 &settings,
                 &call.turns,
@@ -1233,9 +1228,6 @@ async fn llm_send_inner<R: Runtime>(
             } else {
                 &settings
             };
-            if !calls.take() {
-                break Err(llm_call_cap_error());
-            }
             let streamed = llm::stream_chat(
                 call_settings,
                 &turns_now,
@@ -1871,7 +1863,6 @@ async fn llm_send_inner<R: Runtime>(
         app_notice,
         empty_reply,
         produced_work,
-        &mut calls,
     )
     .await;
     let answer_flag;
@@ -3570,34 +3561,6 @@ fn citations_kept_for_answer(
     cited
 }
 
-/// One send shares this across summary, tool rounds, citation retries, and the
-/// completeness retry. Past this, the turn stops instead of stacking more calls.
-const MAX_LLM_CALLS_PER_SEND: usize = 32;
-
-struct SendCallBudget {
-    used: usize,
-    cap: usize,
-}
-
-impl SendCallBudget {
-    fn new(cap: usize) -> Self {
-        Self { used: 0, cap }
-    }
-
-    /// Reserve one model call. False when this send is already at the cap.
-    fn take(&mut self) -> bool {
-        if self.used >= self.cap {
-            return false;
-        }
-        self.used += 1;
-        true
-    }
-}
-
-fn llm_call_cap_error() -> String {
-    "この送信でのモデル呼び出しが上限に達したため、続きを止めています。".into()
-}
-
 struct RewrittenAnswer {
     content: String,
     reasoning: String,
@@ -3652,7 +3615,6 @@ async fn rewrite_incomplete_answer<R: Runtime>(
     app_notice: bool,
     empty_reply: bool,
     produced_work: bool,
-    calls: &mut SendCallBudget,
 ) -> Rewrite {
     let problem = llm::completeness::finished_answer_problem(
         question,
@@ -3677,9 +3639,6 @@ async fn rewrite_incomplete_answer<R: Runtime>(
     let continue_answer = problem == Some(llm::completeness::AnswerProblem::Truncated);
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return kept_original(content, reasoning, empty_reply, true);
-    }
-    if !calls.take() {
-        return kept_original(content, reasoning, empty_reply, false);
     }
 
     let prompt = if continue_answer {
@@ -6297,16 +6256,6 @@ mod tests {
         assert_eq!(answer.kind, llm::completeness::KIND_RETRIED);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn send_call_budget_stops_after_the_cap() {
-        let mut budget = SendCallBudget::new(MAX_LLM_CALLS_PER_SEND);
-        for _ in 0..MAX_LLM_CALLS_PER_SEND {
-            assert!(budget.take());
-        }
-        assert!(!budget.take());
-        assert!(llm_call_cap_error().contains("上限"));
     }
 
     #[tokio::test]
