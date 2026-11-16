@@ -171,7 +171,7 @@ pub fn join_continuation(original: &str, continuation: &str) -> String {
     }
     let kept = trim_trailing_spaces(original);
     if continuation_replaces(kept, continuation) {
-        return continuation.trim().to_string();
+        return normalize_replaced_table_junction(kept, continuation);
     }
     if opening_is_rewritten(kept, continuation) {
         return kept.trim().to_string();
@@ -419,7 +419,7 @@ fn skip_existing_table_rows(original: &str, continuation: &str) -> String {
         if in_table
             && is_complete_table_row(trimmed)
             && !is_separator_row(trimmed)
-            && existing.iter().any(|row| same_table_line(row, trimmed))
+            && existing.iter().any(|row| same_data_row(row, trimmed))
         {
             skipped = true;
             index += 1;
@@ -537,6 +537,57 @@ fn is_separator_row(line: &str) -> bool {
         .filter(|c| !c.is_whitespace() && *c != '|')
         .collect();
     !inner.is_empty() && inner.chars().all(|c| c == '-' || c == ':')
+}
+
+/// Data rows match when each cell is the same after trimming the edges.
+/// Spaces inside a cell, and '-' versus ':', stay different. Header and
+/// separator rows keep [`same_table_line`].
+fn same_data_row(a: &str, b: &str) -> bool {
+    table_cells(a) == table_cells(b)
+}
+
+fn table_cells(line: &str) -> Vec<String> {
+    let mut cells: Vec<String> = line
+        .trim()
+        .split('|')
+        .map(trim_cell)
+        .collect();
+    if cells.first().is_some_and(|cell| cell.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|cell| cell.is_empty()) {
+        cells.pop();
+    }
+    cells
+}
+
+fn trim_cell(cell: &str) -> String {
+    cell.trim_matches(|c: char| {
+        c.is_whitespace() || c == '\u{00a0}' || c == '\u{3000}'
+    })
+    .to_string()
+}
+
+/// The continuation already contains the first answer. A blank line between
+/// that answer's last table row and the next table row would end the table.
+/// A blank line before prose stays.
+fn normalize_replaced_table_junction(original: &str, continuation: &str) -> String {
+    let original = original.trim();
+    let continuation = continuation.trim();
+    let Some(at) = continuation.find(original) else {
+        return continuation.to_string();
+    };
+    if !ends_with_complete_table_row(original) {
+        return continuation.to_string();
+    }
+    let junction = at + original.len();
+    let rest = &continuation[junction..];
+    let body = rest.trim_start_matches(['\n', '\r']);
+    if rest.len() == body.len() || !starts_with_table_row(body) {
+        return continuation.to_string();
+    }
+    let head = continuation[..junction].trim_end_matches(['\n', '\r']);
+    format!("{head}\n{body}")
 }
 
 fn same_table_line(a: &str, b: &str) -> bool {
@@ -1235,6 +1286,38 @@ mod tests {
             assert!(joined.contains("| 解除 | 通知でできます。 |"), "{joined}");
             assert!(!joined.contains("\n\n"), "{joined}");
         }
+    }
+
+    #[test]
+    fn join_continuation_keeps_a_corrected_data_row() {
+        let dates = "| 項目 | 内容 |\n| --- | --- |\n| 期間 | 2024-01-01 |\n| メモ | あり |";
+        let corrected_date =
+            "| 項目 | 内容 |\n| --- | --- |\n| 期間 | 2024:01:01 |\n| 解除 | 通知でできます。 |";
+        let joined = join_continuation(dates, corrected_date);
+        assert!(joined.contains("| 期間 | 2024-01-01 |"), "{joined}");
+        assert!(joined.contains("| 期間 | 2024:01:01 |"), "{joined}");
+
+        let cite = "| 項目 | 内容 |\n| --- | --- |\n| 根拠 | 第1 2条 [1] |\n| メモ | あり |";
+        let corrected_cite =
+            "| 項目 | 内容 |\n| --- | --- |\n| 根拠 | 第12条 [1] |\n| 解除 | 通知でできます。 |";
+        let joined = join_continuation(cite, corrected_cite);
+        assert!(joined.contains("| 根拠 | 第1 2条 [1] |"), "{joined}");
+        assert!(joined.contains("| 根拠 | 第12条 [1] |"), "{joined}");
+        assert_eq!(joined.matches("[1]").count(), 2, "{joined}");
+    }
+
+    #[test]
+    fn join_continuation_closes_a_blank_line_inside_a_replaced_table() {
+        let original = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |";
+        let continuation =
+            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n\n| 解除 | 通知でできます。 |";
+        assert!(continuation.contains(original));
+        assert_eq!(
+            join_continuation(original, continuation),
+            "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n| 解除 | 通知でできます。 |"
+        );
+        let prose = "| 項目 | 内容 |\n| --- | --- |\n| 契約 | 有効です。 |\n\n補足です。";
+        assert_eq!(join_continuation(original, prose), prose);
     }
 
     #[test]
