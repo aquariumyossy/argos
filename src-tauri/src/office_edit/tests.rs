@@ -152,7 +152,7 @@ fn core_xml() -> &'static str {
 }
 
 #[test]
-fn docx_edits_split_runs_stories_and_reports_property_leftovers() {
+fn docx_edits_split_runs_stories_comments_and_properties() {
     let dir = temp_dir("docx");
     let src = dir.join("契約書.docx");
     write_zip(
@@ -200,9 +200,9 @@ fn docx_edits_split_runs_stories_and_reports_property_leftovers() {
     assert!(edited
         .report
         .contains(&format!("{PATH_LINE}{}", edited.path.display())));
-    assert!(edited.report.contains("残存: あり"), "{}", edited.report);
+    assert!(edited.report.contains("残存: なし"), "{}", edited.report);
     assert!(
-        edited.report.contains("文書のプロパティ"),
+        !edited.report.contains("文書のプロパティ"),
         "{}",
         edited.report
     );
@@ -259,10 +259,9 @@ fn docx_edits_split_runs_stories_and_reports_property_leftovers() {
     let comments = read_entry(&edited.path, "word/comments.xml");
     assert!(comments.contains(r#"w:author="佐藤花子""#), "{comments}");
     let core = read_entry(&edited.path, "docProps/core.xml");
-    assert!(
-        core.contains("山田太郎"),
-        "properties stay, and the report names them"
-    );
+    assert!(core.contains("佐藤花子事件"), "{core}");
+    assert!(core.contains("<dc:creator>佐藤花子</dc:creator>"), "{core}");
+    assert!(!core.contains("山田太郎"), "{core}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -662,11 +661,26 @@ fn docx_leftover_check_reports_fields_and_hyperlinks_without_rewriting_them() {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/山田太郎" TargetMode="External"/>
 </Relationships>"#;
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山田太郎</a:t></c:tx>
+</c:chartSpace>"#;
+    let diagram = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <a:t>山田太郎</a:t>
+</dgm:dataModel>"#;
+    let drawing = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <a:t>山田太郎</a:t>
+</w:drawing>"#;
     write_zip(
         &src,
         &[
             ("word/document.xml", document.as_str()),
             ("word/_rels/document.xml.rels", rels),
+            ("word/charts/chart1.xml", chart),
+            ("word/diagrams/data1.xml", diagram),
+            ("word/drawings/drawing1.xml", drawing),
         ],
     );
     let edited = edit_path(
@@ -685,6 +699,47 @@ fn docx_leftover_check_reports_fields_and_hyperlinks_without_rewriting_them() {
     assert!(edited.report.contains("フィールド"), "{}", edited.report);
     assert!(
         edited.report.contains("ハイパーリンク"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("フィールド（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("ハイパーリンク（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    let chart = read_entry(&edited.path, "word/charts/chart1.xml");
+    assert!(chart.contains("山田太郎"), "{chart}");
+    assert!(
+        edited
+            .report
+            .contains("グラフ（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    let diagram = read_entry(&edited.path, "word/diagrams/data1.xml");
+    assert!(diagram.contains("山田太郎"), "{diagram}");
+    assert!(
+        edited
+            .report
+            .contains("図（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    let drawing = read_entry(&edited.path, "word/drawings/drawing1.xml");
+    assert!(drawing.contains("山田太郎"), "{drawing}");
+    assert!(
+        edited
+            .report
+            .contains("図形（このツールでは変更できない場所）"),
         "{}",
         edited.report
     );
@@ -790,18 +845,17 @@ fn explicit_filename_prefers_the_output_file_over_cite_and_attachment() {
     )
     .unwrap();
     assert_eq!(fs::read(&filename_over_cite).unwrap(), b"sheet");
-    let disagree = resolve_edit_source(
-        rows,
-        &dir,
-        &json!({"cite_no": 1, "filename": "ない.docx"}),
-    )
-    .unwrap_err();
+    let disagree = resolve_edit_source(rows, &dir, &json!({"cite_no": 1, "filename": "ない.docx"}))
+        .unwrap_err();
     assert!(disagree.contains("別のファイル"), "{disagree}");
     assert_eq!(fs::read(&attached).unwrap(), b"attached");
     fs::remove_file(out.join("契約書.docx")).unwrap();
-    let cite_and_same_name =
-        resolve_edit_source(rows, &dir, &json!({"cite_no": 1, "filename": "契約書.docx"}))
-            .unwrap();
+    let cite_and_same_name = resolve_edit_source(
+        rows,
+        &dir,
+        &json!({"cite_no": 1, "filename": "契約書.docx"}),
+    )
+    .unwrap();
     assert_eq!(fs::read(&cite_and_same_name).unwrap(), b"attached");
     let _ = fs::remove_dir_all(&dir);
 }
@@ -872,5 +926,559 @@ fn editing_through_a_symlink_outside_the_output_folder_is_rejected() {
     assert!(!out
         .join("link_編集済み（2026-11-10 09-00-00）.docx")
         .exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn word_body(inner: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W}"><w:body>{inner}</w:body></w:document>"#
+    )
+}
+
+fn pasteable_near<'a>(report: &'a str, marker: &str) -> &'a str {
+    let line = report
+        .lines()
+        .find(|line| line.starts_with("近い文字列:") && line.contains(marker))
+        .unwrap_or_else(|| panic!("no near miss containing {marker:?} in {report}"));
+    let open = line.find('「').expect(line) + '「'.len_utf8();
+    let close = line[open..].find('」').expect(line) + open;
+    &line[open..close]
+}
+
+#[test]
+fn whitespace_replacements_match_fullwidth_nbsp_and_tab_across_runs() {
+    let dir = temp_dir("ws-docx");
+    let src = dir.join("名簿.docx");
+    let document = word_body(
+        r#"<w:p><w:r><w:t>山田</w:t></w:r><w:r><w:t>　太郎</w:t></w:r></w:p>
+<w:p><w:r><w:t>A BとA　B</w:t></w:r></w:p>
+<w:p><w:r><w:t>列</w:t></w:r><w:r><w:t>&#9;名</w:t></w:r></w:p>
+<w:p><w:r><w:t>番</w:t></w:r><w:r><w:t>&#x00A0;号</w:t></w:r></w:p>"#,
+    );
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 12-00-00",
+        &request(
+            &[
+                ("山田 太郎", "佐藤花子"),
+                ("A B", "Z"),
+                ("列 名", "項目"),
+                ("番 号", "番号"),
+            ],
+            &[],
+        ),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("佐藤花子"), "{document}");
+    assert!(!document.contains("山田"), "{document}");
+    assert!(document.contains("ZとA　B"), "{document}");
+    assert!(document.contains("項目"), "{document}");
+    assert!(document.contains("番号"), "{document}");
+    assert!(!document.contains('\t'), "{document}");
+    assert!(!document.contains('\u{00A0}'), "{document}");
+    assert!(
+        edited
+            .report
+            .contains("『山田 太郎』→ 原文は『山田　太郎』（全角空白）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("『列 名』→ 原文は『列\t名』（タブ）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("『番 号』→ 原文は『番\u{00A0}号』（NBSP）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        !edited.report.contains("『A B』→ 原文は"),
+        "exact hit stays exact: {}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_miss_reports_byte_exact_near_misses_and_an_unreachable_chart() {
+    let dir = temp_dir("near");
+    let src = dir.join("名簿.docx");
+    let document = word_body(
+        r#"<w:p><w:r><w:t>前文山田&#x2003;太郎。</w:t></w:r></w:p>
+<w:p><w:r><w:t>鈴木一郎です</w:t></w:r></w:p>
+<w:p><w:r><w:t>事件</w:t></w:r></w:p>"#,
+    );
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>残る図表</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/charts/chart1.xml", chart),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 12-00-01",
+        &request(
+            &[
+                ("事件", "案件"),
+                ("山田 太郎", "佐藤花子"),
+                ("鈴木 一郎", "高橋"),
+                ("残る図表", "消す"),
+            ],
+            &[],
+        ),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("案件"), "{document}");
+    assert!(
+        document.contains("&#x2003;") || document.contains('\u{2003}'),
+        "{document}"
+    );
+    assert!(document.contains("鈴木一郎"), "{document}");
+    let chart = read_entry(&edited.path, "word/charts/chart1.xml");
+    assert!(chart.contains("残る図表"), "{chart}");
+    let em = pasteable_near(&edited.report, "\u{2003}");
+    assert_eq!(em, "山田\u{2003}太郎");
+    assert!(!em.contains("U+"));
+    assert!(!em.contains('※'));
+    assert!(edited.report.contains("※U+2003"), "{}", edited.report);
+    let missing = pasteable_near(&edited.report, "鈴木一郎");
+    assert_eq!(missing, "鈴木一郎");
+    assert!(edited.report.contains("※空白なし"), "{}", edited.report);
+    assert!(
+        edited
+            .report
+            .contains("グラフ（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    assert!(edited.report.contains("残存: あり"), "{}", edited.report);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_total_miss_names_the_exact_string_in_an_unreachable_part() {
+    let dir = temp_dir("near-err");
+    let src = dir.join("名簿.docx");
+    let document = word_body(
+        r#"<w:p><w:r><w:t>関係ない</w:t></w:r></w:p><w:p><w:r><w:t>山田&#x2003;太郎</w:t></w:r></w:p>"#,
+    );
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山田太郎</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/charts/chart1.xml", chart),
+        ],
+    );
+    let before = fs::read(&src).unwrap();
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 12-00-02",
+        &request(&[("山田 太郎", "佐藤花子")], &[]),
+    )
+    .unwrap_err();
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert!(err.contains("見つかりませんでした"), "{err}");
+    assert_eq!(pasteable_near(&err, "\u{2003}"), "山田\u{2003}太郎");
+    assert!(err.contains("※U+2003"), "{err}");
+    // The chart's exact "山田太郎" is a compact match of the spaced find too.
+    assert_eq!(pasteable_near(&err, "山田太郎"), "山田太郎");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_exact_miss_that_lives_only_in_a_chart_is_labelled_unreachable() {
+    let dir = temp_dir("chart-only");
+    let src = dir.join("名簿.docx");
+    let document = word_body(r#"<w:p><w:r><w:t>関係ない</w:t></w:r></w:p>"#);
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山田太郎</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/charts/chart1.xml", chart),
+        ],
+    );
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 12-00-03",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("「山田太郎」はグラフ（このツールでは変更できない場所）にあります。"),
+        "{err}"
+    );
+    assert!(!dir.join("out").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn properties_people_and_initials_are_replaced_and_revisions_stay() {
+    let dir = temp_dir("props");
+    let src = dir.join("名簿.docx");
+    let document = word_body(
+        r#"<w:p>
+      <w:del w:id="7" w:author="保持する著者" w:date="2024-01-01T00:00:00Z"><w:r><w:delText>削除文</w:delText></w:r></w:del>
+      <w:ins w:id="8" w:author="保持する著者" w:date="2024-01-01T00:00:00Z"><w:r><w:t>挿入文</w:t></w:r></w:ins>
+    </w:p>"#,
+    );
+    let comments = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="{W}">
+  <w:comment w:id="0" w:author="別人物" w:date="2024-01-15T00:00:00Z" w:initials="山田　太郎">
+    <w:p><w:r><w:t>メモ</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>"#
+    );
+    let core = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:title>山田 太郎の文書</dc:title>
+  <dc:subject>件名は山田　太郎</dc:subject>
+  <dc:creator>山田 太郎</dc:creator>
+  <cp:keywords>山田&#x00A0;太郎</cp:keywords>
+  <dc:description>説明</dc:description>
+  <cp:lastModifiedBy>山田　太郎</cp:lastModifiedBy>
+  <cp:revision>3</cp:revision>
+</cp:coreProperties>"#;
+    let app = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Company>山田 太郎</Company>
+  <Manager>山田　太郎</Manager>
+  <HeadingPairs>
+    <vt:vector size="2" baseType="variant">
+      <vt:variant><vt:lpstr>ワークシート</vt:lpstr></vt:variant>
+      <vt:variant><vt:i4>1</vt:i4></vt:variant>
+    </vt:vector>
+  </HeadingPairs>
+</Properties>"#;
+    let people = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w15:people xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">
+  <w15:person w15:author="山田　太郎" w15:contact="keep-me">
+    <w15:presenceInfo w15:providerId="None" w15:userId="user-1"/>
+  </w15:person>
+</w15:people>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/comments.xml", comments.as_str()),
+            ("docProps/core.xml", core),
+            ("docProps/app.xml", app),
+            ("word/people.xml", people),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 12-00-04",
+        &request(&[("山田 太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains(r#"w:id="7""#), "{document}");
+    assert!(document.contains(r#"w:id="8""#), "{document}");
+    assert_eq!(document.matches("<w:del ").count(), 1, "{document}");
+    assert_eq!(document.matches("<w:ins ").count(), 1, "{document}");
+    assert!(
+        document.contains("<w:delText>削除文</w:delText>"),
+        "{document}"
+    );
+    assert!(document.contains("<w:t>挿入文</w:t>"), "{document}");
+    assert!(
+        document.contains(r#"w:author="保持する著者""#),
+        "{document}"
+    );
+
+    let comments = read_entry(&edited.path, "word/comments.xml");
+    assert!(comments.contains(r#"w:author="別人物""#), "{comments}");
+    assert!(comments.contains(r#"w:initials="佐藤花子""#), "{comments}");
+    assert!(!comments.contains("山田"), "{comments}");
+
+    let core = read_entry(&edited.path, "docProps/core.xml");
+    assert!(core.contains("xmlns:dc="), "{core}");
+    assert!(
+        core.contains("<dc:title>佐藤花子の文書</dc:title>"),
+        "{core}"
+    );
+    assert!(
+        core.contains("<dc:subject>件名は佐藤花子</dc:subject>"),
+        "{core}"
+    );
+    assert!(core.contains("<dc:creator>佐藤花子</dc:creator>"), "{core}");
+    assert!(
+        core.contains("<cp:keywords>佐藤花子</cp:keywords>"),
+        "{core}"
+    );
+    assert!(
+        core.contains("<cp:lastModifiedBy>佐藤花子</cp:lastModifiedBy>"),
+        "{core}"
+    );
+    assert!(
+        core.contains("<dc:description>説明</dc:description>"),
+        "{core}"
+    );
+    assert!(core.contains("<cp:revision>3</cp:revision>"), "{core}");
+    assert!(!core.contains("山田"), "{core}");
+
+    let app = read_entry(&edited.path, "docProps/app.xml");
+    assert!(app.contains("<Company>佐藤花子</Company>"), "{app}");
+    assert!(app.contains("<Manager>佐藤花子</Manager>"), "{app}");
+    assert!(app.contains("<vt:lpstr>ワークシート</vt:lpstr>"), "{app}");
+    assert!(app.contains("<vt:vector"), "{app}");
+    assert!(!app.contains("山田"), "{app}");
+
+    let people = read_entry(&edited.path, "word/people.xml");
+    assert!(people.contains(r#"w15:author="佐藤花子""#), "{people}");
+    assert!(people.contains(r#"w15:contact="keep-me""#), "{people}");
+    assert!(people.contains(r#"w15:userId="user-1""#), "{people}");
+    assert!(!people.contains("山田"), "{people}");
+
+    assert!(edited.report.contains("残存: なし"), "{}", edited.report);
+    assert!(
+        edited.report.contains("『山田　太郎』（全角空白）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited.report.contains("『山田\u{00A0}太郎』（NBSP）"),
+        "{}",
+        edited.report
+    );
+    assert!(!edited.report.contains("イニシャル（"), "{}", edited.report);
+    assert!(
+        !edited.report.contains("文書のプロパティ"),
+        "{}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_replacements_follow_whitespace_and_properties_and_mark_charts() {
+    let dir = temp_dir("ws-xlsx");
+    let src = dir.join("一覧.xlsx");
+    let shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <si><r><t>山田</t></r><r><t>　太郎</t></r></si>
+  <si><t>見出し</t></si>
+  <si><r><t>鈴</t></r><r><t>木&#x2003;一郎</t></r></si>
+</sst>"#;
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="s"><v>0</v></c>
+      <c r="B1" t="inlineStr"><is><r><t>番</t></r><r><t>&#x00A0;号</t></r></is></c>
+      <c r="C1" t="inlineStr"><is><t>列&#9;名</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+    let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="旧　シート" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+    let core = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:creator>山田　太郎</dc:creator>
+</cp:coreProperties>"#;
+    let app = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Company>山田 太郎</Company>
+  <Manager>担当</Manager>
+</Properties>"#;
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>残る図表</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("xl/sharedStrings.xml", shared),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("xl/workbook.xml", workbook),
+            ("docProps/core.xml", core),
+            ("docProps/app.xml", app),
+            ("xl/charts/chart1.xml", chart),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 12-00-05",
+        &request(
+            &[
+                ("山田 太郎", "佐藤花子"),
+                ("番 号", "番号"),
+                ("列 名", "項目"),
+                ("旧 シート", "新シート"),
+                ("見出し", "表題"),
+                ("鈴木 一郎", "高橋"),
+                ("残る図表", "消す"),
+            ],
+            &[],
+        ),
+    )
+    .unwrap();
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(shared.contains("佐藤花子"), "{shared}");
+    assert!(shared.contains("表題"), "{shared}");
+    assert!(
+        shared.contains("木\u{2003}一郎") || shared.contains("&#x2003;"),
+        "{shared}"
+    );
+    assert!(!shared.contains("山田"), "{shared}");
+    let sheet = read_entry(&edited.path, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("番号"), "{sheet}");
+    assert!(sheet.contains("項目"), "{sheet}");
+    assert!(!sheet.contains('\u{00A0}'), "{sheet}");
+    assert!(!sheet.contains('\t'), "{sheet}");
+    let workbook = read_entry(&edited.path, "xl/workbook.xml");
+    assert!(workbook.contains(r#"name="新シート""#), "{workbook}");
+    assert!(!workbook.contains("旧"), "{workbook}");
+    let core = read_entry(&edited.path, "docProps/core.xml");
+    assert!(core.contains("<dc:creator>佐藤花子</dc:creator>"), "{core}");
+    assert!(!core.contains("山田"), "{core}");
+    let app = read_entry(&edited.path, "docProps/app.xml");
+    assert!(app.contains("<Company>佐藤花子</Company>"), "{app}");
+    assert!(app.contains("<Manager>担当</Manager>"), "{app}");
+    let chart = read_entry(&edited.path, "xl/charts/chart1.xml");
+    assert!(chart.contains("残る図表"), "{chart}");
+    assert_eq!(
+        pasteable_near(&edited.report, "\u{2003}"),
+        "鈴木\u{2003}一郎"
+    );
+    assert!(
+        edited
+            .report
+            .contains("『山田 太郎』→ 原文は『山田　太郎』（全角空白）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("『旧 シート』→ 原文は『旧　シート』（全角空白）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("『番 号』→ 原文は『番\u{00A0}号』（NBSP）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("『列 名』→ 原文は『列\t名』（タブ）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("グラフ（このツールでは変更できない場所）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        !edited.report.contains("文書のプロパティ"),
+        "{}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_follow_up_edit_does_not_stack_the_suffix_or_overwrite() {
+    assert_eq!(
+        super::output_filename(
+            Path::new("契約書_編集済み（2026-11-12 09-30-00）.docx"),
+            "2026-11-16 12-00-00",
+            "docx",
+        ),
+        "契約書_編集済み（2026-11-16 12-00-00）.docx"
+    );
+    assert_eq!(
+        super::output_filename(
+            Path::new("甲_乙_編集済み（2026-11-12 09-30-00）_編集済み（2026-11-13 01-00-00）.xlsx",),
+            "2026-11-16 12-00-00",
+            "xlsx",
+        ),
+        "甲_乙_編集済み（2026-11-16 12-00-00）.xlsx"
+    );
+    assert_eq!(
+        super::output_filename(Path::new("契約書.docx"), "2026-11-16 12-00-00", "docx"),
+        "契約書_編集済み（2026-11-16 12-00-00）.docx"
+    );
+
+    let dir = temp_dir("stack");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let src = out.join("契約書_編集済み（2026-11-12 09-30-00）.docx");
+    write_zip(
+        &src,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>佐藤花子</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let before = fs::read(&src).unwrap();
+    let edited = edit_path(
+        &src,
+        &out,
+        "2026-11-16 12-00-00",
+        &request(&[("佐藤花子", "鈴木一郎")], &[]),
+    )
+    .unwrap();
+    assert_eq!(
+        edited.filename,
+        "契約書_編集済み（2026-11-16 12-00-00）.docx"
+    );
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert!(read_entry(&edited.path, "word/document.xml").contains("鈴木一郎"));
+    let again = edit_path(
+        &edited.path,
+        &out,
+        "2026-11-16 12-00-00",
+        &request(&[("鈴木一郎", "高橋次郎")], &[]),
+    )
+    .unwrap();
+    assert_eq!(
+        again.filename,
+        "契約書_編集済み（2026-11-16 12-00-00）（2）.docx"
+    );
+    assert_ne!(again.path, edited.path);
+    assert!(edited.path.exists());
+    assert!(read_entry(&edited.path, "word/document.xml").contains("鈴木一郎"));
+    assert!(!read_entry(&edited.path, "word/document.xml").contains("高橋次郎"));
+    assert!(read_entry(&again.path, "word/document.xml").contains("高橋次郎"));
     let _ = fs::remove_dir_all(&dir);
 }

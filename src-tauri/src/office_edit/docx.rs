@@ -79,16 +79,7 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
         hits.push(hit);
     }
 
-    let mut stats = ChangeStats {
-        hits: req
-            .replacements
-            .iter()
-            .map(|item| (item.find.clone(), item.replace.clone(), 0))
-            .collect(),
-        paragraphs: 0,
-        notes: Vec::new(),
-        paragraph_checks: Vec::new(),
-    };
+    let mut stats = ChangeStats::from_request(req);
 
     for (index, edit) in req.paragraphs.iter().enumerate() {
         let hit = &hits[index];
@@ -109,25 +100,89 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
     for story in &mut stories {
         for group in story.groups.clone() {
             for (index, item) in req.replacements.iter().enumerate() {
-                stats.hits[index].2 +=
-                    replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace);
-                stats.hits[index].2 +=
-                    replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace);
+                super::record_hit(
+                    &mut stats,
+                    index,
+                    replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace),
+                );
+                super::record_hit(
+                    &mut stats,
+                    index,
+                    replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace),
+                );
             }
         }
         story.xml = render_nodes(&story.xml, &story.nodes);
-        let reps = &req.replacements;
         story.xml = map_attr_local(&story.xml, "author", |value| {
-            let mut pieces = vec![value.to_string()];
-            for (index, item) in reps.iter().enumerate() {
-                stats.hits[index].2 +=
-                    super::text::replace_pieces(&mut pieces, &item.find, &item.replace);
-            }
-            pieces.remove(0)
+            super::replace_value(value, req, &mut stats)
+        });
+        story.xml = map_attr_local(&story.xml, "initials", |value| {
+            super::replace_value(value, req, &mut stats)
         });
         entries[story.entry].1 = std::mem::take(&mut story.xml).into_bytes();
     }
+    super::edit_doc_props(entries, req, &mut stats);
+    fill_near_misses(entries, &mut stats);
+    super::note_unreachable_misses(entries, &mut stats);
     Ok(stats)
+}
+
+fn fill_near_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
+    let pending: Vec<(usize, String)> = stats
+        .hits
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, count))| *count == 0)
+        .map(|(index, (find, _, _))| (index, find.clone()))
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let texts = package_texts(entries);
+    for (index, find) in pending {
+        if let Some(slot) = stats.near_misses.get_mut(index) {
+            *slot = super::text::near_misses(&texts, &find, super::text::NEAR_MISS_LIMIT);
+        }
+    }
+}
+
+fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut texts = Vec::new();
+    for (name, bytes) in entries {
+        let Some(xml) = decode_xml_bytes(bytes) else {
+            continue;
+        };
+        if is_word_story(name) {
+            let nodes = scan_text_nodes(&xml, &word_scan());
+            let groups = group_nodes(&nodes);
+            for group in &groups {
+                push_text(&mut texts, joined(&nodes, &group.visible));
+                push_text(&mut texts, joined(&nodes, &group.deleted));
+            }
+            texts.extend(collect_attr_local(&xml, "author"));
+            texts.extend(collect_attr_local(&xml, "initials"));
+            continue;
+        }
+        if is_rels(name) {
+            texts.extend(hyperlink_targets(&xml));
+            continue;
+        }
+        if !is_xml_name(name) {
+            continue;
+        }
+        for (_, text) in leaf_texts(&xml) {
+            push_text(&mut texts, text);
+        }
+        texts.extend(collect_attr_local(&xml, "author"));
+        texts.extend(collect_attr_local(&xml, "initials"));
+    }
+    texts
+}
+
+fn push_text(texts: &mut Vec<String>, text: String) {
+    if !text.is_empty() {
+        texts.push(text);
+    }
 }
 
 fn find_paragraphs(stories: &[Story], needle: &str) -> Vec<Hit> {
@@ -230,12 +285,29 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                     );
                 }
             }
+            for initials in collect_attr_local(&xml, "initials") {
+                for probe in probes {
+                    consider(
+                        &mut leftovers,
+                        &mut truncated,
+                        probe,
+                        &initials,
+                        &format!("イニシャル（{label}）"),
+                    );
+                }
+            }
             for (local, text) in leaf_texts(&xml) {
                 if local != "instrText" && local != "delInstrText" {
                     continue;
                 }
                 for probe in probes {
-                    consider(&mut leftovers, &mut truncated, probe, &text, "フィールド");
+                    consider(
+                        &mut leftovers,
+                        &mut truncated,
+                        probe,
+                        &text,
+                        &super::unreachable_location("フィールド"),
+                    );
                 }
             }
             continue;
@@ -248,7 +320,7 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                         &mut truncated,
                         probe,
                         &target,
-                        "ハイパーリンク",
+                        &super::unreachable_location("ハイパーリンク"),
                     );
                 }
             }
@@ -271,6 +343,17 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                     probe,
                     &author,
                     &format!("作成者（{label}）"),
+                );
+            }
+        }
+        for initials in collect_attr_local(&xml, "initials") {
+            for probe in probes {
+                consider(
+                    &mut leftovers,
+                    &mut truncated,
+                    probe,
+                    &initials,
+                    &format!("イニシャル（{label}）"),
                 );
             }
         }
@@ -331,6 +414,9 @@ fn word_label(name: &str) -> String {
 }
 
 fn other_label(name: &str) -> String {
+    if let Some(kind) = super::unreachable_kind(name) {
+        return super::unreachable_location(kind);
+    }
     let path = name.replace('\\', "/");
     if path.starts_with("docProps/") {
         "文書のプロパティ".into()
@@ -341,7 +427,7 @@ fn other_label(name: &str) -> String {
     }
 }
 
-fn hyperlink_targets(xml: &str) -> Vec<String> {
+pub(crate) fn hyperlink_targets(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while let Some(tag) = next_tag(xml, pos) {
@@ -361,7 +447,7 @@ fn hyperlink_targets(xml: &str) -> Vec<String> {
     out
 }
 
-fn is_rels(name: &str) -> bool {
+pub(crate) fn is_rels(name: &str) -> bool {
     name.replace('\\', "/")
         .to_ascii_lowercase()
         .ends_with(".rels")

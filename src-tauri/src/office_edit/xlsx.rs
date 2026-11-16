@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::text::replace_pieces;
+use super::text::{replace_pieces_flex, ReplaceHit};
 use super::xmlscan::{
     attr_local_value, decode_xml_bytes, group_nodes, joined, leaf_texts, map_element_attr,
     map_leaf_local, next_tag, render_nodes, replace_in_group, rewrite_group, scan_text_nodes,
@@ -45,16 +45,7 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
     let shared_entry = find_entry(entries, |name| file_name(name) == "sharedstrings.xml");
     let workbook_entry = find_entry(entries, |name| file_name(name) == "workbook.xml");
     let rel_entry = find_entry(entries, |name| file_name(name) == "workbook.xml.rels");
-    let mut stats = ChangeStats {
-        hits: req
-            .replacements
-            .iter()
-            .map(|item| (item.find.clone(), item.replace.clone(), 0))
-            .collect(),
-        paragraphs: 0,
-        notes: Vec::new(),
-        paragraph_checks: Vec::new(),
-    };
+    let mut stats = ChangeStats::from_request(req);
 
     let mut shared = shared_entry.and_then(|index| load_story(&entries[index].1, shared_scan()));
     let mut sheets = Vec::new();
@@ -176,16 +167,106 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
         xml = rewrite_formula_parts(&xml, &renames);
         entries[sheet.entry].1 = xml.into_bytes();
     }
+    super::edit_doc_props(entries, req, &mut stats);
+    fill_near_misses(entries, &mut stats);
+    super::note_unreachable_misses(entries, &mut stats);
     Ok(stats)
+}
+
+fn fill_near_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
+    let pending: Vec<(usize, String)> = stats
+        .hits
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, count))| *count == 0)
+        .map(|(index, (find, _, _))| (index, find.clone()))
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let texts = package_texts(entries);
+    for (index, find) in pending {
+        if let Some(slot) = stats.near_misses.get_mut(index) {
+            *slot = super::text::near_misses(&texts, &find, super::text::NEAR_MISS_LIMIT);
+        }
+    }
+}
+
+fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut texts = Vec::new();
+    for (name, bytes) in entries {
+        let Some(xml) = decode_xml_bytes(bytes) else {
+            continue;
+        };
+        if file_name(name) == "sharedstrings.xml" || is_worksheet(name) {
+            let opt = if is_worksheet(name) {
+                sheet_scan()
+            } else {
+                shared_scan()
+            };
+            let nodes = scan_text_nodes(&xml, &opt);
+            let groups = group_nodes(&nodes);
+            for group in &groups {
+                push_text(&mut texts, joined(&nodes, &group.visible));
+                push_text(&mut texts, joined(&nodes, &group.deleted));
+            }
+            if is_worksheet(name) {
+                for (local, text) in leaf_texts(&xml) {
+                    if matches!(
+                        local.as_str(),
+                        "oddHeader"
+                            | "oddFooter"
+                            | "evenHeader"
+                            | "evenFooter"
+                            | "firstHeader"
+                            | "firstFooter"
+                            | "f"
+                    ) {
+                        push_text(&mut texts, text);
+                    }
+                }
+            }
+            continue;
+        }
+        if file_name(name) == "workbook.xml" {
+            for (sheet_name, _) in read_sheet_names(&xml) {
+                push_text(&mut texts, sheet_name);
+            }
+            for (_, text) in leaf_texts(&xml) {
+                push_text(&mut texts, text);
+            }
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".xml") && !lower.ends_with(".rels") {
+            continue;
+        }
+        for (_, text) in leaf_texts(&xml) {
+            push_text(&mut texts, text);
+        }
+    }
+    texts
+}
+
+fn push_text(texts: &mut Vec<String>, text: String) {
+    if !text.is_empty() {
+        texts.push(text);
+    }
 }
 
 fn apply_replacements(story: &mut Story, req: &EditRequest, stats: &mut ChangeStats) {
     for group in story.groups.clone() {
         for (index, item) in req.replacements.iter().enumerate() {
-            stats.hits[index].2 +=
-                replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace);
-            stats.hits[index].2 +=
-                replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace);
+            super::record_hit(
+                stats,
+                index,
+                replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace),
+            );
+            super::record_hit(
+                stats,
+                index,
+                replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace),
+            );
         }
     }
 }
@@ -220,16 +301,15 @@ fn rename_sheets(
         *tally.entry(name.clone()).or_insert(0) += 1;
     }
     let mut accepted = vec![false; original.len()];
-    let mut accepted_counts = vec![0usize; req.replacements.len()];
     for index in 0..original.len() {
         if planned[index] == original[index] {
             continue;
         }
         if tally.get(&planned[index]).copied().unwrap_or(0) == 1 {
             accepted[index] = true;
-            let (_, counts) = apply_named(&original[index], req);
-            for (slot, count) in accepted_counts.iter_mut().zip(counts) {
-                *slot += count;
+            let (_, hits) = apply_named(&original[index], req);
+            for (slot, hit) in hits.into_iter().enumerate() {
+                super::record_hit(stats, slot, hit);
             }
         } else {
             notes.push(format!(
@@ -238,9 +318,6 @@ fn rename_sheets(
             ));
             planned[index] = original[index].clone();
         }
-    }
-    for (slot, count) in stats.hits.iter_mut().zip(accepted_counts) {
-        slot.2 += count;
     }
     let mut cursor = 0usize;
     let xml = map_element_attr(workbook, "sheet", "name", |current| {
@@ -261,13 +338,13 @@ fn rename_sheets(
     (xml, renames, notes)
 }
 
-fn apply_named(text: &str, req: &EditRequest) -> (String, Vec<usize>) {
+fn apply_named(text: &str, req: &EditRequest) -> (String, Vec<ReplaceHit>) {
     let mut pieces = vec![text.to_string()];
-    let mut counts = Vec::new();
+    let mut hits = Vec::new();
     for item in &req.replacements {
-        counts.push(replace_pieces(&mut pieces, &item.find, &item.replace));
+        hits.push(replace_pieces_flex(&mut pieces, &item.find, &item.replace));
     }
-    (pieces.remove(0), counts)
+    (pieces.remove(0), hits)
 }
 
 fn rewrite_formula_parts(xml: &str, renames: &[(String, String)]) -> String {
@@ -682,12 +759,15 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
         if !name.to_ascii_lowercase().ends_with(".xml") {
             continue;
         }
-        let label = if name.replace('\\', "/").contains("comment") {
+        let path = name.replace('\\', "/");
+        let label = if let Some(kind) = super::unreachable_kind(&path) {
+            super::unreachable_location(kind)
+        } else if path.contains("comment") {
             "コメント".to_string()
-        } else if name.replace('\\', "/").starts_with("docProps/") {
+        } else if path.starts_with("docProps/") {
             "文書のプロパティ".to_string()
         } else {
-            format!("その他（{}）", name.replace('\\', "/"))
+            format!("その他（{path}）")
         };
         for (_, text) in leaf_texts(&xml) {
             for probe in probes {

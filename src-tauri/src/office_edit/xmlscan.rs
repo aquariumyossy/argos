@@ -1,6 +1,6 @@
 //! XML text nodes for Office packages. Markup outside the text is left as-is.
 
-use super::text::replace_pieces;
+use super::text::{replace_pieces_flex, ReplaceHit};
 
 #[derive(Debug, Clone)]
 pub struct TextNode {
@@ -166,17 +166,20 @@ pub fn replace_in_group(
     indexes: &[usize],
     find: &str,
     replace: &str,
-) -> usize {
+) -> ReplaceHit {
     if indexes.is_empty() {
-        return 0;
+        return ReplaceHit {
+            count: 0,
+            sources: Vec::new(),
+        };
     }
     let mut pieces: Vec<String> = indexes
         .iter()
         .map(|&index| nodes[index].text.clone())
         .collect();
-    let count = replace_pieces(&mut pieces, find, replace);
-    if count == 0 {
-        return 0;
+    let hit = replace_pieces_flex(&mut pieces, find, replace);
+    if hit.count == 0 {
+        return hit;
     }
     for (slot, &index) in indexes.iter().enumerate() {
         if nodes[index].text != pieces[slot] {
@@ -184,7 +187,7 @@ pub fn replace_in_group(
             nodes[index].dirty = true;
         }
     }
-    count
+    hit
 }
 
 pub fn rewrite_group(nodes: &mut [TextNode], group: &ParaGroup, new_text: &str) {

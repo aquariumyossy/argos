@@ -76,12 +76,57 @@ pub(crate) struct ChangeStats {
     pub paragraphs: usize,
     pub notes: Vec<String>,
     pub paragraph_checks: Vec<(String, String)>,
+    /// Parallel to `hits`: source slices matched by whitespace, not by exact text.
+    pub ws_sources: Vec<Vec<String>>,
+    /// Parallel to `hits`: pasteable near-misses, only filled when that find missed.
+    pub near_misses: Vec<Vec<text::NearMiss>>,
 }
 
 impl ChangeStats {
     fn changed(&self) -> bool {
         self.paragraphs > 0 || self.hits.iter().any(|(_, _, count)| *count > 0)
     }
+
+    pub(crate) fn from_request(req: &EditRequest) -> Self {
+        let count = req.replacements.len();
+        Self {
+            hits: req
+                .replacements
+                .iter()
+                .map(|item| (item.find.clone(), item.replace.clone(), 0))
+                .collect(),
+            paragraphs: 0,
+            notes: Vec::new(),
+            paragraph_checks: Vec::new(),
+            ws_sources: vec![Vec::new(); count],
+            near_misses: vec![Vec::new(); count],
+        }
+    }
+}
+
+pub(crate) fn record_hit(stats: &mut ChangeStats, index: usize, hit: text::ReplaceHit) {
+    if index >= stats.hits.len() {
+        return;
+    }
+    stats.hits[index].2 += hit.count;
+    let Some(slot) = stats.ws_sources.get_mut(index) else {
+        return;
+    };
+    for source in hit.sources {
+        if !slot.iter().any(|item| item == &source) {
+            slot.push(source);
+        }
+    }
+}
+
+/// Apply every replacement to one attribute or property string.
+pub(crate) fn replace_value(text: &str, req: &EditRequest, stats: &mut ChangeStats) -> String {
+    let mut pieces = vec![text.to_string()];
+    for (index, item) in req.replacements.iter().enumerate() {
+        let hit = text::replace_pieces_flex(&mut pieces, &item.find, &item.replace);
+        record_hit(stats, index, hit);
+    }
+    pieces.remove(0)
 }
 
 /// Run the chat tool. Errors are sentences the model can show or correct.
@@ -146,9 +191,14 @@ pub fn edit_path(
     };
     if !stats.changed() {
         let mut message = String::from("指定した文字列は見つかりませんでした。");
+        let detail = format_replacement_lines(&stats);
+        if !detail.is_empty() {
+            message.push('\n');
+            message.push_str(detail.trim_end());
+        }
         for note in &stats.notes {
             message.push('\n');
-            message.push_str(note);
+            message.push_str(note.trim_end());
         }
         return Err(message);
     }
@@ -326,7 +376,8 @@ fn one_line_name(text: &str) -> String {
 
 fn prefer_attachment_or_output_error(attach_err: String, output_err: String) -> String {
     if attach_err.contains("検索で見つかった")
-        && (output_err.contains("見つかりません") || output_err.contains("出力フォルダがありません"))
+        && (output_err.contains("見つかりません")
+            || output_err.contains("出力フォルダがありません"))
     {
         return attach_err;
     }
@@ -640,20 +691,7 @@ fn format_report(
             out.push_str("ほかにも残っています。\n");
         }
     }
-    for (find, replace, count) in &stats.hits {
-        if *count == 0 {
-            out.push_str(&format!(
-                "文字列置換: 「{}」は見つかりませんでした\n",
-                one_line(find)
-            ));
-        } else {
-            out.push_str(&format!(
-                "文字列置換: 「{}」→「{}」を {count} 箇所\n",
-                one_line(find),
-                one_line(replace)
-            ));
-        }
-    }
+    out.push_str(&format_replacement_lines(stats));
     if stats.paragraphs > 0 {
         out.push_str(&format!("段落の書き換え: {} 件\n", stats.paragraphs));
     }
@@ -670,6 +708,230 @@ fn one_line(text: &str) -> String {
     text.replace(['\n', '\r', '\t'], " ")
 }
 
+pub(crate) const UNREACHABLE: &str = "このツールでは変更できない場所";
+
+pub(crate) fn unreachable_location(label: &str) -> String {
+    if label.contains(UNREACHABLE) {
+        label.to_string()
+    } else {
+        format!("{label}（{UNREACHABLE}）")
+    }
+}
+
+/// Charts, diagrams, and other DrawingML parts this tool does not rewrite.
+pub(crate) fn unreachable_kind(name: &str) -> Option<&'static str> {
+    let path = format!(
+        "/{}",
+        name.replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+    );
+    if path.contains("/charts/") || path.contains("/chartsheets/") {
+        Some("グラフ")
+    } else if path.contains("/diagrams/") {
+        Some("図")
+    } else if path.contains("/drawings/") {
+        Some("図形")
+    } else {
+        None
+    }
+}
+
+fn format_replacement_lines(stats: &ChangeStats) -> String {
+    let mut out = String::new();
+    for index in 0..stats.hits.len() {
+        let find = stats.hits[index].0.clone();
+        let replace = stats.hits[index].1.clone();
+        let count = stats.hits[index].2;
+        if count == 0 {
+            out.push_str(&format!(
+                "文字列置換: 「{}」は見つかりませんでした\n",
+                one_line(&find)
+            ));
+            if let Some(misses) = stats.near_misses.get(index) {
+                for miss in misses.iter().take(text::NEAR_MISS_LIMIT) {
+                    out.push_str("近い文字列: 「");
+                    out.push_str(&miss.exact);
+                    out.push('」');
+                    if !miss.note.is_empty() {
+                        out.push_str(" ※");
+                        out.push_str(&miss.note);
+                    }
+                    out.push('\n');
+                }
+            }
+        } else {
+            out.push_str(&format!(
+                "文字列置換: 「{}」→「{}」を {count} 箇所\n",
+                one_line(&find),
+                one_line(&replace)
+            ));
+            if let Some(sources) = stats.ws_sources.get(index) {
+                if !sources.is_empty() {
+                    out.push_str(&format_ws_line(&find, sources));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn format_ws_line(find: &str, sources: &[String]) -> String {
+    let shown = sources.len().min(5);
+    let mut line = String::new();
+    line.push('『');
+    line.push_str(find);
+    line.push_str("』→ 原文は");
+    for (index, source) in sources.iter().take(shown).enumerate() {
+        if index > 0 {
+            line.push('、');
+        }
+        line.push('『');
+        line.push_str(source);
+        line.push('』');
+        let note = text::whitespace_note(source);
+        if !note.is_empty() {
+            line.push('（');
+            line.push_str(&note);
+            line.push('）');
+        }
+    }
+    line.push_str("で一致\n");
+    line
+}
+
+/// Find/replace inside document properties and Word people authors.
+///
+/// Leaf text and the listed attributes only. Tracked changes and comments are
+/// left in the stories that already hold them.
+pub(crate) fn edit_doc_props(
+    entries: &mut [(String, Vec<u8>)],
+    req: &EditRequest,
+    stats: &mut ChangeStats,
+) {
+    if req.replacements.is_empty() {
+        return;
+    }
+    for (name, bytes) in entries.iter_mut() {
+        let path = name.replace('\\', "/").to_ascii_lowercase();
+        let kind = if path == "docprops/core.xml" || path == "docprops/app.xml" {
+            PropKind::Leaves
+        } else if path.ends_with("word/people.xml") {
+            PropKind::People
+        } else {
+            continue;
+        };
+        let Some(xml) = xmlscan::decode_xml_bytes(bytes) else {
+            continue;
+        };
+        let next = match kind {
+            PropKind::Leaves => map_property_leaves(&xml, req, stats),
+            PropKind::People => map_people(&xml, req, stats),
+        };
+        if next != xml {
+            *bytes = next.into_bytes();
+        }
+    }
+}
+
+enum PropKind {
+    Leaves,
+    People,
+}
+
+fn map_property_leaves(xml: &str, req: &EditRequest, stats: &mut ChangeStats) -> String {
+    let mut locals = Vec::new();
+    for (local, _) in xmlscan::leaf_texts(xml) {
+        if !locals.iter().any(|item| item == &local) {
+            locals.push(local);
+        }
+    }
+    let mut xml = xml.to_string();
+    for local in locals {
+        xml = xmlscan::map_leaf_local(&xml, &local, |value| replace_value(value, req, stats));
+    }
+    xml
+}
+
+fn map_people(xml: &str, req: &EditRequest, stats: &mut ChangeStats) -> String {
+    let xml = xmlscan::map_element_attr(xml, "person", "author", |value| {
+        replace_value(value, req, stats)
+    });
+    xmlscan::map_element_attr(&xml, "person", "initials", |value| {
+        replace_value(value, req, stats)
+    })
+}
+
+/// When nothing in an editable part changed, say where an exact find still sits
+/// so the model does not retry a part this tool cannot rewrite.
+pub(crate) fn note_unreachable_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
+    if stats.changed() {
+        return;
+    }
+    let finds: Vec<String> = stats
+        .hits
+        .iter()
+        .filter(|(_, _, count)| *count == 0)
+        .map(|(find, _, _)| find.clone())
+        .collect();
+    for find in finds {
+        for place in unreachable_places(entries, &find) {
+            stats
+                .notes
+                .push(format!("「{}」は{place}にあります。", one_line(&find)));
+        }
+    }
+}
+
+fn unreachable_places(entries: &[(String, Vec<u8>)], find: &str) -> Vec<String> {
+    let mut places = Vec::new();
+    for (name, bytes) in entries {
+        let Some(xml) = xmlscan::decode_xml_bytes(bytes) else {
+            continue;
+        };
+        if docx::is_word_story(name) {
+            for (local, text) in xmlscan::leaf_texts(&xml) {
+                if matches!(local.as_str(), "instrText" | "delInstrText") && text.contains(find) {
+                    push_place(&mut places, &unreachable_location("フィールド"));
+                }
+            }
+            continue;
+        }
+        if docx::is_rels(name) {
+            for target in docx::hyperlink_targets(&xml) {
+                if target.contains(find) {
+                    push_place(&mut places, &unreachable_location("ハイパーリンク"));
+                }
+            }
+            continue;
+        }
+        if let Some(kind) = unreachable_kind(name) {
+            let in_text = xmlscan::leaf_texts(&xml)
+                .into_iter()
+                .any(|(_, text)| text.contains(find));
+            if in_text {
+                push_place(&mut places, &unreachable_location(kind));
+            }
+        }
+    }
+    places
+}
+
+fn push_place(places: &mut Vec<String>, place: &str) {
+    if !places.iter().any(|item| item == place) {
+        places.push(place.to_string());
+    }
+}
+
+/// Drop a previous `_編集済み（…）` suffix so a follow-up pass does not stack it.
+fn strip_prior_edit_suffix(stem: &str) -> &str {
+    const MARK: &str = "_編集済み（";
+    match stem.find(MARK) {
+        Some(index) if index > 0 => stem[..index].trim().trim_end_matches(['.', ' ']),
+        _ => stem,
+    }
+}
+
 pub(crate) fn output_filename(src: &Path, stamp: &str, ext: &str) -> String {
     let stem = src
         .file_stem()
@@ -684,6 +946,8 @@ pub(crate) fn output_filename(src: &Path, stamp: &str, ext: &str) -> String {
         }
     }
     let safe = safe.trim().trim_end_matches(['.', ' ']).trim();
+    let safe = if safe.is_empty() { "文書" } else { safe };
+    let safe = strip_prior_edit_suffix(safe);
     let safe = if safe.is_empty() { "文書" } else { safe };
     let stamp = if stamp.trim().is_empty() {
         "日時"
