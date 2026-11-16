@@ -155,22 +155,69 @@ pub const CONTINUATION_MARK: &str = "（続き）";
 
 /// Keep `original` unchanged and place `continuation` under it.
 /// A blank line and 「（続き）」 stop a markdown table or paragraph from merging.
+/// An unclosed code fence is closed after the original. It is opened again
+/// before the continuation only when that continuation itself stays inside the fence.
 pub fn append_continuation(original: &str, continuation: &str) -> String {
     if continuation.is_empty() {
         return original.to_string();
     }
-    let mut out = String::with_capacity(original.len() + continuation.len() + 16);
+    let open_fence = open_fence_info(original);
+    let mut out = String::with_capacity(original.len() + continuation.len() + 32);
     out.push_str(original);
-    if !(original.ends_with("\n\n") || original.ends_with("\r\n\r\n")) {
-        if !original.ends_with('\n') {
+    if open_fence.is_some() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n");
+    }
+    if !(out.ends_with("\n\n") || out.ends_with("\r\n\r\n")) {
+        if !out.ends_with('\n') {
             out.push('\n');
         }
         out.push('\n');
     }
     out.push_str(CONTINUATION_MARK);
-    out.push('\n');
+    out.push_str("\n\n");
+    if let Some(info) = open_fence {
+        if fence_line_count(continuation) % 2 == 1 {
+            out.push_str(&fence_open_line(&info));
+            out.push('\n');
+        }
+    }
     out.push_str(continuation);
     out
+}
+
+/// Info string of a fence that is still open, such as `mermaid` in ```mermaid.
+fn open_fence_info(text: &str) -> Option<String> {
+    let mut open: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("```") {
+            continue;
+        }
+        if open.is_some() {
+            open = None;
+        } else {
+            let info = trimmed.trim_start_matches('`').trim();
+            open = Some(info.to_string());
+        }
+    }
+    open
+}
+
+fn fence_line_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count()
+}
+
+fn fence_open_line(info: &str) -> String {
+    if info.is_empty() {
+        "```".to_string()
+    } else {
+        format!("```{info}")
+    }
 }
 
 pub fn is_conclusion_prompt(text: &str) -> bool {
@@ -689,7 +736,7 @@ mod tests {
     }
 
     fn appended(original: &str, continuation: &str) -> String {
-        format!("{original}\n\n{mark}\n{continuation}", mark = CONTINUATION_MARK)
+        format!("{original}\n\n{mark}\n\n{continuation}", mark = CONTINUATION_MARK)
     }
 
     #[test]
@@ -699,7 +746,7 @@ mod tests {
         let joined = append_continuation(original, continuation);
         assert!(joined.starts_with(original), "{joined}");
         assert_eq!(joined, appended(original, continuation));
-        assert!(joined.contains("\n\n（続き）\n"));
+        assert!(joined.contains("\n\n（続き）\n\n"));
         assert!(joined.ends_with(continuation));
 
         let repeated = "前半です、";
@@ -738,9 +785,57 @@ mod tests {
         let joined = append_continuation(original, continuation);
         assert!(joined.starts_with(original), "{joined}");
         assert_eq!(joined, appended(original, continuation));
-        assert!(joined.contains("| 損害\n\n（続き）\n賠償を請求できます。 |"), "{joined}");
+        assert!(joined.contains("| 損害\n\n（続き）\n\n賠償を請求できます。 |"), "{joined}");
         assert_eq!(joined.matches("| 損害").count(), 1, "{joined}");
         assert_eq!(joined.matches("賠償を請求できます。 |").count(), 1, "{joined}");
+    }
+
+    #[test]
+    fn an_open_mermaid_fence_is_closed_and_reopened_around_the_continuation() {
+        let question = long_question();
+        let original = "```mermaid\nflowchart LR\nA-->B";
+        let continuation = "C[...]\n```\n以上です。";
+        let joined = append_continuation(original, continuation);
+        assert!(joined.starts_with(original), "{joined}");
+        assert_eq!(
+            joined,
+            "```mermaid\nflowchart LR\nA-->B\n```\n\n（続き）\n\n```mermaid\nC[...]\n```\n以上です。"
+        );
+        assert_eq!(assess_answer(&question, &joined, "", "stop"), None);
+        let still_open = append_continuation("前文です。", "```\nまだ開いている");
+        assert_eq!(
+            assess_answer(&question, &still_open, "", "stop"),
+            Some(AnswerProblem::Truncated),
+            "a continuation that leaves a fence open stays incomplete"
+        );
+    }
+
+    #[test]
+    fn an_open_plain_fence_closes_before_prose_and_keeps_the_cite_outside() {
+        let question = long_question();
+        let original = "引用です。\n```\n第1条 条文";
+        let continuation = "続きの説明です。根拠は [1] です。";
+        let joined = append_continuation(original, continuation);
+        assert_eq!(
+            joined,
+            "引用です。\n```\n第1条 条文\n```\n\n（続き）\n\n続きの説明です。根拠は [1] です。"
+        );
+        let inside = joined.split("```").nth(1).unwrap();
+        let outside = joined.split("```").nth(2).unwrap();
+        assert!(!inside.contains("[1]"), "{joined}");
+        assert!(outside.contains("[1]"), "{joined}");
+        assert!(!outside.contains("```"), "{joined}");
+        assert_eq!(assess_answer(&question, &joined, "", "stop"), None);
+    }
+
+    #[test]
+    fn the_continuation_marker_is_its_own_paragraph() {
+        let original = "前文です。";
+        let list = append_continuation(original, "3. 通知する");
+        assert!(list.contains("（続き）\n\n3. 通知する"), "{list}");
+        let rule = append_continuation(original, "---");
+        assert!(rule.contains("（続き）\n\n---"), "{rule}");
+        assert!(!rule.contains("（続き）\n---"), "{rule}");
     }
 
     #[test]

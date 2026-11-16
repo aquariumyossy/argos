@@ -3714,9 +3714,11 @@ async fn rewrite_incomplete_answer<R: Runtime>(
     // length / max_tokens, or a continuation that still stops midway, is incomplete.
     if continue_answer {
         let appended = llm::completeness::append_continuation(&content, &out.content);
+        // The saved text closes an open fence and may open it again. Judge the
+        // cut on that combined body, not on the continuation's fence lines alone.
         let unfinished = llm::completeness::assess_answer(
             question,
-            &out.content,
+            &appended,
             &out.reasoning,
             &out.finish_reason,
         ) == Some(llm::completeness::AnswerProblem::Truncated);
@@ -6420,7 +6422,7 @@ mod tests {
         let rewrite = format!("{opening}催告をしたうえで解除できます。");
         assert_eq!(
             llm::completeness::append_continuation(&first, &rewrite),
-            format!("{first}\n\n（続き）\n{rewrite}")
+            format!("{first}\n\n（続き）\n\n{rewrite}")
         );
         let (dir, db, thread, result, requests) = send_question(
             "opening-rewrite",
