@@ -3710,50 +3710,45 @@ async fn rewrite_incomplete_answer<R: Runtime>(
         Ok(out) if !out.content.trim().is_empty() => out,
         _ => return kept_original(content, reasoning, empty_reply, false),
     };
-    // A restart is only the continuation. A mid-way tail is appended.
-    // length / max_tokens, or a body that still stops midway, is incomplete.
-    let merged = if continue_answer {
-        Some(llm::completeness::join_continuation(&content, &out.content))
-    } else {
-        None
-    };
-    let checked = merged.as_deref().unwrap_or(out.content.as_str());
-    let problem = llm::completeness::assess_answer(
-        question,
-        checked,
-        &out.reasoning,
-        &out.finish_reason,
-    );
-    if continue_answer && problem == Some(llm::completeness::AnswerProblem::Truncated) {
+    // A cut-off answer stays as written. The continuation is appended under it.
+    // length / max_tokens, or a continuation that still stops midway, is incomplete.
+    if continue_answer {
+        let appended = llm::completeness::append_continuation(&content, &out.content);
+        let unfinished = llm::completeness::assess_answer(
+            question,
+            &out.content,
+            &out.reasoning,
+            &out.finish_reason,
+        ) == Some(llm::completeness::AnswerProblem::Truncated);
         return Rewrite::Done(RewrittenAnswer {
             cited_body: content,
-            content: merged.unwrap_or(out.content),
+            content: appended,
             reasoning,
             empty_reply: false,
-            flag: llm::completeness::KIND_INCOMPLETE,
+            flag: if unfinished {
+                llm::completeness::KIND_INCOMPLETE
+            } else {
+                llm::completeness::KIND_CONTINUED
+            },
             cancelled: false,
         });
     }
+    let problem = llm::completeness::assess_answer(
+        question,
+        &out.content,
+        &out.reasoning,
+        &out.finish_reason,
+    );
     let second_bad = problem.is_some();
     if second_bad || gate.observe(second_bad) != llm::completeness::CompletenessStep::Keep {
         return kept_original(content, reasoning, empty_reply, false);
     }
-    let next_body = merged.unwrap_or(out.content);
-    let next_reasoning = if continue_answer {
-        reasoning
-    } else {
-        out.reasoning
-    };
     Rewrite::Done(RewrittenAnswer {
         cited_body: content,
-        content: next_body,
-        reasoning: next_reasoning,
+        content: out.content,
+        reasoning: out.reasoning,
         empty_reply: false,
-        flag: if continue_answer {
-            llm::completeness::KIND_CONTINUED
-        } else {
-            llm::completeness::KIND_RETRIED
-        },
+        flag: llm::completeness::KIND_RETRIED,
         cancelled: false,
     })
 }
@@ -6333,8 +6328,13 @@ mod tests {
         assert!(requests[1].contains("\"enable_thinking\":false"));
         let messages = db.list_llm_messages(&thread.id).unwrap();
         let answer = final_answer(&messages);
-        assert!(answer.content.contains(&first), "{}", answer.content);
-        assert!(answer.content.contains(tail), "{}", answer.content);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, tail)
+        );
+        assert!(answer.content.starts_with(&first));
+        assert!(answer.content.contains("\n\n（続き）\n"));
+        assert!(answer.content.ends_with(tail));
         assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
@@ -6381,9 +6381,11 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let messages = db.list_llm_messages(&thread.id).unwrap();
         let answer = final_answer(&messages);
-        assert!(answer.content.contains(&first), "{}", answer.content);
-        assert!(answer.content.contains(cut_tail), "{}", answer.content);
-        assert_ne!(answer.content, first);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, cut_tail)
+        );
+        assert!(answer.content.starts_with(&first));
         assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
@@ -6400,22 +6402,25 @@ mod tests {
         assert!(result.error.is_none(), "{:?}", result.error);
         let messages = db.list_llm_messages(&thread.id).unwrap();
         let answer = final_answer(&messages);
-        assert!(answer.content.contains(&first), "{}", answer.content);
-        assert!(answer.content.contains(finished), "{}", answer.content);
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, finished)
+        );
+        assert!(answer.content.starts_with(&first));
         assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn llm_send_keeps_only_a_continuation_that_restarts_from_the_opening() {
+    async fn llm_send_appends_a_rewrite_under_the_original() {
         let question = substantive_question();
         let opening = "契約を解除するには、相手方の債務不履行が契約及び取引上の社会通念に照らして軽微でないことが必要です。";
         let first = format!("{opening}根拠は第541条です。通知は、");
         let rewrite = format!("{opening}催告をしたうえで解除できます。");
         assert_eq!(
-            llm::completeness::join_continuation(&first, &rewrite),
-            rewrite
+            llm::completeness::append_continuation(&first, &rewrite),
+            format!("{first}\n\n（続き）\n{rewrite}")
         );
         let (dir, db, thread, result, requests) = send_question(
             "opening-rewrite",
@@ -6429,8 +6434,13 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let messages = db.list_llm_messages(&thread.id).unwrap();
         let answer = final_answer(&messages);
-        assert_eq!(answer.content, rewrite);
-        assert!(!answer.content.contains("第541条"));
+        assert_eq!(
+            answer.content,
+            llm::completeness::append_continuation(&first, &rewrite)
+        );
+        assert!(answer.content.starts_with(&first));
+        assert!(answer.content.contains("第541条"));
+        assert!(answer.content.contains("催告をしたうえで"));
         assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
