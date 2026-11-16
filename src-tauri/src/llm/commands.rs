@@ -3748,21 +3748,25 @@ async fn rewrite_incomplete_answer<R: Runtime>(
         Ok(out) if !out.content.trim().is_empty() => out,
         _ => return kept_original(content, reasoning, empty_reply, false),
     };
-    let second_bad = llm::completeness::assess_answer(
-        question,
-        &out.content,
-        &out.reasoning,
-        &out.finish_reason,
-    )
-    .is_some();
+    // A cut-off retry is one answer again. 「解除できます。」 is short alone, and the
+    // stream may still say `length`, but the joined body is what gets saved.
+    let merged = if continue_answer {
+        Some(llm::completeness::join_continuation(&content, &out.content))
+    } else {
+        None
+    };
+    let checked = merged.as_deref().unwrap_or(out.content.as_str());
+    let finish = if continue_answer {
+        "stop"
+    } else {
+        out.finish_reason.as_str()
+    };
+    let second_bad =
+        llm::completeness::assess_answer(question, checked, &out.reasoning, finish).is_some();
     if second_bad || gate.observe(second_bad) != llm::completeness::CompletenessStep::Keep {
         return kept_original(content, reasoning, empty_reply, false);
     }
-    let merged = if continue_answer {
-        llm::completeness::join_continuation(&content, &out.content)
-    } else {
-        out.content
-    };
+    let next_body = merged.unwrap_or(out.content);
     let next_reasoning = if continue_answer {
         reasoning
     } else {
@@ -3770,7 +3774,7 @@ async fn rewrite_incomplete_answer<R: Runtime>(
     };
     Rewrite::Done(RewrittenAnswer {
         cited_body: content,
-        content: merged,
+        content: next_body,
         reasoning: next_reasoning,
         empty_reply: false,
         flag: llm::completeness::KIND_RETRIED,

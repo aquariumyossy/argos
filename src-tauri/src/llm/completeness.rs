@@ -145,20 +145,105 @@ pub fn finished_answer_problem(
     }
 }
 
-/// Keep `original` and add only the new tail. A second copy of the whole answer is not glued on.
+/// Minimum shared tail/head, in characters, before the overlap is kept only once.
+const OVERLAP_MIN_CHARS: usize = 8;
+/// A continuation that starts with this much of the original is a rewrite, not a tail.
+const REWRITE_PREFIX_CHARS: usize = 16;
+
+/// Continue a cut-off answer. A mid-sentence or mid-row join has no blank line.
+/// A repeated tail is kept once. A rewrite that already contains the original replaces it.
+/// A partial markdown table row at the end of `original` is dropped first.
 pub fn join_continuation(original: &str, continuation: &str) -> String {
-    let original_trim = original.trim();
     let continuation = continuation.trim();
     if continuation.is_empty() {
-        return original_trim.to_string();
+        return trim_trailing_spaces(original).trim().to_string();
     }
-    if original_trim.is_empty() {
+    let base = without_partial_table_row(trim_trailing_spaces(original));
+    if base.trim().is_empty() {
         return continuation.to_string();
     }
-    if continuation.starts_with(original_trim) {
+    if continuation_replaces(base, continuation) {
         return continuation.to_string();
     }
-    format!("{}\n\n{continuation}", original.trim_end())
+    let tail = strip_overlapping_head(base, continuation);
+    format!("{base}{tail}")
+}
+
+fn trim_trailing_spaces(text: &str) -> &str {
+    text.trim_end_matches([' ', '\t', '\u{3000}'])
+}
+
+fn without_partial_table_row(text: &str) -> &str {
+    if let Some((head, line)) = split_last_line(text) {
+        if is_partial_table_row(line) {
+            return head;
+        }
+        return text;
+    }
+    if is_partial_table_row(text) {
+        ""
+    } else {
+        text
+    }
+}
+
+fn split_last_line(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    let nl = bytes.iter().rposition(|b| *b == b'\n')?;
+    Some((&text[..=nl], text[nl + 1..].trim_end_matches('\r')))
+}
+
+fn is_partial_table_row(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('|') && !line.ends_with('|')
+}
+
+/// The model wrote the answer again, or started over from a real prefix of it.
+fn continuation_replaces(original: &str, continuation: &str) -> bool {
+    let original = original.trim();
+    if original.is_empty() {
+        return false;
+    }
+    if continuation.starts_with(original) {
+        return true;
+    }
+    if shared_prefix_chars(original, continuation) >= REWRITE_PREFIX_CHARS {
+        return true;
+    }
+    original.chars().count() >= REWRITE_PREFIX_CHARS && continuation.contains(original)
+}
+
+fn strip_overlapping_head<'a>(original: &str, continuation: &'a str) -> &'a str {
+    let original = original.trim_end_matches(['\n', '\r']);
+    let o: Vec<char> = original.chars().collect();
+    let c: Vec<char> = continuation.chars().collect();
+    let max = o.len().min(c.len()).min(500);
+    if max < OVERLAP_MIN_CHARS {
+        return continuation;
+    }
+    let mut overlap = 0usize;
+    for len in (OVERLAP_MIN_CHARS..=max).rev() {
+        if o[o.len() - len..] == c[..len] {
+            overlap = len;
+            break;
+        }
+    }
+    if overlap == 0 {
+        return continuation;
+    }
+    let byte = continuation
+        .char_indices()
+        .nth(overlap)
+        .map(|(i, _)| i)
+        .unwrap_or(continuation.len());
+    &continuation[byte..]
+}
+
+fn shared_prefix_chars(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 pub fn is_conclusion_prompt(text: &str) -> bool {
@@ -668,9 +753,6 @@ mod tests {
         assert!(is_conclusion_prompt(&prompt));
         assert!(is_conclusion_prompt(CONTINUE_HINT));
         assert!(!is_conclusion_prompt("契約を説明してください。"));
-        let continued = join_continuation("前半です、", "後半です。");
-        assert!(continued.contains("前半です、"));
-        assert!(continued.contains("後半です。"));
         assert_eq!(
             join_continuation("前半です、", "前半です、\n後半です。"),
             "前半です、\n後半です。"
@@ -678,5 +760,65 @@ mod tests {
         assert_eq!(INCOMPLETE_MARK, "不完全な可能性");
         assert_ne!(KIND_RETRIED, "notice");
         assert_ne!(KIND_INCOMPLETE, "notice");
+    }
+
+    #[test]
+    fn join_continuation_does_not_split_a_sentence_or_repeat_its_tail() {
+        let joined = join_continuation("契約は有効で", "あり、公序良俗に反しません。");
+        assert_eq!(joined, "契約は有効であり、公序良俗に反しません。");
+        assert!(!joined.contains("\n\n"));
+
+        let original = "前提となる事実は次のとおりです。解除は内容証明で行い";
+        let continuation = "解除は内容証明で行い、到達の翌日から効力が生じます。";
+        let joined = join_continuation(original, continuation);
+        assert_eq!(
+            joined,
+            "前提となる事実は次のとおりです。解除は内容証明で行い、到達の翌日から効力が生じます。"
+        );
+        assert_eq!(joined.matches("解除は内容証明で行い").count(), 1);
+
+        let short_overlap = join_continuation("結論はです", "です。解除できます。");
+        assert_eq!(
+            short_overlap, "結論はですです。解除できます。",
+            "an overlap under 8 characters stays, so a short particle is not eaten"
+        );
+    }
+
+    #[test]
+    fn join_continuation_uses_a_rewrite_that_already_contains_the_original() {
+        let original = "解除できるのは相手の債務不履行が重大なときで、通知は";
+        let rewrite = "解除できるのは相手の債務不履行が重大なときです。通知のうえ解除できます。";
+        assert_eq!(join_continuation(original, rewrite), rewrite);
+
+        let cut = "ここまでの分析です。解除は重大な不履行のときに限ります";
+        let restarted = format!("前置きを補います。{cut}。以上です。");
+        assert_eq!(join_continuation(cut, &restarted), restarted);
+    }
+
+    #[test]
+    fn join_continuation_drops_a_partial_table_row() {
+        let original = "| 項目 | 内容 |\n| --- | --- |\n| 損害";
+        let continuation = "| 損害 | 賠償できます。 |";
+        assert_eq!(
+            join_continuation(original, continuation),
+            "| 項目 | 内容 |\n| --- | --- |\n| 損害 | 賠償できます。 |"
+        );
+        let kept = join_continuation("| 項目 | 内容 |\n| 損害 | あり |", "補足です。");
+        assert!(kept.contains("| 損害 | あり |"));
+        assert!(kept.ends_with("補足です。"));
+    }
+
+    #[test]
+    fn a_short_continuation_is_judged_on_the_joined_body() {
+        let question = long_question();
+        let original = format!("{}、", "あ".repeat(80));
+        let joined = join_continuation(&original, "解除できます。");
+        assert_eq!(joined, format!("{}、解除できます。", "あ".repeat(80)));
+        assert_eq!(assess_answer(&question, &joined, "", "stop"), None);
+        assert_eq!(
+            assess_answer(&question, "解除できます。", "", "length"),
+            Some(AnswerProblem::Truncated),
+            "the continuation stream's length cap is not the joined answer"
+        );
     }
 }
