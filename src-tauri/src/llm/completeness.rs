@@ -164,11 +164,12 @@ pub fn append_continuation(original: &str, continuation: &str) -> String {
     let open_fence = open_fence_info(original);
     let mut out = String::with_capacity(original.len() + continuation.len() + 32);
     out.push_str(original);
-    if open_fence.is_some() {
+    if let Some(fence) = &open_fence {
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str("```\n");
+        out.push_str(&fence.closing_line());
+        out.push('\n');
     }
     if !(out.ends_with("\n\n") || out.ends_with("\r\n\r\n")) {
         if !out.ends_with('\n') {
@@ -178,9 +179,11 @@ pub fn append_continuation(original: &str, continuation: &str) -> String {
     }
     out.push_str(CONTINUATION_MARK);
     out.push_str("\n\n");
-    if let Some(info) = open_fence {
-        if fence_line_count(continuation) % 2 == 1 {
-            out.push_str(&fence_open_line(&info));
+    if let Some(fence) = &open_fence {
+        // A bare ``` is the model closing the quote. Reopen so that line
+        // closes the original fence instead of starting a new block.
+        if first_fence_is_bare_close(continuation) {
+            out.push_str(&fence.opening_line());
             out.push('\n');
         }
     }
@@ -188,36 +191,90 @@ pub fn append_continuation(original: &str, continuation: &str) -> String {
     out
 }
 
-/// Info string of a fence that is still open, such as `mermaid` in ```mermaid.
-fn open_fence_info(text: &str) -> Option<String> {
-    let mut open: Option<String> = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("```") {
-            continue;
-        }
-        if open.is_some() {
-            open = None;
+struct OpenFence {
+    indent: String,
+    info: String,
+}
+
+impl OpenFence {
+    fn closing_line(&self) -> String {
+        format!("{}```", self.indent)
+    }
+
+    fn opening_line(&self) -> String {
+        if self.info.is_empty() {
+            format!("{}```", self.indent)
         } else {
-            let info = trimmed.trim_start_matches('`').trim();
-            open = Some(info.to_string());
+            format!("{}```{}", self.indent, self.info)
+        }
+    }
+}
+
+/// The fence still open at the end of `text`, including its leading whitespace.
+fn open_fence_info(text: &str) -> Option<OpenFence> {
+    let mut open: Option<OpenFence> = None;
+    for line in text.lines() {
+        if let Some(opened) = &open {
+            if is_bare_closing_fence(line, &opened.indent) {
+                open = None;
+            }
+        } else if let Some(next) = parse_opening_fence(line) {
+            open = Some(next);
         }
     }
     open
 }
 
-fn fence_line_count(text: &str) -> usize {
-    text.lines()
-        .filter(|line| line.trim_start().starts_with("```"))
-        .count()
+fn parse_opening_fence(line: &str) -> Option<OpenFence> {
+    let indent_len = line
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| c.len_utf8())
+        .sum();
+    let rest = &line[indent_len..];
+    let ticks = rest.chars().take_while(|c| *c == '`').count();
+    if ticks < 3 {
+        return None;
+    }
+    let info = rest[ticks..].trim();
+    if info.contains('`') {
+        return None;
+    }
+    Some(OpenFence {
+        indent: line[..indent_len].to_string(),
+        info: info.to_string(),
+    })
 }
 
-fn fence_open_line(info: &str) -> String {
-    if info.is_empty() {
-        "```".to_string()
-    } else {
-        format!("```{info}")
+/// A closing fence is backticks only. ```text and ```mermaid open a fence; they do not close one.
+fn is_bare_closing_fence(line: &str, indent: &str) -> bool {
+    if !line.starts_with(indent) {
+        return false;
     }
+    let rest = &line[indent.len()..];
+    if rest.starts_with(' ') || rest.starts_with('\t') {
+        return false;
+    }
+    let rest = rest.trim_end();
+    rest.len() >= 3 && rest.chars().all(|c| c == '`')
+}
+
+fn first_fence_is_bare_close(text: &str) -> bool {
+    for line in text.lines() {
+        let indent_len = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .map(|c| c.len_utf8())
+            .sum();
+        let rest = &line[indent_len..];
+        if !rest.starts_with("```") {
+            continue;
+        }
+        let ticks = rest.chars().take_while(|c| *c == '`').count();
+        let info = rest[ticks..].trim();
+        return ticks >= 3 && info.is_empty();
+    }
+    false
 }
 
 pub fn is_conclusion_prompt(text: &str) -> bool {
@@ -365,11 +422,7 @@ fn stopped_for_length(finish_reason: &str) -> bool {
 }
 
 fn unclosed_fence(text: &str) -> bool {
-    text.lines()
-        .filter(|line| line.trim_start().starts_with("```"))
-        .count()
-        % 2
-        == 1
+    open_fence_info(text).is_some()
 }
 
 fn unclosed_bracket(text: &str) -> bool {
@@ -802,6 +855,21 @@ mod tests {
             "```mermaid\nflowchart LR\nA-->B\n```\n\n（続き）\n\n```mermaid\nC[...]\n```\n以上です。"
         );
         assert_eq!(assess_answer(&question, &joined, "", "stop"), None);
+        let quote = "```\n第1条 条文の途中";
+        let mixed = "残りの条文\n```\n結論は [1] です。\n```text\nまだ途中";
+        let saved = append_continuation(quote, mixed);
+        assert!(saved.starts_with(quote), "{saved}");
+        assert!(
+            saved.contains("条文の途中\n```\n\n（続き）\n\n```\n残りの条文\n```\n結論は [1] です。\n```text\nまだ途中"),
+            "{saved}"
+        );
+        let after_close = saved.split("残りの条文\n```\n").nth(1).unwrap();
+        assert!(after_close.starts_with("結論は [1] です。"), "{saved}");
+        assert_eq!(
+            assess_answer(&question, &saved, "", "stop"),
+            Some(AnswerProblem::Truncated),
+            "```text opens a fence and does not close it"
+        );
         let still_open = append_continuation("前文です。", "```\nまだ開いている");
         assert_eq!(
             assess_answer(&question, &still_open, "", "stop"),
@@ -826,6 +894,25 @@ mod tests {
         assert!(outside.contains("[1]"), "{joined}");
         assert!(!outside.contains("```"), "{joined}");
         assert_eq!(assess_answer(&question, &joined, "", "stop"), None);
+        assert!(unclosed_fence("```\nquote\n```text"));
+        assert!(!unclosed_fence("```\nquote\n```"));
+    }
+
+    #[test]
+    fn an_indented_fence_is_closed_at_the_same_indent() {
+        let question = long_question();
+        let original = "1. 条文\n   ```\n   第1条 途中";
+        let continuation = "続きの説明です。根拠は [1] です。";
+        let joined = append_continuation(original, continuation);
+        assert!(joined.starts_with(original), "{joined}");
+        assert_eq!(
+            joined,
+            "1. 条文\n   ```\n   第1条 途中\n   ```\n\n（続き）\n\n続きの説明です。根拠は [1] です。"
+        );
+        assert!(joined.contains("[1]"), "{joined}");
+        assert_eq!(assess_answer(&question, &joined, "", "stop"), None);
+        assert!(unclosed_fence("1. 条文\n   ```\n   第1条\n```"));
+        assert!(!unclosed_fence("1. 条文\n   ```\n   第1条\n   ```"));
     }
 
     #[test]
