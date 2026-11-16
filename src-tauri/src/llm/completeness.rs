@@ -182,7 +182,7 @@ pub fn append_continuation(original: &str, continuation: &str) -> String {
     if let Some(fence) = &open_fence {
         // A bare ``` is the model closing the quote. Reopen so that line
         // closes the original fence instead of starting a new block.
-        if first_fence_is_bare_close(continuation, fence.ticks) {
+        if first_fence_is_bare_close(continuation, fence.indent_spaces(), fence.ticks) {
             out.push_str(&fence.opening_line());
             out.push('\n');
         }
@@ -213,6 +213,10 @@ impl OpenFence {
             format!("{}{}{}", self.indent, self.marker(), self.info)
         }
     }
+
+    fn indent_spaces(&self) -> usize {
+        self.indent.bytes().take_while(|b| *b == b' ').count()
+    }
 }
 
 /// The fence still open at the end of `text`, including its leading whitespace.
@@ -220,7 +224,7 @@ fn open_fence_info(text: &str) -> Option<OpenFence> {
     let mut open: Option<OpenFence> = None;
     for line in text.lines() {
         if let Some(opened) = &open {
-            if is_bare_closing_fence(line, opened.ticks) {
+            if is_bare_closing_fence(line, opened.indent_spaces(), opened.ticks) {
                 open = None;
             }
         } else if let Some(next) = parse_opening_fence(line) {
@@ -252,12 +256,12 @@ fn parse_opening_fence(line: &str) -> Option<OpenFence> {
     })
 }
 
-/// CommonMark closing fence: 0-3 spaces, at least as many backticks as the
-/// opener, and only whitespace after. The indent does not have to match.
-/// A line with an info string, such as a text or mermaid fence, does not close.
-fn is_bare_closing_fence(line: &str, opening_ticks: usize) -> bool {
+/// A bare closing fence may be indented from column 0 up to the opener's
+/// indent plus 3 spaces. It needs at least as many backticks as the opener
+/// and only whitespace after. An info string does not close a fence.
+fn is_bare_closing_fence(line: &str, opening_indent: usize, opening_ticks: usize) -> bool {
     let spaces = line.bytes().take_while(|b| *b == b' ').count();
-    if spaces > 3 {
+    if spaces > opening_indent.saturating_add(3) {
         return false;
     }
     let rest = &line[spaces..];
@@ -268,7 +272,7 @@ fn is_bare_closing_fence(line: &str, opening_ticks: usize) -> bool {
     rest[ticks..].chars().all(|c| c == ' ' || c == '\t')
 }
 
-fn first_fence_is_bare_close(text: &str, opening_ticks: usize) -> bool {
+fn first_fence_is_bare_close(text: &str, opening_indent: usize, opening_ticks: usize) -> bool {
     for line in text.lines() {
         let indent_len = line
             .chars()
@@ -279,7 +283,7 @@ fn first_fence_is_bare_close(text: &str, opening_ticks: usize) -> bool {
         if !rest.starts_with("```") {
             continue;
         }
-        return is_bare_closing_fence(line, opening_ticks);
+        return is_bare_closing_fence(line, opening_indent, opening_ticks);
     }
     false
 }
@@ -954,6 +958,23 @@ mod tests {
             "```\n途中\n```\n\n（続き）\n\n```\n  ```\n以上です。"
         );
         assert!(!unclosed_fence(&reopened), "{reopened}");
+    }
+
+    #[test]
+    fn a_list_fence_may_close_deeper_than_three_spaces() {
+        let question = long_question();
+        let finished = full_answer();
+        let four = format!("{finished}\n- 図\n    ```mermaid\n    flowchart LR\n    A-->B\n    ```");
+        assert!(!unclosed_fence(&four), "{four}");
+        assert_eq!(assess_answer(&question, &four, "", "stop"), None);
+        let five = format!("{finished}\n- 親\n  - 子\n     ```\n     code\n     ```");
+        assert!(!unclosed_fence(&five), "{five}");
+        assert_eq!(assess_answer(&question, &five, "", "stop"), None);
+        assert!(unclosed_fence(
+            "- 図\n    ```mermaid\n    flowchart LR\n    ```text"
+        ));
+        assert!(!unclosed_fence("    ```\ncode\n       ```"));
+        assert!(unclosed_fence("    ```\ncode\n        ```"));
     }
 
     #[test]
