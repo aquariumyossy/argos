@@ -1,7 +1,7 @@
 //! Edit an attached .docx or .xlsx, or one already in the output folder, into a new file.
 //! The source is only opened for reading. Search-folder files stay closed.
 
-mod docx;
+pub(crate) mod docx;
 mod text;
 mod xlsx;
 mod xmlscan;
@@ -68,6 +68,9 @@ pub(crate) struct Leftover {
     pub find: String,
     pub location: String,
     pub snippet: String,
+    /// `snippet` is the source string itself and can be pasted into the next find.
+    pub pasteable: bool,
+    pub ws_note: String,
 }
 
 #[derive(Debug)]
@@ -78,7 +81,9 @@ pub(crate) struct ChangeStats {
     pub paragraph_checks: Vec<(String, String)>,
     /// Parallel to `hits`: source slices matched by whitespace, not by exact text.
     pub ws_sources: Vec<Vec<String>>,
-    /// Parallel to `hits`: pasteable near-misses, only filled when that find missed.
+    /// Parallel to `hits`: how many of `hits` were exact.
+    pub exact_hits: Vec<usize>,
+    /// Parallel to `hits`: pasteable near-misses for a find that missed entirely.
     pub near_misses: Vec<Vec<text::NearMiss>>,
 }
 
@@ -99,6 +104,7 @@ impl ChangeStats {
             notes: Vec::new(),
             paragraph_checks: Vec::new(),
             ws_sources: vec![Vec::new(); count],
+            exact_hits: vec![0; count],
             near_misses: vec![Vec::new(); count],
         }
     }
@@ -109,6 +115,9 @@ pub(crate) fn record_hit(stats: &mut ChangeStats, index: usize, hit: text::Repla
         return;
     }
     stats.hits[index].2 += hit.count;
+    if let Some(exact) = stats.exact_hits.get_mut(index) {
+        *exact += hit.exact;
+    }
     let Some(slot) = stats.ws_sources.get_mut(index) else {
         return;
     };
@@ -570,6 +579,29 @@ pub(crate) fn push_leftover(
             find: probe.find.clone(),
             location: location.to_string(),
             snippet: text::snippet(text, start, &probe.find),
+            pasteable: false,
+            ws_note: String::new(),
+        });
+    }
+    for slice in text::ws_variant_slices(text, &probe.find, &probe.explain) {
+        if leftovers.len() >= limit {
+            *truncated = true;
+            return;
+        }
+        if leftovers.iter().any(|item| {
+            item.pasteable
+                && item.find == probe.find
+                && item.location == location
+                && item.snippet == slice
+        }) {
+            continue;
+        }
+        leftovers.push(Leftover {
+            find: probe.find.clone(),
+            location: location.to_string(),
+            snippet: slice.clone(),
+            pasteable: true,
+            ws_note: text::variant_note(&probe.find, &slice),
         });
     }
 }
@@ -680,7 +712,15 @@ fn format_report(
             }
             out.push_str("- ");
             out.push_str(&item.location);
-            if !item.snippet.is_empty() {
+            if item.pasteable {
+                out.push('「');
+                out.push_str(&item.snippet);
+                out.push('」');
+                if !item.ws_note.is_empty() {
+                    out.push_str(" ※");
+                    out.push_str(&item.ws_note);
+                }
+            } else if !item.snippet.is_empty() {
                 out.push('（');
                 out.push_str(&one_line(&item.snippet));
                 out.push('）');
@@ -696,6 +736,10 @@ fn format_report(
         out.push_str(&format!("段落の書き換え: {} 件\n", stats.paragraphs));
     }
     for note in &stats.notes {
+        // check() already lists the same unreachable hit in 残存.
+        if !leftovers.is_empty() && note.contains("にあります") {
+            continue;
+        }
         out.push_str(note);
         if !note.ends_with('\n') {
             out.push('\n');
@@ -761,15 +805,26 @@ fn format_replacement_lines(stats: &ChangeStats) -> String {
                 }
             }
         } else {
-            out.push_str(&format!(
-                "文字列置換: 「{}」→「{}」を {count} 箇所\n",
-                one_line(&find),
-                one_line(&replace)
-            ));
-            if let Some(sources) = stats.ws_sources.get(index) {
-                if !sources.is_empty() {
-                    out.push_str(&format_ws_line(&find, sources));
-                }
+            let exact = stats.exact_hits.get(index).copied().unwrap_or(0);
+            let sources = stats
+                .ws_sources
+                .get(index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if sources.is_empty() {
+                out.push_str(&format!(
+                    "文字列置換: 「{}」→「{}」を {count} 箇所\n",
+                    one_line(&find),
+                    one_line(&replace)
+                ));
+            } else {
+                let differed = count.saturating_sub(exact);
+                out.push_str(&format!(
+                    "文字列置換: 「{}」→「{}」を {count} 箇所（完全一致 {exact}、空白の違い {differed}）\n",
+                    one_line(&find),
+                    one_line(&replace)
+                ));
+                out.push_str(&format_ws_line(&find, sources));
             }
         }
     }
@@ -862,23 +917,31 @@ fn map_people(xml: &str, req: &EditRequest, stats: &mut ChangeStats) -> String {
     })
 }
 
-/// When nothing in an editable part changed, say where an exact find still sits
-/// so the model does not retry a part this tool cannot rewrite.
+/// Say where a find, or a whitespace variant of it, still sits in a part this
+/// tool cannot rewrite. Runs whether or not the replacement already hit.
 pub(crate) fn note_unreachable_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
-    if stats.changed() {
-        return;
-    }
-    let finds: Vec<String> = stats
+    let finds: Vec<(String, String)> = stats
         .hits
         .iter()
-        .filter(|(_, _, count)| *count == 0)
-        .map(|(find, _, _)| find.clone())
+        .map(|(find, replace, _)| (find.clone(), replace.clone()))
         .collect();
-    for find in finds {
+    for (find, explain) in finds {
+        if find.is_empty() {
+            continue;
+        }
         for place in unreachable_places(entries, &find) {
             stats
                 .notes
                 .push(format!("「{}」は{place}にあります。", one_line(&find)));
+        }
+        for (place, slice) in unreachable_variants(entries, &find, &explain) {
+            let note = text::variant_note(&find, &slice);
+            let mut line = format!("「{}」は{place}にあります。「{slice}」", one_line(&find));
+            if !note.is_empty() {
+                line.push_str(" ※");
+                line.push_str(&note);
+            }
+            stats.notes.push(line);
         }
     }
 }
@@ -915,6 +978,48 @@ fn unreachable_places(entries: &[(String, Vec<u8>)], find: &str) -> Vec<String> 
         }
     }
     places
+}
+
+fn unreachable_variants(
+    entries: &[(String, Vec<u8>)],
+    find: &str,
+    explain: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, bytes) in entries {
+        let Some(xml) = xmlscan::decode_xml_bytes(bytes) else {
+            continue;
+        };
+        let mut take = |place: &str, text: &str| {
+            for slice in text::ws_variant_slices(text, find, explain) {
+                if out.iter().any(|(got, seen)| got == place && seen == &slice) {
+                    continue;
+                }
+                out.push((place.to_string(), slice));
+            }
+        };
+        if docx::is_word_story(name) {
+            for (local, text) in xmlscan::leaf_texts(&xml) {
+                if matches!(local.as_str(), "instrText" | "delInstrText") {
+                    take(&unreachable_location("フィールド"), &text);
+                }
+            }
+            continue;
+        }
+        if docx::is_rels(name) {
+            for target in docx::hyperlink_targets(&xml) {
+                take(&unreachable_location("ハイパーリンク"), &target);
+            }
+            continue;
+        }
+        if let Some(kind) = unreachable_kind(name) {
+            let place = unreachable_location(kind);
+            for (_, text) in xmlscan::leaf_texts(&xml) {
+                take(&place, &text);
+            }
+        }
+    }
+    out
 }
 
 fn push_place(places: &mut Vec<String>, place: &str) {

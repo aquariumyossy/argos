@@ -174,18 +174,17 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
 }
 
 fn fill_near_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
-    let pending: Vec<(usize, String)> = stats
+    let finds: Vec<(usize, String)> = stats
         .hits
         .iter()
         .enumerate()
-        .filter(|(_, (_, _, count))| *count == 0)
         .map(|(index, (find, _, _))| (index, find.clone()))
         .collect();
-    if pending.is_empty() {
+    if finds.is_empty() {
         return;
     }
     let texts = package_texts(entries);
-    for (index, find) in pending {
+    for (index, find) in finds {
         if let Some(slot) = stats.near_misses.get_mut(index) {
             *slot = super::text::near_misses(&texts, &find, super::text::NEAR_MISS_LIMIT);
         }
@@ -753,7 +752,22 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
             }
             continue;
         }
-        if file_name(name) == "sharedstrings.xml" || file_name(name) == "workbook.xml.rels" {
+        if super::docx::is_rels(name) {
+            for target in super::docx::hyperlink_targets(&xml) {
+                for probe in probes {
+                    push_leftover(
+                        &mut leftovers,
+                        &mut truncated,
+                        probe,
+                        &target,
+                        &super::unreachable_location("ハイパーリンク"),
+                        MAX_LEFTOVERS,
+                    );
+                }
+            }
+            continue;
+        }
+        if file_name(name) == "sharedstrings.xml" {
             continue;
         }
         if !name.to_ascii_lowercase().ends_with(".xml") {

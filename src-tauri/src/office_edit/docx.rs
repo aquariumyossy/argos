@@ -128,18 +128,17 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
 }
 
 fn fill_near_misses(entries: &[(String, Vec<u8>)], stats: &mut ChangeStats) {
-    let pending: Vec<(usize, String)> = stats
+    let finds: Vec<(usize, String)> = stats
         .hits
         .iter()
         .enumerate()
-        .filter(|(_, (_, _, count))| *count == 0)
         .map(|(index, (find, _, _))| (index, find.clone()))
         .collect();
-    if pending.is_empty() {
+    if finds.is_empty() {
         return;
     }
     let texts = package_texts(entries);
-    for (index, find) in pending {
+    for (index, find) in finds {
         if let Some(slot) = stats.near_misses.get_mut(index) {
             *slot = super::text::near_misses(&texts, &find, super::text::NEAR_MISS_LIMIT);
         }

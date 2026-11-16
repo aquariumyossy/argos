@@ -7,6 +7,9 @@ pub const NEAR_MISS_LIMIT: usize = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceHit {
     pub count: usize,
+    /// Hits whose source text was exactly `find`.
+    pub exact: usize,
+    /// Distinct source slices that matched with different whitespace.
     pub sources: Vec<String>,
 }
 
@@ -62,30 +65,35 @@ pub fn replace_pieces(pieces: &mut [String], find: &str, replace: &str) -> usize
     spans.len()
 }
 
-/// Exact matches win. A whitespace retry runs only when `find` has 0 exact hits
-/// in these `pieces`.
+/// Replace `find`, including whitespace variants in the same joined text.
 ///
-/// On that retry, each whitespace run in `find` matches a non-empty run of
-/// ASCII space, U+3000, NBSP, or tab in the source. A match may still cross
-/// `pieces`. `sources` lists the distinct source slices, in order.
+/// An exact hit is taken at the position where it starts. Other positions
+/// still match whitespace variants, including across `pieces`. When `find`
+/// itself contains whitespace, each of its whitespace runs matches a non-empty
+/// run of ASCII space, U+3000, NBSP, or tab. When `find` contains none, one
+/// such run may sit between adjacent characters. `exact` counts identical
+/// hits. `sources` lists the distinct source slices that differed.
 pub fn replace_pieces_flex(pieces: &mut [String], find: &str, replace: &str) -> ReplaceHit {
     if find.is_empty() || pieces.is_empty() || find == replace {
         return ReplaceHit {
             count: 0,
+            exact: 0,
             sources: Vec::new(),
         };
     }
     let (concat, ranges) = concat_pieces(pieces);
-    let (spans, sources) = mixed_spans(&concat, find);
+    let (spans, sources, exact) = mixed_spans(&concat, find);
     if spans.is_empty() {
         return ReplaceHit {
             count: 0,
+            exact: 0,
             sources: Vec::new(),
         };
     }
     apply_piece_spans(pieces, &ranges, &spans, replace);
     ReplaceHit {
         count: spans.len(),
+        exact,
         sources,
     }
 }
@@ -166,24 +174,47 @@ fn has_flex_ws(find: &str) -> bool {
     find.chars().any(is_flex_ws)
 }
 
-/// Exact hits win for this whole string. Flex runs only when the exact `find` has 0 hits.
-fn mixed_spans(text: &str, find: &str) -> (Vec<(usize, usize)>, Vec<String>) {
-    let exact = find_spans(text, find);
-    if !exact.is_empty() || !has_flex_ws(find) {
-        return (exact, Vec::new());
-    }
-    let parts = find_parts(find);
+/// Exact hit at a position wins. Every other whitespace variant in `text` is kept.
+fn mixed_spans(text: &str, find: &str) -> (Vec<(usize, usize)>, Vec<String>, usize) {
+    let parts = if has_flex_ws(find) {
+        Some(find_parts(find))
+    } else {
+        None
+    };
+    let interstitial = parts.is_none();
     let mut spans = Vec::new();
     let mut sources = Vec::new();
+    let mut exact = 0usize;
     let mut index = 0usize;
     while index < text.len() {
         if !text.is_char_boundary(index) {
             index += 1;
             continue;
         }
-        if let Some(end) = match_parts_at(text, index, &parts) {
+        if text[index..].starts_with(find) {
+            let end = index + find.len();
+            spans.push((index, end));
+            exact += 1;
+            index = end;
+            continue;
+        }
+        let flex_end = if let Some(parts) = &parts {
+            match_parts_at(text, index, parts)
+        } else if interstitial
+            && text[index..]
+                .chars()
+                .next()
+                .is_some_and(|ch| !is_flex_ws(ch))
+        {
+            match_interstitial(text, index, find)
+        } else {
+            None
+        };
+        if let Some(end) = flex_end {
             let slice = text[index..end].to_string();
-            if !sources.contains(&slice) {
+            if slice == find {
+                exact += 1;
+            } else if !sources.contains(&slice) {
                 sources.push(slice);
             }
             spans.push((index, end));
@@ -196,7 +227,36 @@ fn mixed_spans(text: &str, find: &str) -> (Vec<(usize, usize)>, Vec<String>) {
             .map(|ch| ch.len_utf8())
             .unwrap_or(1);
     }
-    (spans, sources)
+    (spans, sources, exact)
+}
+
+/// One optional flex-whitespace run between adjacent characters of `find`.
+/// The span starts and ends on a character of `find`.
+fn match_interstitial(text: &str, start: usize, find: &str) -> Option<usize> {
+    let mut pos = start;
+    let mut first = true;
+    for ch in find.chars() {
+        if !first {
+            let mut consumed = 0usize;
+            for next in text[pos..].chars() {
+                if !is_flex_ws(next) {
+                    break;
+                }
+                consumed += next.len_utf8();
+            }
+            pos += consumed;
+        }
+        first = false;
+        if text[pos..].chars().next() != Some(ch) {
+            return None;
+        }
+        pos += ch.len_utf8();
+    }
+    if pos == start {
+        None
+    } else {
+        Some(pos)
+    }
 }
 
 fn match_parts_at(text: &str, start: usize, parts: &[Part<'_>]) -> Option<usize> {
@@ -248,6 +308,8 @@ pub fn whitespace_note(text: &str) -> String {
     }
     if text.contains("  ") {
         kinds.push("連続する半角空白");
+    } else if text.contains(' ') {
+        kinds.push("半角空白");
     }
     let mut extras = Vec::new();
     for ch in text.chars() {
@@ -288,17 +350,42 @@ pub fn near_misses(texts: &[String], find: &str, limit: usize) -> Vec<NearMiss> 
     found.truncate(limit);
     found
         .into_iter()
-        .map(|exact| {
-            let mut note = whitespace_note(&exact);
-            if note.is_empty()
-                && find.chars().any(|ch| ch.is_whitespace())
-                && !exact.chars().any(|ch| ch.is_whitespace())
-            {
-                note = "空白なし".to_string();
-            }
-            NearMiss { exact, note }
+        .map(|exact| NearMiss {
+            note: variant_note(find, &exact),
+            exact,
         })
         .collect()
+}
+
+/// Pasteable source slices that compact-match `find` but are not `find` itself.
+///
+/// `explain` is the replacement. A slice inside that new text is the edit.
+pub fn ws_variant_slices(text: &str, find: &str, explain: &str) -> Vec<String> {
+    if find.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let target: Vec<char> = find.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if target.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    collect_compact(text, find, &target, &mut found, 32);
+    if !explain.is_empty() {
+        found.retain(|slice| !explain.contains(slice));
+    }
+    found
+}
+
+pub fn variant_note(find: &str, exact: &str) -> String {
+    let note = whitespace_note(exact);
+    if note.is_empty()
+        && find.chars().any(|ch| ch.is_whitespace())
+        && !exact.chars().any(|ch| ch.is_whitespace())
+    {
+        "空白なし".to_string()
+    } else {
+        note
+    }
 }
 
 fn collect_compact(text: &str, find: &str, target: &[char], out: &mut Vec<String>, limit: usize) {
@@ -503,12 +590,52 @@ mod tests {
     }
 
     #[test]
-    fn exact_match_takes_priority_over_a_whitespace_variant() {
+    fn whitespace_variants_in_one_paragraph_are_all_replaced() {
         let mut pieces = vec!["A B/A　B".to_string()];
         let hit = replace_pieces_flex(&mut pieces, "A B", "Z");
+        assert_eq!(hit.count, 2);
+        assert_eq!(hit.exact, 1);
+        assert_eq!(hit.sources, vec!["A　B".to_string()]);
+        assert_eq!(pieces, vec!["Z/Z".to_string()]);
+    }
+
+    #[test]
+    fn a_name_without_spaces_matches_one_whitespace_run_between_characters() {
+        let mut pieces = vec!["原告山田 太郎（以下「山田　太郎」という。）".to_string()];
+        let hit = replace_pieces_flex(&mut pieces, "山田太郎", "佐藤花子");
+        assert_eq!(hit.exact, 0);
+        assert_eq!(hit.count, 2);
+        assert_eq!(pieces[0], "原告佐藤花子（以下「佐藤花子」という。）");
+        assert_eq!(
+            hit.sources,
+            vec!["山田 太郎".to_string(), "山田　太郎".to_string()]
+        );
+
+        let mut pieces = vec!["当事者目録　原告　山田".to_string(), "　太郎".to_string()];
+        let hit = replace_pieces_flex(&mut pieces, "山田太郎", "佐藤花子");
         assert_eq!(hit.count, 1);
+        assert_eq!(hit.exact, 0);
+        assert_eq!(hit.sources, vec!["山田　太郎".to_string()]);
+        assert_eq!(
+            pieces,
+            vec!["当事者目録　原告　佐藤花子".to_string(), String::new()]
+        );
+
+        let mut edged = vec!["　山田太郎　".to_string()];
+        let hit = replace_pieces_flex(&mut edged, "山田太郎", "佐藤花子");
+        assert_eq!(hit.exact, 1);
         assert!(hit.sources.is_empty());
-        assert_eq!(pieces, vec!["Z/A　B".to_string()]);
+        assert_eq!(edged, vec!["　佐藤花子　".to_string()]);
+
+        let mut broken = vec!["山　田あ太郎".to_string()];
+        let hit = replace_pieces_flex(&mut broken, "山田太郎", "佐藤花子");
+        assert_eq!(hit.count, 0);
+        assert_eq!(broken, vec!["山　田あ太郎".to_string()]);
+
+        let mut one_run = vec!["山田 \t　太郎".to_string()];
+        let hit = replace_pieces_flex(&mut one_run, "山田太郎", "佐藤花子");
+        assert_eq!(hit.count, 1);
+        assert_eq!(one_run, vec!["佐藤花子".to_string()]);
     }
 
     #[test]

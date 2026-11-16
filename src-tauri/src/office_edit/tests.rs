@@ -975,7 +975,8 @@ fn whitespace_replacements_match_fullwidth_nbsp_and_tab_across_runs() {
     let document = read_entry(&edited.path, "word/document.xml");
     assert!(document.contains("佐藤花子"), "{document}");
     assert!(!document.contains("山田"), "{document}");
-    assert!(document.contains("ZとA　B"), "{document}");
+    assert!(document.contains("ZとZ"), "{document}");
+    assert!(!document.contains("A　B"), "{document}");
     assert!(document.contains("項目"), "{document}");
     assert!(document.contains("番号"), "{document}");
     assert!(!document.contains('\t'), "{document}");
@@ -1002,8 +1003,15 @@ fn whitespace_replacements_match_fullwidth_nbsp_and_tab_across_runs() {
         edited.report
     );
     assert!(
-        !edited.report.contains("『A B』→ 原文は"),
-        "exact hit stays exact: {}",
+        edited
+            .report
+            .contains("『A B』→ 原文は『A　B』（全角空白）で一致"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited.report.contains("完全一致 1、空白の違い 1"),
+        "{}",
         edited.report
     );
     let _ = fs::remove_dir_all(&dir);
@@ -1480,5 +1488,175 @@ fn a_follow_up_edit_does_not_stack_the_suffix_or_overwrite() {
     assert!(read_entry(&edited.path, "word/document.xml").contains("鈴木一郎"));
     assert!(!read_entry(&edited.path, "word/document.xml").contains("高橋次郎"));
     assert!(read_entry(&again.path, "word/document.xml").contains("高橋次郎"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn pasteable_at<'a>(report: &'a str, location: &str) -> &'a str {
+    let line = report
+        .lines()
+        .find(|line| line.starts_with("- ") && line.contains(location))
+        .unwrap_or_else(|| panic!("no leftover at {location} in {report}"));
+    let open = line.find('「').unwrap_or_else(|| panic!("{line}")) + '「'.len_utf8();
+    let close = line[open..].find('」').unwrap_or_else(|| panic!("{line}")) + open;
+    &line[open..close]
+}
+
+#[test]
+fn a_spaceless_find_replaces_every_whitespace_variant_in_each_paragraph() {
+    let dir = temp_dir("opus");
+    let src = dir.join("訴状.docx");
+    let document = word_body(&format!(
+        "<w:p><w:r><w:t>原告山田 太郎（以下「山田\u{3000}太郎」という。）</w:t></w:r></w:p>\
+<w:p><w:r><w:t>当事者目録\u{3000}原告\u{3000}山田</w:t></w:r><w:r><w:t>\u{3000}太郎</w:t></w:r></w:p>"
+    ));
+    write_zip(&src, &[("word/document.xml", document.as_str())]);
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 13-00-00",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(
+        document.contains("原告佐藤花子（以下「佐藤花子」という。）"),
+        "{document}"
+    );
+    assert!(
+        document.contains("当事者目録\u{3000}原告\u{3000}佐藤花子"),
+        "{document}"
+    );
+    assert!(!document.contains("山田"), "{document}");
+    assert!(
+        edited.report.contains("完全一致 0、空白の違い 3"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited.report.contains("『山田 太郎』（半角空白）"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited.report.contains("『山田\u{3000}太郎』（全角空白）"),
+        "{}",
+        edited.report
+    );
+    assert!(edited.report.contains("残存: なし"), "{}", edited.report);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_body_hit_still_reports_chart_and_hyperlink_whitespace_leftovers() {
+    let dir = temp_dir("left-ws");
+    let src = dir.join("訴状.docx");
+    let document = word_body(
+        r#"<w:p><w:r><w:t>本文の山田太郎</w:t></w:r></w:p>
+<w:p><w:r><w:instrText xml:space="preserve"> REF 山田　太郎 \h </w:instrText></w:r></w:p>"#,
+    );
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/山田 太郎" TargetMode="External"/>
+</Relationships>"#;
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山田　太郎</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("word/_rels/document.xml.rels", rels),
+            ("word/charts/chart1.xml", chart),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 13-00-01",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("本文の佐藤花子"), "{document}");
+    assert!(document.contains("REF 山田　太郎"), "{document}");
+    let chart = read_entry(&edited.path, "word/charts/chart1.xml");
+    assert!(chart.contains("山田　太郎"), "{chart}");
+    let rels = read_entry(&edited.path, "word/_rels/document.xml.rels");
+    assert!(rels.contains("山田 太郎"), "{rels}");
+    assert!(edited.report.contains("残存: あり"), "{}", edited.report);
+    assert!(
+        edited.report.contains("完全一致 1、空白の違い 0") || edited.report.contains("を 1 箇所"),
+        "{}",
+        edited.report
+    );
+    let chart_text = pasteable_at(&edited.report, "グラフ（このツールでは変更できない場所）");
+    assert_eq!(chart_text, "山田\u{3000}太郎");
+    assert!(
+        edited.report.lines().any(
+            |line| line.contains("グラフ（このツールでは変更できない場所）")
+                && line.contains("※全角空白")
+                && !chart_text.contains("全角")
+        ),
+        "{}",
+        edited.report
+    );
+    let link_text = pasteable_at(
+        &edited.report,
+        "ハイパーリンク（このツールでは変更できない場所）",
+    );
+    assert_eq!(link_text, "山田 太郎");
+    assert!(
+        edited.report.lines().any(|line| line
+            .contains("ハイパーリンク（このツールでは変更できない場所）")
+            && line.contains("※半角空白")),
+        "{}",
+        edited.report
+    );
+    let field_text = pasteable_at(
+        &edited.report,
+        "フィールド（このツールでは変更できない場所）",
+    );
+    assert_eq!(field_text, "山田\u{3000}太郎");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_xlsx_body_hit_still_reports_a_chart_whitespace_leftover() {
+    let dir = temp_dir("xlsx-left");
+    let src = dir.join("一覧.xlsx");
+    let shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <si><t>本文の山田太郎</t></si>
+</sst>"#;
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData>
+</worksheet>"#;
+    let chart = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:tx><a:t>山田　太郎</a:t></c:tx>
+</c:chartSpace>"#;
+    write_zip(
+        &src,
+        &[
+            ("xl/sharedStrings.xml", shared),
+            ("xl/worksheets/sheet1.xml", sheet),
+            ("xl/charts/chart1.xml", chart),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-16 13-00-02",
+        &request(&[("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(shared.contains("本文の佐藤花子"), "{shared}");
+    assert!(!shared.contains("山田"), "{shared}");
+    let chart_text = pasteable_at(&edited.report, "グラフ（このツールでは変更できない場所）");
+    assert_eq!(chart_text, "山田\u{3000}太郎");
+    assert!(edited.report.contains("※全角空白"), "{}", edited.report);
     let _ = fs::remove_dir_all(&dir);
 }

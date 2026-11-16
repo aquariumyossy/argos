@@ -170,6 +170,7 @@ pub fn replace_in_group(
     if indexes.is_empty() {
         return ReplaceHit {
             count: 0,
+            exact: 0,
             sources: Vec::new(),
         };
     }
