@@ -3710,6 +3710,11 @@ async fn rewrite_incomplete_answer<R: Runtime>(
         Ok(out) if !out.content.trim().is_empty() => out,
         _ => return kept_original(content, reasoning, empty_reply, false),
     };
+    // A prose answer rewritten from the same opening is not a continuation.
+    // Keep the first answer, including later rows and [n], and do not append.
+    if continue_answer && llm::completeness::opening_is_rewritten(&content, &out.content) {
+        return kept_original(content, reasoning, empty_reply, false);
+    }
     // The joined body is what gets saved. A continuation that itself stops on
     // length, and still does not finish a sentence, stays joined and is marked
     // incomplete. A length cap that lands on a sentence end is not another cut.
@@ -6406,6 +6411,32 @@ mod tests {
         assert!(answer.content.contains(&first), "{}", answer.content);
         assert!(answer.content.contains(finished), "{}", answer.content);
         assert_eq!(answer.kind, llm::completeness::KIND_CONTINUED);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn llm_send_keeps_the_original_when_the_continuation_rewrites_the_opening() {
+        let question = substantive_question();
+        let opening = "契約を解除するには、相手方の債務不履行が契約及び取引上の社会通念に照らして軽微でないことが必要です。";
+        let first = format!("{opening}根拠は第541条です。通知は、");
+        let rewrite = format!("{opening}催告をしたうえで解除できます。");
+        assert!(llm::completeness::opening_is_rewritten(&first, &rewrite));
+        let (dir, db, thread, result, requests) = send_question(
+            "opening-rewrite",
+            8,
+            vec![content_stop(&first), content_stop(&rewrite)],
+            false,
+            &question,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(requests.len(), 2);
+        let messages = db.list_llm_messages(&thread.id).unwrap();
+        let answer = final_answer(&messages);
+        assert_eq!(answer.content, first);
+        assert!(!answer.content.contains("催告をしたうえで"));
+        assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
