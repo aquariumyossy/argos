@@ -98,7 +98,13 @@ const messagesB = [
   },
 ];
 
-let messagesA: Array<typeof originalUser & { reasoning?: string }> = [originalUser];
+let messagesA: Array<
+  typeof originalUser & {
+    reasoning?: string;
+    originalContent?: string;
+    scriptFix?: string;
+  }
+> = [originalUser];
 let sourcesA: Array<Record<string, unknown>> = [];
 let pastedAttachResult: Record<string, unknown> | null = null;
 let releaseSend: () => void = () => {};
@@ -448,6 +454,36 @@ describe("foreign character notice", () => {
       "日本語で用いない文字: 这、问",
     );
     expect(screen.getByText("日本語で用いない文字: 这、问").textContent).not.toContain("П");
+    expect(screen.queryByRole("button", { name: "元の回答を見る" })).toBeNull();
+  });
+
+  it("underlines mapped characters and keeps the original reply", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "a-fixed",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "現在は기타です。",
+        originalContent: "现在は기타です。",
+        scriptFix: JSON.stringify({
+          fixes: [{ at: 0, from: "现", to: "現" }],
+          rewritten: true,
+        }),
+        createdAt: 2,
+      },
+    ];
+    await renderChat();
+    expect(screen.getByText("现→現 など1か所を直しました")).toBeTruthy();
+    expect(screen.getByText("AIが外国文字を含む部分を書き直しました")).toBeTruthy();
+    expect(screen.getByText("日本語で用いない文字: 기、타")).toBeTruthy();
+    expect(document.querySelector(".chat-han-fix")?.textContent).toBe("現");
+    expect(document.querySelector(".chat-msg.assistant .chat-msg-body")?.textContent).toContain(
+      "現在は기타です。",
+    );
+    expect(screen.queryByText("现在は기타です。")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "元の回答を見る" }));
+    expect(screen.getByText("现在は기타です。")).toBeTruthy();
   });
 
   it("shows the notice while streaming and does not scan reasoning", async () => {

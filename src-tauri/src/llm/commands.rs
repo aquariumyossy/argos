@@ -1866,8 +1866,8 @@ async fn llm_send_inner<R: Runtime>(
     )
     .await;
     let answer_flag;
-    let send_cancelled;
-    let cited_body;
+    let mut send_cancelled;
+    let mut cited_body;
     (
         result_text,
         final_reasoning,
@@ -1886,7 +1886,59 @@ async fn llm_send_inner<R: Runtime>(
         ),
     };
 
-    result_text = crate::statute::mark_unverified(&result_text, &verified_cites);
+    // App notices are instructions, not a model reply. Leave them unchanged.
+    let app_notice = answer_flag != llm::completeness::KIND_RETRIED
+        && answer_flag != llm::completeness::KIND_CONTINUED
+        && !(answer_flag == llm::completeness::KIND_INCOMPLETE && !empty_reply)
+        && ((round_limit_final && round_limit_aside.is_none()) || empty_reply);
+    let (original_content, script_fix) = if app_notice || result_text.is_empty() {
+        result_text = crate::statute::mark_unverified(&result_text, &verified_cites);
+        (String::new(), String::new())
+    } else {
+        let mapped = crate::llm::han_fix::map_reply(&result_text);
+        let rewrite = if mapped.needs_rewrite {
+            Some(
+                rewrite_foreign_reply(
+                    app,
+                    &settings,
+                    cancel.clone(),
+                    &request_id,
+                    &thread.id,
+                    &mapped.text,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if rewrite.as_ref().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_err_and(|err| llm::is_cancelled_error(err))
+                || cancel.load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            send_cancelled = true;
+        }
+        let correction = crate::llm::han_fix::apply_rewrite(mapped, rewrite);
+        if !correction.original.is_empty() {
+            if cited_body.is_empty() {
+                cited_body = correction.original.clone();
+            } else if !cited_body.contains(&correction.original) {
+                cited_body.push('\n');
+                cited_body.push_str(&correction.original);
+            }
+        }
+        let marked = crate::statute::mark_unverified(&correction.content, &verified_cites);
+        let fixes = crate::llm::han_fix::shift_fixes_past_unverified_marks(
+            &correction.content,
+            &correction.fixes,
+            &marked,
+        );
+        let original_content = correction.original;
+        let script_fix = crate::llm::han_fix::script_fix_json(&fixes, correction.rewritten);
+        result_text = marked;
+        (original_content, script_fix)
+    };
 
     busy.finish();
     kick_pending_ocr(&app, state_arc.clone());
@@ -1911,6 +1963,8 @@ async fn llm_send_inner<R: Runtime>(
             &result_text,
             &final_reasoning,
             result_kind,
+            &original_content,
+            &script_fix,
         )?)
     };
     if let Some(notice) = round_limit_aside.as_deref() {
@@ -2203,6 +2257,8 @@ fn history_with_meter_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMe
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
+        original_content: String::new(),
+        script_fix: String::new(),
         carries_summary: false,
     });
     history
@@ -3523,12 +3579,71 @@ fn save_assistant_answer(
     content: &str,
     reasoning: &str,
     kind: &str,
+    original_content: &str,
+    script_fix: &str,
 ) -> Result<crate::db::LlmMessageRow, String> {
     if kind != crate::db::LLM_MESSAGE_NOTICE {
         raise_ledger_for_kept_answer(db, thread_id, content);
     }
-    db.insert_llm_message_full(thread_id, "assistant", content, reasoning, "", "", "", kind)
-        .map_err(|e| e.to_string())
+    db.insert_llm_message_stored(
+        thread_id,
+        "assistant",
+        content,
+        reasoning,
+        "",
+        "",
+        "",
+        kind,
+        original_content,
+        script_fix,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// One local completion, tools and thinking off. Failure leaves the mapped text in place.
+async fn rewrite_foreign_reply<R: Runtime>(
+    app: &AppHandle<R>,
+    settings: &crate::db::Settings,
+    cancel: Arc<AtomicBool>,
+    request_id: &str,
+    thread_id: &str,
+    text: &str,
+) -> Result<String, String> {
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
+    let _ = app.emit(
+        "llm-chat-delta",
+        LlmChatDelta {
+            request_id: request_id.to_string(),
+            thread_id: thread_id.to_string(),
+            text: crate::llm::han_fix::REWRITE_STATUS.into(),
+            kind: "status".into(),
+        },
+    );
+    let mut thinking_off = settings.clone();
+    thinking_off.llm_thinking = "off".into();
+    let turns = vec![ChatTurn::text(
+        "user",
+        crate::llm::han_fix::foreign_rewrite_request(text),
+    )];
+    let streamed = llm::stream_chat(
+        &thinking_off,
+        &turns,
+        cancel,
+        None,
+        llm::runaway_chars_for(&settings.llm_base_url),
+        Some(false),
+        None,
+        |_kind, _delta| {},
+    )
+    .await?;
+    let next = crate::llm::han_fix::normalize_rewrite(&streamed.content);
+    if next.is_empty() {
+        Err("empty rewrite".into())
+    } else {
+        Ok(next)
+    }
 }
 
 /// A kept answer may cite only sources that existed when it was written.
@@ -4423,7 +4538,7 @@ mod tests {
         let mut slot = None;
         remember_phantom_answer(&mut slot, answer, "", &sources_then);
         let kept = slot.expect("the first phantom answer is kept");
-        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "").unwrap();
+        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "", "", "").unwrap();
         assert_eq!(saved.content, kept.content);
         assert_ne!(saved.kind, crate::db::LLM_MESSAGE_NOTICE);
         let (later, _) = db
@@ -4457,7 +4572,7 @@ mod tests {
         let mut slot = None;
         remember_phantom_answer(&mut slot, answer, "", &sources_then);
         let kept = slot.expect("the first phantom answer is kept");
-        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "").unwrap();
+        let saved = save_assistant_answer(&db, &thread.id, &kept.content, "", "", "", "").unwrap();
         assert_eq!(saved.content, kept.content);
         assert_eq!(db.llm_cite_counter(&thread.id).unwrap(), 5);
         let (memo, _) = db
@@ -4497,7 +4612,7 @@ mod tests {
             PhantomRetryAnswer::Retry
         ));
         let retry = "調べ直しても [5] のままです。巨大な脚注 [9223372036854775807] は進めません。";
-        let saved = save_assistant_answer(&db, &thread.id, retry, "考え", "").unwrap();
+        let saved = save_assistant_answer(&db, &thread.id, retry, "考え", "", "", "").unwrap();
         assert_eq!(saved.role, "assistant");
         assert_eq!(saved.content, retry);
         assert_ne!(saved.kind, crate::db::LLM_MESSAGE_NOTICE);
@@ -4516,6 +4631,8 @@ mod tests {
             "案内 [9]",
             "",
             crate::db::LLM_MESSAGE_NOTICE,
+            "",
+            "",
         )
         .unwrap();
         assert_eq!(notice.kind, crate::db::LLM_MESSAGE_NOTICE);
@@ -4737,6 +4854,8 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            original_content: String::new(),
+            script_fix: String::new(),
             carries_summary: false,
         }
     }

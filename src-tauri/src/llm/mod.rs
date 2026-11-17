@@ -9,6 +9,7 @@ pub mod create_office;
 pub mod fetch_url;
 pub mod files;
 pub mod grain;
+pub mod han_fix;
 pub mod http_error;
 pub mod japanese_han;
 pub mod output_files;

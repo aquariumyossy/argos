@@ -471,6 +471,8 @@ pub fn prepare_model_history(
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
+        original_content: String::new(),
+        script_fix: String::new(),
         carries_summary: true,
     };
     // Notices are not replayed. The next row that is actually sent decides merge vs standalone.
@@ -565,6 +567,8 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            original_content: String::new(),
+            script_fix: String::new(),
             carries_summary: false,
         }
     }

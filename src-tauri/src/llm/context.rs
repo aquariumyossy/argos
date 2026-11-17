@@ -1115,6 +1115,8 @@ fn history_including_draft(history: &[LlmMessageRow], draft: &str) -> Vec<LlmMes
         tool_call_id: String::new(),
         tool_name: String::new(),
         kind: String::new(),
+        original_content: String::new(),
+        script_fix: String::new(),
         carries_summary: false,
     });
     history
@@ -2837,8 +2839,27 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            original_content: String::new(),
+            script_fix: String::new(),
             carries_summary: false,
         }
+    }
+
+    #[test]
+    fn history_sends_the_corrected_reply_not_the_original() {
+        let mut assistant = msg("a1", "assistant", "現在の契約です。");
+        assistant.original_content = "现在の契約です。".into();
+        assistant.script_fix =
+            r#"{"fixes":[{"at":0,"from":"现","to":"現"}],"rewritten":false}"#.into();
+        let history = vec![msg("u1", "user", "契約は？"), assistant];
+        let (turns, _) = assemble_turns("役割", &[], &history, 100_000);
+        let body = turns
+            .iter()
+            .map(|turn| turn.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("現在の契約です。"), "{body}");
+        assert!(!body.contains('现'), "{body}");
     }
 
     #[test]

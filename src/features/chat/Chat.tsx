@@ -23,7 +23,12 @@ import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
-import { foreignCharNoticeForAssistant } from "./japaneseHan";
+import {
+  foreignCharNoticeForAssistant,
+  hanMapNote,
+  HAN_REWRITE_NOTE,
+  parseScriptFix,
+} from "./japaneseHan";
 import { OfficeFileCards } from "./OfficeFileCard";
 import { HtmlPreviews } from "./HtmlPreview";
 import { officeCardsByMessage } from "./officeCards";
@@ -110,6 +115,10 @@ type LlmMessageRow = {
   /** "notice" is shown in the chat and left out of the token estimate.
    *  "retried" / "continued" / "incomplete" stay in the transcript and carry a small label. */
   kind?: string;
+  /** Reply text before foreign-script correction. Empty when nothing was changed. */
+  originalContent?: string;
+  /** JSON `{fixes, rewritten}` for the notice under the reply. */
+  scriptFix?: string;
 };
 
 type LlmSourceRow = {
@@ -456,6 +465,50 @@ function IconTrash() {
 
 function foreignReplyNotice(content: string, toolCalls?: string): string | null {
   return foreignCharNoticeForAssistant(content, toolCalls ?? "");
+}
+
+function OriginalReply({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="chat-original-reply">
+      <button
+        type="button"
+        className="chat-original-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        元の回答を見る
+      </button>
+      {open ? <div className="chat-original-reply-body">{text}</div> : null}
+    </div>
+  );
+}
+
+function ForeignReplyFoot({
+  content,
+  toolCalls,
+  originalContent,
+  scriptFix,
+}: {
+  content: string;
+  toolCalls?: string;
+  originalContent?: string;
+  scriptFix?: string;
+}) {
+  const fix = parseScriptFix(scriptFix);
+  const mapNote = hanMapNote(fix?.fixes ?? []);
+  const rewriteNote = fix?.rewritten ? HAN_REWRITE_NOTE : null;
+  const warning = foreignReplyNotice(content, toolCalls);
+  const original = (originalContent ?? "").trim();
+  if (!mapNote && !rewriteNote && !warning && !original) return null;
+  return (
+    <>
+      {mapNote ? <p className="chat-foreign-notice">{mapNote}</p> : null}
+      {rewriteNote ? <p className="chat-foreign-notice">{rewriteNote}</p> : null}
+      {warning ? <p className="chat-foreign-notice">{warning}</p> : null}
+      {original ? <OriginalReply text={original} /> : null}
+    </>
+  );
 }
 
 function toolCallNames(raw: string | undefined): string[] {
@@ -2293,10 +2346,6 @@ export default function Chat() {
               const office =
                 m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
-              const foreignNotice =
-                m.role === "assistant" && !isNotice
-                  ? foreignReplyNotice(m.content, m.toolCalls)
-                  : null;
               const completeness =
                 m.role === "assistant" && !isNotice ? answerCompletenessLabel(m.kind) : "";
               const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
@@ -2359,6 +2408,7 @@ export default function Chat() {
                       ) : m.content.trim() ? (
                         <AssistantBody
                           text={m.content}
+                          hanFixes={parseScriptFix(m.scriptFix)?.fixes}
                           citeNos={citeInfo.nos}
                           onCite={(n) => {
                             const s = citeInfo.byNo.get(n);
@@ -2369,9 +2419,14 @@ export default function Chat() {
                           onLayout={scrollAfterLayout}
                         />
                       ) : null}
-                      {foreignNotice ? (
-                        <p className="chat-foreign-notice">{foreignNotice}</p>
-                      ) : null}
+                      {isNotice ? null : (
+                        <ForeignReplyFoot
+                          content={m.content}
+                          toolCalls={m.toolCalls}
+                          originalContent={m.originalContent}
+                          scriptFix={m.scriptFix}
+                        />
+                      )}
                       {cards.length > 0 ? (
                         <OfficeFileCards files={cards} onOpen={openSavedFile} />
                       ) : null}

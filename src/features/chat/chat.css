@@ -925,6 +925,34 @@ body.md-col-resizing {
   color: #c2410c;
 }
 
+.chat-han-fix {
+  text-decoration: underline;
+  text-decoration-color: #c2410c;
+  text-underline-offset: 2px;
+}
+
+.chat-original-reply {
+  margin-top: 6px;
+}
+
+.chat-original-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #c2410c;
+  font: inherit;
+  font-size: 0.8em;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chat-original-reply-body {
+  margin-top: 6px;
+  white-space: pre-wrap;
+  color: var(--ink);
+}
+
 @keyframes chat-caret-blink {
   50% {
     opacity: 0;

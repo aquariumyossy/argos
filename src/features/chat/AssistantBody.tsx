@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   parseChoiceLines,
   renderAssistantMdHtml,
@@ -6,6 +6,7 @@ import {
   type AssistantBlock,
 } from "./assistantMd";
 import { attachResizableChatTables } from "./chatTableResize";
+import { hanMarkedHtml, markHanFixes, stripHanMarks, type HanFix } from "./japaneseHan";
 import { sanitizeMermaidSource } from "./mermaidSanitize";
 
 type MermaidApi = {
@@ -59,7 +60,7 @@ function MermaidBlock({
   const [error, setError] = useState<string | null>(null);
   const hostRef = useRef<HTMLDivElement>(null);
 
-  const renderSource = useMemo(() => sanitizeMermaidSource(source), [source]);
+  const renderSource = useMemo(() => sanitizeMermaidSource(stripHanMarks(source)), [source]);
 
   useEffect(() => {
     if (mode !== "diagram") return;
@@ -115,7 +116,9 @@ function MermaidBlock({
         <div className="chat-mermaid-view">
           {error ? <p className="chat-mermaid-error">{error}</p> : null}
           <pre>
-            <code>{renderSource}</code>
+            <code>
+              <HanMarked text={source} />
+            </code>
           </pre>
         </div>
       ) : (
@@ -143,7 +146,7 @@ function MdHtml({
         .filter(Boolean)
         .map((s) => Number(s)),
     );
-    return renderAssistantMdHtml(text, set);
+    return hanMarkedHtml(renderAssistantMdHtml(text, set));
   }, [text, citeKey]);
   // React 19 compares dangerouslySetInnerHTML by object identity. A fresh
   // `{ __html }` on each Chat re-render (draft, dialog, preview focus)
@@ -168,10 +171,33 @@ function MdHtml({
   );
 }
 
+function HanMarked({ text }: { text: string }) {
+  const parts: ReactNode[] = [];
+  const re = /\uE000([^\uE001]*)\uE001/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+  while ((match = re.exec(text))) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    parts.push(
+      <span key={key} className="chat-han-fix">
+        {match[1]}
+      </span>,
+    );
+    key += 1;
+    last = match.index + match[0].length;
+  }
+  if (!parts.length) return <>{text}</>;
+  if (last < text.length) parts.push(text.slice(last));
+  return <>{parts}</>;
+}
+
 function FenceFallback({ text }: { text: string }) {
   return (
     <pre>
-      <code>{text}</code>
+      <code>
+        <HanMarked text={text} />
+      </code>
     </pre>
   );
 }
@@ -206,13 +232,13 @@ function BlockView({
       <div className="chat-choices">
         {lines.map((line, i) => (
           <button
-            key={`${i}:${line}`}
+            key={`${i}:${stripHanMarks(line)}`}
             type="button"
             className="chat-choice"
             disabled={choicesDisabled}
-            onClick={() => onChoice(line)}
+            onClick={() => onChoice(stripHanMarks(line))}
           >
-            {line}
+            <HanMarked text={line} />
           </button>
         ))}
       </div>
@@ -230,6 +256,7 @@ export function AssistantBody({
   streaming,
   showCaret,
   onLayout,
+  hanFixes,
 }: {
   text: string;
   citeNos: ReadonlySet<number>;
@@ -239,6 +266,7 @@ export function AssistantBody({
   streaming?: boolean;
   showCaret?: boolean;
   onLayout?: () => void;
+  hanFixes?: HanFix[];
 }) {
   const [shown, setShown] = useState(text);
 
@@ -251,7 +279,17 @@ export function AssistantBody({
     return () => window.clearTimeout(t);
   }, [text, streaming]);
 
-  const blocks = useMemo(() => splitAssistantBlocks(shown), [shown]);
+  const fixKey = (hanFixes ?? [])
+    .map((fix) => `${fix.at}\u0000${fix.from}\u0000${fix.to}`)
+    .join("\n");
+  const marked = useMemo(
+    () => markHanFixes(shown, hanFixes),
+    // The parent builds a fresh fixes array on each chat render. Key on the
+    // positions so an unchanged reply does not rebuild the markdown HTML.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [shown, fixKey],
+  );
+  const blocks = useMemo(() => splitAssistantBlocks(marked), [marked]);
 
   return (
     <div className="chat-msg-body md-body md-body--hierarchy">

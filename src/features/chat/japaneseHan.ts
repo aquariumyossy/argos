@@ -1,4 +1,5 @@
 import { HAN_BMP_A, HAN_BMP_A0, HAN_BMP_B, HAN_BMP_B0, HAN_EXTRA } from "./japaneseHanData";
+import { HAN_JP_PAIRS } from "./japaneseHanMap";
 
 const SHOWN_LIMIT = 12;
 
@@ -215,4 +216,102 @@ export function foreignCharNoticeForAssistant(
     }
   }
   return foreignCharNotice(...parts);
+}
+
+function loadHanMap(): Map<number, string> {
+  const bytes = decodeBase64(HAN_JP_PAIRS.replace(/\s+/g, ""));
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const map = new Map<number, string>();
+  for (let i = 0; i + 8 <= bytes.length; i += 8) {
+    map.set(view.getUint32(i, true), String.fromCodePoint(view.getUint32(i + 4, true)));
+  }
+  return map;
+}
+
+const hanMap = loadHanMap();
+
+/** One-to-one substitutions. Kana, Latin, and Greek are not in the table. */
+export function applyHanMap(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    const to = cp === undefined ? undefined : hanMap.get(cp);
+    if (cp !== undefined && to) {
+      const dst = to.codePointAt(0);
+      if (
+        dst !== undefined &&
+        isCjkIdeograph(cp) &&
+        !isJapaneseHan(cp) &&
+        isJapaneseHan(dst)
+      ) {
+        out += to;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+export type HanFix = { at: number; from: string; to: string };
+
+export type ScriptFix = { fixes: HanFix[]; rewritten: boolean };
+
+export function parseScriptFix(raw: string | undefined | null): ScriptFix | null {
+  const text = (raw ?? "").trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text) as { fixes?: unknown; rewritten?: unknown };
+    const fixes: HanFix[] = [];
+    if (Array.isArray(parsed.fixes)) {
+      for (const item of parsed.fixes) {
+        if (!item || typeof item !== "object") continue;
+        const row = item as { at?: unknown; from?: unknown; to?: unknown };
+        if (
+          typeof row.at !== "number" ||
+          typeof row.from !== "string" ||
+          typeof row.to !== "string"
+        ) {
+          continue;
+        }
+        fixes.push({ at: row.at, from: row.from, to: row.to });
+      }
+    }
+    return { fixes, rewritten: parsed.rewritten === true };
+  } catch {
+    return null;
+  }
+}
+
+/** 「现→現 など3か所を直しました」 */
+export function hanMapNote(fixes: HanFix[]): string | null {
+  const first = fixes[0];
+  if (!first) return null;
+  return `${first.from}→${first.to} など${fixes.length}か所を直しました`;
+}
+
+export const HAN_REWRITE_NOTE = "AIが外国文字を含む部分を書き直しました";
+
+const HAN_MARK_L = "\uE000";
+const HAN_MARK_R = "\uE001";
+
+/** Wrap substituted characters so the markdown renderer can underline them. */
+export function markHanFixes(text: string, fixes: HanFix[] | undefined): string {
+  if (!fixes?.length) return text;
+  const ats = new Set(fixes.map((fix) => fix.at));
+  let out = "";
+  let index = 0;
+  for (const ch of text) {
+    out += ats.has(index) ? `${HAN_MARK_L}${ch}${HAN_MARK_R}` : ch;
+    index += 1;
+  }
+  return out;
+}
+
+export function stripHanMarks(text: string): string {
+  return text.replace(/\uE000([^\uE001]*)\uE001/g, "$1");
+}
+
+export function hanMarkedHtml(html: string): string {
+  return html.replace(/\uE000([^\uE001]*)\uE001/g, '<span class="chat-han-fix">$1</span>');
 }

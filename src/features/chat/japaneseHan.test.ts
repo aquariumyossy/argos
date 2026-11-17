@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyHanMap,
   authoredToolTexts,
   foreignCharNotice,
   foreignCharNoticeForAssistant,
   foreignChars,
+  HAN_REWRITE_NOTE,
+  hanMapNote,
   isCjkIdeograph,
   isJapaneseHan,
+  parseScriptFix,
 } from "./japaneseHan";
 
 describe("foreignChars", () => {
@@ -101,6 +105,36 @@ describe("foreignCharNotice", () => {
         replacements: [{ find: "这个", replace: "本文" }],
       }),
     ).toEqual(["本文"]);
+  });
+});
+
+describe("applyHanMap", () => {
+  it("maps 现在 to 現在 and leaves Japanese, Latin, and Greek", () => {
+    expect(applyHanMap("现在")).toBe("現在");
+    expect(applyHanMap("说")).toBe("説");
+    expect(applyHanMap("第1条　甲は乙に対し、瑕疵を理由に契約を解除できる。")).toBe(
+      "第1条　甲は乙に対し、瑕疵を理由に契約を解除できる。",
+    );
+    expect(applyHanMap("α版　μm　OK 123")).toBe("α版　μm　OK 123");
+    expect(applyHanMap("发")).toBe("发");
+    expect(applyHanMap("国学个干后面里")).toBe("国学个干后面里");
+  });
+
+  it("describes the places that were replaced", () => {
+    expect(
+      hanMapNote([
+        { at: 0, from: "现", to: "現" },
+        { at: 3, from: "说", to: "説" },
+        { at: 8, from: "现", to: "現" },
+      ]),
+    ).toBe("现→現 など3か所を直しました");
+    expect(hanMapNote([])).toBeNull();
+    expect(HAN_REWRITE_NOTE).toBe("AIが外国文字を含む部分を書き直しました");
+    expect(parseScriptFix("")).toBeNull();
+    expect(parseScriptFix('{"fixes":[{"at":0,"from":"现","to":"現"}],"rewritten":true}')).toEqual({
+      fixes: [{ at: 0, from: "现", to: "現" }],
+      rewritten: true,
+    });
   });
 });
 
