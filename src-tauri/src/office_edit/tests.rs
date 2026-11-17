@@ -2852,7 +2852,7 @@ fn xlsx_replaces_numeric_cells_ignoring_commas_and_yen() {
         "{sheet}"
     );
     assert!(
-        sheet.contains(r#"<c r="E1" t="str"><f>T("山田太郎")</f><v>山田太郎</v></c>"#),
+        sheet.contains(r#"<c r="E1" t="str"><f>T("山田太郎")</f><v>佐藤花子</v></c>"#),
         "{sheet}"
     );
     assert!(sheet.contains("<t>備考</t>"), "{sheet}");
@@ -2872,7 +2872,7 @@ fn xlsx_replaces_numeric_cells_ignoring_commas_and_yen() {
         edited.report
     );
     assert!(
-        edited
+        !edited
             .report
             .contains("シート「在庫」セル E1 は計算式のセルなので変えていない。"),
         "{}",
@@ -2989,6 +2989,54 @@ fn xlsx_numeric_match_is_the_whole_cell_and_strings_stay() {
     assert!(shared.contains("<t>佐藤花子</t>"), "{shared}");
     assert!(!shared.contains("995"), "{shared}");
     let workbook = read_entry(&edited.path, "xl/workbook.xml");
-    assert!(!workbook.contains("fullCalcOnLoad"), "{workbook}");
+    assert!(workbook.contains("fullCalcOnLoad=\"1\""), "{workbook}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_replaces_cached_formula_text_and_recalculates() {
+    let dir = temp_dir("xlsx-str-formula");
+    let src = dir.join("宛名.xlsx");
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="str"><f>A1&amp;" 様"</f><v>山田太郎 様</v></c><c r="C1"><f>A1+1</f><v>849995</v></c></row></sheetData></worksheet>"#;
+    write_inventory_xlsx(&src, sheet, "<calcPr calcMode=\"auto\"/>");
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-17 06-20-00",
+        &request(&[("山田太郎", "佐藤花子"), ("849995", "1")], &[]),
+    )
+    .unwrap();
+    let sheet = read_entry(&edited.path, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(r#"<f>A1&amp;" 様"</f>"#), "{sheet}");
+    assert!(sheet.contains("<v>佐藤花子 様</v>"), "{sheet}");
+    assert!(!sheet.contains("<v>山田太郎 様</v>"), "{sheet}");
+    assert!(
+        sheet.contains(r#"<c r="C1"><f>A1+1</f><v>849995</v></c>"#),
+        "{sheet}"
+    );
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(shared.contains("<t>佐藤花子</t>"), "{shared}");
+    let workbook = read_entry(&edited.path, "xl/workbook.xml");
+    assert!(workbook.contains("fullCalcOnLoad=\"1\""), "{workbook}");
+    assert!(
+        edited
+            .report
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("シート「在庫」セル C1 は計算式のセルなので変えていない。"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        !edited.report.contains("セル B1 は計算式"),
+        "{}",
+        edited.report
+    );
     let _ = fs::remove_dir_all(&dir);
 }

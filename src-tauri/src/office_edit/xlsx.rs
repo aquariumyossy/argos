@@ -1,6 +1,6 @@
 //! Edit cell text, numeric cell values, and sheet names. Styles and columns stay
-//! in place. Formula cells are left unchanged, except sheet-name references,
-//! which follow a renamed sheet.
+//! in place. Cached text of a formula is replaced with other cell text. A numeric
+//! formula cache is left unchanged. Sheet-name references follow a renamed sheet.
 
 use std::collections::HashMap;
 
@@ -171,27 +171,25 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
             entries[index].1 = render_nodes(&story.xml, &story.nodes).into_bytes();
         }
     }
-    let mut numeric_changed = false;
     for sheet in sheets {
         let mut xml = render_nodes(&sheet.story.xml, &sheet.story.nodes);
         xml = rewrite_formula_parts(&xml, &renames);
-        let (next, wrote) = replace_numeric_values(&xml, &sheet.name, req, &mut stats);
+        let (next, _) = replace_numeric_values(&xml, &sheet.name, req, &mut stats);
         xml = next;
-        numeric_changed |= wrote;
         entries[sheet.entry].1 = xml.into_bytes();
     }
-    // A numeric write can make a cached formula result stale. fullCalcOnLoad asks
-    // Excel to recalculate on open. The calc chain is left as-is: dropping
-    // xl/calcChain.xml would also require its relationship and content type,
-    // and Excel rebuilds the chain when it recalculates.
-    if numeric_changed {
+    super::edit_doc_props(entries, req, &mut stats);
+    // A string or numeric write can leave a cached formula result stale.
+    // fullCalcOnLoad asks Excel to recalculate on open. The calc chain is left
+    // as-is: dropping xl/calcChain.xml would also require its relationship and
+    // content type, and Excel rebuilds the chain when it recalculates.
+    if stats.changed() {
         if let Some(index) = workbook_entry {
             if let Some(xml) = decode_xml_bytes(&entries[index].1) {
                 entries[index].1 = ensure_full_calc_on_load(&xml).into_bytes();
             }
         }
     }
-    super::edit_doc_props(entries, req, &mut stats);
     fill_near_misses(entries, &mut stats);
     super::note_unreachable_misses(entries, &mut stats);
     Ok(stats)
@@ -289,29 +287,19 @@ fn push_text(texts: &mut Vec<(String, String)>, text: String, location: &str) {
 
 fn apply_replacements(story: &mut Story, req: &EditRequest, stats: &mut ChangeStats) {
     for group in story.groups.clone() {
-        let visible = unlocked(&story.nodes, &group.visible);
-        let deleted = unlocked(&story.nodes, &group.deleted);
         for (index, item) in req.replacements.iter().enumerate() {
             super::record_hit(
                 stats,
                 index,
-                replace_in_group(&mut story.nodes, &visible, &item.find, &item.replace),
+                replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace),
             );
             super::record_hit(
                 stats,
                 index,
-                replace_in_group(&mut story.nodes, &deleted, &item.find, &item.replace),
+                replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace),
             );
         }
     }
-}
-
-fn unlocked(nodes: &[TextNode], indexes: &[usize]) -> Vec<usize> {
-    indexes
-        .iter()
-        .copied()
-        .filter(|&index| nodes[index].locked.is_none())
-        .collect()
 }
 
 fn rename_sheets(
@@ -710,7 +698,7 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                             );
                         }
                     }
-                } else if cell.typ == "str" && !cell.formula {
+                } else if cell.typ == "str" {
                     for probe in probes {
                         push_leftover(
                             &mut leftovers,
@@ -1010,15 +998,15 @@ fn replace_numeric_values(
 }
 
 fn formula_value_matches(cell: &Cell, find: &str) -> bool {
-    if find.is_empty() || cell.typ == "s" || cell.typ == "inlineStr" {
+    // Cached formula text (`t="str"`) is ordinary wording and is replaced.
+    // Only a numeric cache is reported and left in place.
+    if find.is_empty() || (cell.typ != "n" && !cell.typ.is_empty()) {
         return false;
     }
-    if let (Some(value), Some(target)) = (normalize_number(&cell.value), normalize_number(find)) {
-        if value == target {
-            return true;
-        }
+    match (normalize_number(&cell.value), normalize_number(find)) {
+        (Some(value), Some(target)) => value == target,
+        _ => false,
     }
-    cell.typ == "str" && cell.value.contains(find)
 }
 
 /// Drop thousands separators and yen signs, and fold full-width digits.

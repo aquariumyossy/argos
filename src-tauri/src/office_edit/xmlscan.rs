@@ -34,7 +34,6 @@ pub struct ScanOpt {
     pub text_locals: &'static [&'static str],
     pub track_del: bool,
     /// `<v>` text of a cell whose `t` attribute is `str` (cached formula text).
-    /// A cell that also has `<f>` is locked and is not rewritten.
     pub cached_string_values: bool,
 }
 
@@ -55,8 +54,6 @@ pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
     let mut del_depth = 0i32;
     let mut cell_type = String::new();
     let mut in_cell = false;
-    let mut cell_formula = false;
-    let mut cached_value_at: Option<usize> = None;
     let mut pos = 0usize;
     while let Some(tag) = next_tag(xml, pos) {
         if tag.is_end {
@@ -69,8 +66,6 @@ pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
             if tag.local == "c" {
                 in_cell = false;
                 cell_type.clear();
-                cell_formula = false;
-                cached_value_at = None;
             }
             pos = tag.end;
             continue;
@@ -80,17 +75,7 @@ pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
         }
         if tag.local == "c" && !tag.is_self {
             in_cell = true;
-            cell_formula = false;
-            cached_value_at = None;
             cell_type = attr_local_value(&xml[tag.start..tag.end], "t").unwrap_or_default();
-        }
-        if in_cell && tag.local == "f" {
-            cell_formula = true;
-            if let Some(index) = cached_value_at.take() {
-                if let Some(node) = nodes.get_mut(index) {
-                    node.locked = Some("数式");
-                }
-            }
         }
         if opt.para_locals.contains(&tag.local.as_str()) && !tag.is_self {
             para_stack.push((next_para, tag.local.clone()));
@@ -104,16 +89,11 @@ pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
                 let inner_start = tag.end;
                 let inner_end = tag.end + rel;
                 let close_end = inner_end + close.len();
-                if tag.local == "v" && cell_formula {
-                    pos = close_end;
-                    continue;
-                }
                 let (para, para_local) = para_stack
                     .last()
                     .map(|(id, local)| (*id, local.clone()))
                     .unwrap_or((0, String::new()));
                 let deleted = tag.local == "delText" || (opt.track_del && del_depth > 0);
-                let index = nodes.len();
                 nodes.push(TextNode {
                     open_start: tag.start,
                     inner_start,
@@ -127,9 +107,6 @@ pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
                     fallback: false,
                     locked: None,
                 });
-                if tag.local == "v" {
-                    cached_value_at = Some(index);
-                }
                 pos = close_end;
                 continue;
             }
