@@ -1,5 +1,6 @@
-//! Edit an attached .docx or .xlsx, or one already in the output folder, into a new file.
-//! The source is only opened for reading. Search-folder files stay closed.
+//! Edit an attached .docx or .xlsx, or one already in the output folder.
+//! An original file is never overwritten. A follow-up edit of a file this chat's
+//! `edit_office` already saved replaces that output in place. Search-folder files stay closed.
 
 pub(crate) mod docx;
 mod revise;
@@ -24,6 +25,9 @@ pub const PATH_LINE: &str = "保存先: ";
 pub const SOURCE_LINE: &str = "元ファイル: ";
 /// Third field is a bare file name. The chat card passes that name, never a path.
 pub const OFFICE_MARKER: &str = "[[argos-office]]";
+/// Shown when this chat's earlier `edit_office` output is replaced in place.
+const OVERWRITE_LINE: &str = "前回の編集済みファイルに上書きした";
+const EDIT_MARK: &str = "_編集済み（";
 const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 80 * 1024 * 1024;
 const MAX_REPLACEMENTS: usize = 40;
@@ -181,12 +185,17 @@ fn edit_from_tool_inner(
         request.revision_date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     }
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
-    edit_path(
-        Path::new(&path),
-        &state.data_dir.join(OUTPUT_DIR_NAME),
-        &stamp,
-        &request,
-    )
+    let output_dir = state.data_dir.join(OUTPUT_DIR_NAME);
+    let messages = state
+        .db
+        .list_llm_messages(thread_id)
+        .map_err(|err| format!("会話を読めません（{err}）。"))?;
+    let prior: Vec<(&str, &str)> = messages
+        .iter()
+        .map(|message| (message.tool_name.as_str(), message.content.as_str()))
+        .collect();
+    let overwrite = replaces_chat_output(Path::new(&path), &output_dir, &prior);
+    edit_path_mode(Path::new(&path), &output_dir, &stamp, &request, overwrite)
 }
 
 pub fn edit_path(
@@ -194,6 +203,19 @@ pub fn edit_path(
     output_dir: &Path,
     stamp: &str,
     request: &EditRequest,
+) -> Result<EditOutcome, String> {
+    edit_path_mode(src, output_dir, stamp, request, false)
+}
+
+/// `overwrite` replaces `src` only when the caller has already decided it is
+/// this chat's own `_編集済み` output. The file is written to a temp name in
+/// the same folder and renamed into place, so a failed edit leaves `src` as it was.
+pub(crate) fn edit_path_mode(
+    src: &Path,
+    output_dir: &Path,
+    stamp: &str,
+    request: &EditRequest,
+    overwrite: bool,
 ) -> Result<EditOutcome, String> {
     if request.replacements.is_empty() && request.paragraphs.is_empty() {
         return Err("replacements か paragraphs を指定してください。".into());
@@ -243,8 +265,13 @@ pub fn edit_path(
         return Err(message);
     }
     fs::create_dir_all(output_dir).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
+    let replace_existing = overwrite && is_direct_output_file(src, output_dir);
     let filename = output_filename(src, stamp, &ext);
-    let dest = unique_dest(output_dir, &filename, src);
+    let dest = if replace_existing {
+        src.to_path_buf()
+    } else {
+        unique_dest(output_dir, &filename, src)
+    };
     write_zip(&dest, &entries)?;
     let written = read_zip(&dest)?;
     let probes = probes_of(request, &stats);
@@ -274,6 +301,7 @@ pub fn edit_path(
             &stats,
             &leftovers,
             truncated,
+            replace_existing,
         ),
         filename,
         path: dest,
@@ -731,6 +759,7 @@ fn format_report(
     stats: &ChangeStats,
     leftovers: &[Leftover],
     truncated: bool,
+    overwrite: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str(FILE_LINE);
@@ -747,6 +776,10 @@ fn format_report(
     out.push('\t');
     out.push_str(filename);
     out.push('\n');
+    if overwrite {
+        out.push_str(OVERWRITE_LINE);
+        out.push('\n');
+    }
     let source = one_line(source_name);
     let source = source.trim();
     if !source.is_empty() {
@@ -1109,8 +1142,7 @@ fn push_place(places: &mut Vec<String>, place: &str) {
 
 /// Drop a previous `_編集済み（…）` suffix so a follow-up pass does not stack it.
 fn strip_prior_edit_suffix(stem: &str) -> &str {
-    const MARK: &str = "_編集済み（";
-    match stem.find(MARK) {
+    match stem.find(EDIT_MARK) {
         Some(index) if index > 0 => stem[..index].trim().trim_end_matches(['.', ' ']),
         _ => stem,
     }
@@ -1197,30 +1229,76 @@ fn read_zip(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
-    }
-    let tmp = path.with_extension("tmpzip");
-    {
-        let file =
-            fs::File::create(&tmp).map_err(|err| format!("出力を書き出せません（{err}）。"))?;
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (name, bytes) in entries {
-            zip.start_file(name.as_str(), options)
-                .map_err(|err| format!("出力を書き出せません（{err}）。"))?;
-            zip.write_all(bytes)
-                .map_err(|err| format!("出力を書き出せません（{err}）。"))?;
-        }
-        zip.finish()
-            .map_err(|err| format!("出力を書き出せません（{err}）。"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
+    let tmp = parent.join(format!(".argos-{}.tmp", uuid::Uuid::new_v4()));
+    if let Err(err) = write_zip_file(&tmp, entries) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
     }
     fs::rename(&tmp, path).map_err(|err| {
         let _ = fs::remove_file(&tmp);
         format!("出力を保存できません（{err}）。")
     })?;
     Ok(())
+}
+
+fn write_zip_file(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+    let file = fs::File::create(path).map_err(|err| format!("出力を書き出せません（{err}）。"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in entries {
+        zip.start_file(name.as_str(), options)
+            .map_err(|err| format!("出力を書き出せません（{err}）。"))?;
+        zip.write_all(bytes)
+            .map_err(|err| format!("出力を書き出せません（{err}）。"))?;
+    }
+    zip.finish()
+        .map_err(|err| format!("出力を書き出せません（{err}）。"))?;
+    Ok(())
+}
+
+/// True when `src` is this chat's own `_編集済み` file in the output folder.
+///
+/// `prior` is `(tool name, tool result)` from that chat only. A file saved by
+/// another tool, or named in another chat, does not qualify.
+pub(crate) fn replaces_chat_output(src: &Path, output_dir: &Path, prior: &[(&str, &str)]) -> bool {
+    if !is_direct_output_file(src, output_dir) {
+        return false;
+    }
+    let Some(name) = src.file_name().and_then(|item| item.to_str()) else {
+        return false;
+    };
+    if !name.contains(EDIT_MARK) {
+        return false;
+    }
+    prior
+        .iter()
+        .any(|(tool, content)| *tool == "edit_office" && marker_names_file(content, name))
+}
+
+fn is_direct_output_file(src: &Path, output_dir: &Path) -> bool {
+    let Ok(dir) = fs::canonicalize(output_dir) else {
+        return false;
+    };
+    let Ok(file) = fs::canonicalize(src) else {
+        return false;
+    };
+    file.is_file() && file.parent() == Some(dir.as_path())
+}
+
+fn marker_names_file(content: &str, filename: &str) -> bool {
+    let prefix = format!("{OFFICE_MARKER}\t");
+    content.lines().any(|line| {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            return false;
+        };
+        let Some((_, name)) = rest.split_once('\t') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case(filename)
+    })
 }
 
 fn extension_of(path: &Path) -> String {
