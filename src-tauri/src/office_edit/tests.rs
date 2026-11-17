@@ -1763,6 +1763,61 @@ fn the_same_chat_overwrites_its_own_edited_file_and_leaves_failures() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn an_open_edited_file_is_left_and_a_new_file_is_saved() {
+    let dir = temp_dir("overwrite-open");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let name = "契約書_編集済み（2026-11-12 09-30-00）.docx";
+    let src = out.join(name);
+    write_zip(
+        &src,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>佐藤花子</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let before = fs::read(&src).unwrap();
+    super::fail_next_replace_of_existing_file();
+    let edited = super::edit_path_mode(
+        &src,
+        &out,
+        "2026-11-16 16-00-00",
+        &request(&[("佐藤花子", "鈴木一郎")], &[]),
+        true,
+    )
+    .unwrap();
+    let fresh = "契約書_編集済み（2026-11-16 16-00-00）.docx";
+    assert_eq!(edited.filename, fresh);
+    assert_eq!(edited.path, out.join(fresh));
+    assert!(edited.path.is_file());
+    assert_eq!(fs::read(&src).unwrap(), before);
+    assert!(read_entry(&src, "word/document.xml").contains("佐藤花子"));
+    assert!(read_entry(&edited.path, "word/document.xml").contains("鈴木一郎"));
+    assert!(
+        edited
+            .report
+            .contains("前回のファイルが開かれていたため、新しいファイルに保存した"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited.report.contains(&format!("{FILE_LINE}{fresh}\n")),
+        "{}",
+        edited.report
+    );
+    assert!(
+        !edited.report.contains("前回の編集済みファイルに上書きした"),
+        "{}",
+        edited.report
+    );
+    let mut expected = vec![fresh.to_string(), name.to_string()];
+    expected.sort();
+    assert_eq!(docx_names(&out), expected);
+    assert!(dir_has_no_temp(&out));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn docx_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()

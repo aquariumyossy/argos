@@ -27,6 +27,8 @@ pub const SOURCE_LINE: &str = "元ファイル: ";
 pub const OFFICE_MARKER: &str = "[[argos-office]]";
 /// Shown when this chat's earlier `edit_office` output is replaced in place.
 const OVERWRITE_LINE: &str = "前回の編集済みファイルに上書きした";
+/// Shown when that file is open, so the edit is saved as a new file instead.
+const OPEN_FILE_LINE: &str = "前回のファイルが開かれていたため、新しいファイルに保存した";
 const EDIT_MARK: &str = "_編集済み（";
 const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 80 * 1024 * 1024;
@@ -267,12 +269,21 @@ pub(crate) fn edit_path_mode(
     fs::create_dir_all(output_dir).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
     let replace_existing = overwrite && is_direct_output_file(src, output_dir);
     let filename = output_filename(src, stamp, &ext);
-    let dest = if replace_existing {
-        src.to_path_buf()
+    let (dest, notice) = if replace_existing {
+        match write_zip(src, &entries) {
+            Ok(()) => (src.to_path_buf(), SaveNotice::Overwrote),
+            Err(PlaceError::Replace(_)) => {
+                let dest = unique_dest(output_dir, &filename, src);
+                write_zip(&dest, &entries).map_err(PlaceError::message)?;
+                (dest, SaveNotice::Opened)
+            }
+            Err(PlaceError::Write(message)) => return Err(message),
+        }
     } else {
-        unique_dest(output_dir, &filename, src)
+        let dest = unique_dest(output_dir, &filename, src);
+        write_zip(&dest, &entries).map_err(PlaceError::message)?;
+        (dest, SaveNotice::New)
     };
-    write_zip(&dest, &entries)?;
     let written = read_zip(&dest)?;
     let probes = probes_of(request, &stats);
     let (leftovers, truncated) = match ext.as_str() {
@@ -301,7 +312,7 @@ pub(crate) fn edit_path_mode(
             &stats,
             &leftovers,
             truncated,
-            replace_existing,
+            notice,
         ),
         filename,
         path: dest,
@@ -759,7 +770,7 @@ fn format_report(
     stats: &ChangeStats,
     leftovers: &[Leftover],
     truncated: bool,
-    overwrite: bool,
+    notice: SaveNotice,
 ) -> String {
     let mut out = String::new();
     out.push_str(FILE_LINE);
@@ -776,9 +787,16 @@ fn format_report(
     out.push('\t');
     out.push_str(filename);
     out.push('\n');
-    if overwrite {
-        out.push_str(OVERWRITE_LINE);
-        out.push('\n');
+    match notice {
+        SaveNotice::Overwrote => {
+            out.push_str(OVERWRITE_LINE);
+            out.push('\n');
+        }
+        SaveNotice::Opened => {
+            out.push_str(OPEN_FILE_LINE);
+            out.push('\n');
+        }
+        SaveNotice::New => {}
     }
     let source = one_line(source_name);
     let source = source.trim();
@@ -1228,19 +1246,71 @@ fn read_zip(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(entries)
 }
 
-fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+enum SaveNotice {
+    New,
+    Overwrote,
+    Opened,
+}
+
+enum PlaceError {
+    Write(String),
+    Replace(String),
+}
+
+impl PlaceError {
+    fn message(self) -> String {
+        match self {
+            PlaceError::Write(message) | PlaceError::Replace(message) => message,
+        }
+    }
+}
+
+fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), PlaceError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| PlaceError::Write(format!("出力フォルダを作れません（{err}）。")))?;
     let tmp = parent.join(format!(".argos-{}.tmp", uuid::Uuid::new_v4()));
     if let Err(err) = write_zip_file(&tmp, entries) {
         let _ = fs::remove_file(&tmp);
-        return Err(err);
+        return Err(PlaceError::Write(err));
     }
-    fs::rename(&tmp, path).map_err(|err| {
+    if let Err(err) = rename_onto(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        format!("出力を保存できません（{err}）。")
-    })?;
+        return Err(PlaceError::Replace(err));
+    }
     Ok(())
+}
+
+fn rename_onto(tmp: &Path, dest: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if take_forced_replace_failure(dest) {
+        return Err("出力を保存できません（os error 5）。".into());
+    }
+    fs::rename(tmp, dest).map_err(|err| format!("出力を保存できません（{err}）。"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_REPLACE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next rename onto a file that already exists fails once, as if Word or
+/// Excel still had it open. The following save of a new file is unaffected.
+#[cfg(test)]
+pub(crate) fn fail_next_replace_of_existing_file() {
+    FORCE_REPLACE_FAILURE.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn take_forced_replace_failure(dest: &Path) -> bool {
+    FORCE_REPLACE_FAILURE.with(|flag| {
+        if flag.get() && dest.exists() {
+            flag.set(false);
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn write_zip_file(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
