@@ -23,6 +23,7 @@ import ChatNotePicker from "./ChatNotePicker";
 import PromptLibrary from "./PromptLibrary";
 import { isImeEnter } from "./imeEnter";
 import { AssistantBody } from "./AssistantBody";
+import { foreignCharNoticeForAssistant } from "./japaneseHan";
 import { OfficeFileCards } from "./OfficeFileCard";
 import { HtmlPreviews } from "./HtmlPreview";
 import { officeCardsByMessage } from "./officeCards";
@@ -451,6 +452,10 @@ function IconTrash() {
       <path d="M5 5.5l.5 7h5l.5-7" />
     </ActionIcon>
   );
+}
+
+function foreignReplyNotice(content: string, toolCalls?: string): string | null {
+  return foreignCharNoticeForAssistant(content, toolCalls ?? "");
 }
 
 function toolCallNames(raw: string | undefined): string[] {
@@ -986,6 +991,7 @@ export default function Chat() {
 
   const viewingLive = live && active?.id === live.threadId ? live : null;
   const stream = viewingLive?.stream ?? "";
+  const streamNotice = stream ? foreignReplyNotice(stream) : null;
   const thinking = viewingLive?.thinking ?? "";
   const toolHint = viewingLive?.toolHint ?? "";
   const status = viewingLive?.status ?? "";
@@ -2287,6 +2293,10 @@ export default function Chat() {
               const office =
                 m.role === "tool" ? editOfficeFileLink(m.toolName, m.content) : null;
               const isNotice = m.kind === "notice";
+              const foreignNotice =
+                m.role === "assistant" && !isNotice
+                  ? foreignReplyNotice(m.content, m.toolCalls)
+                  : null;
               const completeness =
                 m.role === "assistant" && !isNotice ? answerCompletenessLabel(m.kind) : "";
               const officeFile = isNotice ? parseOfficeFileNotice(m.content) : null;
@@ -2358,6 +2368,9 @@ export default function Chat() {
                           choicesDisabled={blocked}
                           onLayout={scrollAfterLayout}
                         />
+                      ) : null}
+                      {foreignNotice ? (
+                        <p className="chat-foreign-notice">{foreignNotice}</p>
                       ) : null}
                       {cards.length > 0 ? (
                         <OfficeFileCards files={cards} onOpen={openSavedFile} />
@@ -2461,6 +2474,9 @@ export default function Chat() {
                 showCaret={!!stream || (!thinking && !toolHint && !status)}
                 onLayout={scrollAfterLayout}
               />
+              {streamNotice ? (
+                <p className="chat-foreign-notice">{streamNotice}</p>
+              ) : null}
               {liveCiteGroups.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
                   {liveCiteGroups.map((g) => {

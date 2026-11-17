@@ -10,6 +10,7 @@ pub mod fetch_url;
 pub mod files;
 pub mod grain;
 pub mod http_error;
+pub mod japanese_han;
 pub mod output_files;
 pub mod pdf_win;
 pub mod searxng;
@@ -29,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::db::{
-    Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, LLM_NOTE_HINT, LLM_NOTE_SENTINEL,
-    LLM_REREAD_HINT, LLM_REREAD_SENTINEL,
+    Settings, LLM_FORMAT_HINT, LLM_FORMAT_SENTINEL, LLM_JA_HINT, LLM_JA_SENTINEL, LLM_NOTE_HINT,
+    LLM_NOTE_SENTINEL, LLM_REREAD_HINT, LLM_REREAD_SENTINEL,
 };
 use crate::llm::context::ChatTurn;
 use crate::statute::{LLM_STATUTE_HINT, LLM_STATUTE_SENTINEL};
@@ -234,6 +235,12 @@ pub fn system_for_request(settings: &Settings) -> String {
             s.push('\n');
         }
         s.push_str(LLM_STATUTE_HINT);
+    }
+    if !s.contains(LLM_JA_SENTINEL) && !s.contains(LLM_JA_HINT) {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(LLM_JA_HINT);
     }
     s
 }
@@ -1973,6 +1980,28 @@ mod tests {
             again.matches(crate::statute::LLM_STATUTE_SENTINEL).count(),
             1,
             "{again}"
+        );
+    }
+
+    #[test]
+    fn japanese_writing_hint_is_appended_even_when_the_prompt_was_edited() {
+        let def = system_for_request(&Settings::default());
+        assert_eq!(def.matches(LLM_JA_SENTINEL).count(), 1, "{def}");
+        assert!(def.contains("「기타」"));
+        let mut custom = Settings::default();
+        custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+        let sys = system_for_request(&custom);
+        assert!(sys.contains("事務所の独自ルール"));
+        assert_eq!(sys.matches(LLM_JA_SENTINEL).count(), 1, "{sys}");
+        let again = system_for_request(&Settings {
+            llm_system_prompt: sys,
+            ..Settings::default()
+        });
+        assert_eq!(again.matches(LLM_JA_SENTINEL).count(), 1, "{again}");
+        let summary = crate::llm::summary::summary_system_prompt();
+        assert!(
+            !summary.contains(LLM_JA_SENTINEL),
+            "summary prompt must not carry the writing hint: {summary}"
         );
     }
 

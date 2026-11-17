@@ -2638,6 +2638,9 @@ fn execute_tool_inner(
     _request_id: &str,
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    if let Some(message) = crate::llm::japanese_han::foreign_char_tool_error(name, &args) {
+        return Ok(ToolExec::text(format!("エラー: {message}")));
+    }
     match name {
         TOOL_LAW => Ok(tool_law_article(state, &args)),
         TOOL_LIST_CALENDAR => Ok(tool_list_calendar(state, &args)),
