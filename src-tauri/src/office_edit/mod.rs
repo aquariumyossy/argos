@@ -252,10 +252,9 @@ pub fn edit_path(
         "docx" => docx::check(
             &written,
             &probes,
-            request.track_changes.then_some((
-                request.revision_author.as_str(),
-                request.revision_date.as_str(),
-            )),
+            request
+                .track_changes
+                .then_some(request.revision_author.as_str()),
         ),
         _ => xlsx::check(&written, &probes),
     };

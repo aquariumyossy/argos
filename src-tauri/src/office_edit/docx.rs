@@ -128,9 +128,10 @@ pub fn edit(
             .any(|item| !item.comment.trim().is_empty());
     let mut next_id = super::revise::max_revision_id(entries).saturating_add(1);
     let mut made_comments = Vec::new();
-    let mut comment_stories = Vec::new();
     let mut shape_direct = false;
     let mut tracked_hits = 0usize;
+    let mut untracked_span = false;
+    let mut skipped_comments = false;
     for story in &mut stories {
         if markup {
             if story.nodes.iter().any(|node| node.dirty) {
@@ -145,6 +146,7 @@ pub fn edit(
                 &story.groups,
                 req,
                 &mut next_id,
+                comments_allowed(&entries[story.entry].0),
             );
             for hit in revised.hits {
                 if hit.record {
@@ -163,10 +165,11 @@ pub fn edit(
                 }
             }
             if !revised.comments.is_empty() {
-                comment_stories.push(entries[story.entry].0.clone());
                 made_comments.extend(revised.comments);
             }
             shape_direct |= revised.shape_direct;
+            untracked_span |= revised.untracked_span;
+            skipped_comments |= revised.skipped_comments;
             story.xml = revised.xml;
         } else {
             for group in story.groups.clone() {
@@ -194,7 +197,6 @@ pub fn edit(
             &made_comments,
             &req.revision_author,
             &req.revision_date,
-            &comment_stories,
         );
     }
     if tracked_hits > 0 {
@@ -212,6 +214,18 @@ pub fn edit(
         stats
             .notes
             .push("図形の文字は変更履歴にできないため、文字だけ置換しました。".into());
+    }
+    if untracked_span {
+        stats.notes.push(
+            "途中で別の要素をまたぐ置換は変更履歴にできないため、その箇所は文字だけ置換しました。"
+                .into(),
+        );
+    }
+    if skipped_comments {
+        stats.notes.push(
+            "ヘッダー、フッター、脚注、文末脚注にはコメントを付けられないため、その箇所のコメントは付けませんでした。"
+                .into(),
+        );
     }
     super::edit_doc_props(entries, req, &mut stats);
     fill_near_misses(entries, &mut stats);
@@ -357,7 +371,7 @@ fn paragraph_locations(label: &str, groups: &[ParaGroup], nodes: &[TextNode]) ->
 pub fn check(
     entries: &[(String, Vec<u8>)],
     probes: &[Probe],
-    own_revision: Option<(&str, &str)>,
+    own_author: Option<&str>,
 ) -> (Vec<Leftover>, bool) {
     let mut leftovers = Vec::new();
     let mut truncated = false;
@@ -374,8 +388,8 @@ pub fn check(
                     continue;
                 }
                 let visible = editable_joined(&nodes, &group.visible);
-                let own_ranges = own_revision
-                    .map(|(author, date)| super::revise::own_del_ranges(&xml, author, date))
+                let own_ranges = own_author
+                    .map(|author| super::revise::own_del_ranges(&xml, author))
                     .unwrap_or_default();
                 let deleted_ids: Vec<usize> = group
                     .deleted
@@ -620,7 +634,7 @@ fn rewrite_story_attrs(
     while let Some(tag) = next_tag(xml, pos) {
         out.push_str(&xml[pos..tag.start]);
         let raw = &xml[tag.start..tag.end];
-        if tag.is_end || lock_at(&locks, tag.start).is_some() {
+        if tag.is_end || lock_at(&locks, tag.start).is_some() || authored_by_this_call(raw, req) {
             out.push_str(raw);
         } else if range_contains(&fallbacks, tag.start) {
             out.push_str(&rewrite_names(raw, |value| quiet_replace(value, req)));
@@ -633,6 +647,25 @@ fn rewrite_story_attrs(
     }
     out.push_str(&xml[pos..]);
     out
+}
+
+fn authored_by_this_call(raw: &str, req: &super::EditRequest) -> bool {
+    let Some(tag) = next_tag(raw, 0) else {
+        return false;
+    };
+    if tag.is_end || !matches!(tag.local.as_str(), "del" | "ins" | "comment") {
+        return false;
+    }
+    let author = attr_local_value(raw, "author").unwrap_or_default();
+    let date = attr_local_value(raw, "date").unwrap_or_default();
+    !req.revision_author.is_empty()
+        && author == req.revision_author
+        && !req.revision_date.is_empty()
+        && date == req.revision_date
+}
+
+fn comments_allowed(path: &str) -> bool {
+    file_name(path).eq_ignore_ascii_case("document.xml")
 }
 
 fn rewrite_names(tag: &str, mut edit: impl FnMut(&str) -> String) -> String {

@@ -26,6 +26,10 @@ pub struct ReviseOut {
     pub hits: Vec<ReviseHit>,
     /// A drawingML `a:t` was changed in place because it cannot hold `w:del`.
     pub shape_direct: bool,
+    /// A match crossed a non-run element, so that occurrence was written in place.
+    pub untracked_span: bool,
+    /// A comment was dropped because this story cannot hold one.
+    pub skipped_comments: bool,
 }
 
 struct Mark {
@@ -55,6 +59,7 @@ pub fn revise_story(
     groups: &[ParaGroup],
     req: &EditRequest,
     next_id: &mut u32,
+    allow_comments: bool,
 ) -> ReviseOut {
     let mut nodes_owned: Vec<TextNode> = nodes.to_vec();
     let runs = element_ranges(xml, "r");
@@ -62,6 +67,8 @@ pub fn revise_story(
     let mut comments = Vec::new();
     let mut hits = Vec::new();
     let mut shape_direct = false;
+    let mut untracked_span = false;
+    let mut skipped_comments = false;
 
     for group in groups {
         let visible: Vec<usize> = group
@@ -96,31 +103,40 @@ pub fn revise_story(
                     });
                 }
             }
-            let hit = replace_in_group(&mut nodes_owned, &deleted, &item.find, &item.replace);
-            if hit.count > 0 {
-                hits.push(ReviseHit {
-                    index,
-                    count: hit.count,
-                    exact: hit.exact,
-                    sources: hit.sources,
-                    record: !group.fallback,
-                    tracked: false,
-                });
+            // Tracked edits leave every existing deletion alone, including ones from
+            // an earlier call in this conversation. Direct edits still update them.
+            if !req.track_changes {
+                let hit = replace_in_group(&mut nodes_owned, &deleted, &item.find, &item.replace);
+                if hit.count > 0 {
+                    hits.push(ReviseHit {
+                        index,
+                        count: hit.count,
+                        exact: hit.exact,
+                        sources: hit.sources,
+                        record: !group.fallback,
+                        tracked: false,
+                    });
+                }
             }
         }
 
-        if let Some((start, end, new_xml, group_hits, group_comments)) = revise_word_runs(
-            xml,
-            &nodes_owned,
-            &word,
-            &runs,
-            req,
-            next_id,
-            !group.fallback,
-        ) {
+        if let Some((start, end, new_xml, group_hits, group_comments, span, skipped)) =
+            revise_word_runs(
+                xml,
+                &nodes_owned,
+                &word,
+                &runs,
+                req,
+                next_id,
+                !group.fallback,
+                allow_comments,
+            )
+        {
             splices.push((start, end, new_xml));
             hits.extend(group_hits);
             comments.extend(group_comments);
+            untracked_span |= span;
+            skipped_comments |= skipped;
         } else {
             // A w:t with no surrounding w:r cannot become w:del / w:ins.
             for (index, item) in req.replacements.iter().enumerate() {
@@ -170,6 +186,8 @@ pub fn revise_story(
         comments,
         hits,
         shape_direct,
+        untracked_span,
+        skipped_comments,
     }
 }
 
@@ -181,7 +199,16 @@ fn revise_word_runs(
     req: &EditRequest,
     next_id: &mut u32,
     record: bool,
-) -> Option<(usize, usize, String, Vec<ReviseHit>, Vec<MadeComment>)> {
+    allow_comments: bool,
+) -> Option<(
+    usize,
+    usize,
+    String,
+    Vec<ReviseHit>,
+    Vec<MadeComment>,
+    bool,
+    bool,
+)> {
     if indexes.is_empty() || req.replacements.is_empty() {
         return None;
     }
@@ -210,9 +237,25 @@ fn revise_word_runs(
     }
     let region_start = pieces[0].run_start;
     let region_end = pieces[pieces.len() - 1].run_end;
-    let (new_xml, hits, comments) =
-        emit_region(xml, &pieces, &marks, region_start, req, next_id, record);
-    Some((region_start, region_end, new_xml, hits, comments))
+    let (new_xml, hits, comments, untracked, skipped) = emit_region(
+        xml,
+        &pieces,
+        &marks,
+        region_start,
+        req,
+        next_id,
+        record,
+        allow_comments,
+    );
+    Some((
+        region_start,
+        region_end,
+        new_xml,
+        hits,
+        comments,
+        untracked,
+        skipped,
+    ))
 }
 
 fn marks_in(text: &str, replacements: &[Replacement]) -> Vec<Mark> {
@@ -252,99 +295,120 @@ fn emit_region(
     req: &EditRequest,
     next_id: &mut u32,
     record: bool,
-) -> (String, Vec<ReviseHit>, Vec<MadeComment>) {
+    allow_comments: bool,
+) -> (String, Vec<ReviseHit>, Vec<MadeComment>, bool, bool) {
     let mut out = String::new();
-    let mut cursor = region_start;
-    let mut piece_i = 0usize;
-    let mut skip_until = 0usize;
     let mut hits = Vec::new();
     let mut comments = Vec::new();
+    let mut untracked = false;
+    let mut skipped = false;
     let author = escape_attr(&req.revision_author);
     let date = escape_attr(&req.revision_date);
+    let mut piece_i = 0usize;
+    let mut local = 0usize;
+    let mut omit_until = 0usize;
+    let mut run_open = false;
+    let mut lead_done: Option<usize> = None;
+
     while piece_i < pieces.len() {
         let piece = &pieces[piece_i];
-        if piece.concat_end <= skip_until {
-            push_run_tail(&mut out, xml, pieces, piece_i);
-            cursor = piece.run_end;
-            piece_i += 1;
-            continue;
-        }
-        let local_base = if piece.concat_start < skip_until {
-            skip_until - piece.concat_start
-        } else {
-            if piece.run_start > cursor {
-                out.push_str(&xml[cursor..piece.run_start]);
-            }
-            0
-        };
-        let abs_base = piece.concat_start + local_base;
-        if let Some(mark) = marks
-            .iter()
-            .find(|mark| mark.start >= abs_base && mark.start < piece.concat_end)
-        {
-            let prefix_len = mark.start - piece.concat_start;
-            let lead = if sole_piece(pieces, piece_i) && local_base == 0 {
-                extras_before(xml, piece)
+        let first_of_run = piece_i == 0 || pieces[piece_i - 1].run_start != piece.run_start;
+        let last_of_run =
+            piece_i + 1 == pieces.len() || pieces[piece_i + 1].run_start != piece.run_start;
+
+        if first_of_run && local == 0 && lead_done != Some(piece.run_start) {
+            close_run(&mut out, &mut run_open);
+            let gap_from = if piece_i == 0 {
+                region_start
             } else {
-                ""
+                pieces[piece_i - 1].run_end
             };
-            if prefix_len > local_base || !lead.trim().is_empty() {
-                let prefix = if prefix_len > local_base {
-                    text_node("t", &piece.text[local_base..prefix_len])
-                } else {
-                    String::new()
-                };
-                out.push_str(&format!("<w:r>{}{lead}{prefix}</w:r>", piece.rpr));
+            if gap_from < piece.run_start {
+                out.push_str(&xml[gap_from..piece.run_start]);
             }
-            let last = pieces
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, item)| mark.end > item.concat_start && mark.start < item.concat_end)
-                .map(|(index, _)| index)
-                .unwrap_or(piece_i);
-            let mut del_runs = String::new();
-            if req.track_changes {
-                for index in piece_i..=last {
-                    let item = &pieces[index];
-                    let local_start = mark.start.max(item.concat_start) - item.concat_start;
-                    let local_end = mark.end.min(item.concat_end) - item.concat_start;
-                    let slice = &item.text[local_start..local_end];
-                    if slice.is_empty() {
-                        continue;
+            let lead = extras_before(xml, piece);
+            if !lead.is_empty() {
+                out.push_str("<w:r>");
+                out.push_str(&piece.rpr);
+                out.push_str(lead);
+                run_open = true;
+            }
+            lead_done = Some(piece.run_start);
+        }
+
+        if local >= piece.text.len() {
+            if last_of_run {
+                let trail = extras_after(xml, piece);
+                if !trail.is_empty() {
+                    if !run_open {
+                        out.push_str("<w:r>");
+                        out.push_str(&piece.rpr);
+                        run_open = true;
                     }
-                    del_runs.push_str("<w:r>");
-                    del_runs.push_str(&item.rpr);
-                    del_runs.push_str(&text_node("delText", slice));
-                    del_runs.push_str("</w:r>");
+                    out.push_str(trail);
+                }
+                close_run(&mut out, &mut run_open);
+            } else {
+                let between = &xml[piece.node_end..pieces[piece_i + 1].node_start];
+                if !between.is_empty() {
+                    if !run_open {
+                        out.push_str("<w:r>");
+                        out.push_str(&piece.rpr);
+                        run_open = true;
+                    }
+                    out.push_str(between);
                 }
             }
-            let mut body = String::new();
-            if req.track_changes {
-                let del_id = take_id(next_id);
-                let ins_id = take_id(next_id);
-                body.push_str(&format!(
-                    "<w:del w:id=\"{del_id}\" w:author=\"{author}\" w:date=\"{date}\">{del_runs}</w:del>"
+            piece_i += 1;
+            local = 0;
+            continue;
+        }
+
+        let abs = piece.concat_start + local;
+        if abs < omit_until {
+            local = piece.concat_end.min(omit_until) - piece.concat_start;
+            continue;
+        }
+
+        if let Some(mark_at) = marks
+            .iter()
+            .position(|mark| mark.start >= abs && mark.start < piece.concat_end)
+        {
+            let mark = &marks[mark_at];
+            if mark.start > abs {
+                if !run_open {
+                    out.push_str("<w:r>");
+                    out.push_str(&piece.rpr);
+                    run_open = true;
+                }
+                out.push_str(&text_node(
+                    "t",
+                    &piece.text[local..mark.start - piece.concat_start],
                 ));
-                body.push_str(&format!(
-                    "<w:ins w:id=\"{ins_id}\" w:author=\"{author}\" w:date=\"{date}\">{}</w:ins>",
-                    synth_run(&piece.rpr, "t", &mark.replacement)
-                ));
-            } else {
-                body.push_str(&synth_run(&piece.rpr, "t", &mark.replacement));
+                local = mark.start - piece.concat_start;
+                continue;
             }
-            if mark.comment.is_empty() || !record {
-                out.push_str(&body);
-            } else {
-                let comment_id = take_id(next_id);
-                out.push_str(&format!(
-                    "<w:commentRangeStart w:id=\"{comment_id}\"/>{body}<w:commentRangeEnd w:id=\"{comment_id}\"/><w:r><w:commentReference w:id=\"{comment_id}\"/></w:r>"
-                ));
-                comments.push(MadeComment {
-                    id: comment_id,
-                    text: mark.comment.clone(),
-                });
+            let cross = req.track_changes && mark_crosses(xml, pieces, mark);
+            let (last_i, last_local) = mark_end_pos(pieces, mark.end);
+            let tracked = req.track_changes && !cross;
+            if cross {
+                untracked = true;
             }
+            close_run(&mut out, &mut run_open);
+            let body = if tracked {
+                tracked_change(xml, pieces, mark, &author, &date, next_id)
+            } else {
+                synth_run(&piece.rpr, "t", &mark.replacement)
+            };
+            out.push_str(&with_comment(
+                &body,
+                &mark.comment,
+                record,
+                allow_comments,
+                next_id,
+                &mut comments,
+                &mut skipped,
+            ));
             if record {
                 hits.push(ReviseHit {
                     index: mark.index,
@@ -356,41 +420,153 @@ fn emit_region(
                         vec![mark.source.clone()]
                     },
                     record: true,
-                    tracked: req.track_changes,
+                    tracked,
                 });
             }
-            skip_until = mark.end;
-            if last == piece_i {
+            if tracked {
+                piece_i = last_i;
+                local = last_local;
+                lead_done = Some(pieces[last_i].run_start);
                 continue;
             }
-            for index in piece_i..last {
-                push_run_tail(&mut out, xml, pieces, index);
-            }
-            cursor = pieces[last].run_start;
-            piece_i = last;
+            omit_until = mark.end;
+            local = mark.end.min(piece.concat_end) - piece.concat_start;
             continue;
         }
-        if local_base > 0 {
-            let suffix = if local_base < piece.text.len() {
-                text_node("t", &piece.text[local_base..])
-            } else {
-                String::new()
-            };
-            let trail = if sole_piece(pieces, piece_i) {
-                extras_after(xml, piece)
-            } else {
-                ""
-            };
-            if !suffix.is_empty() || !trail.trim().is_empty() {
-                out.push_str(&format!("<w:r>{}{suffix}{trail}</w:r>", piece.rpr));
-            }
-        } else {
-            out.push_str(&xml[piece.run_start..piece.run_end]);
+
+        if !run_open {
+            out.push_str("<w:r>");
+            out.push_str(&piece.rpr);
+            run_open = true;
         }
-        cursor = piece.run_end;
-        piece_i += 1;
+        out.push_str(&text_node("t", &piece.text[local..]));
+        local = piece.text.len();
     }
-    (out, hits, comments)
+    close_run(&mut out, &mut run_open);
+    (out, hits, comments, untracked, skipped)
+}
+
+fn close_run(out: &mut String, run_open: &mut bool) {
+    if *run_open {
+        out.push_str("</w:r>");
+        *run_open = false;
+    }
+}
+
+fn mark_crosses(xml: &str, pieces: &[Piece], mark: &Mark) -> bool {
+    let mut previous: Option<usize> = None;
+    for (index, piece) in pieces.iter().enumerate() {
+        if piece.concat_end <= mark.start || piece.concat_start >= mark.end {
+            continue;
+        }
+        if let Some(previous) = previous {
+            if pieces[previous].run_start != piece.run_start {
+                let gap = &xml[pieces[previous].run_end..piece.run_start];
+                if gap.contains('<') {
+                    return true;
+                }
+            }
+        }
+        previous = Some(index);
+    }
+    false
+}
+
+fn mark_end_pos(pieces: &[Piece], end: usize) -> (usize, usize) {
+    for (index, piece) in pieces.iter().enumerate() {
+        if end > piece.concat_start && end <= piece.concat_end {
+            return (index, end - piece.concat_start);
+        }
+    }
+    (
+        pieces.len().saturating_sub(1),
+        pieces.last().map(|piece| piece.text.len()).unwrap_or(0),
+    )
+}
+
+fn tracked_change(
+    xml: &str,
+    pieces: &[Piece],
+    mark: &Mark,
+    author: &str,
+    date: &str,
+    next_id: &mut u32,
+) -> String {
+    let overlapping: Vec<usize> = pieces
+        .iter()
+        .enumerate()
+        .filter(|(_, piece)| piece.concat_end > mark.start && piece.concat_start < mark.end)
+        .map(|(index, _)| index)
+        .collect();
+    let mut deleted = String::new();
+    for (nth, &index) in overlapping.iter().enumerate() {
+        let piece = &pieces[index];
+        let mut lead = String::new();
+        if nth > 0 {
+            let previous = overlapping[nth - 1];
+            if pieces[previous].run_start == piece.run_start {
+                let between = &xml[pieces[previous].node_end..piece.node_start];
+                if !between.is_empty() {
+                    deleted.push_str("<w:r>");
+                    deleted.push_str(&piece.rpr);
+                    deleted.push_str(between);
+                    deleted.push_str("</w:r>");
+                }
+            } else {
+                deleted.push_str(&xml[pieces[previous].run_end..piece.run_start]);
+                lead = extras_before(xml, piece).to_string();
+            }
+        }
+        let local_start = mark.start.max(piece.concat_start) - piece.concat_start;
+        let local_end = mark.end.min(piece.concat_end) - piece.concat_start;
+        let slice = &piece.text[local_start..local_end];
+        if slice.is_empty() && lead.is_empty() {
+            continue;
+        }
+        deleted.push_str("<w:r>");
+        deleted.push_str(&piece.rpr);
+        deleted.push_str(&lead);
+        if !slice.is_empty() {
+            deleted.push_str(&text_node("delText", slice));
+        }
+        deleted.push_str("</w:r>");
+    }
+    let ins_rpr = overlapping
+        .first()
+        .map(|&index| pieces[index].rpr.as_str())
+        .unwrap_or("");
+    let del_id = take_id(next_id);
+    let ins_id = take_id(next_id);
+    format!(
+        "<w:del w:id=\"{del_id}\" w:author=\"{author}\" w:date=\"{date}\">{deleted}</w:del><w:ins w:id=\"{ins_id}\" w:author=\"{author}\" w:date=\"{date}\">{}</w:ins>",
+        synth_run(ins_rpr, "t", &mark.replacement)
+    )
+}
+
+fn with_comment(
+    body: &str,
+    comment: &str,
+    record: bool,
+    allow_comments: bool,
+    next_id: &mut u32,
+    comments: &mut Vec<MadeComment>,
+    skipped: &mut bool,
+) -> String {
+    if comment.is_empty() || !record {
+        return body.to_string();
+    }
+    if !allow_comments {
+        *skipped = true;
+        return body.to_string();
+    }
+    let comment_id = take_id(next_id);
+    comments.push(MadeComment {
+        id: comment_id,
+        text: comment.to_string(),
+    });
+    format!(
+        "<w:commentRangeStart w:id=\"{comment_id}\"/>{body}<w:commentRangeEnd w:id=\"{comment_id}\"/><w:r><w:commentReference w:id=\"{comment_id}\"/></w:r>"
+    )
 }
 
 fn take_id(next_id: &mut u32) -> u32 {
@@ -401,14 +577,6 @@ fn take_id(next_id: &mut u32) -> u32 {
 
 fn synth_run(rpr: &str, local: &str, text: &str) -> String {
     format!("<w:r>{rpr}{}</w:r>", text_node(local, text))
-}
-
-fn sole_piece(pieces: &[Piece], index: usize) -> bool {
-    let run = pieces[index].run_start;
-    !pieces
-        .iter()
-        .enumerate()
-        .any(|(other, piece)| other != index && piece.run_start == run)
 }
 
 fn extras_before<'a>(xml: &'a str, piece: &Piece) -> &'a str {
@@ -431,17 +599,6 @@ fn extras_before<'a>(xml: &'a str, piece: &Piece) -> &'a str {
 fn extras_after<'a>(xml: &'a str, piece: &Piece) -> &'a str {
     let after = &xml[piece.node_end..piece.run_end];
     after.trim_end().strip_suffix("</w:r>").unwrap_or(after)
-}
-
-fn push_run_tail(out: &mut String, xml: &str, pieces: &[Piece], index: usize) {
-    if !sole_piece(pieces, index) {
-        return;
-    }
-    let trail = extras_after(xml, &pieces[index]);
-    if trail.trim().is_empty() {
-        return;
-    }
-    out.push_str(&format!("<w:r>{}{trail}</w:r>", pieces[index].rpr));
 }
 
 fn text_node(local: &str, text: &str) -> String {
@@ -518,9 +675,12 @@ fn run_rpr(run_xml: &str) -> String {
     String::new()
 }
 
-pub fn own_del_ranges(xml: &str, author: &str, date: &str) -> Vec<(usize, usize)> {
+/// Deletions written by `author`, whatever date they carry.
+///
+/// A later tracked edit uses a new timestamp, so the date cannot identify the
+/// deletions this author already recorded.
+pub fn own_del_ranges(xml: &str, author: &str) -> Vec<(usize, usize)> {
     let author = escape_attr(author);
-    let date = escape_attr(date);
     element_ranges(xml, "del")
         .into_iter()
         .filter(|(start, end)| {
@@ -530,7 +690,6 @@ pub fn own_del_ranges(xml: &str, author: &str, date: &str) -> Vec<(usize, usize)
                 .unwrap_or(*start);
             let header = &xml[*start..header_end];
             header.contains(&format!("w:author=\"{author}\""))
-                && header.contains(&format!("w:date=\"{date}\""))
         })
         .collect()
 }
@@ -569,16 +728,15 @@ pub fn install_comments(
     comments: &[MadeComment],
     author: &str,
     date: &str,
-    story_paths: &[String],
 ) {
     if comments.is_empty() {
         return;
     }
     upsert_comments_part(entries, comments, author, date);
     ensure_content_type(entries);
-    for path in story_paths {
-        ensure_comments_rel(entries, path);
-    }
+    // Comments are a document-level part. Header, footer, and note stories
+    // do not get their own comments relationship.
+    ensure_comments_rel(entries, "word/document.xml");
 }
 
 fn upsert_comments_part(
