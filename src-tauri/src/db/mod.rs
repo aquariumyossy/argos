@@ -70,6 +70,8 @@ pub struct Settings {
     pub searxng_url: String,
     pub searxng_timeout_ms: u32,
     pub llm_web_search_top_k: u32,
+    /// Name written on edit_office tracked changes and comments. Blank means Argos.
+    pub office_revision_author: String,
 }
 
 fn default_true() -> bool {
@@ -199,6 +201,7 @@ impl Default for Settings {
             searxng_url: String::new(),
             searxng_timeout_ms: DEFAULT_SEARXNG_TIMEOUT_MS,
             llm_web_search_top_k: DEFAULT_LLM_WEB_SEARCH_TOP_K,
+            office_revision_author: String::new(),
         }
     }
 }
@@ -1389,6 +1392,7 @@ impl Db {
                             .unwrap_or(DEFAULT_LLM_WEB_SEARCH_TOP_K)
                             .clamp(1, 8)
                     }
+                    "office_revision_author" => s.office_revision_author = row.1,
                     _ => {}
                 }
             }
@@ -1479,6 +1483,7 @@ impl Db {
             ("searxng_url", s.searxng_url.clone()),
             ("searxng_timeout_ms", s.searxng_timeout_ms.to_string()),
             ("llm_web_search_top_k", s.llm_web_search_top_k.to_string()),
+            ("office_revision_author", s.office_revision_author.clone()),
         ];
         for (k, v) in pairs {
             conn.execute(
@@ -5985,6 +5990,12 @@ mod folder_index_status_tests {
         let s = db.load_settings();
         assert_eq!(s.llm_max_context_tokens, MIN_LLM_CONTEXT_TOKENS);
         assert_eq!(s.llm_max_context_tokens, 16_384);
+        assert_eq!(s.office_revision_author, "");
+
+        let mut saved = db.load_settings();
+        saved.office_revision_author = "審査太郎".into();
+        db.save_settings(&saved).unwrap();
+        assert_eq!(db.load_settings().office_revision_author, "審査太郎");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

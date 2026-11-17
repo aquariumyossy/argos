@@ -67,6 +67,30 @@ pub fn replace_pieces(pieces: &mut [String], find: &str, replace: &str) -> usize
     spans.len()
 }
 
+/// One match of `find` in `text`, using the same whitespace rules as replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlexSpan {
+    pub start: usize,
+    pub end: usize,
+    pub exact: bool,
+}
+
+/// Non-overlapping matches of `find` in `text`. The replacement text is not involved.
+pub fn flex_spans(text: &str, find: &str) -> Vec<FlexSpan> {
+    if find.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let (spans, _, _) = mixed_spans(text, find);
+    spans
+        .into_iter()
+        .map(|(start, end)| FlexSpan {
+            exact: text.get(start..end).is_some_and(|slice| slice == find),
+            start,
+            end,
+        })
+        .collect()
+}
+
 /// Replace `find`, including whitespace variants when `find` itself contains whitespace.
 ///
 /// An exact hit is taken at the position where it starts. When `find` contains

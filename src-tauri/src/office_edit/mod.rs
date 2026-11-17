@@ -2,6 +2,7 @@
 //! The source is only opened for reading. Search-folder files stay closed.
 
 pub(crate) mod docx;
+mod revise;
 mod text;
 mod xlsx;
 mod xmlscan;
@@ -36,6 +37,8 @@ pub(crate) const MAX_LEFTOVERS: usize = 30;
 pub struct Replacement {
     pub find: String,
     pub replace: String,
+    /// Empty when this replacement has no comment.
+    pub comment: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +51,22 @@ pub struct ParagraphEdit {
 pub struct EditRequest {
     pub replacements: Vec<Replacement>,
     pub paragraphs: Vec<ParagraphEdit>,
+    /// Write each docx replacement as `w:del` + `w:ins` instead of changing the text.
+    pub track_changes: bool,
+    /// Author stored on those revisions and comments. Never empty (`Argos` when unset).
+    pub revision_author: String,
+    /// `w:date` for those revisions and comments. Empty until the edit starts.
+    pub revision_date: String,
+}
+
+/// Blank settings use this author on revisions and comments.
+pub fn office_revision_author(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "Argos".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[derive(Debug)]
@@ -156,7 +175,11 @@ fn edit_from_tool_inner(
         .list_llm_sources(thread_id)
         .map_err(|err| format!("添付を読めません（{err}）。"))?;
     let path = resolve_edit_source(&sources, &state.data_dir, args)?;
-    let request = EditRequest::from_args(args)?;
+    let mut request = EditRequest::from_args(args)?;
+    request.revision_author = office_revision_author(&state.settings.read().office_revision_author);
+    if request.revision_date.trim().is_empty() {
+        request.revision_date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
     edit_path(
         Path::new(&path),
@@ -175,6 +198,14 @@ pub fn edit_path(
     if request.replacements.is_empty() && request.paragraphs.is_empty() {
         return Err("replacements か paragraphs を指定してください。".into());
     }
+    let mut request = request.clone();
+    if request.revision_author.trim().is_empty() {
+        request.revision_author = office_revision_author("");
+    }
+    if request.revision_date.trim().is_empty() {
+        request.revision_date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
+    let request = &request;
     let ext = extension_of(src);
     match ext.as_str() {
         "docx" | "xlsx" => {}
@@ -218,7 +249,13 @@ pub fn edit_path(
     let written = read_zip(&dest)?;
     let probes = probes_of(request, &stats);
     let (leftovers, truncated) = match ext.as_str() {
-        "docx" => docx::check(&written, &probes),
+        "docx" => docx::check(
+            &written,
+            &probes,
+            request
+                .track_changes
+                .then_some(request.revision_author.as_str()),
+        ),
         _ => xlsx::check(&written, &probes),
     };
     let filename = dest
@@ -413,7 +450,8 @@ impl EditRequest {
             if find.is_empty() && replace.is_empty() {
                 continue;
             }
-            push_replacement(&mut replacements, find, replace)?;
+            let comment = text_or_empty(&item, &["comment", "note"]);
+            push_replacement(&mut replacements, find, replace, comment)?;
         }
         if replacements.is_empty() {
             let find = first_text(args, &["find", "from", "old"]);
@@ -422,6 +460,7 @@ impl EditRequest {
                     &mut replacements,
                     find,
                     text_or_empty(args, &["replace", "to", "new"]),
+                    text_or_empty(args, &["comment", "note"]),
                 )?;
             }
         }
@@ -450,7 +489,19 @@ impl EditRequest {
         Ok(Self {
             replacements,
             paragraphs,
+            track_changes: arg_bool(args.get("tracked")),
+            revision_author: office_revision_author(""),
+            revision_date: String::new(),
         })
+    }
+}
+
+fn arg_bool(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number.as_i64() == Some(1),
+        Some(Value::String(text)) => matches!(text.trim(), "1" | "true" | "yes" | "on"),
+        _ => false,
     }
 }
 
@@ -458,17 +509,25 @@ fn push_replacement(
     out: &mut Vec<Replacement>,
     find: String,
     replace: String,
+    comment: String,
 ) -> Result<(), String> {
     if find.is_empty() {
         return Err("置換する文字列 find が空です。".into());
     }
-    if find.chars().count() > MAX_FIND_CHARS || replace.chars().count() > MAX_REPLACE_CHARS {
+    if find.chars().count() > MAX_FIND_CHARS
+        || replace.chars().count() > MAX_REPLACE_CHARS
+        || comment.chars().count() > MAX_REPLACE_CHARS
+    {
         return Err("置換する文字列が長すぎます。".into());
     }
-    if find == replace {
+    if find == replace && comment.trim().is_empty() {
         return Ok(());
     }
-    out.push(Replacement { find, replace });
+    out.push(Replacement {
+        find,
+        replace,
+        comment: comment.trim().to_string(),
+    });
     Ok(())
 }
 
