@@ -429,6 +429,40 @@ describe("background generation", () => {
   }, 15000);
 });
 
+describe("foreign character notice", () => {
+  it("shows glyphs from the reply and leaves the text, ignoring reasoning", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "a-foreign",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "这问条款。",
+        reasoning: "Привет",
+        createdAt: 2,
+      },
+    ];
+    await renderChat();
+    expect(screen.getByText("这问条款。")).toBeTruthy();
+    expect(screen.getByText("日本語で用いない文字: 这、问").textContent).toBe(
+      "日本語で用いない文字: 这、问",
+    );
+    expect(screen.getByText("日本語で用いない文字: 这、问").textContent).not.toContain("П");
+  });
+
+  it("shows the notice while streaming and does not scan reasoning", async () => {
+    await renderChat();
+    fireEvent.click(screen.getByRole("button", { name: "再送" }));
+    await screen.findByText("生成中…");
+    await emitDelta("thread-a", "Привет", "reasoning");
+    expect(screen.queryByText(/日本語で用いない文字/)).toBeNull();
+    await emitDelta("thread-a", "这问");
+    const notice = screen.getByText("日本語で用いない文字: 这、问");
+    expect(notice.textContent).not.toContain("П");
+    expect(await screen.findByText("这问")).toBeTruthy();
+  });
+});
+
 describe("scroll follow during generation", () => {
   const jump = () => screen.queryByRole("button", { name: "↓最新へ" });
 

@@ -919,6 +919,12 @@ body.md-col-resizing {
   color: var(--muted);
 }
 
+.chat-foreign-notice {
+  margin: 6px 0 0;
+  font-size: 0.8em;
+  color: #c2410c;
+}
+
 @keyframes chat-caret-blink {
   50% {
     opacity: 0;

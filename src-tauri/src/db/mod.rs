@@ -100,6 +100,11 @@ pub const LEGACY_TOOL_LLM_SYSTEM_PROMPT: &str =
 pub const LLM_FORMAT_HINT: &str =
     "回答はMarkdownで書いてください。見出し・箇条書き・表を使ってよいです。生のHTMLは書かないでください。ユーザーに選ばせるときは ```choices フェンスに選択肢を1行ずつ書いてください。";
 pub const LLM_FORMAT_SENTINEL: &str = "生のHTMLは書かないでください";
+/// Appended on each chat request, including a prompt the user edited.
+/// The auto-summary prompt does not use this.
+pub const LLM_JA_HINT: &str =
+    "書き言葉はすべて日本語にします。簡体字・繁体字・旧字体や日本語にない漢字、ハングル・キリル文字などの他の文字体系は、本文・コメント・チャットの報告・ツールの引数にも使いません。「기타」のような他言語の単語を日本語の文の中に混ぜません。";
+pub const LLM_JA_SENTINEL: &str = "書き言葉はすべて日本語にします";
 pub const LLM_NOTE_HINT: &str =
     "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。書いたと報告してよいです。採否はユーザーがノートで行います。読む前に消さないでください。全文を書き換えるときは、変えない箇所もそのまま含めてください。対象ノートが無いときは list_notes か create_note を使います。";
 pub const LLM_NOTE_SENTINEL: &str = "書いた内容はすぐメモに反映されます";
