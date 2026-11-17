@@ -48,7 +48,7 @@ pub(crate) struct Tag {
 }
 
 pub fn scan_text_nodes(xml: &str, opt: &ScanOpt) -> Vec<TextNode> {
-    let mut nodes = Vec::new();
+    let mut nodes: Vec<TextNode> = Vec::new();
     let mut para_stack: Vec<(u32, String)> = Vec::new();
     let mut next_para = 1u32;
     let mut del_depth = 0i32;
