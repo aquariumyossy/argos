@@ -8,12 +8,12 @@
 //! drops a citation, an article number, a URL, or code, or the length is
 //! implausible. Latin and Greek are not foreign script.
 //!
-//! A named script in the recent user turns (中国語, 韓国語, Chinese, Korean, …)
-//! skips both steps for the whole reply. The orange warning then lists only
-//! foreign characters on lines that contain kana. `・` and `ー` are not kana.
-//! Generic words (訳して, 翻訳, translate, 和訳, 英訳) skip only when the reply
-//! is also mostly foreign. Foreign text left inside a quote or a code span
-//! still gets the warning. A quote may span lines.
+//! If the recent user turns mention a foreign language (中国語, 한국어, Chinese, …),
+//! lines and table cells with no kana are left byte-for-byte alone: no mapping,
+//! no rewrite, and no orange warning. Lines and cells that contain kana are
+//! corrected as usual. `・` and `ー` are not kana. Generic words (訳して, 翻訳,
+//! translate, 和訳, 英訳) skip the whole reply only when it is mostly foreign.
+//! Quotes, code, and blockquotes stay excluded. A quote may span lines.
 
 #[path = "japanese_han_map.rs"]
 mod japanese_han_map;
@@ -198,6 +198,7 @@ pub const FOREIGN_SCRIPT_KEYWORDS: &[&str] = &[
     "朝鮮語",
     "中文",
     "한국어",
+    "한국말",
     "簡体字",
     "繁体字",
     "ハングル",
@@ -218,87 +219,13 @@ fn contains_keyword(prompt: &str, words: &[&str]) -> bool {
     words.iter().any(|word| lower.contains(&word.to_lowercase()))
 }
 
-/// The user asked for the reply itself to be in Chinese, Korean, or another script.
+/// Any mention of a foreign language in the recent user text.
 ///
-/// 「中国語に訳して」「中国語で書いて」「中文に翻訳」「韓国語訳」「in Korean」
-/// 「into Chinese」 count. 「中国語の契約書」「中文版」「Chinese wall」
-/// 「中国語から日本語に」 do not: the language is the source, not the output.
+/// The phrasing does not matter: 「中国語にしてください」「中国語の契約書」
+/// 「Chinese wall」「한국어로 번역」 all count. Kana-less lines are then left
+/// untouched, and lines that contain kana are corrected as usual.
 pub fn names_foreign_script(prompt: &str) -> bool {
-    let lower = prompt.to_lowercase();
-    for lang in FOREIGN_SCRIPT_KEYWORDS {
-        if *lang == "chinese" || *lang == "korean" {
-            if english_target(&lower, lang) {
-                return true;
-            }
-        } else if japanese_target(&lower, lang) {
-            return true;
-        }
-    }
-    false
-}
-
-fn english_target(lower: &str, lang: &str) -> bool {
-    for frame in [
-        format!("into {lang}"),
-        format!("in {lang}"),
-        format!("to {lang}"),
-    ] {
-        if lower.match_indices(&frame).any(|(idx, _)| {
-            idx == 0
-                || !lower
-                    .as_bytes()
-                    .get(idx - 1)
-                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        }) {
-            return true;
-        }
-    }
-    false
-}
-
-fn japanese_target(text: &str, lang: &str) -> bool {
-    let mut rest = text;
-    while let Some(idx) = rest.find(lang) {
-        let after = rest[idx + lang.len()..].trim_start();
-        if japanese_target_suffix(after) {
-            return true;
-        }
-        rest = &rest[idx + lang.len()..];
-    }
-    false
-}
-
-fn japanese_target_suffix(after: &str) -> bool {
-    after.starts_with("に訳")
-        || after.starts_with("に翻訳")
-        || after.starts_with("に直")
-        || after.starts_with("で書いて")
-        || after.starts_with("で書け")
-        || after.starts_with("で答えて")
-        || bare_translation_noun(after)
-        || bare_de(after)
-}
-
-/// 「韓国語訳」. 「訳の」 modifies the next noun, so it is not a request.
-fn bare_translation_noun(after: &str) -> bool {
-    let Some(rest) = after.strip_prefix('訳') else {
-        return false;
-    };
-    if rest.starts_with('の') {
-        return false;
-    }
-    rest.is_empty()
-        || rest.starts_with(['を', 'は', 'が', 'に', '、', '。', '！', '？', '\n', ' '])
-        || rest.starts_with("して")
-}
-
-/// 「ハングルで」 with nothing after it, or only punctuation.
-fn bare_de(after: &str) -> bool {
-    let Some(rest) = after.strip_prefix('で') else {
-        return false;
-    };
-    let rest = rest.trim_start();
-    rest.is_empty() || rest.starts_with(['。', '、', '！', '？', '\n'])
+    contains_keyword(prompt, FOREIGN_SCRIPT_KEYWORDS)
 }
 
 /// 「訳して」「翻訳」「translate」「和訳」「英訳」 without naming the script.
@@ -404,14 +331,47 @@ fn is_markdown_table_row(line: &str) -> bool {
     line.matches('|').count() >= 2
 }
 
-/// Skip step 1 and step 2 for this whole reply.
-///
-/// A named script always skips. The orange warning is then limited to lines
-/// that contain kana. Generic translation words skip only a mostly-foreign reply.
-pub fn should_skip_foreign_fix(prompt: &str, text: &str) -> bool {
-    if names_foreign_script(prompt) {
-        return true;
+fn mask_kana_less_regions(text: &str, mask: &mut [bool]) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && chars[i] != '\n' {
+            i += 1;
+        }
+        let line_end = i;
+        let line: String = chars[start..line_end].iter().collect();
+        if is_markdown_table_row(&line) {
+            let mut j = start;
+            while j < line_end {
+                if chars[j] == '|' {
+                    j += 1;
+                    continue;
+                }
+                let cell_start = j;
+                while j < line_end && chars[j] != '|' {
+                    j += 1;
+                }
+                let cell: String = chars[cell_start..j].iter().collect();
+                if !line_has_kana(&cell) {
+                    mask[cell_start..j].fill(true);
+                }
+            }
+        } else if !line_has_kana(&line) {
+            mask[start..line_end].fill(true);
+        }
+        if i < chars.len() {
+            i += 1;
+        }
     }
+}
+
+/// Skip step 1 and step 2 for the whole reply.
+///
+/// Only generic translation words do this, and only when the reply is mostly
+/// foreign. A mentioned language does not skip the reply: kana-less pieces are
+/// masked instead.
+pub fn should_skip_foreign_fix(prompt: &str, text: &str) -> bool {
     if has_enough_kana(text) {
         return false;
     }
@@ -657,18 +617,6 @@ fn dirty_segments(text: &str, fixes: &[HanFix], mask: &[bool]) -> Vec<DirtySegme
 
 /// Map outside quotes and code. `user_prompt` is the recent user turns joined.
 pub fn prepare_reply(user_prompt: &str, text: &str) -> MappedReply {
-    if names_foreign_script(user_prompt) {
-        // No replacement. Warn only on lines that contain kana.
-        let warn_kana_lines = text.split('\n').any(line_has_kana);
-        return MappedReply {
-            input: text.to_string(),
-            text: text.to_string(),
-            fixes: Vec::new(),
-            needs_rewrite: false,
-            segments: Vec::new(),
-            suppress_warning: !warn_kana_lines,
-        };
-    }
     if should_skip_foreign_fix(user_prompt, text) {
         return MappedReply {
             input: text.to_string(),
@@ -679,7 +627,10 @@ pub fn prepare_reply(user_prompt: &str, text: &str) -> MappedReply {
             suppress_warning: true,
         };
     }
-    let mask = protected_mask(text);
+    let mut mask = protected_mask(text);
+    if names_foreign_script(user_prompt) {
+        mask_kana_less_regions(text, &mut mask);
+    }
     let (mapped, fixes) = map_outside(text, &mask);
     let segments = dirty_segments(&mapped, &fixes, &mask);
     MappedReply {
@@ -1523,11 +1474,16 @@ mod tests {
         assert!(names_foreign_script("into Chinese"));
         assert!(names_foreign_script("in Korean"));
         assert!(names_foreign_script("translate this to Chinese"));
+        assert!(names_foreign_script("このメールを中国語にしてください"));
+        assert!(names_foreign_script("簡体字にして"));
+        assert!(names_foreign_script("中文版を作って"));
+        assert!(names_foreign_script("한국어로 번역해 주세요"));
+        assert!(names_foreign_script("한국말로 써 주세요"));
         assert!(!names_foreign_script("翻訳会社との契約"));
-        assert!(!names_foreign_script("この中国語の契約書の要点を日本語で教えて"));
-        assert!(!names_foreign_script("中文版と日文版のどちらが優先？"));
-        assert!(!names_foreign_script("Chinese wall の運用は？"));
-        assert!(!names_foreign_script("中国語から日本語に訳して"));
+        assert!(names_foreign_script("この中国語の契約書の要点を日本語で教えて"));
+        assert!(names_foreign_script("中文版と日文版のどちらが優先？"));
+        assert!(names_foreign_script("Chinese wall の運用は？"));
+        assert!(names_foreign_script("中国語から日本語に訳して"));
         assert!(asks_generic_translation("和訳して"));
         assert!(asks_generic_translation("英訳"));
 
@@ -1544,12 +1500,11 @@ mod tests {
         assert!(!stopped.rewritten);
         assert!(stopped.script_fix_json().contains("rewriteStopped"));
 
-        let asked = correct_reply("中国語に訳して", "这个合同现在生效", |_| {
-            panic!("a translation request is not corrected")
+        let asked = correct_reply("このメールを中国語にしてください", "这个合同现在生效", |_| {
+            panic!("a kana-less reply is not rewritten")
         });
         assert_eq!(asked.content, "这个合同现在生效");
-        assert!(asked.suppress_warning);
-        assert!(asked.script_fix_json().contains("suppressWarning"));
+        assert!(foreign_notice_text("このメールを中国語にしてください", &asked.content).is_empty());
         assert!(!asked.rewritten);
     }
 
@@ -1608,61 +1563,63 @@ mod tests {
         assert!(skipped.suppress_warning);
 
         let explained = correct_reply("中国語に訳して", reply, |_| {
-            panic!("a named script skips the whole reply")
+            panic!("a kana line is corrected, not sent to step 2")
         });
-        assert_eq!(explained.content, reply);
-        assert!(explained.content.contains('现'));
-        assert!(foreign_notice_text("中国語に訳して", &explained.content).contains('现'));
+        assert!(explained.content.contains('現'));
+        assert!(explained.content.contains('約'));
         assert!(!explained.suppress_warning);
     }
 
     #[test]
-    fn a_named_script_is_not_corrected_and_warns_only_on_kana_lines() {
+    fn a_mentioned_language_protects_only_kana_less_pieces() {
         let chinese = "本合同自签订之日起生效，双方应当遵守本合同的全部条款并及时履行各自的义务。";
-        let mixed = format!("以下が第5条の中国語訳です。现の条文です。\n{chinese}");
-        let out = correct_reply("第5条を中国語に訳して", &mixed, |_| {
-            panic!("nothing is rewritten")
-        });
-        assert_eq!(out.content, mixed);
-        assert!(out.content.contains('现'));
-        let notice = foreign_notice_text("第5条を中国語に訳して", &out.content);
-        assert!(notice.contains('现'));
-        assert!(!notice.contains("本合同"));
-        assert!(!out.suppress_warning);
+        let prompt = "このメールを中国語にしてください";
+        let pure = correct_reply(prompt, chinese, |_| panic!("pure Chinese is not rewritten"));
+        assert_eq!(pure.content, chinese);
+        assert!(foreign_notice_text(prompt, &pure.content).is_empty());
+        assert!(!pure.rewritten);
 
-        let table = "| 当事者の義務 | 当事人的义务 |";
-        let row = correct_reply("中国語に訳して", table, |_| panic!("a table row is not rewritten"));
-        assert_eq!(row.content, table);
-        let cells = foreign_notice_text("中国語に訳して", table);
-        assert!(cells.contains("当事者の義務"));
+        let mixed = format!("以下が中国語版です。\n{chinese}");
+        let with_preface = correct_reply(prompt, &mixed, |_| panic!("the preface needs no rewrite"));
+        assert!(with_preface.content.starts_with("以下が中国語版です。\n"));
+        assert!(with_preface.content.contains(chinese));
+        assert_eq!(
+            with_preface.content.rsplit_once('\n').unwrap().1,
+            chinese
+        );
+
+        let source = "要点は现在の解除条項です。甲は乙に対し通知します。";
+        let kept = correct_reply("この中国語の契約書の要点を日本語で", source, |_| {
+            panic!("a kana line is corrected without step 2")
+        });
+        assert!(kept.content.contains("現在の解除条項"));
+        assert!(!kept.content.contains('现'));
+
+        let table = "| 当事者の现在 | 当事人的义务 |";
+        let row = correct_reply(prompt, table, |_| panic!("the Chinese cell is not a segment"));
+        assert!(row.content.contains("| 当事者の現在 |"));
+        assert!(row.content.contains("| 当事人的义务 |"));
+        let cells = foreign_notice_text(prompt, &row.content);
+        assert!(cells.contains("当事者の現在"));
         assert!(!cells.contains('义'));
         assert!(!cells.contains('务'));
 
-        let same = format!("以下が第5条の中国語訳です。{chinese}");
-        let paragraph = correct_reply("中国語に訳して", &same, |_| panic!("one paragraph stays"));
-        assert_eq!(paragraph.content, same);
+        let plain = correct_reply("", "现在の契約です。", |_| panic!("no language mention"));
+        assert_eq!(plain.content, "現在の契約です。");
 
-        let dot = "・签订之日起生效";
-        let dotted = correct_reply("中国語に訳して", dot, |_| panic!("a middle dot is not kana"));
-        assert_eq!(dotted.content, dot);
-        assert!(!foreign_notice_text("中国語に訳して", dot).contains('签'));
-        let prolonged = "ー签订之日起生效";
-        assert_eq!(
-            correct_reply("中国語に訳して", prolonged, |_| panic!("ー alone is not kana")).content,
-            prolonged
-        );
-
-        let korean = format!("韓国語訳は次のとおりです。现の確認です。\n안녕하세요");
-        let ko = correct_reply("韓国語に訳して", &korean, |_| panic!("Korean is not rewritten"));
+        let korean = "안녕하세요 이것은 제2조입니다";
+        let ko = correct_reply("한국어로 번역해 주세요", korean, |_| panic!("Korean stays"));
         assert_eq!(ko.content, korean);
-        assert!(foreign_notice_text("韓国語に訳して", &ko.content).contains('现'));
-        assert!(!foreign_notice_text("韓国語に訳して", &ko.content).contains('안'));
+        assert!(foreign_notice_text("한국어로 번역해 주세요", korean).is_empty());
 
-        let noted = format!("{chinese}\n（注：现の訳は参考です。）");
-        let note = correct_reply("中国語に訳して", &noted, |_| panic!("the note is not rewritten"));
-        assert_eq!(note.content, noted);
-        assert!(foreign_notice_text("中国語に訳して", &note.content).contains('现'));
-        assert!(!foreign_notice_text("中国語に訳して", &note.content).contains("本合同"));
+        let residue = format!("现在は기타です。\n{chinese}");
+        let rewritten = correct_reply(prompt, &residue, |segments| {
+            assert!(segments.iter().all(|segment| !segment.contains('合')));
+            assert!(segments.iter().any(|segment| segment.contains('기')));
+            Ok(vec![stop_piece("現在はその他です。")])
+        });
+        assert!(rewritten.content.contains("現在はその他です。"));
+        assert!(rewritten.content.ends_with(chinese));
     }
 
     #[test]

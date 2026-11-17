@@ -310,6 +310,7 @@ export const FOREIGN_SCRIPT_KEYWORDS = [
   "朝鮮語",
   "中文",
   "한국어",
+  "한국말",
   "簡体字",
   "繁体字",
   "ハングル",
@@ -333,73 +334,9 @@ function containsKeyword(prompt: string, words: readonly string[]): boolean {
   return words.some((word) => lower.includes(word.toLowerCase()));
 }
 
-/**
- * The user asked for the reply itself to be in that script.
- * 「中国語に訳して」「中国語で書いて」「中文に翻訳」「韓国語訳」「in Korean」
- * 「into Chinese」 count. 「中国語の契約書」「中文版」「Chinese wall」 do not.
- */
+/** Any mention. 「中国語にしてください」 and 「中国語の契約書」 both count. */
 export function namesForeignScript(prompt: string): boolean {
-  const lower = prompt.toLowerCase();
-  for (const lang of FOREIGN_SCRIPT_KEYWORDS) {
-    if (lang === "chinese" || lang === "korean") {
-      if (englishTarget(lower, lang)) return true;
-    } else if (japaneseTarget(lower, lang)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function englishTarget(lower: string, lang: string): boolean {
-  for (const frame of [`into ${lang}`, `in ${lang}`, `to ${lang}`]) {
-    let from = 0;
-    while (from <= lower.length) {
-      const idx = lower.indexOf(frame, from);
-      if (idx < 0) break;
-      const prev = idx === 0 ? "" : lower[idx - 1];
-      if (!prev || !/[0-9A-Za-z]/.test(prev)) return true;
-      from = idx + 1;
-    }
-  }
-  return false;
-}
-
-function japaneseTarget(text: string, lang: string): boolean {
-  let rest = text;
-  while (rest.length > 0) {
-    const idx = rest.indexOf(lang);
-    if (idx < 0) return false;
-    const after = rest.slice(idx + lang.length).trimStart();
-    if (japaneseTargetSuffix(after)) return true;
-    rest = rest.slice(idx + lang.length);
-  }
-  return false;
-}
-
-function japaneseTargetSuffix(after: string): boolean {
-  return (
-    after.startsWith("に訳") ||
-    after.startsWith("に翻訳") ||
-    after.startsWith("に直") ||
-    after.startsWith("で書いて") ||
-    after.startsWith("で書け") ||
-    after.startsWith("で答えて") ||
-    bareTranslationNoun(after) ||
-    bareDe(after)
-  );
-}
-
-function bareTranslationNoun(after: string): boolean {
-  if (!after.startsWith("訳")) return false;
-  const rest = after.slice(1);
-  if (rest.startsWith("の")) return false;
-  return rest.length === 0 || "をはがに、。！？\n ".includes(rest[0]) || rest.startsWith("して");
-}
-
-function bareDe(after: string): boolean {
-  if (!after.startsWith("で")) return false;
-  const rest = after.slice(1).trimStart();
-  return rest.length === 0 || "。、！？\n".includes(rest[0]);
+  return containsKeyword(prompt, FOREIGN_SCRIPT_KEYWORDS);
 }
 
 export function asksGenericTranslation(prompt: string): boolean {
@@ -488,11 +425,11 @@ export function foreignNoticeText(prompt: string, text: string): string {
 }
 
 /**
- * A named script skips the whole reply. Generic translation words skip only a
- * mostly-foreign reply. Enough kana keeps the correction otherwise.
+ * Generic translation words skip the whole reply only when it is mostly foreign.
+ * A mentioned language does not skip the reply; kana-less pieces are left out
+ * of the warning instead.
  */
 export function shouldSkipForeignFix(prompt: string, text: string): boolean {
-  if (namesForeignScript(prompt)) return true;
   if (hasEnoughKana(text)) return false;
   return asksGenericTranslation(prompt) && replyIsMostlyForeign(text);
 }

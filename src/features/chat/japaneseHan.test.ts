@@ -164,10 +164,15 @@ describe("applyHanMap", () => {
     expect(namesForeignScript("in Korean")).toBe(true);
     expect(namesForeignScript("translate this to Chinese")).toBe(true);
     expect(namesForeignScript("翻訳会社との契約")).toBe(false);
-    expect(namesForeignScript("この中国語の契約書の要点を日本語で教えて")).toBe(false);
-    expect(namesForeignScript("中文版と日文版のどちらが優先？")).toBe(false);
-    expect(namesForeignScript("Chinese wall の運用は？")).toBe(false);
-    expect(namesForeignScript("中国語から日本語に訳して")).toBe(false);
+    expect(namesForeignScript("このメールを中国語にしてください")).toBe(true);
+    expect(namesForeignScript("簡体字にして")).toBe(true);
+    expect(namesForeignScript("中文版を作って")).toBe(true);
+    expect(namesForeignScript("한국어로 번역해 주세요")).toBe(true);
+    expect(namesForeignScript("한국말로")).toBe(true);
+    expect(namesForeignScript("この中国語の契約書の要点を日本語で教えて")).toBe(true);
+    expect(namesForeignScript("中文版と日文版のどちらが優先？")).toBe(true);
+    expect(namesForeignScript("Chinese wall の運用は？")).toBe(true);
+    expect(namesForeignScript("中国語から日本語に訳して")).toBe(true);
     expect(asksGenericTranslation("和訳して")).toBe(true);
     expect(asksGenericTranslation("Please translate this")).toBe(true);
     expect(asksGenericTranslation("契約を要約して")).toBe(false);
@@ -179,13 +184,12 @@ describe("applyHanMap", () => {
     expect(shouldSkipForeignFix("この英文契約の第5条を和訳して", japanese)).toBe(false);
     expect(shouldSkipForeignFix("翻訳会社との業務委託契約の注意点は？", japanese)).toBe(false);
     expect(shouldSkipForeignFix("第1条を中国語に訳して\n第2条も同様に", chinese)).toBe(true);
-    expect(shouldSkipForeignFix("中国語に訳して", japanese)).toBe(true);
-    const mixed = "以下が第5条の中国語訳です。现の条文です。\n本合同自签订之日起生效";
-    expect(shouldSkipForeignFix("中国語に訳して", mixed)).toBe(true);
-    expect(foreignNoticeText("中国語に訳して", mixed)).toBe(
-      "以下が第5条の中国語訳です。现の条文です。",
-    );
-    expect(foreignNoticeText("中国語に訳して", mixed)).toContain("现");
+    expect(shouldSkipForeignFix("中国語に訳して", japanese)).toBe(false);
+    expect(shouldSkipForeignFix("この中国語の契約書の要点を日本語で", japanese)).toBe(false);
+    const mixed = "以下が中国語版です。\n本合同自签订之日起生效";
+    expect(shouldSkipForeignFix("このメールを中国語にしてください", mixed)).toBe(false);
+    expect(foreignNoticeText("このメールを中国語にしてください", mixed)).toBe("以下が中国語版です。");
+    expect(foreignNoticeText("このメールを中国語にしてください", chinese)).toBe("");
     expect(foreignNoticeText("韓国語に訳して", "韓国語訳は次のとおりです。\n안녕하세요")).toBe(
       "韓国語訳は次のとおりです。",
     );
