@@ -437,17 +437,17 @@ describe("foreign character notice", () => {
         id: "a-foreign",
         threadId: "thread-a",
         role: "assistant",
-        content: "这个条款。",
+        content: "这问条款。",
         reasoning: "Привет",
         createdAt: 2,
       },
     ];
     await renderChat();
-    expect(screen.getByText("这个条款。")).toBeTruthy();
-    expect(screen.getByText("日本語で用いない文字: 这、个").textContent).toBe(
-      "日本語で用いない文字: 这、个",
+    expect(screen.getByText("这问条款。")).toBeTruthy();
+    expect(screen.getByText("日本語で用いない文字: 这、问").textContent).toBe(
+      "日本語で用いない文字: 这、问",
     );
-    expect(screen.getByText("日本語で用いない文字: 这、个").textContent).not.toContain("П");
+    expect(screen.getByText("日本語で用いない文字: 这、问").textContent).not.toContain("П");
   });
 
   it("shows the notice while streaming and does not scan reasoning", async () => {
@@ -456,10 +456,10 @@ describe("foreign character notice", () => {
     await screen.findByText("生成中…");
     await emitDelta("thread-a", "Привет", "reasoning");
     expect(screen.queryByText(/日本語で用いない文字/)).toBeNull();
-    await emitDelta("thread-a", "这个");
-    const notice = screen.getByText("日本語で用いない文字: 这、个");
+    await emitDelta("thread-a", "这问");
+    const notice = screen.getByText("日本語で用いない文字: 这、问");
     expect(notice.textContent).not.toContain("П");
-    expect(await screen.findByText("这个")).toBeTruthy();
+    expect(await screen.findByText("这问")).toBeTruthy();
   });
 });
 

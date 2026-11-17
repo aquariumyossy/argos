@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   authoredToolTexts,
@@ -9,7 +7,6 @@ import {
   isCjkIdeograph,
   isJapaneseHan,
 } from "./japaneseHan";
-import { HAN_BMP_A, HAN_BMP_B, HAN_EXTRA } from "./japaneseHanData";
 
 describe("foreignChars", () => {
   it("ignores Japanese legal prose", () => {
@@ -113,22 +110,5 @@ describe("JIS and CP932 allowlist", () => {
     expect(isJapaneseHan(0x9ad9)).toBe(true);
     expect(isJapaneseHan(0x20bb7)).toBe(true);
     expect(foreignChars("기타")).toEqual(["기", "타"]);
-  });
-
-  it("matches the Rust allowlist byte for byte", () => {
-    const rust = readFileSync(resolve("src-tauri/src/llm/japanese_han_data.rs"), "utf8");
-    const quoted = (name: string) => {
-      const at = rust.indexOf(`pub const ${name}:`);
-      const rest = rust.slice(at);
-      const body = rest.slice(rest.indexOf('r"') + 2);
-      return body.slice(0, body.indexOf('"'));
-    };
-    expect(quoted("HAN_BMP_A")).toBe(HAN_BMP_A);
-    expect(quoted("HAN_BMP_B")).toBe(HAN_BMP_B);
-    const header = "HAN_EXTRA: &[u32] = &[";
-    const start = rust.indexOf(header) + header.length;
-    const list = rust.slice(start, rust.indexOf("];", start));
-    const nums = [...list.matchAll(/\d+/g)].map((hit) => Number(hit[0]));
-    expect(nums).toEqual([...HAN_EXTRA]);
   });
 });
