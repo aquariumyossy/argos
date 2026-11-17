@@ -168,16 +168,21 @@ describe("applyHanMap", () => {
     expect(shouldSkipForeignFix("この英文契約の第5条を和訳して", japanese)).toBe(false);
     expect(shouldSkipForeignFix("翻訳会社との業務委託契約の注意点は？", japanese)).toBe(false);
     expect(shouldSkipForeignFix("第1条を中国語に訳して\n第2条も同様に", chinese)).toBe(true);
-    expect(shouldSkipForeignFix("中国語に訳して", japanese)).toBe(false);
-    const mixed = "以下が第5条の中国語訳です。\n本合同自签订之日起生效";
-    expect(shouldSkipForeignFix("中国語に訳して", mixed)).toBe(false);
-    expect(foreignNoticeText("中国語に訳して", mixed)).toBe("以下が第5条の中国語訳です。");
+    expect(shouldSkipForeignFix("中国語に訳して", japanese)).toBe(true);
+    const mixed = "以下が第5条の中国語訳です。现の条文です。\n本合同自签订之日起生效";
+    expect(shouldSkipForeignFix("中国語に訳して", mixed)).toBe(true);
+    expect(foreignNoticeText("中国語に訳して", mixed)).toBe(
+      "以下が第5条の中国語訳です。现の条文です。",
+    );
+    expect(foreignNoticeText("中国語に訳して", mixed)).toContain("现");
     expect(foreignNoticeText("韓国語に訳して", "韓国語訳は次のとおりです。\n안녕하세요")).toBe(
       "韓国語訳は次のとおりです。",
     );
-    expect(foreignNoticeText("中国語に訳して", `${chinese}\n（注：参考です。）`)).toBe(
-      "（注：参考です。）",
+    expect(foreignNoticeText("中国語に訳して", `${chinese}\n（注：现の訳は参考です。）`)).toBe(
+      "（注：现の訳は参考です。）",
     );
+    expect(foreignNoticeText("中国語に訳して", "・签订之日起生效")).toBe("");
+    expect(foreignNoticeText("中国語に訳して", "ー签订之日起生效")).toBe("");
     expect(applyHanMap("谭")).toBe("譚");
     expect(applyHanMap("岗")).toBe("崗");
     expect(applyHanMap("岗")).not.toBe("岡");

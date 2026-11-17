@@ -351,6 +351,8 @@ export function recentUserText(messages: { role: string; content: string }[]): s
 
 function isKana(ch: string): boolean {
   const cp = ch.codePointAt(0) ?? 0;
+  // U+30FB ・ and U+30FC ー are not kana. A line of only those is not Japanese.
+  if (cp === 0x30fb || cp === 0x30fc) return false;
   return (
     (cp >= 0x3040 && cp <= 0x309f) ||
     (cp >= 0x30a0 && cp <= 0x30ff) ||
@@ -401,36 +403,22 @@ export function hasEnoughKana(text: string): boolean {
   return kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters;
 }
 
-/** One line of a requested translation: foreign letters and almost no kana. */
-export function lineIsForeignTranslation(line: string): boolean {
-  let foreign = false;
-  for (const ch of line) {
-    const cp = ch.codePointAt(0) ?? 0;
-    if (isForeignScript(cp) || (isCjkIdeograph(cp) && !isJapaneseHan(cp))) {
-      foreign = true;
-      break;
-    }
-  }
-  return foreign && !hasEnoughKana(line);
-}
-
-/** Drop translation lines when a target script was named. Other lines stay. */
+/** Lines kept for the orange warning after a named-script reply is left as-is. */
 export function foreignNoticeText(prompt: string, text: string): string {
   if (!namesForeignScript(prompt)) return text;
   return text
     .split("\n")
-    .filter((line) => !lineIsForeignTranslation(line))
+    .filter((line) => [...line].some((ch) => isKana(ch)))
     .join("\n");
 }
 
 /**
- * Named script skips a reply that has almost no kana. A mixed reply is judged
- * per line. Generic translation words skip only a mostly-foreign reply.
- * Enough kana keeps the correction.
+ * A named script skips the whole reply. Generic translation words skip only a
+ * mostly-foreign reply. Enough kana keeps the correction otherwise.
  */
 export function shouldSkipForeignFix(prompt: string, text: string): boolean {
-  if (hasEnoughKana(text)) return false;
   if (namesForeignScript(prompt)) return true;
+  if (hasEnoughKana(text)) return false;
   return asksGenericTranslation(prompt) && replyIsMostlyForeign(text);
 }
 
