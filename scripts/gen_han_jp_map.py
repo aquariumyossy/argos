@@ -344,9 +344,12 @@ def build_map(
             return trad if is_jp(trad) else None
         if is_jp(trad):
             return trad
-        japanese = {node for node in full if is_jp(node)}
-        if len(japanese) == 1:
-            return next(iter(japanese))
+        # A neighbor reached only through a same-gloss link must be jōyō or
+        # jinmeiyō, which the branches above already returned. 夠 → 彀 is not.
+        # A z-variant or shinjitai that is only kyūjitai may still be used.
+        strict_jp = {node for node in strict if is_jp(node)}
+        if len(strict_jp) == 1:
+            return next(iter(strict_jp))
         return None
 
     def seeds_of(cp: int) -> set[int]:
@@ -366,6 +369,16 @@ def build_map(
         if is_cjk(cp) and not is_jp(cp)
     }
     for cp in sources:
+        # Two traditional forms that do not land on one Japanese character
+        # are a meaning split (恶 惡/噁, 脏 臟/髒, 发 發/髮). Leave them unmapped.
+        direct = {trad for trad in raw.get(cp, {}).get("kTraditionalVariant", ()) if trad != cp}
+        if len(direct) >= 2:
+            resolved = {result for trad in direct if (result := resolve(trad)) is not None}
+            if len(resolved) == 1:
+                mapping[cp] = next(iter(resolved))
+            elif len(resolved) > 1:
+                ambiguous.add(cp)
+            continue
         seeds = seeds_of(cp) | set(zvar.get(cp, ()))
         seeds.add(cp)
         targets: set[int] = set()
@@ -481,6 +494,10 @@ def main() -> None:
     expect(mapping, "发", None)
     expect(mapping, "历", None)
     expect(mapping, "复", None)
+    expect(mapping, "恶", None)
+    expect(mapping, "脏", None)
+    expect(mapping, "够", None)
+    expect(mapping, "夠", None)
     expect(mapping, "线", "線")
     expect(mapping, "举", "挙")
     expect(mapping, "鉴", "鑑")

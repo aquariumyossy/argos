@@ -13,9 +13,10 @@ import {
   isJapaneseHan,
   markHanFixes,
   parseScriptFix,
-  recentUserRequestsForeignWriting,
+  asksGenericTranslation,
+  namesForeignScript,
   replyIsMostlyForeign,
-  userRequestsForeignWriting,
+  shouldSkipForeignFix,
 } from "./japaneseHan";
 
 describe("foreignChars", () => {
@@ -149,30 +150,33 @@ describe("applyHanMap", () => {
       rewriteStopped: false,
       suppressWarning: false,
     });
-    expect(userRequestsForeignWriting("中国語に訳して")).toBe(true);
-    expect(userRequestsForeignWriting("Please translate this")).toBe(true);
-    expect(userRequestsForeignWriting("簡体字で書いて")).toBe(true);
-    expect(userRequestsForeignWriting("繁体字に直して")).toBe(true);
-    expect(userRequestsForeignWriting("ハングルで")).toBe(true);
-    expect(userRequestsForeignWriting("契約を要約して")).toBe(false);
-    expect(
-      recentUserRequestsForeignWriting([
-        { role: "user", content: "第1条を中国語に訳して" },
-        { role: "assistant", content: "第一条" },
-        { role: "user", content: "第2条も同様に" },
-      ]),
-    ).toBe(true);
+    expect(namesForeignScript("中国語に訳して")).toBe(true);
+    expect(namesForeignScript("簡体字で書いて")).toBe(true);
+    expect(namesForeignScript("繁体字に直して")).toBe(true);
+    expect(namesForeignScript("ハングルで")).toBe(true);
+    expect(namesForeignScript("Please write this in Chinese")).toBe(true);
+    expect(namesForeignScript("翻訳会社との契約")).toBe(false);
+    expect(asksGenericTranslation("和訳して")).toBe(true);
+    expect(asksGenericTranslation("Please translate this")).toBe(true);
+    expect(asksGenericTranslation("契約を要約して")).toBe(false);
     const chinese =
       "本合同自签订之日起生效，双方应当遵守本合同的全部条款并及时履行各自的义务。";
+    const japanese = "第5条は、契约が现在も有効であることを定めています。甲は乙に対し通知しなければなりません。";
     expect(replyIsMostlyForeign(chinese)).toBe(true);
-    expect(replyIsMostlyForeign("现在の契約は有効です。甲は乙に対し金銭を支払います。")).toBe(
-      false,
-    );
+    expect(replyIsMostlyForeign(japanese)).toBe(false);
+    expect(shouldSkipForeignFix("この英文契約の第5条を和訳して", japanese)).toBe(false);
+    expect(shouldSkipForeignFix("翻訳会社との業務委託契約の注意点は？", japanese)).toBe(false);
+    expect(shouldSkipForeignFix("第1条を中国語に訳して\n第2条も同様に", chinese)).toBe(true);
+    expect(shouldSkipForeignFix("中国語に訳して", japanese)).toBe(false);
     expect(applyHanMap("谭")).toBe("譚");
     expect(applyHanMap("岗")).toBe("崗");
     expect(applyHanMap("岗")).not.toBe("岡");
     expect(applyHanMap("箫")).toBe("簫");
     expect(applyHanMap("鲶")).toBe("鯰");
+    expect(applyHanMap("恶")).toBe("恶");
+    expect(applyHanMap("脏")).toBe("脏");
+    expect(applyHanMap("够")).toBe("够");
+    expect(applyHanMap("线")).toBe("線");
   });
 
   it("does not underline inside a URL or an HTML attribute", () => {

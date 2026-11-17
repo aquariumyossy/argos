@@ -8,10 +8,10 @@
 //! drops a citation, an article number, a URL, or code, or the length is
 //! implausible. Latin and Greek are not foreign script.
 //!
-//! When the user asks for Chinese, Korean, or a translation, both steps are
-//! skipped and the orange warning is suppressed. The check looks at the last
-//! few user turns, not only the latest line, and also at a reply that is
-//! mostly foreign script and has almost no kana. Foreign text left inside a
+//! A named script in the recent user turns (中国語, 韓国語, Chinese, Korean, …)
+//! skips both steps only when the reply has almost no kana. Generic words
+//! (訳して, 翻訳, translate, 和訳, 英訳) skip only when the reply is also mostly
+//! foreign. A reply with enough kana is corrected. Foreign text left inside a
 //! quote or a code span still gets the warning. A quote may span lines.
 
 #[path = "japanese_han_map.rs"]
@@ -190,29 +190,41 @@ fn is_foreign_char(ch: char) -> bool {
 /// How many recent user turns are checked for a translation request.
 pub const RECENT_USER_TURNS: usize = 4;
 
-/// The user's message asks to translate or to write in a foreign language.
-///
-/// The check is the keywords 中国語, 韓国語, 朝鮮語, 中文, 한국어, 簡体字,
-/// 繁体字, ハングル, 訳して, 翻訳, and `translate`. Correction is skipped and
-/// the orange warning is hidden. Pass the last [`RECENT_USER_TURNS`] user
-/// messages joined together so a follow-up such as 「第2条も同様に」 still matches.
-pub fn user_requests_foreign_writing(prompt: &str) -> bool {
+/// A named target script. These skip correction only when the reply has almost no kana.
+pub const FOREIGN_SCRIPT_KEYWORDS: &[&str] = &[
+    "中国語",
+    "韓国語",
+    "朝鮮語",
+    "中文",
+    "한국어",
+    "簡体字",
+    "繁体字",
+    "ハングル",
+    "chinese",
+    "korean",
+];
+
+/// Generic translation words. They skip only together with [`reply_is_mostly_foreign`].
+pub const GENERIC_TRANSLATION_KEYWORDS: &[&str] = &["訳して", "翻訳", "translate", "和訳", "英訳"];
+
+/// Thresholds shared with `japaneseHan.ts`.
+pub const MOSTLY_FOREIGN_MIN_LETTERS: usize = 24;
+pub const MOSTLY_FOREIGN_MIN_FOREIGN: usize = 6;
+pub const MOSTLY_FOREIGN_MAX_KANA: usize = 2;
+
+fn contains_keyword(prompt: &str, words: &[&str]) -> bool {
     let lower = prompt.to_lowercase();
-    [
-        "中国語",
-        "韓国語",
-        "朝鮮語",
-        "中文",
-        "한국어",
-        "簡体字",
-        "繁体字",
-        "ハングル",
-        "訳して",
-        "翻訳",
-        "translate",
-    ]
-    .iter()
-    .any(|word| lower.contains(&word.to_lowercase()))
+    words.iter().any(|word| lower.contains(&word.to_lowercase()))
+}
+
+/// The recent user text names Chinese, Korean, or another target script.
+pub fn names_foreign_script(prompt: &str) -> bool {
+    contains_keyword(prompt, FOREIGN_SCRIPT_KEYWORDS)
+}
+
+/// 「訳して」「翻訳」「translate」「和訳」「英訳」 without naming the script.
+pub fn asks_generic_translation(prompt: &str) -> bool {
+    contains_keyword(prompt, GENERIC_TRANSLATION_KEYWORDS)
 }
 
 fn is_kana(ch: char) -> bool {
@@ -244,13 +256,50 @@ pub fn reply_is_mostly_foreign(text: &str) -> bool {
             letters += 1;
         }
     }
-    if letters < 24 || foreign < 6 {
+    if letters < MOSTLY_FOREIGN_MIN_LETTERS || foreign < MOSTLY_FOREIGN_MIN_FOREIGN {
         return false;
     }
-    if kana > 2 || kana.saturating_mul(20) > letters {
+    if kana > MOSTLY_FOREIGN_MAX_KANA || kana.saturating_mul(20) > letters {
         return false;
     }
     foreign.saturating_mul(6) >= letters
+}
+
+/// A normal Japanese reply. More kana than the "almost none" bar above.
+pub fn has_enough_kana(text: &str) -> bool {
+    let mut kana = 0usize;
+    let mut letters = 0usize;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if is_kana(ch) {
+            letters += 1;
+            kana += 1;
+        } else if is_foreign_char(ch)
+            || crate::llm::japanese_han::is_cjk_ideograph(cp)
+            || ch.is_alphabetic()
+        {
+            letters += 1;
+        }
+    }
+    if kana == 0 {
+        return false;
+    }
+    kana > MOSTLY_FOREIGN_MAX_KANA || kana.saturating_mul(20) > letters
+}
+
+/// Skip correction and the orange warning.
+///
+/// A named script in the recent user text skips only when the reply has almost
+/// no kana. Generic translation words skip only when the reply is also mostly
+/// foreign. A reply with enough kana is corrected either way.
+pub fn should_skip_foreign_fix(prompt: &str, text: &str) -> bool {
+    if has_enough_kana(text) {
+        return false;
+    }
+    if names_foreign_script(prompt) {
+        return true;
+    }
+    asks_generic_translation(prompt) && reply_is_mostly_foreign(text)
 }
 
 /// Code, blockquotes, and quoted spans. Indexes are Unicode scalars.
@@ -490,9 +539,9 @@ fn dirty_segments(text: &str, fixes: &[HanFix], mask: &[bool]) -> Vec<DirtySegme
     out
 }
 
-/// Map outside quotes and code. `user_prompt` skips both steps when it asks for a translation.
+/// Map outside quotes and code. `user_prompt` is the recent user turns joined.
 pub fn prepare_reply(user_prompt: &str, text: &str) -> MappedReply {
-    if user_requests_foreign_writing(user_prompt) || reply_is_mostly_foreign(text) {
+    if should_skip_foreign_fix(user_prompt, text) {
         return MappedReply {
             input: text.to_string(),
             text: text.to_string(),
@@ -1106,6 +1155,10 @@ mod tests {
         assert_eq!(map[&('鲶' as u32)], '鯰');
         assert_ne!(map.get(&('鲶' as u32)), Some(&'鮎'));
         assert!(!map.contains_key(&('发' as u32)));
+        assert!(!map.contains_key(&('恶' as u32)));
+        assert!(!map.contains_key(&('脏' as u32)));
+        assert!(!map.contains_key(&('够' as u32)));
+        assert!(!map.contains_key(&('夠' as u32)));
     }
 
     #[test]
@@ -1327,11 +1380,17 @@ mod tests {
         });
         assert_eq!(follow.content, zh);
         assert!(follow.suppress_warning);
-        let unspoken = correct_reply("第2条も同様に", zh, |_| panic!("mostly foreign"));
-        assert!(unspoken.suppress_warning);
-        assert!(user_requests_foreign_writing("簡体字で書いて"));
-        assert!(user_requests_foreign_writing("繁体字に直して"));
-        assert!(user_requests_foreign_writing("ハングルで"));
+        let unspoken = correct_reply("第2条も同様に", zh, |segments| {
+            Ok(segments.iter().map(|segment| stop_piece(segment.clone())).collect())
+        });
+        assert!(!unspoken.suppress_warning);
+        assert!(names_foreign_script("簡体字で書いて"));
+        assert!(names_foreign_script("繁体字に直して"));
+        assert!(names_foreign_script("ハングルで"));
+        assert!(names_foreign_script("Please write this in Chinese"));
+        assert!(!names_foreign_script("翻訳会社との契約"));
+        assert!(asks_generic_translation("和訳して"));
+        assert!(asks_generic_translation("英訳"));
 
         let japanese = "现在の契約は有効です。甲は乙に対し、金銭を支払う義務を負います。";
         let kana = correct_reply("第2条も同様に", japanese, |_| {
@@ -1353,6 +1412,86 @@ mod tests {
         assert!(asked.suppress_warning);
         assert!(asked.script_fix_json().contains("suppressWarning"));
         assert!(!asked.rewritten);
+    }
+
+    #[test]
+    fn translation_skip_keeps_a_japanese_reply() {
+        let reply = "第5条は、契约が现在も有効であることを定めています。甲は乙に対し通知しなければなりません。";
+        let translated = correct_reply("この英文契約の第5条を和訳して", reply, |_| {
+            panic!("a Japanese 和訳 is still corrected")
+        });
+        assert!(translated.content.contains('約'));
+        assert!(translated.content.contains('現'));
+        assert!(!translated.suppress_warning);
+
+        let follow = "有効期間は契約締結日から3年です。ただし现在の特約があるときは、この限りではありません。";
+        let next = correct_reply(
+            "この英文契約の第5条を和訳して\nこの契約の有効期間は？",
+            follow,
+            |_| panic!("the next Japanese question is corrected"),
+        );
+        assert!(next.content.contains('現'));
+        assert!(!next.suppress_warning);
+
+        let note = "秘密保持と现在の再委託制限を確認してください。甲は乙に対し報告します。";
+        let company = correct_reply("翻訳会社との業務委託契約の注意点は？", note, |_| {
+            panic!("翻訳会社 is not a request to write in a foreign script")
+        });
+        assert!(company.content.contains('現'));
+        assert!(!company.suppress_warning);
+
+        let zh = "本合同自签订之日起生效，双方应当遵守本合同的全部条款并及时履行各自的义务。";
+        let skipped = correct_reply("第1条を中国語に訳して\n第2条も同様に", zh, |_| {
+            panic!("a Chinese follow-up stays uncorrected")
+        });
+        assert_eq!(skipped.content, zh);
+        assert!(skipped.suppress_warning);
+
+        let explained = correct_reply("中国語に訳して", reply, |_| {
+            panic!("a kana reply is corrected even after 中国語")
+        });
+        assert!(explained.content.contains('現'));
+        assert!(!explained.suppress_warning);
+    }
+
+    #[test]
+    fn gou_stays_unmapped_and_goes_to_step_two() {
+        assert_eq!(map_foreign_han("足够").0, "足够");
+        assert_eq!(map_foreign_han("能够").0, "能够");
+        assert_eq!(map_foreign_han("恶").0, "恶");
+        assert_eq!(map_foreign_han("脏").0, "脏");
+        let mut calls = 0;
+        let out = correct_reply("", "足够です。", |segments| {
+            calls += 1;
+            assert!(segments.iter().any(|segment| segment.contains('够')));
+            Ok(vec![stop_piece("十分です。")])
+        });
+        assert_eq!(calls, 1);
+        assert!(out.rewritten);
+        assert!(out.content.contains("十分"));
+    }
+
+    #[test]
+    fn typescript_skip_rules_match_rust() {
+        let ts = include_str!("../../../src/features/chat/japaneseHan.ts");
+        for word in FOREIGN_SCRIPT_KEYWORDS
+            .iter()
+            .chain(GENERIC_TRANSLATION_KEYWORDS.iter())
+        {
+            assert!(
+                ts.contains(&format!("\"{word}\"")),
+                "{word} missing from japaneseHan.ts"
+            );
+        }
+        for needle in [
+            "MOSTLY_FOREIGN_MIN_LETTERS = 24",
+            "MOSTLY_FOREIGN_MIN_FOREIGN = 6",
+            "MOSTLY_FOREIGN_MAX_KANA = 2",
+            "kana * 20",
+            "foreign * 6",
+        ] {
+            assert!(ts.contains(needle), "{needle}");
+        }
     }
 
     #[test]

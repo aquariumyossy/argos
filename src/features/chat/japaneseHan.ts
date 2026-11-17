@@ -303,26 +303,50 @@ export function parseScriptFix(raw: string | undefined | null): ScriptFix | null
   }
 }
 
-/**
- * Skip correction, and hide the orange warning, when the user asked for this.
- * Same list as the Rust check: 中国語 / 韓国語 / 朝鮮語 / 中文 / 한국어 / 簡体字 /
- * 繁体字 / ハングル / 訳して / 翻訳 / translate.
- */
-export function userRequestsForeignWriting(prompt: string): boolean {
-  return /中国語|韓国語|朝鮮語|中文|한국어|簡体字|繁体字|ハングル|訳して|翻訳|translate/i.test(
-    prompt,
-  );
-}
+/** Named target scripts. Same list as the Rust check, including chinese / korean. */
+export const FOREIGN_SCRIPT_KEYWORDS = [
+  "中国語",
+  "韓国語",
+  "朝鮮語",
+  "中文",
+  "한국어",
+  "簡体字",
+  "繁体字",
+  "ハングル",
+  "chinese",
+  "korean",
+] as const;
+
+/** Generic translation words. They skip only when the reply is mostly foreign. */
+export const GENERIC_TRANSLATION_KEYWORDS = ["訳して", "翻訳", "translate", "和訳", "英訳"] as const;
+
+/** Same numbers as the Rust constants. */
+export const MOSTLY_FOREIGN_MIN_LETTERS = 24;
+export const MOSTLY_FOREIGN_MIN_FOREIGN = 6;
+export const MOSTLY_FOREIGN_MAX_KANA = 2;
 
 /** How many recent user turns are checked. Same as the Rust constant. */
 export const RECENT_USER_TURNS = 4;
 
-export function recentUserRequestsForeignWriting(
-  messages: { role: string; content: string }[],
-): boolean {
+function containsKeyword(prompt: string, words: readonly string[]): boolean {
+  const lower = prompt.toLowerCase();
+  return words.some((word) => lower.includes(word.toLowerCase()));
+}
+
+export function namesForeignScript(prompt: string): boolean {
+  return containsKeyword(prompt, FOREIGN_SCRIPT_KEYWORDS);
+}
+
+export function asksGenericTranslation(prompt: string): boolean {
+  return containsKeyword(prompt, GENERIC_TRANSLATION_KEYWORDS);
+}
+
+export function recentUserText(messages: { role: string; content: string }[]): string {
   const users = messages.filter((message) => message.role === "user");
-  const recent = users.slice(-RECENT_USER_TURNS).map((message) => message.content).join("\n");
-  return userRequestsForeignWriting(recent);
+  return users
+    .slice(-RECENT_USER_TURNS)
+    .map((message) => message.content)
+    .join("\n");
 }
 
 function isKana(ch: string): boolean {
@@ -355,9 +379,43 @@ export function replyIsMostlyForeign(text: string): boolean {
       letters += 1;
     }
   }
-  if (letters < 24 || foreign < 6) return false;
-  if (kana > 2 || kana * 20 > letters) return false;
+  if (letters < MOSTLY_FOREIGN_MIN_LETTERS || foreign < MOSTLY_FOREIGN_MIN_FOREIGN) return false;
+  if (kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters) return false;
   return foreign * 6 >= letters;
+}
+
+/** More kana than the "almost none" bar. A normal Japanese sentence qualifies. */
+export function hasEnoughKana(text: string): boolean {
+  let kana = 0;
+  let letters = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isKana(ch)) {
+      letters += 1;
+      kana += 1;
+    } else if (isForeignScript(cp) || isCjkIdeograph(cp) || /\p{L}/u.test(ch)) {
+      letters += 1;
+    }
+  }
+  if (kana === 0) return false;
+  return kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters;
+}
+
+/**
+ * Named script skips only a reply with almost no kana. Generic translation
+ * words skip only a mostly-foreign reply. Enough kana keeps the correction.
+ */
+export function shouldSkipForeignFix(prompt: string, text: string): boolean {
+  if (hasEnoughKana(text)) return false;
+  if (namesForeignScript(prompt)) return true;
+  return asksGenericTranslation(prompt) && replyIsMostlyForeign(text);
+}
+
+export function recentShouldSkipForeignFix(
+  messages: { role: string; content: string }[],
+  text: string,
+): boolean {
+  return shouldSkipForeignFix(recentUserText(messages), text);
 }
 
 /** 「现→現 など3か所を直しました」 */
