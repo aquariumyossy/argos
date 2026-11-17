@@ -1818,6 +1818,190 @@ fn an_open_edited_file_is_left_and_a_new_file_is_saved() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_transient_replace_failure_still_overwrites() {
+    let dir = temp_dir("overwrite-retry");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let name = "契約書_編集済み（2026-11-12 09-30-00）.docx";
+    let src = out.join(name);
+    write_zip(
+        &src,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>佐藤花子</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    super::fail_replace_of_existing_file_times(1);
+    let edited = super::edit_path_mode(
+        &src,
+        &out,
+        "2026-11-16 16-30-00",
+        &request(&[("佐藤花子", "鈴木一郎")], &[]),
+        true,
+    )
+    .unwrap();
+    assert_eq!(edited.path, src);
+    assert!(
+        edited.report.contains("前回の編集済みファイルに上書きした"),
+        "{}",
+        edited.report
+    );
+    assert!(read_entry(&src, "word/document.xml").contains("鈴木一郎"));
+    assert_eq!(docx_names(&out), vec![name.to_string()]);
+    assert!(dir_has_no_temp(&out));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeated_edits_of_one_source_update_the_same_file() {
+    let (dir, db, thread) = open_chat("same-source");
+    let out = dir.join(super::OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let original = out.join("メモ.docx");
+    write_zip(
+        &original,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>甲乙丙</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let original_bytes = fs::read(&original).unwrap();
+
+    let first = edit_named(&db, &dir, &thread, "メモ.docx", "甲", "丁");
+    assert!(!first.report.contains("上書きした"), "{}", first.report);
+    assert!(first.filename.contains("メモ_編集済み（"));
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert!(read_entry(&first.path, "word/document.xml").contains("丁乙丙"));
+
+    db.insert_llm_message_full(
+        &thread,
+        "tool",
+        "（文脈の上限に達したため、この結果は省略しました）",
+        "",
+        "",
+        "call-1",
+        "edit_office",
+        "",
+    )
+    .unwrap();
+
+    let second = edit_named(&db, &dir, &thread, "メモ.docx", "乙", "戊");
+    assert_eq!(second.path, first.path);
+    assert!(
+        second.report.contains("前回の編集済みファイルに上書きした"),
+        "{}",
+        second.report
+    );
+    assert!(read_entry(&first.path, "word/document.xml").contains("丁戊丙"));
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+
+    let third = edit_named(&db, &dir, &thread, "メモ.docx", "丙", "己");
+    assert_eq!(third.path, first.path);
+    assert!(read_entry(&first.path, "word/document.xml").contains("丁戊己"));
+    assert!(!read_entry(&first.path, "word/document.xml").contains("甲"));
+    assert_eq!(edited_names(&out), vec![first.filename.clone()]);
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert!(dir_has_no_temp(&out));
+
+    let other = db.create_llm_thread("other", false).unwrap();
+    let elsewhere = edit_named(&db, &dir, &other.id, "メモ.docx", "甲", "壬");
+    assert_ne!(elsewhere.path, first.path);
+    assert!(read_entry(&elsewhere.path, "word/document.xml").contains("壬乙丙"));
+    assert!(read_entry(&first.path, "word/document.xml").contains("丁戊己"));
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert_eq!(edited_names(&out).len(), 2);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_attached_original_stays_put_while_follow_ups_stack() {
+    let (dir, db, thread) = open_chat("attached-source");
+    let original = dir.join("契約書.docx");
+    write_zip(
+        &original,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>甲です</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let original_bytes = fs::read(&original).unwrap();
+    db.insert_llm_source(
+        &thread,
+        "attach",
+        &original.to_string_lossy(),
+        "契約書.docx",
+        "",
+        "",
+        "",
+    )
+    .unwrap();
+    let first = edit_named(&db, &dir, &thread, "契約書.docx", "甲", "乙");
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert!(read_entry(&first.path, "word/document.xml").contains("乙です"));
+    db.insert_llm_message_full(
+        &thread,
+        "tool",
+        "（文脈の上限に達したため、この結果は省略しました）",
+        "",
+        "",
+        "call-1",
+        "edit_office",
+        "",
+    )
+    .unwrap();
+    let second = edit_named(&db, &dir, &thread, "契約書.docx", "乙", "丙");
+    assert_eq!(second.path, first.path);
+    assert!(
+        second.report.contains("前回の編集済みファイルに上書きした"),
+        "{}",
+        second.report
+    );
+    assert!(read_entry(&first.path, "word/document.xml").contains("丙です"));
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert_eq!(
+        edited_names(&dir.join(super::OUTPUT_DIR_NAME)),
+        vec![first.filename]
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn open_chat(label: &str) -> (PathBuf, crate::db::Db, String) {
+    let dir = temp_dir(label);
+    let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();
+    let thread = db.create_llm_thread(label, false).unwrap();
+    (dir, db, thread.id)
+}
+
+fn edit_named(
+    db: &crate::db::Db,
+    data_dir: &Path,
+    thread: &str,
+    filename: &str,
+    find: &str,
+    replace: &str,
+) -> super::EditOutcome {
+    super::edit_in_thread(
+        db,
+        data_dir,
+        "",
+        thread,
+        &json!({
+            "filename": filename,
+            "replacements": [{"find": find, "replace": replace}],
+            "paragraphs": []
+        }),
+    )
+    .unwrap_or_else(|err| panic!("{filename}: {err}"))
+}
+
+fn edited_names(dir: &Path) -> Vec<String> {
+    docx_names(dir)
+        .into_iter()
+        .filter(|name| name.contains("編集済み"))
+        .collect()
+}
+
 fn docx_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
