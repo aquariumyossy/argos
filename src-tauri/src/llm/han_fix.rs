@@ -191,7 +191,7 @@ fn is_foreign_char(ch: char) -> bool {
 /// How many recent user turns are checked for a translation request.
 pub const RECENT_USER_TURNS: usize = 4;
 
-/// A named target script. These skip correction only when the reply has almost no kana.
+/// Language names. A bare mention does not skip correction; see [`names_foreign_script`].
 pub const FOREIGN_SCRIPT_KEYWORDS: &[&str] = &[
     "中国語",
     "韓国語",
@@ -218,9 +218,87 @@ fn contains_keyword(prompt: &str, words: &[&str]) -> bool {
     words.iter().any(|word| lower.contains(&word.to_lowercase()))
 }
 
-/// The recent user text names Chinese, Korean, or another target script.
+/// The user asked for the reply itself to be in Chinese, Korean, or another script.
+///
+/// 「中国語に訳して」「中国語で書いて」「中文に翻訳」「韓国語訳」「in Korean」
+/// 「into Chinese」 count. 「中国語の契約書」「中文版」「Chinese wall」
+/// 「中国語から日本語に」 do not: the language is the source, not the output.
 pub fn names_foreign_script(prompt: &str) -> bool {
-    contains_keyword(prompt, FOREIGN_SCRIPT_KEYWORDS)
+    let lower = prompt.to_lowercase();
+    for lang in FOREIGN_SCRIPT_KEYWORDS {
+        if *lang == "chinese" || *lang == "korean" {
+            if english_target(&lower, lang) {
+                return true;
+            }
+        } else if japanese_target(&lower, lang) {
+            return true;
+        }
+    }
+    false
+}
+
+fn english_target(lower: &str, lang: &str) -> bool {
+    for frame in [
+        format!("into {lang}"),
+        format!("in {lang}"),
+        format!("to {lang}"),
+    ] {
+        if lower.match_indices(&frame).any(|(idx, _)| {
+            idx == 0
+                || !lower
+                    .as_bytes()
+                    .get(idx - 1)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn japanese_target(text: &str, lang: &str) -> bool {
+    let mut rest = text;
+    while let Some(idx) = rest.find(lang) {
+        let after = rest[idx + lang.len()..].trim_start();
+        if japanese_target_suffix(after) {
+            return true;
+        }
+        rest = &rest[idx + lang.len()..];
+    }
+    false
+}
+
+fn japanese_target_suffix(after: &str) -> bool {
+    after.starts_with("に訳")
+        || after.starts_with("に翻訳")
+        || after.starts_with("に直")
+        || after.starts_with("で書いて")
+        || after.starts_with("で書け")
+        || after.starts_with("で答えて")
+        || bare_translation_noun(after)
+        || bare_de(after)
+}
+
+/// 「韓国語訳」. 「訳の」 modifies the next noun, so it is not a request.
+fn bare_translation_noun(after: &str) -> bool {
+    let Some(rest) = after.strip_prefix('訳') else {
+        return false;
+    };
+    if rest.starts_with('の') {
+        return false;
+    }
+    rest.is_empty()
+        || rest.starts_with(['を', 'は', 'が', 'に', '、', '。', '！', '？', '\n', ' '])
+        || rest.starts_with("して")
+}
+
+/// 「ハングルで」 with nothing after it, or only punctuation.
+fn bare_de(after: &str) -> bool {
+    let Some(rest) = after.strip_prefix('で') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.is_empty() || rest.starts_with(['。', '、', '！', '？', '\n'])
 }
 
 /// 「訳して」「翻訳」「translate」「和訳」「英訳」 without naming the script.
@@ -297,18 +375,33 @@ pub fn has_enough_kana(text: &str) -> bool {
     kana > MOSTLY_FOREIGN_MAX_KANA || kana.saturating_mul(20) > letters
 }
 
-/// Lines kept for the orange warning after a named-script reply is left as-is.
+/// Pieces kept for the orange warning after a named-script reply is left as-is.
 ///
-/// Only lines that contain kana are kept. Translation lines, and table rows
-/// whose cells have no kana, drop out. `・` and `ー` do not make a line count.
+/// A line with kana is kept. A line with no kana is dropped, so the translation
+/// itself is not listed. A markdown table row is split on `|` and each cell is
+/// judged alone: `| 当事者の義務 | 当事人的义务 |` warns only from the Japanese
+/// cell. `・` and `ー` do not count as kana.
 pub fn foreign_notice_text(prompt: &str, text: &str) -> String {
     if !names_foreign_script(prompt) {
         return text.to_string();
     }
-    text.split('\n')
-        .filter(|line| line_has_kana(line))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut kept = Vec::new();
+    for line in text.split('\n') {
+        if is_markdown_table_row(line) {
+            for cell in line.split('|') {
+                if line_has_kana(cell) {
+                    kept.push(cell);
+                }
+            }
+        } else if line_has_kana(line) {
+            kept.push(line);
+        }
+    }
+    kept.join("\n")
+}
+
+fn is_markdown_table_row(line: &str) -> bool {
+    line.matches('|').count() >= 2
 }
 
 /// Skip step 1 and step 2 for this whole reply.
@@ -1423,7 +1516,18 @@ mod tests {
         assert!(names_foreign_script("繁体字に直して"));
         assert!(names_foreign_script("ハングルで"));
         assert!(names_foreign_script("Please write this in Chinese"));
+        assert!(names_foreign_script("中国語で書いて"));
+        assert!(names_foreign_script("中国語で答えて"));
+        assert!(names_foreign_script("中文に翻訳"));
+        assert!(names_foreign_script("韓国語訳"));
+        assert!(names_foreign_script("into Chinese"));
+        assert!(names_foreign_script("in Korean"));
+        assert!(names_foreign_script("translate this to Chinese"));
         assert!(!names_foreign_script("翻訳会社との契約"));
+        assert!(!names_foreign_script("この中国語の契約書の要点を日本語で教えて"));
+        assert!(!names_foreign_script("中文版と日文版のどちらが優先？"));
+        assert!(!names_foreign_script("Chinese wall の運用は？"));
+        assert!(!names_foreign_script("中国語から日本語に訳して"));
         assert!(asks_generic_translation("和訳して"));
         assert!(asks_generic_translation("英訳"));
 
@@ -1475,6 +1579,27 @@ mod tests {
         assert!(company.content.contains('現'));
         assert!(!company.suppress_warning);
 
+        let source_doc = "要点は现在の解除条項です。甲は乙に対し通知します。";
+        let explained_in_japanese = correct_reply(
+            "この中国語の契約書の要点を日本語で教えて",
+            source_doc,
+            |_| panic!("mentioning 中国語 as the source still corrects"),
+        );
+        assert!(explained_in_japanese.content.contains('現'));
+        assert!(!explained_in_japanese.suppress_warning);
+        let which = correct_reply(
+            "中文版と日文版のどちらが優先？",
+            source_doc,
+            |_| panic!("中文版 does not name an output language"),
+        );
+        assert!(which.content.contains('現'));
+        let wall = correct_reply(
+            "Chinese wall の運用は？",
+            source_doc,
+            |_| panic!("Chinese wall does not name an output language"),
+        );
+        assert!(wall.content.contains('現'));
+
         let zh = "本合同自签订之日起生效，双方应当遵守本合同的全部条款并及时履行各自的义务。";
         let skipped = correct_reply("第1条を中国語に訳して\n第2条も同様に", zh, |_| {
             panic!("a Chinese follow-up stays uncorrected")
@@ -1508,6 +1633,10 @@ mod tests {
         let table = "| 当事者の義務 | 当事人的义务 |";
         let row = correct_reply("中国語に訳して", table, |_| panic!("a table row is not rewritten"));
         assert_eq!(row.content, table);
+        let cells = foreign_notice_text("中国語に訳して", table);
+        assert!(cells.contains("当事者の義務"));
+        assert!(!cells.contains('义'));
+        assert!(!cells.contains('务'));
 
         let same = format!("以下が第5条の中国語訳です。{chinese}");
         let paragraph = correct_reply("中国語に訳して", &same, |_| panic!("one paragraph stays"));

@@ -156,7 +156,18 @@ describe("applyHanMap", () => {
     expect(namesForeignScript("繁体字に直して")).toBe(true);
     expect(namesForeignScript("ハングルで")).toBe(true);
     expect(namesForeignScript("Please write this in Chinese")).toBe(true);
+    expect(namesForeignScript("中国語で書いて")).toBe(true);
+    expect(namesForeignScript("中国語で答えて")).toBe(true);
+    expect(namesForeignScript("中文に翻訳")).toBe(true);
+    expect(namesForeignScript("韓国語訳")).toBe(true);
+    expect(namesForeignScript("into Chinese")).toBe(true);
+    expect(namesForeignScript("in Korean")).toBe(true);
+    expect(namesForeignScript("translate this to Chinese")).toBe(true);
     expect(namesForeignScript("翻訳会社との契約")).toBe(false);
+    expect(namesForeignScript("この中国語の契約書の要点を日本語で教えて")).toBe(false);
+    expect(namesForeignScript("中文版と日文版のどちらが優先？")).toBe(false);
+    expect(namesForeignScript("Chinese wall の運用は？")).toBe(false);
+    expect(namesForeignScript("中国語から日本語に訳して")).toBe(false);
     expect(asksGenericTranslation("和訳して")).toBe(true);
     expect(asksGenericTranslation("Please translate this")).toBe(true);
     expect(asksGenericTranslation("契約を要約して")).toBe(false);
@@ -183,6 +194,16 @@ describe("applyHanMap", () => {
     );
     expect(foreignNoticeText("中国語に訳して", "・签订之日起生效")).toBe("");
     expect(foreignNoticeText("中国語に訳して", "ー签订之日起生效")).toBe("");
+    const table = "| 当事者の義務 | 当事人的义务 |";
+    const cells = foreignNoticeText("中国語に訳して", table);
+    expect(cells).toContain("当事者の義務");
+    expect(cells).not.toContain("义");
+    expect(cells).not.toContain("务");
+    expect(shouldSkipForeignFix("この中国語の契約書の要点を日本語で教えて", japanese)).toBe(
+      false,
+    );
+    expect(shouldSkipForeignFix("中文版と日文版のどちらが優先？", japanese)).toBe(false);
+    expect(shouldSkipForeignFix("Chinese wall の運用は？", japanese)).toBe(false);
     expect(applyHanMap("谭")).toBe("譚");
     expect(applyHanMap("岗")).toBe("崗");
     expect(applyHanMap("岗")).not.toBe("岡");
