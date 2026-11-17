@@ -1966,6 +1966,146 @@ fn an_attached_original_stays_put_while_follow_ups_stack() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn alternating_originals_keep_their_own_edited_files() {
+    let (dir, db, thread) = open_chat("alternate");
+    let out = dir.join(super::OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let contract = out.join("契約書.docx");
+    let exhibit = out.join("別紙.docx");
+    write_zip(
+        &contract,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>甲乙丙</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    write_zip(
+        &exhibit,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>一二</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let contract_bytes = fs::read(&contract).unwrap();
+    let exhibit_bytes = fs::read(&exhibit).unwrap();
+
+    let first = edit_named(&db, &dir, &thread, "契約書.docx", "甲", "丁");
+    let other = edit_named(&db, &dir, &thread, "別紙.docx", "一", "壱");
+    assert_ne!(first.path, other.path);
+    let third = edit_named(&db, &dir, &thread, "契約書.docx", "乙", "戊");
+    assert_eq!(third.path, first.path);
+    assert!(
+        third.report.contains(&format!(
+            "前回の編集済みファイル「{}」を編集した",
+            first.filename
+        )),
+        "{}",
+        third.report
+    );
+    assert!(read_entry(&first.path, "word/document.xml").contains("丁戊丙"));
+    assert!(read_entry(&other.path, "word/document.xml").contains("壱二"));
+    assert_eq!(fs::read(&contract).unwrap(), contract_bytes);
+    assert_eq!(fs::read(&exhibit).unwrap(), exhibit_bytes);
+    let contract_edits: Vec<_> = edited_names(&out)
+        .into_iter()
+        .filter(|name| name.starts_with("契約書_編集済み"))
+        .collect();
+    assert_eq!(contract_edits, vec![first.filename.clone()]);
+    let recorded = db.list_llm_office_edits(&thread).unwrap();
+    assert_eq!(
+        recorded.last().map(|row| row.output_name.as_str()),
+        Some(first.filename.as_str())
+    );
+
+    let by_name = edit_named(&db, &dir, &thread, &first.filename, "丙", "己");
+    assert_eq!(by_name.filename, first.filename);
+    assert!(read_entry(&first.path, "word/document.xml").contains("丁戊己"));
+    let again = edit_named(&db, &dir, &thread, "契約書.docx", "丁", "庚");
+    assert_eq!(again.path, first.path);
+    assert!(read_entry(&first.path, "word/document.xml").contains("庚戊己"));
+    assert_eq!(fs::read(&contract).unwrap(), contract_bytes);
+    assert_eq!(
+        db.list_llm_office_edits(&thread)
+            .unwrap()
+            .last()
+            .map(|row| row.output_name.clone()),
+        Some(first.filename)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fresh_starts_from_the_original_and_a_miss_names_the_edited_file() {
+    let (dir, db, thread) = open_chat("fresh");
+    let out = dir.join(super::OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let original = out.join("契約書.docx");
+    write_zip(
+        &original,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>甲乙</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let original_bytes = fs::read(&original).unwrap();
+    let first = edit_named(&db, &dir, &thread, "契約書.docx", "甲", "丁");
+    let kept = fs::read(&first.path).unwrap();
+
+    let missed = super::edit_in_thread(
+        &db,
+        &dir,
+        "",
+        &thread,
+        &json!({
+            "filename": "契約書.docx",
+            "replacements": [{"find": "いない", "replace": "誰か"}],
+            "paragraphs": []
+        }),
+    )
+    .unwrap_err();
+    assert!(
+        missed.contains(&format!(
+            "前回の編集済みファイル「{}」で探したが見つからなかった。元の版から作り直すには fresh を指定する",
+            first.filename
+        )),
+        "{missed}"
+    );
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    assert_eq!(fs::read(&first.path).unwrap(), kept);
+
+    let restarted = super::edit_in_thread(
+        &db,
+        &dir,
+        "",
+        &thread,
+        &json!({
+            "filename": "契約書.docx",
+            "fresh": true,
+            "replacements": [{"find": "乙", "replace": "戊"}],
+            "paragraphs": []
+        }),
+    )
+    .unwrap();
+    assert_ne!(restarted.path, first.path);
+    assert!(
+        !restarted.report.contains("を編集した"),
+        "{}",
+        restarted.report
+    );
+    assert!(read_entry(&restarted.path, "word/document.xml").contains("甲戊"));
+    assert!(!read_entry(&restarted.path, "word/document.xml").contains("丁"));
+    assert_eq!(fs::read(&first.path).unwrap(), kept);
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+
+    let stacked = edit_named(&db, &dir, &thread, "契約書.docx", "甲", "己");
+    assert_eq!(stacked.path, restarted.path);
+    assert!(read_entry(&restarted.path, "word/document.xml").contains("己戊"));
+    assert_eq!(fs::read(&first.path).unwrap(), kept);
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn open_chat(label: &str) -> (PathBuf, crate::db::Db, String) {
     let dir = temp_dir(label);
     let db = crate::db::Db::open(&dir.join("argos.db")).unwrap();

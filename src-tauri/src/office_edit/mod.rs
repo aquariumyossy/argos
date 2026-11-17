@@ -205,8 +205,37 @@ pub(crate) fn edit_in_thread(
     let edits = db
         .list_llm_office_edits(thread_id)
         .map_err(|err| format!("編集の記録を読めません（{err}）。"))?;
-    let (read_path, overwrite) = edit_target(&requested, &output_dir, &prior, &edits);
-    let mut outcome = edit_path_mode(&read_path, &output_dir, &stamp, &request, overwrite)?;
+    let fresh = args.get("fresh").and_then(|value| value.as_bool()) == Some(true);
+    let (read_path, overwrite) = if fresh {
+        (requested.clone(), false)
+    } else {
+        edit_target(&requested, &output_dir, &prior, &edits)
+    };
+    let redirected = !fresh && !same_file(&requested, &read_path);
+    let edited_name = read_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut outcome = match edit_path_mode(&read_path, &output_dir, &stamp, &request, overwrite) {
+        Ok(outcome) => outcome,
+        Err(message) if redirected && message.contains("見つかりません") => {
+            return Err(format!(
+                "前回の編集済みファイル「{edited_name}」で探したが見つからなかった。元の版から作り直すには fresh を指定する\n{message}"
+            ));
+        }
+        Err(message) if redirected => {
+            return Err(format!(
+                "前回の編集済みファイル「{edited_name}」を対象にしました。\n{message}"
+            ));
+        }
+        Err(message) => return Err(message),
+    };
+    if redirected {
+        outcome.report.insert_str(
+            0,
+            &format!("前回の編集済みファイル「{edited_name}」を編集した\n"),
+        );
+    }
     if let Err(err) = remember_office_edit(db, thread_id, &requested, &read_path, &outcome) {
         outcome
             .report
@@ -1389,8 +1418,9 @@ pub(crate) fn replaces_chat_output(src: &Path, output_dir: &Path, prior: &[(&str
 
 /// Where to read, and whether to write back over that file.
 ///
-/// Passing this chat's latest edited file, or the original that file was made
-/// from, updates that edited file. Anything else starts a new file.
+/// Passing one of this chat's edited files updates that file. Passing an
+/// original updates the newest edited file still on disk that was made from it.
+/// A newer edit of a different original does not hide that file.
 fn edit_target(
     requested: &Path,
     output_dir: &Path,
@@ -1408,14 +1438,15 @@ fn edit_target(
             return (requested.to_path_buf(), true);
         }
     }
-    if let Some(latest) = edits.last() {
-        let source = Path::new(&latest.source_path);
-        let output = output_dir.join(&latest.output_name);
-        if latest.output_name.contains(EDIT_MARK)
-            && output.is_file()
-            && same_file(requested, source)
-            && !same_file(requested, &output)
-        {
+    for edit in edits.iter().rev() {
+        if !edit.output_name.contains(EDIT_MARK) {
+            continue;
+        }
+        let output = output_dir.join(&edit.output_name);
+        if !output.is_file() || same_file(requested, &output) {
+            continue;
+        }
+        if same_file(requested, Path::new(&edit.source_path)) {
             return (output, true);
         }
     }
