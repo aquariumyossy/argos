@@ -401,9 +401,32 @@ export function hasEnoughKana(text: string): boolean {
   return kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters;
 }
 
+/** One line of a requested translation: foreign letters and almost no kana. */
+export function lineIsForeignTranslation(line: string): boolean {
+  let foreign = false;
+  for (const ch of line) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isForeignScript(cp) || (isCjkIdeograph(cp) && !isJapaneseHan(cp))) {
+      foreign = true;
+      break;
+    }
+  }
+  return foreign && !hasEnoughKana(line);
+}
+
+/** Drop translation lines when a target script was named. Other lines stay. */
+export function foreignNoticeText(prompt: string, text: string): string {
+  if (!namesForeignScript(prompt)) return text;
+  return text
+    .split("\n")
+    .filter((line) => !lineIsForeignTranslation(line))
+    .join("\n");
+}
+
 /**
- * Named script skips only a reply with almost no kana. Generic translation
- * words skip only a mostly-foreign reply. Enough kana keeps the correction.
+ * Named script skips a reply that has almost no kana. A mixed reply is judged
+ * per line. Generic translation words skip only a mostly-foreign reply.
+ * Enough kana keeps the correction.
  */
 export function shouldSkipForeignFix(prompt: string, text: string): boolean {
   if (hasEnoughKana(text)) return false;

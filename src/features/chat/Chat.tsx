@@ -28,8 +28,9 @@ import {
   hanMapNote,
   HAN_REWRITE_NOTE,
   HAN_REWRITE_STOPPED_NOTE,
+  foreignNoticeText,
   parseScriptFix,
-  recentShouldSkipForeignFix,
+  recentUserText,
 } from "./japaneseHan";
 import { OfficeFileCards } from "./OfficeFileCard";
 import { HtmlPreviews } from "./HtmlPreview";
@@ -491,17 +492,22 @@ function ForeignReplyFoot({
   toolCalls,
   originalContent,
   scriptFix,
+  userText,
 }: {
   content: string;
   toolCalls?: string;
   originalContent?: string;
   scriptFix?: string;
+  /** Recent user turns, so a requested translation is not warned about. */
+  userText?: string;
 }) {
   const fix = parseScriptFix(scriptFix);
   const mapNote = hanMapNote(fix?.fixes ?? []);
   const rewriteNote = fix?.rewritten ? HAN_REWRITE_NOTE : null;
   const stoppedNote = fix?.rewriteStopped ? HAN_REWRITE_STOPPED_NOTE : null;
-  const warning = fix?.suppressWarning ? null : foreignReplyNotice(content, toolCalls);
+  const warning = fix?.suppressWarning
+    ? null
+    : foreignReplyNotice(foreignNoticeText(userText ?? "", content), toolCalls);
   const original = (originalContent ?? "").trim();
   if (!mapNote && !rewriteNote && !stoppedNote && !warning && !original) return null;
   return (
@@ -1048,8 +1054,9 @@ export default function Chat() {
 
   const viewingLive = live && active?.id === live.threadId ? live : null;
   const stream = viewingLive?.stream ?? "";
-  const streamNotice =
-    stream && !recentShouldSkipForeignFix(messages, stream) ? foreignReplyNotice(stream) : null;
+  const streamNotice = stream
+    ? foreignReplyNotice(foreignNoticeText(recentUserText(messages), stream))
+    : null;
   const thinking = viewingLive?.thinking ?? "";
   const toolHint = viewingLive?.toolHint ?? "";
   const status = viewingLive?.status ?? "";
@@ -2342,7 +2349,7 @@ export default function Chat() {
               検索やノートの「チャット」から出典を送るか、ファイルを添付して会話できます。出典なしでも、設定の「ローカルLLM」に接続して会話できます。足りない資料はモデルがインデックスを検索することもあります。
             </p>
           ) : (
-            messages.map((m) => {
+            messages.map((m, index) => {
               const cites =
                 m.role === "assistant" ? citedForMessage(sources, m.id) : [];
               const citeGroups = groupSources(cites);
@@ -2430,6 +2437,7 @@ export default function Chat() {
                           toolCalls={m.toolCalls}
                           originalContent={m.originalContent}
                           scriptFix={m.scriptFix}
+                          userText={recentUserText(messages.slice(0, index))}
                         />
                       )}
                       {cards.length > 0 ? (
