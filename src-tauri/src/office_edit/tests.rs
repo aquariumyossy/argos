@@ -2066,7 +2066,7 @@ fn fresh_starts_from_the_original_and_a_miss_names_the_edited_file() {
     .unwrap_err();
     assert!(
         missed.contains(&format!(
-            "前回の編集済みファイル「{}」で探したが見つからなかった。元の版から作り直すには fresh を指定する",
+            "前回の編集済みファイル「{}」の中を探したが、指定した文字列は見つからなかった。fresh は、利用者が元の版からやり直すと頼んだときだけ指定する。",
             first.filename
         )),
         "{missed}"
@@ -2101,6 +2101,43 @@ fn fresh_starts_from_the_original_and_a_miss_names_the_edited_file() {
     let stacked = edit_named(&db, &dir, &thread, "契約書.docx", "甲", "己");
     assert_eq!(stacked.path, restarted.path);
     assert!(read_entry(&restarted.path, "word/document.xml").contains("己戊"));
+    assert_eq!(fs::read(&first.path).unwrap(), kept);
+    assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fresh_string_true_starts_from_the_original() {
+    let (dir, db, thread) = open_chat("fresh-string");
+    let out = dir.join(super::OUTPUT_DIR_NAME);
+    fs::create_dir_all(&out).unwrap();
+    let original = out.join("別紙.docx");
+    write_zip(
+        &original,
+        &[(
+            "word/document.xml",
+            word_body(r#"<w:p><w:r><w:t>甲</w:t></w:r></w:p>"#).as_str(),
+        )],
+    );
+    let original_bytes = fs::read(&original).unwrap();
+    let first = edit_named(&db, &dir, &thread, "別紙.docx", "甲", "乙");
+    let kept = fs::read(&first.path).unwrap();
+    let restarted = super::edit_in_thread(
+        &db,
+        &dir,
+        "",
+        &thread,
+        &json!({
+            "filename": "別紙.docx",
+            "fresh": "true",
+            "replacements": [{"find": "甲", "replace": "丙"}],
+            "paragraphs": []
+        }),
+    )
+    .unwrap();
+    assert_ne!(restarted.path, first.path);
+    assert!(read_entry(&restarted.path, "word/document.xml").contains("丙"));
+    assert!(!read_entry(&restarted.path, "word/document.xml").contains("乙"));
     assert_eq!(fs::read(&first.path).unwrap(), kept);
     assert_eq!(fs::read(&original).unwrap(), original_bytes);
     let _ = fs::remove_dir_all(&dir);

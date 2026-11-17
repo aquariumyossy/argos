@@ -205,7 +205,7 @@ pub(crate) fn edit_in_thread(
     let edits = db
         .list_llm_office_edits(thread_id)
         .map_err(|err| format!("編集の記録を読めません（{err}）。"))?;
-    let fresh = args.get("fresh").and_then(|value| value.as_bool()) == Some(true);
+    let fresh = arg_bool(args.get("fresh"));
     let (read_path, overwrite) = if fresh {
         (requested.clone(), false)
     } else {
@@ -220,7 +220,7 @@ pub(crate) fn edit_in_thread(
         Ok(outcome) => outcome,
         Err(message) if redirected && message.contains("見つかりません") => {
             return Err(format!(
-                "前回の編集済みファイル「{edited_name}」で探したが見つからなかった。元の版から作り直すには fresh を指定する\n{message}"
+                "前回の編集済みファイル「{edited_name}」の中を探したが、指定した文字列は見つからなかった。fresh は、利用者が元の版からやり直すと頼んだときだけ指定する。\n{message}"
             ));
         }
         Err(message) if redirected => {
