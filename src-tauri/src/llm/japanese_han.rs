@@ -276,9 +276,15 @@ mod tests {
 
     #[test]
     fn flags_simplified_chinese_that_is_not_japanese_running_text() {
-        assert_eq!(chars("这个合同的问题"), vec!['这', '个', '问', '题']);
+        // 个 is a JIS X 0208 kanji, so it stays. 这问题 are not.
+        assert_eq!(chars("这个合同的问题"), vec!['这', '问', '题']);
         assert_eq!(chars("门发经问题"), vec!['门', '发', '经', '问', '题']);
-        assert_eq!(chars("为了对从开关"), vec!['为', '对', '从', '开', '关']);
+        // 从 is JIS X 0208. The other simplified forms are not.
+        assert_eq!(chars("为了对从开关"), vec!['为', '对', '开', '关']);
+        assert_eq!(
+            chars("们这说话门问题"),
+            vec!['们', '这', '说', '话', '门', '问', '题']
+        );
     }
 
     #[test]
@@ -314,8 +320,12 @@ mod tests {
         assert!(chars("侠客の躯を掴み、麹と蝉と泪").is_empty());
         assert!(is_japanese_han('嘘' as u32));
         assert!(is_japanese_han('噓' as u32));
-        assert!(!is_japanese_han('个' as u32));
         assert!(is_japanese_han('個' as u32));
+        // These look simplified and are still JIS X 0208.
+        assert!(is_japanese_han('个' as u32));
+        assert!(is_japanese_han('无' as u32));
+        assert!(is_japanese_han('从' as u32));
+        assert!(is_japanese_han('广' as u32));
     }
 
     #[test]
@@ -328,7 +338,7 @@ mod tests {
 
     #[test]
     fn dedupes_in_first_seen_order() {
-        assert_eq!(foreign_chars(&["这这", "个这"]), vec!['这', '个']);
+        assert_eq!(foreign_chars(&["这这", "问这"]), vec!['这', '问']);
     }
 
     #[test]
@@ -336,7 +346,7 @@ mod tests {
         assert!(foreign_char_notice(&["条項を点検しました。"]).is_none());
         assert_eq!(
             foreign_char_notice(&["这个条款。"]).as_deref(),
-            Some("日本語で用いない文字: 这、个")
+            Some("日本語で用いない文字: 这")
         );
         assert_eq!(
             foreign_char_notice(&["主張 기타 クレーム"]).as_deref(),
@@ -403,5 +413,72 @@ mod tests {
             foreign_char_tool_error("search_index", &json!({"query": "最高人民法院"})).is_none()
         );
         assert!(foreign_char_tool_error("read_unit", &json!({"articles": "这个"})).is_none());
+    }
+
+    #[test]
+    fn jis_x_0208_and_cp932_kanji_and_tsuchi_yoshi_are_allowed() {
+        // encoding_rs SHIFT_JIS is Windows-31J (cp932). Python's shift_jis
+        // kanji are a subset of that set, so this covers JIS X 0208 as well.
+        let mut count = 0u32;
+        let leads = (0x81u8..0xA0).chain(0xE0u8..0xFD);
+        let seconds = (0x40u8..0x7F).chain(0x80u8..0xFD);
+        for lead in leads {
+            for second in seconds.clone() {
+                let bytes = [lead, second];
+                let (text, _, failed) = encoding_rs::SHIFT_JIS.decode(&bytes);
+                if failed {
+                    continue;
+                }
+                let mut chars_in = text.chars();
+                let Some(ch) = chars_in.next() else {
+                    continue;
+                };
+                if chars_in.next().is_some() || !is_cjk_ideograph(ch as u32) {
+                    continue;
+                }
+                assert!(
+                    is_japanese_han(ch as u32),
+                    "U+{:04X} {ch} from CP932 {:02X}{:02X}",
+                    ch as u32,
+                    lead,
+                    second
+                );
+                count += 1;
+            }
+        }
+        assert!(count >= 6_356, "JIS X 0208 has 6356 kanji, saw {count}");
+        assert!(count >= 6_716, "CP932 has 6716 kanji, saw {count}");
+        assert!(is_japanese_han(0x9AD9), "髙");
+        assert!(is_japanese_han(0x20BB7), "𠮷");
+        assert!(chars("髙橋𠮷田姜砺薮").is_empty());
+        for ch in ['们', '这', '说', '话', '门', '问', '题'] {
+            assert!(!is_japanese_han(ch as u32), "{ch}");
+        }
+        assert_eq!(chars("기타"), vec!['기', '타']);
+    }
+
+    #[test]
+    fn typescript_allowlist_matches_the_rust_one() {
+        let ts = include_str!("../../../src/features/chat/japaneseHanData.ts");
+        let a = quoted_after(ts, "HAN_BMP_A =");
+        let b = quoted_after(ts, "HAN_BMP_B =");
+        assert_eq!(a, super::japanese_han_data::HAN_BMP_A);
+        assert_eq!(b, super::japanese_han_data::HAN_BMP_B);
+        let start = ts.find("HAN_EXTRA = [").unwrap();
+        let end = ts[start..].find("];").unwrap();
+        let nums: Vec<u32> = ts[start..start + end]
+            .split(|ch: char| !ch.is_ascii_digit())
+            .filter(|item| !item.is_empty())
+            .map(|item| item.parse().unwrap())
+            .collect();
+        assert_eq!(nums, super::japanese_han_data::HAN_EXTRA);
+    }
+
+    fn quoted_after<'a>(text: &'a str, marker: &str) -> &'a str {
+        let from = text.find(marker).unwrap() + marker.len();
+        let rest = text[from..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap();
+        let end = rest.find('"').unwrap();
+        &rest[..end]
     }
 }
