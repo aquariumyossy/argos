@@ -1,5 +1,6 @@
-//! Edit cell text and sheet names. Styles, columns, and formulas stay in place
-//! except sheet-name references, which follow a renamed sheet.
+//! Edit cell text, numeric cell values, and sheet names. Styles and columns stay
+//! in place. Formula cells are left unchanged, except sheet-name references,
+//! which follow a renamed sheet.
 
 use std::collections::HashMap;
 
@@ -38,6 +39,9 @@ struct Cell {
     coord: String,
     typ: String,
     value: String,
+    /// Byte range of the first `<v>` inner text in the sheet XML.
+    value_span: Option<(usize, usize)>,
+    formula: bool,
     inline_at: Option<usize>,
 }
 
@@ -167,10 +171,25 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
             entries[index].1 = render_nodes(&story.xml, &story.nodes).into_bytes();
         }
     }
+    let mut numeric_changed = false;
     for sheet in sheets {
         let mut xml = render_nodes(&sheet.story.xml, &sheet.story.nodes);
         xml = rewrite_formula_parts(&xml, &renames);
+        let (next, wrote) = replace_numeric_values(&xml, &sheet.name, req, &mut stats);
+        xml = next;
+        numeric_changed |= wrote;
         entries[sheet.entry].1 = xml.into_bytes();
+    }
+    // A numeric write can make a cached formula result stale. fullCalcOnLoad asks
+    // Excel to recalculate on open. The calc chain is left as-is: dropping
+    // xl/calcChain.xml would also require its relationship and content type,
+    // and Excel rebuilds the chain when it recalculates.
+    if numeric_changed {
+        if let Some(index) = workbook_entry {
+            if let Some(xml) = decode_xml_bytes(&entries[index].1) {
+                entries[index].1 = ensure_full_calc_on_load(&xml).into_bytes();
+            }
+        }
     }
     super::edit_doc_props(entries, req, &mut stats);
     fill_near_misses(entries, &mut stats);
@@ -270,19 +289,29 @@ fn push_text(texts: &mut Vec<(String, String)>, text: String, location: &str) {
 
 fn apply_replacements(story: &mut Story, req: &EditRequest, stats: &mut ChangeStats) {
     for group in story.groups.clone() {
+        let visible = unlocked(&story.nodes, &group.visible);
+        let deleted = unlocked(&story.nodes, &group.deleted);
         for (index, item) in req.replacements.iter().enumerate() {
             super::record_hit(
                 stats,
                 index,
-                replace_in_group(&mut story.nodes, &group.visible, &item.find, &item.replace),
+                replace_in_group(&mut story.nodes, &visible, &item.find, &item.replace),
             );
             super::record_hit(
                 stats,
                 index,
-                replace_in_group(&mut story.nodes, &group.deleted, &item.find, &item.replace),
+                replace_in_group(&mut story.nodes, &deleted, &item.find, &item.replace),
             );
         }
     }
+}
+
+fn unlocked(nodes: &[TextNode], indexes: &[usize]) -> Vec<usize> {
+    indexes
+        .iter()
+        .copied()
+        .filter(|&index| nodes[index].locked.is_none())
+        .collect()
 }
 
 fn rename_sheets(
@@ -681,7 +710,7 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
                             );
                         }
                     }
-                } else if cell.typ == "str" {
+                } else if cell.typ == "str" && !cell.formula {
                     for probe in probes {
                         push_leftover(
                             &mut leftovers,
@@ -874,8 +903,14 @@ fn worksheet_cells(xml: &str) -> Vec<Cell> {
                 coord: attr_local_value(raw, "r").unwrap_or_else(|| "セル".into()),
                 typ: attr_local_value(raw, "t").unwrap_or_default(),
                 value: String::new(),
+                value_span: None,
+                formula: false,
                 inline_at: None,
             });
+        } else if !tag.is_end && tag.local == "f" {
+            if let Some(cell) = open.as_mut() {
+                cell.formula = true;
+            }
         } else if !tag.is_end && tag.local == "is" && !tag.is_self {
             if let Some(cell) = open.as_mut() {
                 cell.inline_at = Some(inline_count);
@@ -886,7 +921,10 @@ fn worksheet_cells(xml: &str) -> Vec<Cell> {
             if let Some(rel) = xml[tag.end..].find(&close) {
                 let text = super::xmlscan::unescape_text(&xml[tag.end..tag.end + rel]);
                 if let Some(cell) = open.as_mut() {
-                    cell.value = text;
+                    if cell.value_span.is_none() {
+                        cell.value = text;
+                        cell.value_span = Some((tag.end, tag.end + rel));
+                    }
                 }
                 pos = tag.end + rel + close.len();
                 continue;
@@ -895,6 +933,181 @@ fn worksheet_cells(xml: &str) -> Vec<Cell> {
         pos = tag.end;
     }
     cells
+}
+
+/// Replace numeric `<v>` values in place. The first matching replacement wins.
+/// A formula cell is never written, even when its cached value matches.
+fn replace_numeric_values(
+    xml: &str,
+    sheet: &str,
+    req: &EditRequest,
+    stats: &mut ChangeStats,
+) -> (String, bool) {
+    let cells = worksheet_cells(xml);
+    let mut edits = Vec::new();
+    for cell in cells {
+        if cell.formula {
+            if req
+                .replacements
+                .iter()
+                .any(|item| formula_value_matches(&cell, &item.find))
+            {
+                stats.notes.push(format!(
+                    "シート「{sheet}」セル {} は計算式のセルなので変えていない。",
+                    cell.coord
+                ));
+            }
+            continue;
+        }
+        if cell.typ != "n" && !cell.typ.is_empty() {
+            continue;
+        }
+        let Some(span) = cell.value_span else {
+            continue;
+        };
+        let Some(current) = normalize_number(&cell.value) else {
+            continue;
+        };
+        for (index, item) in req.replacements.iter().enumerate() {
+            let Some(find) = normalize_number(&item.find) else {
+                continue;
+            };
+            if find != current {
+                continue;
+            }
+            match normalize_number(&item.replace) {
+                Some(value) => {
+                    edits.push((span.0, span.1, format_plain_number(value)));
+                    super::record_hit(
+                        stats,
+                        index,
+                        ReplaceHit {
+                            count: 1,
+                            exact: 1,
+                            sources: Vec::new(),
+                        },
+                    );
+                }
+                None => {
+                    stats.notes.push(format!(
+                        "シート「{sheet}」セル {} は数値のセルですが、「{}」は数値として書けないので変えていません。",
+                        cell.coord, item.replace
+                    ));
+                }
+            }
+            break;
+        }
+    }
+    if edits.is_empty() {
+        return (xml.to_string(), false);
+    }
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut out = xml.to_string();
+    for (start, end, value) in edits {
+        out.replace_range(start..end, &value);
+    }
+    (out, true)
+}
+
+fn formula_value_matches(cell: &Cell, find: &str) -> bool {
+    if find.is_empty() || cell.typ == "s" || cell.typ == "inlineStr" {
+        return false;
+    }
+    if let (Some(value), Some(target)) = (normalize_number(&cell.value), normalize_number(find)) {
+        if value == target {
+            return true;
+        }
+    }
+    cell.typ == "str" && cell.value.contains(find)
+}
+
+/// Drop thousands separators and yen signs, and fold full-width digits.
+/// Anything else (including 円) means this is not a pure number.
+fn normalize_number(raw: &str) -> Option<f64> {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_whitespace() || matches!(ch, ',' | '，' | '¥' | '￥') {
+            continue;
+        }
+        let mapped = match ch {
+            '０'..='９' => char::from_u32(u32::from('0') + (u32::from(ch) - u32::from('０')))?,
+            '．' => '.',
+            '＋' => '+',
+            '－' | '−' => '-',
+            _ => ch,
+        };
+        out.push(mapped);
+    }
+    if out.is_empty()
+        || !out
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-' | 'e' | 'E'))
+    {
+        return None;
+    }
+    let value = out.parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
+}
+
+fn format_plain_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < (1i64 << 53) as f64 {
+        return (value as i64).to_string();
+    }
+    value.to_string()
+}
+
+fn ensure_full_calc_on_load(xml: &str) -> String {
+    let mut found = false;
+    let mut out = String::new();
+    let mut pos = 0usize;
+    while let Some(tag) = next_tag(xml, pos) {
+        out.push_str(&xml[pos..tag.start]);
+        if !tag.is_end && tag.local == "calcPr" {
+            found = true;
+            out.push_str(&with_full_calc(&xml[tag.start..tag.end]));
+        } else {
+            out.push_str(&xml[tag.start..tag.end]);
+        }
+        pos = tag.end;
+    }
+    out.push_str(&xml[pos..]);
+    if found {
+        return out;
+    }
+    if let Some(at) = out.rfind("</workbook>") {
+        let mut next = String::new();
+        next.push_str(&out[..at]);
+        next.push_str("<calcPr fullCalcOnLoad=\"1\"/>");
+        next.push_str(&out[at..]);
+        return next;
+    }
+    out
+}
+
+fn with_full_calc(tag: &str) -> String {
+    const KEY: &str = "fullCalcOnLoad=";
+    if let Some(start) = tag.find(KEY) {
+        let rest = &tag[start + KEY.len()..];
+        let quote = rest.chars().next().unwrap_or('"');
+        if quote == '"' || quote == '\'' {
+            if let Some(end_rel) = rest[quote.len_utf8()..].find(quote) {
+                let value_start = start + KEY.len() + quote.len_utf8();
+                let value_end = value_start + end_rel;
+                let mut out = String::new();
+                out.push_str(&tag[..value_start]);
+                out.push('1');
+                out.push_str(&tag[value_end..]);
+                return out;
+            }
+        }
+    }
+    if let Some(stripped) = tag.strip_suffix("/>") {
+        return format!("{stripped} fullCalcOnLoad=\"1\"/>");
+    }
+    if let Some(stripped) = tag.strip_suffix('>') {
+        return format!("{stripped} fullCalcOnLoad=\"1\">");
+    }
+    tag.to_string()
 }
 
 fn read_sheet_names(xml: &str) -> Vec<(String, String)> {

@@ -2790,3 +2790,205 @@ fn revision_author_matching_the_find_is_not_rewritten() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn write_inventory_xlsx(path: &Path, sheet: &str, workbook_body: &str) {
+    let workbook = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="在庫" sheetId="1" r:id="rId1"/></sheets>{workbook_body}</workbook>"#
+    );
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+    let shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2"><si><t>山田太郎</t></si><si><t>849995</t></si></sst>"#;
+    let chain = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<calcChain xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><c r="C1" i="1" l="1"/></calcChain>"#;
+    write_zip(
+        path,
+        &[
+            ("xl/workbook.xml", workbook.as_str()),
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/sharedStrings.xml", shared),
+            ("xl/calcChain.xml", chain),
+            ("xl/worksheets/sheet1.xml", sheet),
+        ],
+    );
+}
+
+#[test]
+fn xlsx_replaces_numeric_cells_ignoring_commas_and_yen() {
+    let dir = temp_dir("xlsx-num");
+    let src = dir.join("在庫.xlsx");
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>849995</v></c><c r="B1" t="n"><v>1232</v></c><c r="C1"><f>A1+1</f><v>849995</v></c><c r="D1" t="s"><v>1</v></c><c r="E1" t="str"><f>T("山田太郎")</f><v>山田太郎</v></c><c r="F1" t="s"><v>0</v></c><c r="G1" t="inlineStr"><is><t>備考</t></is></c></row></sheetData></worksheet>"#;
+    write_inventory_xlsx(
+        &src,
+        sheet,
+        r#"<calcPr calcMode="auto" fullCalcOnLoad="0"/>"#,
+    );
+    let chain_before = read_entry(&src, "xl/calcChain.xml");
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-17 06-10-00",
+        &request(
+            &[
+                ("¥849,995", "¥1,000"),
+                ("￥１，２３２", "2,000"),
+                ("山田太郎", "佐藤花子"),
+            ],
+            &[],
+        ),
+    )
+    .unwrap();
+    let sheet = read_entry(&edited.path, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(r#"<c r="A1"><v>1000</v></c>"#), "{sheet}");
+    assert!(
+        sheet.contains(r#"<c r="B1" t="n"><v>2000</v></c>"#),
+        "{sheet}"
+    );
+    assert!(!sheet.contains("t=\"s\"><v>1000</v>"), "{sheet}");
+    assert!(
+        sheet.contains(r#"<c r="C1"><f>A1+1</f><v>849995</v></c>"#),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains(r#"<c r="E1" t="str"><f>T("山田太郎")</f><v>山田太郎</v></c>"#),
+        "{sheet}"
+    );
+    assert!(sheet.contains("<t>備考</t>"), "{sheet}");
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(shared.contains("<t>佐藤花子</t>"), "{shared}");
+    assert!(shared.contains("<t>849995</t>"), "{shared}");
+    assert!(!shared.contains("山田太郎"), "{shared}");
+    let workbook = read_entry(&edited.path, "xl/workbook.xml");
+    assert!(workbook.contains("fullCalcOnLoad=\"1\""), "{workbook}");
+    assert!(!workbook.contains("fullCalcOnLoad=\"0\""), "{workbook}");
+    assert_eq!(read_entry(&edited.path, "xl/calcChain.xml"), chain_before);
+    assert!(
+        edited
+            .report
+            .contains("シート「在庫」セル C1 は計算式のセルなので変えていない。"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("シート「在庫」セル E1 は計算式のセルなので変えていない。"),
+        "{}",
+        edited.report
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_inserts_full_calc_on_load_when_calc_pr_is_missing() {
+    let dir = temp_dir("xlsx-calc");
+    let src = dir.join("在庫.xlsx");
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>849995</v></c></row></sheetData></worksheet>"#;
+    write_inventory_xlsx(&src, sheet, "");
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-17 06-11-00",
+        &request(&[("849,995", "1000")], &[]),
+    )
+    .unwrap();
+    let sheet = read_entry(&edited.path, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("<v>1000</v>"), "{sheet}");
+    assert!(!sheet.contains("t=\"s\""), "{sheet}");
+    let workbook = read_entry(&edited.path, "xl/workbook.xml");
+    assert!(
+        workbook.contains("<calcPr fullCalcOnLoad=\"1\"/></workbook>"),
+        "{workbook}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_skips_a_numeric_cell_when_the_replacement_is_not_a_number() {
+    let dir = temp_dir("xlsx-nan");
+    let src = dir.join("在庫.xlsx");
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="B1" t="n"><v>1232</v></c></row></sheetData></worksheet>"#;
+    write_inventory_xlsx(&src, sheet, "<calcPr calcMode=\"auto\"/>");
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-17 06-12-00",
+        &request(&[("1,232", "メモ")], &[]),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("シート「在庫」セル B1 は数値のセルですが、「メモ」は数値として書けないので変えていません。"),
+        "{err}"
+    );
+    let sheet = read_entry(&src, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("<v>1232</v>"), "{sheet}");
+    let workbook = read_entry(&src, "xl/workbook.xml");
+    assert!(!workbook.contains("fullCalcOnLoad"), "{workbook}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_reports_a_formula_cell_when_nothing_else_changes() {
+    let dir = temp_dir("xlsx-formula");
+    let src = dir.join("在庫.xlsx");
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="C1"><f>A1+1</f><v>849995</v></c></row></sheetData></worksheet>"#;
+    write_inventory_xlsx(&src, sheet, "<calcPr calcMode=\"auto\"/>");
+    let err = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-17 06-13-00",
+        &request(&[("￥849,995", "1000")], &[]),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("シート「在庫」セル C1 は計算式のセルなので変えていない。"),
+        "{err}"
+    );
+    let sheet = read_entry(&src, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains(r#"<f>A1+1</f><v>849995</v>"#), "{sheet}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xlsx_numeric_match_is_the_whole_cell_and_strings_stay() {
+    let dir = temp_dir("xlsx-whole");
+    let src = dir.join("在庫.xlsx");
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>849995</v></c><c r="F1" t="s"><v>0</v></c></row></sheetData></worksheet>"#;
+    let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="在庫" sheetId="1" r:id="rId1"/></sheets><calcPr calcMode="auto"/></workbook>"#;
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+    let shared = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>山田太郎</t></si></sst>"#;
+    write_zip(
+        &src,
+        &[
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/sharedStrings.xml", shared),
+            ("xl/worksheets/sheet1.xml", sheet),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-17 06-14-00",
+        &request(&[("995", "1"), ("山田太郎", "佐藤花子")], &[]),
+    )
+    .unwrap();
+    let sheet = read_entry(&edited.path, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("<v>849995</v>"), "{sheet}");
+    assert!(!sheet.contains("<v>1</v>"), "{sheet}");
+    let shared = read_entry(&edited.path, "xl/sharedStrings.xml");
+    assert!(shared.contains("<t>佐藤花子</t>"), "{shared}");
+    assert!(!shared.contains("995"), "{shared}");
+    let workbook = read_entry(&edited.path, "xl/workbook.xml");
+    assert!(!workbook.contains("fullCalcOnLoad"), "{workbook}");
+    let _ = fs::remove_dir_all(&dir);
+}
