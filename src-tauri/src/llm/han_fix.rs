@@ -8,10 +8,11 @@
 //! drops a citation, an article number, a URL, or code, or the length is
 //! implausible. Latin and Greek are not foreign script.
 //!
-//! When the user's own message asks for Chinese, Korean, or a translation
-//! (`中国語` / `韓国語` / `訳して` / `翻訳` / `translate`), both steps are skipped
-//! and the orange warning is suppressed. Foreign text left inside a quote or a
-//! code span still gets the warning.
+//! When the user asks for Chinese, Korean, or a translation, both steps are
+//! skipped and the orange warning is suppressed. The check looks at the last
+//! few user turns, not only the latest line, and also at a reply that is
+//! mostly foreign script and has almost no kana. Foreign text left inside a
+//! quote or a code span still gets the warning. A quote may span lines.
 
 #[path = "japanese_han_map.rs"]
 mod japanese_han_map;
@@ -186,15 +187,70 @@ fn is_foreign_char(ch: char) -> bool {
             && !crate::llm::japanese_han::is_japanese_han(cp))
 }
 
+/// How many recent user turns are checked for a translation request.
+pub const RECENT_USER_TURNS: usize = 4;
+
 /// The user's message asks to translate or to write in a foreign language.
 ///
-/// The check is the keywords 中国語, 韓国語, 朝鮮語, 中文, 한국어, 訳して, 翻訳,
-/// and `translate`. Correction is skipped and the orange warning is hidden.
+/// The check is the keywords 中国語, 韓国語, 朝鮮語, 中文, 한국어, 簡体字,
+/// 繁体字, ハングル, 訳して, 翻訳, and `translate`. Correction is skipped and
+/// the orange warning is hidden. Pass the last [`RECENT_USER_TURNS`] user
+/// messages joined together so a follow-up such as 「第2条も同様に」 still matches.
 pub fn user_requests_foreign_writing(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
-    ["中国語", "韓国語", "朝鮮語", "中文", "한국어", "訳して", "翻訳", "translate"]
-        .iter()
-        .any(|word| lower.contains(&word.to_lowercase()))
+    [
+        "中国語",
+        "韓国語",
+        "朝鮮語",
+        "中文",
+        "한국어",
+        "簡体字",
+        "繁体字",
+        "ハングル",
+        "訳して",
+        "翻訳",
+        "translate",
+    ]
+    .iter()
+    .any(|word| lower.contains(&word.to_lowercase()))
+}
+
+fn is_kana(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}'
+    )
+}
+
+/// A long reply that is mostly non-Japanese letters and has almost no kana.
+///
+/// Conservative on purpose: at least 24 letters, at least 6 foreign characters,
+/// foreign characters at least one sixth of the letters, and at most 2 kana
+/// (under 5%). A Japanese sentence with a few foreign characters still has kana
+/// and is corrected.
+pub fn reply_is_mostly_foreign(text: &str) -> bool {
+    let mut kana = 0usize;
+    let mut foreign = 0usize;
+    let mut letters = 0usize;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if is_kana(ch) {
+            letters += 1;
+            kana += 1;
+        } else if is_foreign_char(ch) {
+            letters += 1;
+            foreign += 1;
+        } else if crate::llm::japanese_han::is_cjk_ideograph(cp) || ch.is_alphabetic() {
+            letters += 1;
+        }
+    }
+    if letters < 24 || foreign < 6 {
+        return false;
+    }
+    if kana > 2 || kana.saturating_mul(20) > letters {
+        return false;
+    }
+    foreign.saturating_mul(6) >= letters
 }
 
 /// Code, blockquotes, and quoted spans. Indexes are Unicode scalars.
@@ -261,9 +317,18 @@ fn protected_mask(text: &str) -> Vec<bool> {
     mask
 }
 
+/// An unclosed quote, or one longer than this, protects nothing. A statute
+/// quotation can span lines, but a missing closer must not swallow the reply.
+const QUOTE_MAX_CHARS: usize = 1_500;
+
 fn find_close(chars: &[char], mask: &[bool], from: usize, close: char) -> Option<usize> {
     let mut j = from;
-    while j < chars.len() && !mask[j] && chars[j] != close && chars[j] != '\n' {
+    let mut seen = 0usize;
+    while j < chars.len() && !mask[j] && chars[j] != close {
+        if seen >= QUOTE_MAX_CHARS {
+            return None;
+        }
+        seen += 1;
         j += 1;
     }
     if j < chars.len() && chars[j] == close {
@@ -298,19 +363,65 @@ fn map_outside(text: &str, mask: &[bool]) -> (String, Vec<HanFix>) {
     (out, fixes)
 }
 
-fn sentence_bounds(chars: &[char]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for (i, ch) in chars.iter().enumerate() {
-        if matches!(*ch, '。' | '！' | '？' | '!' | '?' | '\n') {
-            out.push((start, i + 1));
-            start = i + 1;
+fn is_inline_ws(ch: char) -> bool {
+    ch != '\n' && ch.is_whitespace()
+}
+
+/// Line-leading `#`, `-`, `*`, `+`, `>`, `|`, or `1.` stays outside the segment.
+fn skip_markdown_prefix(chars: &[char], start: usize, end: usize) -> usize {
+    if start >= end {
+        return start;
+    }
+    let ch = chars[start];
+    if ch == '#' {
+        let mut k = start;
+        while k < end && chars[k] == '#' {
+            k += 1;
+        }
+        return k;
+    }
+    if matches!(ch, '-' | '*' | '+') {
+        if start + 1 < end && chars[start + 1] == ch {
+            return start;
+        }
+        if start + 1 == end || is_inline_ws(chars[start + 1]) {
+            return start + 1;
+        }
+        return start;
+    }
+    if ch == '>' {
+        return start + 1;
+    }
+    if ch.is_ascii_digit() {
+        let mut k = start;
+        while k < end && chars[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k < end && chars[k] == '.' {
+            return k + 1;
         }
     }
-    if start < chars.len() {
-        out.push((start, chars.len()));
+    start
+}
+
+fn core_bounds(chars: &[char], start: usize, end: usize, line_start: usize) -> (usize, usize) {
+    let mut i = start;
+    let mut j = end;
+    while j > i && is_inline_ws(chars[j - 1]) {
+        j -= 1;
     }
-    out
+    let lead = i;
+    while i < j && is_inline_ws(chars[i]) {
+        i += 1;
+    }
+    let at_line_start = chars[line_start..lead].iter().all(|ch| is_inline_ws(*ch));
+    if at_line_start {
+        i = skip_markdown_prefix(chars, i, j);
+        while i < j && is_inline_ws(chars[i]) {
+            i += 1;
+        }
+    }
+    (i, j)
 }
 
 fn touches_suspect(chars: &[char], at: usize) -> bool {
@@ -334,23 +445,45 @@ fn run_is_dirty(chars: &[char], start: usize, end: usize, fixes: &[HanFix]) -> b
 fn dirty_segments(text: &str, fixes: &[HanFix], mask: &[bool]) -> Vec<DirtySegment> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
-    for (sent_start, sent_end) in sentence_bounds(&chars) {
-        let mut i = sent_start;
-        while i < sent_end {
-            if mask.get(i) == Some(&true) {
-                i += 1;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\n' {
+            i += 1;
+            continue;
+        }
+        let line_start = i;
+        while i < chars.len() && chars[i] != '\n' {
+            i += 1;
+        }
+        let line_end = i;
+        let mut j = line_start;
+        while j < line_end {
+            if mask.get(j) == Some(&true) {
+                j += 1;
                 continue;
             }
-            let run_start = i;
-            while i < sent_end && mask.get(i) != Some(&true) {
-                i += 1;
+            let run_start = j;
+            while j < line_end && mask.get(j) != Some(&true) {
+                j += 1;
             }
-            if run_is_dirty(&chars, run_start, i, fixes) {
-                out.push(DirtySegment {
-                    start: run_start,
-                    end: i,
-                    text: chars[run_start..i].iter().collect(),
-                });
+            let mut piece = run_start;
+            while piece < j {
+                if chars[piece] == '|' {
+                    piece += 1;
+                    continue;
+                }
+                let cell_start = piece;
+                while piece < j && chars[piece] != '|' {
+                    piece += 1;
+                }
+                let (core_start, core_end) = core_bounds(&chars, cell_start, piece, line_start);
+                if core_start < core_end && run_is_dirty(&chars, core_start, core_end, fixes) {
+                    out.push(DirtySegment {
+                        start: core_start,
+                        end: core_end,
+                        text: chars[core_start..core_end].iter().collect(),
+                    });
+                }
             }
         }
     }
@@ -359,7 +492,7 @@ fn dirty_segments(text: &str, fixes: &[HanFix], mask: &[bool]) -> Vec<DirtySegme
 
 /// Map outside quotes and code. `user_prompt` skips both steps when it asks for a translation.
 pub fn prepare_reply(user_prompt: &str, text: &str) -> MappedReply {
-    if user_requests_foreign_writing(user_prompt) {
+    if user_requests_foreign_writing(user_prompt) || reply_is_mostly_foreign(text) {
         return MappedReply {
             input: text.to_string(),
             text: text.to_string(),
@@ -670,7 +803,8 @@ pub fn accept_segment(source: &str, raw: &str, finish_reason: &str) -> Option<St
         return None;
     }
     let text = strip_preamble(&normalize_rewrite(raw));
-    if text.is_empty() || text == source {
+    // A segment is one line. A newline in the rewrite would join or split lines.
+    if text.is_empty() || text == source || text.contains('\n') {
         return None;
     }
     if !same_anchors(source, &text) || !plausible_len(source, &text) {
@@ -964,6 +1098,13 @@ mod tests {
         assert_eq!(map[&('鉴' as u32)], '鑑');
         assert_eq!(map[&('净' as u32)], '浄');
         assert_eq!(map[&('账' as u32)], '帳');
+        assert_eq!(map[&('谭' as u32)], '譚');
+        assert_eq!(map[&('岗' as u32)], '崗');
+        assert_ne!(map[&('岗' as u32)], '岡');
+        assert_eq!(map[&('箫' as u32)], '簫');
+        assert_ne!(map.get(&('箫' as u32)), Some(&'焼'));
+        assert_eq!(map[&('鲶' as u32)], '鯰');
+        assert_ne!(map.get(&('鲶' as u32)), Some(&'鮎'));
         assert!(!map.contains_key(&('发' as u32)));
     }
 
@@ -1144,6 +1285,60 @@ mod tests {
 
         let named = correct_reply("", "名前は\"现在\"です。", |_| panic!("an ascii quote"));
         assert_eq!(named.content, "名前は\"现在\"です。");
+
+        let lines = "## 关于本件\n本文です。";
+        let heading = correct_reply("", lines, |segments| {
+            assert_eq!(segments.len(), 1);
+            assert!(!segments[0].contains('\n'));
+            assert!(!segments[0].contains('#'));
+            Ok(vec![stop_piece("本件について")])
+        });
+        assert_eq!(heading.content, "## 本件について\n本文です。");
+
+        let bullets = "- 关于本件\n  - 关于子项\n1. 关于本件\n";
+        let listed = correct_reply("", bullets, |segments| {
+            assert!(segments.len() >= 3);
+            assert!(segments.iter().all(|segment| {
+                !segment.contains('\n') && !segment.starts_with('-') && !segment.starts_with('#')
+            }));
+            Ok(segments
+                .iter()
+                .map(|_| stop_piece("項目"))
+                .collect())
+        });
+        assert!(listed.content.starts_with("- 項目\n"));
+        assert!(listed.content.contains("\n  - 項目\n"));
+        assert!(listed.content.contains("\n1. 項目\n"));
+
+        let quoted = "前置き。\n「现在\n生效」\n本文は现在です。";
+        let kept_quote = correct_reply("", quoted, |_| panic!("a multi-line quote is not rewritten"));
+        assert!(kept_quote.content.contains("「现在\n生效」"));
+        assert!(kept_quote.content.contains("現在"));
+        assert!(!kept_quote.suppress_warning);
+
+        let open = "「现在\n本文は现在です。";
+        let unclosed = correct_reply("", open, |_| panic!("an unclosed quote protects nothing"));
+        assert!(!unclosed.content.contains('现'));
+        assert!(unclosed.content.contains('現'));
+
+        let zh = "本合同自签订之日起生效，双方应当遵守本合同的全部条款并及时履行各自的义务。";
+        let follow = correct_reply("第1条を中国語に訳して\n第2条も同様に", zh, |_| {
+            panic!("a translation follow-up is not corrected")
+        });
+        assert_eq!(follow.content, zh);
+        assert!(follow.suppress_warning);
+        let unspoken = correct_reply("第2条も同様に", zh, |_| panic!("mostly foreign"));
+        assert!(unspoken.suppress_warning);
+        assert!(user_requests_foreign_writing("簡体字で書いて"));
+        assert!(user_requests_foreign_writing("繁体字に直して"));
+        assert!(user_requests_foreign_writing("ハングルで"));
+
+        let japanese = "现在の契約は有効です。甲は乙に対し、金銭を支払う義務を負います。";
+        let kana = correct_reply("第2条も同様に", japanese, |_| {
+            panic!("a Japanese reply with kana is not a translation")
+        });
+        assert!(kana.content.starts_with("現在"));
+        assert!(!kana.suppress_warning);
 
         let stopped = correct_reply("", "现在は기타です", |_| Err("rewrite-stopped".into()));
         assert_eq!(stopped.content, "現在は기타です");

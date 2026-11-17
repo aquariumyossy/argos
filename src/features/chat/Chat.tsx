@@ -29,7 +29,8 @@ import {
   HAN_REWRITE_NOTE,
   HAN_REWRITE_STOPPED_NOTE,
   parseScriptFix,
-  userRequestsForeignWriting,
+  recentUserRequestsForeignWriting,
+  replyIsMostlyForeign,
 } from "./japaneseHan";
 import { OfficeFileCards } from "./OfficeFileCard";
 import { HtmlPreviews } from "./HtmlPreview";
@@ -1048,9 +1049,8 @@ export default function Chat() {
 
   const viewingLive = live && active?.id === live.threadId ? live : null;
   const stream = viewingLive?.stream ?? "";
-  const lastUser = [...messages].reverse().find((message) => message.role === "user");
   const streamNotice =
-    stream && !userRequestsForeignWriting(lastUser?.content ?? "")
+    stream && !recentUserRequestsForeignWriting(messages) && !replyIsMostlyForeign(stream)
       ? foreignReplyNotice(stream)
       : null;
   const thinking = viewingLive?.thinking ?? "";

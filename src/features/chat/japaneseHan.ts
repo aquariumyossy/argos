@@ -305,10 +305,59 @@ export function parseScriptFix(raw: string | undefined | null): ScriptFix | null
 
 /**
  * Skip correction, and hide the orange warning, when the user asked for this.
- * Same list as the Rust check: 中国語 / 韓国語 / 朝鮮語 / 中文 / 한국어 / 訳して / 翻訳 / translate.
+ * Same list as the Rust check: 中国語 / 韓国語 / 朝鮮語 / 中文 / 한국어 / 簡体字 /
+ * 繁体字 / ハングル / 訳して / 翻訳 / translate.
  */
 export function userRequestsForeignWriting(prompt: string): boolean {
-  return /中国語|韓国語|朝鮮語|中文|한국어|訳して|翻訳|translate/i.test(prompt);
+  return /中国語|韓国語|朝鮮語|中文|한국어|簡体字|繁体字|ハングル|訳して|翻訳|translate/i.test(
+    prompt,
+  );
+}
+
+/** How many recent user turns are checked. Same as the Rust constant. */
+export const RECENT_USER_TURNS = 4;
+
+export function recentUserRequestsForeignWriting(
+  messages: { role: string; content: string }[],
+): boolean {
+  const users = messages.filter((message) => message.role === "user");
+  const recent = users.slice(-RECENT_USER_TURNS).map((message) => message.content).join("\n");
+  return userRequestsForeignWriting(recent);
+}
+
+function isKana(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  return (
+    (cp >= 0x3040 && cp <= 0x309f) ||
+    (cp >= 0x30a0 && cp <= 0x30ff) ||
+    (cp >= 0x31f0 && cp <= 0x31ff) ||
+    (cp >= 0xff66 && cp <= 0xff9d)
+  );
+}
+
+/**
+ * Same threshold as the Rust check. A long reply with almost no kana and a
+ * real share of non-Japanese characters is left alone, warning included.
+ */
+export function replyIsMostlyForeign(text: string): boolean {
+  let kana = 0;
+  let foreign = 0;
+  let letters = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isKana(ch)) {
+      letters += 1;
+      kana += 1;
+    } else if (isForeignScript(cp) || (isCjkIdeograph(cp) && !isJapaneseHan(cp))) {
+      letters += 1;
+      foreign += 1;
+    } else if (isCjkIdeograph(cp) || /\p{L}/u.test(ch)) {
+      letters += 1;
+    }
+  }
+  if (letters < 24 || foreign < 6) return false;
+  if (kana > 2 || kana * 20 > letters) return false;
+  return foreign * 6 >= letters;
 }
 
 /** 「现→現 など3か所を直しました」 */

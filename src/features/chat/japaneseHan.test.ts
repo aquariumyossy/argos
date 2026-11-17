@@ -13,6 +13,8 @@ import {
   isJapaneseHan,
   markHanFixes,
   parseScriptFix,
+  recentUserRequestsForeignWriting,
+  replyIsMostlyForeign,
   userRequestsForeignWriting,
 } from "./japaneseHan";
 
@@ -149,7 +151,28 @@ describe("applyHanMap", () => {
     });
     expect(userRequestsForeignWriting("中国語に訳して")).toBe(true);
     expect(userRequestsForeignWriting("Please translate this")).toBe(true);
+    expect(userRequestsForeignWriting("簡体字で書いて")).toBe(true);
+    expect(userRequestsForeignWriting("繁体字に直して")).toBe(true);
+    expect(userRequestsForeignWriting("ハングルで")).toBe(true);
     expect(userRequestsForeignWriting("契約を要約して")).toBe(false);
+    expect(
+      recentUserRequestsForeignWriting([
+        { role: "user", content: "第1条を中国語に訳して" },
+        { role: "assistant", content: "第一条" },
+        { role: "user", content: "第2条も同様に" },
+      ]),
+    ).toBe(true);
+    const chinese =
+      "本合同自签订之日起生效，双方应当遵守本合同的全部条款并及时履行各自的义务。";
+    expect(replyIsMostlyForeign(chinese)).toBe(true);
+    expect(replyIsMostlyForeign("现在の契約は有効です。甲は乙に対し金銭を支払います。")).toBe(
+      false,
+    );
+    expect(applyHanMap("谭")).toBe("譚");
+    expect(applyHanMap("岗")).toBe("崗");
+    expect(applyHanMap("岗")).not.toBe("岡");
+    expect(applyHanMap("箫")).toBe("簫");
+    expect(applyHanMap("鲶")).toBe("鯰");
   });
 
   it("does not underline inside a URL or an HTML attribute", () => {

@@ -1895,7 +1895,7 @@ async fn llm_send_inner<R: Runtime>(
         result_text = crate::statute::mark_unverified(&result_text, &verified_cites);
         (String::new(), String::new())
     } else {
-        let mapped = crate::llm::han_fix::prepare_reply(&content, &result_text);
+        let mapped = crate::llm::han_fix::prepare_reply(&recent_user_prompt(&history), &result_text);
         // Stopping here keeps the step-1 reply. It is not a cancelled generation.
         let rewrite = if mapped.needs_rewrite {
             match rewrite_foreign_reply(
@@ -3603,6 +3603,18 @@ fn save_assistant_answer(
         script_fix,
     )
     .map_err(|e| e.to_string())
+}
+
+/// The last few user turns, so 「第2条も同様に」 still sees 「中国語に訳して」.
+fn recent_user_prompt(history: &[crate::db::LlmMessageRow]) -> String {
+    let mut texts = Vec::new();
+    for message in history {
+        if message.role == "user" {
+            texts.push(message.content.as_str());
+        }
+    }
+    let start = texts.len().saturating_sub(crate::llm::han_fix::RECENT_USER_TURNS);
+    texts[start..].join("\n")
 }
 
 /// One local completion for the dirty segments only. Tools and thinking stay off.
