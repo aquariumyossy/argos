@@ -27,7 +27,9 @@ import {
   foreignCharNoticeForAssistant,
   hanMapNote,
   HAN_REWRITE_NOTE,
+  HAN_REWRITE_STOPPED_NOTE,
   parseScriptFix,
+  userRequestsForeignWriting,
 } from "./japaneseHan";
 import { OfficeFileCards } from "./OfficeFileCard";
 import { HtmlPreviews } from "./HtmlPreview";
@@ -498,13 +500,15 @@ function ForeignReplyFoot({
   const fix = parseScriptFix(scriptFix);
   const mapNote = hanMapNote(fix?.fixes ?? []);
   const rewriteNote = fix?.rewritten ? HAN_REWRITE_NOTE : null;
-  const warning = foreignReplyNotice(content, toolCalls);
+  const stoppedNote = fix?.rewriteStopped ? HAN_REWRITE_STOPPED_NOTE : null;
+  const warning = fix?.suppressWarning ? null : foreignReplyNotice(content, toolCalls);
   const original = (originalContent ?? "").trim();
-  if (!mapNote && !rewriteNote && !warning && !original) return null;
+  if (!mapNote && !rewriteNote && !stoppedNote && !warning && !original) return null;
   return (
     <>
       {mapNote ? <p className="chat-foreign-notice">{mapNote}</p> : null}
       {rewriteNote ? <p className="chat-foreign-notice">{rewriteNote}</p> : null}
+      {stoppedNote ? <p className="chat-foreign-notice">{stoppedNote}</p> : null}
       {warning ? <p className="chat-foreign-notice">{warning}</p> : null}
       {original ? <OriginalReply text={original} /> : null}
     </>
@@ -1044,7 +1048,11 @@ export default function Chat() {
 
   const viewingLive = live && active?.id === live.threadId ? live : null;
   const stream = viewingLive?.stream ?? "";
-  const streamNotice = stream ? foreignReplyNotice(stream) : null;
+  const lastUser = [...messages].reverse().find((message) => message.role === "user");
+  const streamNotice =
+    stream && !userRequestsForeignWriting(lastUser?.content ?? "")
+      ? foreignReplyNotice(stream)
+      : null;
   const thinking = viewingLive?.thinking ?? "";
   const toolHint = viewingLive?.toolHint ?? "";
   const status = viewingLive?.status ?? "";

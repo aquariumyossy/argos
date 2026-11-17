@@ -486,6 +486,47 @@ describe("foreign character notice", () => {
     expect(screen.getByText("现在は기타です。")).toBeTruthy();
   });
 
+  it("says the rewrite was stopped and still warns about residue", async () => {
+    messagesA = [
+      originalUser,
+      {
+        id: "a-stopped",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "現在は기타です。",
+        originalContent: "现在は기타です。",
+        scriptFix: JSON.stringify({
+          fixes: [{ at: 0, from: "现", to: "現" }],
+          rewritten: false,
+          rewriteStopped: true,
+        }),
+        createdAt: 2,
+      },
+    ];
+    await renderChat();
+    expect(screen.getByText("書き直しを中止しました")).toBeTruthy();
+    expect(screen.getByText("日本語で用いない文字: 기、타")).toBeTruthy();
+    expect(screen.queryByText("生成を停止しました。")).toBeNull();
+    expect(screen.queryByText("AIが外国文字を含む部分を書き直しました")).toBeNull();
+  });
+
+  it("hides the warning when the user asked for a translation", async () => {
+    messagesA = [
+      { ...originalUser, content: "中国語に訳して" },
+      {
+        id: "a-translate",
+        threadId: "thread-a",
+        role: "assistant",
+        content: "这个合同现在生效",
+        scriptFix: JSON.stringify({ fixes: [], rewritten: false, suppressWarning: true }),
+        createdAt: 2,
+      },
+    ];
+    await renderChat();
+    expect(screen.queryByText(/日本語で用いない文字/)).toBeNull();
+    expect(screen.getByText("这个合同现在生效")).toBeTruthy();
+  });
+
   it("shows the notice while streaming and does not scan reasoning", async () => {
     await renderChat();
     fireEvent.click(screen.getByRole("button", { name: "再送" }));

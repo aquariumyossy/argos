@@ -255,13 +255,28 @@ export function applyHanMap(text: string): string {
 
 export type HanFix = { at: number; from: string; to: string };
 
-export type ScriptFix = { fixes: HanFix[]; rewritten: boolean };
+export type ScriptFix = {
+  fixes: HanFix[];
+  rewritten: boolean;
+  /** The user stopped the rewrite. The step-1 text is what is stored. */
+  rewriteStopped: boolean;
+  /**
+   * The user asked for a translation or for Chinese/Korean. The orange warning
+   * is hidden. Quotes and code are not corrected, but they still warn.
+   */
+  suppressWarning: boolean;
+};
 
 export function parseScriptFix(raw: string | undefined | null): ScriptFix | null {
   const text = (raw ?? "").trim();
   if (!text) return null;
   try {
-    const parsed = JSON.parse(text) as { fixes?: unknown; rewritten?: unknown };
+    const parsed = JSON.parse(text) as {
+      fixes?: unknown;
+      rewritten?: unknown;
+      rewriteStopped?: unknown;
+      suppressWarning?: unknown;
+    };
     const fixes: HanFix[] = [];
     if (Array.isArray(parsed.fixes)) {
       for (const item of parsed.fixes) {
@@ -277,10 +292,23 @@ export function parseScriptFix(raw: string | undefined | null): ScriptFix | null
         fixes.push({ at: row.at, from: row.from, to: row.to });
       }
     }
-    return { fixes, rewritten: parsed.rewritten === true };
+    return {
+      fixes,
+      rewritten: parsed.rewritten === true,
+      rewriteStopped: parsed.rewriteStopped === true,
+      suppressWarning: parsed.suppressWarning === true,
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * Skip correction, and hide the orange warning, when the user asked for this.
+ * Same list as the Rust check: 中国語 / 韓国語 / 朝鮮語 / 中文 / 한국어 / 訳して / 翻訳 / translate.
+ */
+export function userRequestsForeignWriting(prompt: string): boolean {
+  return /中国語|韓国語|朝鮮語|中文|한국어|訳して|翻訳|translate/i.test(prompt);
 }
 
 /** 「现→現 など3か所を直しました」 */
@@ -292,13 +320,42 @@ export function hanMapNote(fixes: HanFix[]): string | null {
 
 export const HAN_REWRITE_NOTE = "AIが外国文字を含む部分を書き直しました";
 
+export const HAN_REWRITE_STOPPED_NOTE = "書き直しを中止しました";
+
 const HAN_MARK_L = "\uE000";
 const HAN_MARK_R = "\uE001";
+
+function startsAt(chars: string[], index: number, needle: string): boolean {
+  for (let i = 0; i < needle.length; i += 1) {
+    if (chars[index + i] !== needle[i]) return false;
+  }
+  return true;
+}
+
+function urlIndexes(text: string): Set<number> {
+  const blocked = new Set<number>();
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    const https = startsAt(chars, i, "https://");
+    const http = !https && startsAt(chars, i, "http://");
+    if (!https && !http) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    i += https ? "https://".length : "http://".length;
+    while (i < chars.length && !/\s/.test(chars[i] ?? "")) i += 1;
+    for (let at = start; at < i; at += 1) blocked.add(at);
+  }
+  return blocked;
+}
 
 /** Wrap substituted characters so the markdown renderer can underline them. */
 export function markHanFixes(text: string, fixes: HanFix[] | undefined): string {
   if (!fixes?.length) return text;
-  const ats = new Set(fixes.map((fix) => fix.at));
+  const blocked = urlIndexes(text);
+  const ats = new Set(fixes.map((fix) => fix.at).filter((at) => !blocked.has(at)));
   let out = "";
   let index = 0;
   for (const ch of text) {
@@ -312,6 +369,22 @@ export function stripHanMarks(text: string): string {
   return text.replace(/\uE000([^\uE001]*)\uE001/g, "$1");
 }
 
+/** Underline markers in text nodes only. Markers inside a tag or attribute are removed. */
 export function hanMarkedHtml(html: string): string {
-  return html.replace(/\uE000([^\uE001]*)\uE001/g, '<span class="chat-han-fix">$1</span>');
+  let out = "";
+  let index = 0;
+  while (index < html.length) {
+    if (html[index] === "<") {
+      const end = html.indexOf(">", index);
+      const tag = end < 0 ? html.slice(index) : html.slice(index, end + 1);
+      out += tag.replace(/\uE000([^\uE001]*)\uE001/g, "$1");
+      index = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    const next = html.indexOf("<", index);
+    const chunk = next < 0 ? html.slice(index) : html.slice(index, next);
+    out += chunk.replace(/\uE000([^\uE001]*)\uE001/g, '<span class="chat-han-fix">$1</span>');
+    index = next < 0 ? html.length : next;
+  }
+  return out;
 }

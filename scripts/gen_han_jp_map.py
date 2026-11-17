@@ -13,13 +13,16 @@ and the variant links point at exactly one allowlisted kanji.
 Links used as equivalences:
 
 - kSimplifiedVariant, kTraditionalVariant, kZVariant (either direction)
-- kJapaneseNewVariant / kJapaneseOldVariant, only to prefer the shinjitai when
-  several allowlisted forms are old and new shapes of that one kanji
-  (為/爲 → 為, 關 → 関). A split such as 发 → 発/髪 stays unmapped.
+- kJapaneseNewVariant / kJapaneseOldVariant, to prefer shinjitai (關 → 関)
+- kZVariant, kSpoofingVariant, and a mutual kSemanticVariant, only to move from
+  an old or variant form onto the one jōyō or jinmeiyō kanji it belongs to
+  (线 → 線, 举 → 挙, 鉴 → 鑑, 净 → 浄, 账 → 帳)
 
-kSemanticVariant is read and then ignored. Unihan uses it for loose relations
-that are not the same character (亲→榛, 氯→綠, 开→幵). Substituting those
-would change the meaning.
+A split such as 发 → 発/髪 stays unmapped. A loose semantic link is not a new
+source: 关 stays 関 via kJapaneseNewVariant, and is not pulled toward 寡.
+When no jōyō or jinmeiyō form is reachable, the allowlisted kyūjitai stays.
+kGB0 (GB 2312 level 1) is checked so a reachable standard form is not left
+behind.
 
 When the traditional form itself is not allowlisted, one extra hop through
 that form is allowed (乡 → 鄉 → 郷) and only if it still yields one target.
@@ -37,6 +40,7 @@ import base64
 import re
 import urllib.request
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +58,8 @@ STRONG = ("kSimplifiedVariant", "kTraditionalVariant", "kZVariant")
 SEMANTIC = "kSemanticVariant"
 JP_NEW = "kJapaneseNewVariant"
 JP_OLD = "kJapaneseOldVariant"
-WANTED = set(STRONG) | {SEMANTIC, JP_NEW, JP_OLD}
+EQUIV = ("kZVariant", "kSpoofingVariant", JP_NEW, JP_OLD)
+WANTED = set(STRONG) | {SEMANTIC, "kSpoofingVariant", JP_NEW, JP_OLD}
 
 
 def is_cjk(cp: int) -> bool:
@@ -129,8 +134,44 @@ def load_variants(zip_path: Path) -> dict[int, dict[str, set[int]]]:
     return raw
 
 
-def build_map(raw: dict[int, dict[str, set[int]]], is_jp) -> tuple[dict[int, int], int]:
+def load_sets(zip_path: Path) -> tuple[set[int], set[int], set[int]]:
+    import zipfile
+
+    joyo: set[int] = set()
+    jinmeiyo: set[int] = set()
+    gb0: set[int] = set()
+    with zipfile.ZipFile(zip_path) as archive:
+        text = archive.read("Unihan_OtherMappings.txt").decode("utf-8")
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        cp = int(parts[0][2:], 16)
+        if parts[1] == "kJoyoKanji":
+            joyo.add(cp)
+        elif parts[1] == "kJinmeiyoKanji":
+            jinmeiyo.add(cp)
+        elif parts[1] == "kGB0":
+            gb0.add(cp)
+    return joyo, jinmeiyo, gb0
+
+
+def build_map(
+    raw: dict[int, dict[str, set[int]]],
+    is_jp,
+    joyo: set[int],
+    jinmeiyo: set[int],
+) -> tuple[
+    dict[int, int],
+    int,
+    set[int],
+    Callable[[int], tuple[set[int], set[int]]],
+]:
     strong: dict[int, set[int]] = defaultdict(set)
+    equiv: dict[int, set[int]] = defaultdict(set)
+    sem: dict[int, set[int]] = defaultdict(set)
     jp_new: dict[int, set[int]] = defaultdict(set)
     semantic_rows = 0
     for cp, fields in raw.items():
@@ -138,25 +179,32 @@ def build_map(raw: dict[int, dict[str, set[int]]], is_jp) -> tuple[dict[int, int
             semantic_rows += 1
         for field in STRONG:
             for target in fields.get(field, ()):
-                if target == cp:
-                    continue
-                strong[cp].add(target)
-                strong[target].add(cp)
+                if target != cp:
+                    strong[cp].add(target)
+                    strong[target].add(cp)
+        for field in EQUIV:
+            for target in fields.get(field, ()):
+                if target != cp:
+                    equiv[cp].add(target)
+                    equiv[target].add(cp)
         for target in fields.get(JP_NEW, ()):
             if target != cp:
                 jp_new[cp].add(target)
         for target in fields.get(JP_OLD, ()):
             if target != cp:
                 jp_new[target].add(cp)
+        for target in fields.get(SEMANTIC, ()):
+            if target != cp and cp in raw[target].get(SEMANTIC, ()):
+                sem[cp].add(target)
 
-    def new_forms(cp: int) -> set[int]:
-        return {target for target in jp_new.get(cp, ()) if is_jp(target) and target != cp}
+    def is_standard(cp: int) -> bool:
+        return is_jp(cp) and (cp in joyo or cp in jinmeiyo)
 
-    def prefer(cp: int) -> int:
+    def new_chain(cp: int) -> int:
         seen = {cp}
         cur = cp
         for _ in range(4):
-            nxts = new_forms(cur)
+            nxts = {target for target in jp_new.get(cur, ()) if is_jp(target) and target != cur}
             if len(nxts) != 1:
                 return cur
             nxt = next(iter(nxts))
@@ -166,37 +214,98 @@ def build_map(raw: dict[int, dict[str, set[int]]], is_jp) -> tuple[dict[int, int
             cur = nxt
         return cur
 
+    def component(start: int) -> set[int]:
+        seen = {start}
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            for target in equiv.get(node, ()):
+                if target not in seen:
+                    seen.add(target)
+                    queue.append(target)
+        return seen
+
+    def standards_via_link(cp: int) -> tuple[set[int], set[int]]:
+        """Jōyō / jinmeiyō forms one mutual semantic hop away, plus shape variants."""
+        seeds = {cp} | sem.get(cp, set())
+        joy: set[int] = set()
+        jin: set[int] = set()
+        for seed in seeds:
+            for node in component(seed):
+                if not is_jp(node):
+                    continue
+                if node in joyo:
+                    joy.add(node)
+                elif node in jinmeiyo:
+                    jin.add(node)
+        return joy, jin
+
+    def upgrade(cp: int) -> int:
+        """Prefer one jōyō form, else one jinmeiyō form, else the shinjitai chain."""
+        chained = new_chain(cp)
+        if is_standard(chained):
+            return chained
+        joy, jin = standards_via_link(cp)
+        if chained != cp:
+            joy2, jin2 = standards_via_link(chained)
+            joy |= joy2
+            jin |= jin2
+        if len(joy) == 1:
+            return next(iter(joy))
+        if not joy and len(jin) == 1:
+            return next(iter(jin))
+        return chained
+
     def direct(cp: int) -> set[int]:
-        return {prefer(target) for target in strong.get(cp, ()) if is_jp(target)}
+        return {target for target in strong.get(cp, ()) if is_jp(target)}
 
     mapping: dict[int, int] = {}
     ambiguous: set[int] = set()
     sources = [cp for cp in strong if is_cjk(cp) and not is_jp(cp)]
     for cp in sources:
         found = direct(cp)
-        if len(found) == 1:
-            mapping[cp] = next(iter(found))
-        elif len(found) > 1:
-            ambiguous.add(cp)
-
-    for cp in sources:
-        if cp in mapping or cp in ambiguous:
+        if not found:
+            hopped: set[int] = set()
+            for mid in strong.get(cp, ()):
+                if is_jp(mid):
+                    continue
+                hopped |= direct(mid)
+            hopped.discard(cp)
+            found = hopped
+        if not found:
             continue
-        found: set[int] = set()
-        for mid in strong.get(cp, ()):
-            if is_jp(mid):
-                continue
-            found |= direct(mid)
-        found.discard(cp)
-        if len(found) == 1:
-            mapping[cp] = next(iter(found))
+        upgraded = {upgrade(target) for target in found}
+        upgraded = {target for target in upgraded if is_jp(target) and target != cp}
+        if len(upgraded) == 1:
+            mapping[cp] = next(iter(upgraded))
+        elif len(upgraded) > 1:
+            ambiguous.add(cp)
+    return mapping, semantic_rows, ambiguous, standards_via_link
 
-    cleaned = {
-        src: dst
-        for src, dst in mapping.items()
-        if src != dst and is_cjk(src) and not is_jp(src) and is_jp(dst)
-    }
-    return cleaned, semantic_rows
+
+def audit_gb0(
+    mapping: dict[int, int],
+    gb0: set[int],
+    joyo: set[int],
+    jinmeiyo: set[int],
+    standards_via_link,
+) -> None:
+    """GB 2312 level 1 must not keep a kyūjitai when one standard form is reachable."""
+    missed: list[str] = []
+    kyujitai_only = 0
+    for src in sorted(gb0):
+        dst = mapping.get(src)
+        if dst is None:
+            continue
+        if dst in joyo or dst in jinmeiyo:
+            continue
+        kyujitai_only += 1
+        joy, jin = standards_via_link(dst)
+        if len(joy) == 1 or (not joy and len(jin) == 1):
+            missed.append(f"{chr(src)}→{chr(dst)}")
+    if missed:
+        raise SystemExit("kGB0 target ignored a jōyō/jinmeiyō form: " + " ".join(missed[:20]))
+    print(f"kGB0 mappings that stay kyūjitai (no standard form): {kyujitai_only}")
 
 
 def pack(mapping: dict[int, int]) -> str:
@@ -217,9 +326,10 @@ def write_outputs(encoded: str) -> None:
         "/* Japanese Han substitutions.\n"
         " * Generated by scripts/gen_han_jp_map.py from Unicode "
         f"{UNIHAN_VERSION} Unihan (kSimplifiedVariant,\n"
-        " * kTraditionalVariant, kZVariant, then kJapaneseNewVariant to prefer shinjitai).\n"
-        " * Little-endian (source, target) code point pairs. Sources are not on the\n"
-        " * Japanese allowlist; each source has one allowlisted target.\n"
+        " * kTraditionalVariant, kZVariant). A reachable jōyō or jinmeiyō form\n"
+        " * (kZVariant / kSemanticVariant / kSpoofingVariant / kJapaneseNewVariant)\n"
+        " * wins over kyūjitai. Little-endian (source, target) pairs. Sources are\n"
+        " * not on the Japanese allowlist; each source has one allowlisted target.\n"
         " * Whitespace in the string is not part of the base64. */\n"
         "export const HAN_JP_PAIRS = `\n"
         + body
@@ -229,10 +339,11 @@ def write_outputs(encoded: str) -> None:
         "//! Japanese Han substitutions.\n"
         "//!\n"
         f"//! Generated by `scripts/gen_han_jp_map.py` from Unicode {UNIHAN_VERSION} Unihan\n"
-        "//! (`kSimplifiedVariant`, `kTraditionalVariant`, `kZVariant`, then\n"
-        "//! `kJapaneseNewVariant` to prefer shinjitai). Little-endian `(source, target)`\n"
-        "//! code point pairs. Sources are not on the Japanese allowlist; each source has\n"
-        "//! one allowlisted target. Whitespace in the string is not part of the base64.\n"
+        "//! (`kSimplifiedVariant`, `kTraditionalVariant`, `kZVariant`). A reachable\n"
+        "//! jōyō or jinmeiyō form (`kZVariant` / `kSemanticVariant` /\n"
+        "//! `kSpoofingVariant` / `kJapaneseNewVariant`) wins over kyūjitai.\n"
+        "//! Little-endian `(source, target)` pairs. Sources are not on the Japanese\n"
+        "//! allowlist; each source has one allowlisted target. Whitespace is ignored.\n"
         "\n"
         'pub const HAN_JP_PAIRS: &str = r"\n'
         + body
@@ -251,8 +362,10 @@ def expect(mapping: dict[int, int], src: str, dst: str | None) -> None:
 def main() -> None:
     bmp_a, bmp_b, extra = load_allowlist()
     is_jp = make_is_jp(bmp_a, bmp_b, extra)
-    raw = load_variants(ensure_unihan())
-    mapping, semantic_rows = build_map(raw, is_jp)
+    unihan = ensure_unihan()
+    raw = load_variants(unihan)
+    joyo, jinmeiyo, gb0 = load_sets(unihan)
+    mapping, semantic_rows, ambiguous, standards_via_link = build_map(raw, is_jp, joyo, jinmeiyo)
     expect(mapping, "现", "現")
     expect(mapping, "说", "説")
     expect(mapping, "这", "這")
@@ -267,13 +380,20 @@ def main() -> None:
     expect(mapping, "发", None)
     expect(mapping, "历", None)
     expect(mapping, "复", None)
+    expect(mapping, "线", "線")
+    expect(mapping, "举", "挙")
+    expect(mapping, "鉴", "鑑")
+    expect(mapping, "净", "浄")
+    expect(mapping, "账", "帳")
+    audit_gb0(mapping, gb0, joyo, jinmeiyo, standards_via_link)
+    print(f"ambiguous sources left unmapped: {len(ambiguous)}")
     for ch in "国学体来与个无从广干后面里会":
         if ord(ch) in mapping:
             raise SystemExit(f"{ch} is Japanese and must not be rewritten")
     encoded = pack(mapping)
     write_outputs(encoded)
     print(f"mappings: {len(mapping)}")
-    print(f"semantic rows ignored: {semantic_rows}")
+    print(f"semantic variant rows read: {semantic_rows}")
     print(f"wrote {TS_OUT.relative_to(ROOT)} and {RS_OUT.relative_to(ROOT)}")
 
 

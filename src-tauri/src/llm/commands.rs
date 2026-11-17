@@ -1866,7 +1866,7 @@ async fn llm_send_inner<R: Runtime>(
     )
     .await;
     let answer_flag;
-    let mut send_cancelled;
+    let send_cancelled;
     let mut cited_body;
     (
         result_text,
@@ -1895,30 +1895,30 @@ async fn llm_send_inner<R: Runtime>(
         result_text = crate::statute::mark_unverified(&result_text, &verified_cites);
         (String::new(), String::new())
     } else {
-        let mapped = crate::llm::han_fix::map_reply(&result_text);
+        let mapped = crate::llm::han_fix::prepare_reply(&content, &result_text);
+        // Stopping here keeps the step-1 reply. It is not a cancelled generation.
         let rewrite = if mapped.needs_rewrite {
-            Some(
-                rewrite_foreign_reply(
-                    app,
-                    &settings,
-                    cancel.clone(),
-                    &request_id,
-                    &thread.id,
-                    &mapped.text,
-                )
-                .await,
+            match rewrite_foreign_reply(
+                app,
+                &settings,
+                cancel.clone(),
+                &request_id,
+                &thread.id,
+                mapped
+                    .segments
+                    .iter()
+                    .map(|segment| segment.text.clone())
+                    .collect::<Vec<_>>(),
             )
+            .await
+            {
+                Ok(pieces) => crate::llm::han_fix::RewriteInput::Pieces(pieces),
+                Err(error) if error == "rewrite-stopped" => crate::llm::han_fix::RewriteInput::Stopped,
+                Err(_) => crate::llm::han_fix::RewriteInput::Failed,
+            }
         } else {
-            None
+            crate::llm::han_fix::RewriteInput::NotRun
         };
-        if rewrite.as_ref().is_some_and(|result| {
-            result
-                .as_ref()
-                .is_err_and(|err| llm::is_cancelled_error(err))
-                || cancel.load(std::sync::atomic::Ordering::SeqCst)
-        }) {
-            send_cancelled = true;
-        }
         let correction = crate::llm::han_fix::apply_rewrite(mapped, rewrite);
         if !correction.original.is_empty() {
             if cited_body.is_empty() {
@@ -1935,7 +1935,12 @@ async fn llm_send_inner<R: Runtime>(
             &marked,
         );
         let original_content = correction.original;
-        let script_fix = crate::llm::han_fix::script_fix_json(&fixes, correction.rewritten);
+        let script_fix = crate::llm::han_fix::script_fix_json(
+            &fixes,
+            correction.rewritten,
+            correction.rewrite_stopped,
+            correction.suppress_warning,
+        );
         result_text = marked;
         (original_content, script_fix)
     };
@@ -3600,17 +3605,23 @@ fn save_assistant_answer(
     .map_err(|e| e.to_string())
 }
 
-/// One local completion, tools and thinking off. Failure leaves the mapped text in place.
+/// One local completion for the dirty segments only. Tools and thinking stay off.
+///
+/// `Err("rewrite-stopped")` means the user stopped this stage. `Err("timeout")`
+/// and any other error keep the step-1 text with no cancel banner.
 async fn rewrite_foreign_reply<R: Runtime>(
     app: &AppHandle<R>,
     settings: &crate::db::Settings,
     cancel: Arc<AtomicBool>,
     request_id: &str,
     thread_id: &str,
-    text: &str,
-) -> Result<String, String> {
+    segments: Vec<String>,
+) -> Result<Vec<crate::llm::han_fix::SegmentRewrite>, String> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err("cancelled".into());
+        return Err("rewrite-stopped".into());
     }
     let _ = app.emit(
         "llm-chat-delta",
@@ -3623,27 +3634,40 @@ async fn rewrite_foreign_reply<R: Runtime>(
     );
     let mut thinking_off = settings.clone();
     thinking_off.llm_thinking = "off".into();
-    let turns = vec![ChatTurn::text(
-        "user",
-        crate::llm::han_fix::foreign_rewrite_request(text),
-    )];
-    let streamed = llm::stream_chat(
+    let prompt = crate::llm::han_fix::foreign_rewrite_request(&segments);
+    let turns = vec![ChatTurn::text("user", prompt)];
+    let call = llm::stream_chat(
         &thinking_off,
         &turns,
-        cancel,
+        cancel.clone(),
         None,
         llm::runaway_chars_for(&settings.llm_base_url),
         Some(false),
         None,
         |_kind, _delta| {},
+    );
+    let streamed = match tokio::time::timeout(
+        std::time::Duration::from_secs(crate::llm::han_fix::REWRITE_TIMEOUT_SECS),
+        call,
     )
-    .await?;
-    let next = crate::llm::han_fix::normalize_rewrite(&streamed.content);
-    if next.is_empty() {
-        Err("empty rewrite".into())
-    } else {
-        Ok(next)
+    .await
+    {
+        Err(_) => return Err("timeout".into()),
+        Ok(Err(error)) if llm::is_cancelled_error(&error) => return Err("rewrite-stopped".into()),
+        Ok(Err(error)) => return Err(error),
+        Ok(Ok(out)) => out,
+    };
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("rewrite-stopped".into());
     }
+    let bodies = crate::llm::han_fix::parse_rewritten_segments(&streamed.content, segments.len());
+    Ok(bodies
+        .into_iter()
+        .map(|text| crate::llm::han_fix::SegmentRewrite {
+            text,
+            finish_reason: streamed.finish_reason.clone(),
+        })
+        .collect())
 }
 
 /// A kept answer may cite only sources that existed when it was written.

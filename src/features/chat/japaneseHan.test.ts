@@ -6,10 +6,14 @@ import {
   foreignCharNoticeForAssistant,
   foreignChars,
   HAN_REWRITE_NOTE,
+  HAN_REWRITE_STOPPED_NOTE,
   hanMapNote,
+  hanMarkedHtml,
   isCjkIdeograph,
   isJapaneseHan,
+  markHanFixes,
   parseScriptFix,
+  userRequestsForeignWriting,
 } from "./japaneseHan";
 
 describe("foreignChars", () => {
@@ -118,6 +122,11 @@ describe("applyHanMap", () => {
     expect(applyHanMap("α版　μm　OK 123")).toBe("α版　μm　OK 123");
     expect(applyHanMap("发")).toBe("发");
     expect(applyHanMap("国学个干后面里")).toBe("国学个干后面里");
+    expect(applyHanMap("线")).toBe("線");
+    expect(applyHanMap("举")).toBe("挙");
+    expect(applyHanMap("鉴")).toBe("鑑");
+    expect(applyHanMap("净")).toBe("浄");
+    expect(applyHanMap("账")).toBe("帳");
   });
 
   it("describes the places that were replaced", () => {
@@ -130,11 +139,28 @@ describe("applyHanMap", () => {
     ).toBe("现→現 など3か所を直しました");
     expect(hanMapNote([])).toBeNull();
     expect(HAN_REWRITE_NOTE).toBe("AIが外国文字を含む部分を書き直しました");
+    expect(HAN_REWRITE_STOPPED_NOTE).toBe("書き直しを中止しました");
     expect(parseScriptFix("")).toBeNull();
     expect(parseScriptFix('{"fixes":[{"at":0,"from":"现","to":"現"}],"rewritten":true}')).toEqual({
       fixes: [{ at: 0, from: "现", to: "現" }],
       rewritten: true,
+      rewriteStopped: false,
+      suppressWarning: false,
     });
+    expect(userRequestsForeignWriting("中国語に訳して")).toBe(true);
+    expect(userRequestsForeignWriting("Please translate this")).toBe(true);
+    expect(userRequestsForeignWriting("契約を要約して")).toBe(false);
+  });
+
+  it("does not underline inside a URL or an HTML attribute", () => {
+    const url = "参照 https://example.com/现 です";
+    const at = [...url].findIndex((ch) => ch === "现");
+    expect(markHanFixes(url, [{ at, from: "现", to: "現" }])).toBe(url);
+    const html = `<a href="https://example.com/\uE000現\uE001">\uE000現\uE001</a>`;
+    const marked = hanMarkedHtml(html);
+    expect(marked).toContain('href="https://example.com/現"');
+    expect(marked).toContain('<span class="chat-han-fix">現</span>');
+    expect(marked).not.toContain("\uE000");
   });
 });
 
