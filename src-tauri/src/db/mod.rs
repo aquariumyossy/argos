@@ -261,6 +261,13 @@ pub struct LlmMessageRow {
 /// App-generated chat row. Saved and shown, but left out of later model context.
 pub const LLM_MESSAGE_NOTICE: &str = "notice";
 
+/// A file `edit_office` wrote in one chat. Not sent to the model.
+#[derive(Debug, Clone)]
+pub(crate) struct LlmOfficeEdit {
+    pub output_name: String,
+    pub source_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmSourceRow {
@@ -993,6 +1000,16 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_llm_messages_thread
               ON llm_messages(thread_id, created_at);
+            CREATE TABLE IF NOT EXISTS llm_office_edits (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              thread_id TEXT NOT NULL,
+              output_name TEXT NOT NULL,
+              source_path TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_office_edits_thread
+              ON llm_office_edits(thread_id, id);
             CREATE TABLE IF NOT EXISTS llm_thread_sources (
               id TEXT PRIMARY KEY,
               thread_id TEXT NOT NULL,
@@ -3742,6 +3759,89 @@ impl Db {
             })
         })?;
         Ok(rows.flatten().collect())
+    }
+
+    /// One `edit_office` save in a chat. Kept out of the model transcript so a
+    /// shortened tool result cannot hide the file that later edits should update.
+    pub(crate) fn insert_llm_office_edit(
+        &self,
+        thread_id: &str,
+        output_name: &str,
+        source_path: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO llm_office_edits(thread_id, output_name, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![thread_id, output_name, source_path, now],
+        )?;
+        Ok(())
+    }
+
+    /// Oldest first. The last row is the latest edited file in the thread.
+    pub(crate) fn list_llm_office_edits(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<LlmOfficeEdit>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT output_name, source_path FROM llm_office_edits
+             WHERE thread_id=?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([thread_id], |row| {
+            Ok(LlmOfficeEdit {
+                output_name: row.get(0)?,
+                source_path: row.get(1)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Point an existing output row at `to_name` and make that row the latest.
+    ///
+    /// Re-inserts so `id` moves forward with `created_at`. An update of
+    /// `created_at` alone would stay behind newer rows when the list is ordered
+    /// by id.
+    pub(crate) fn retarget_llm_office_edit(
+        &self,
+        thread_id: &str,
+        from_name: &str,
+        to_name: &str,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let source = match conn.query_row(
+            "SELECT source_path FROM llm_office_edits
+             WHERE thread_id=?1 AND output_name=?2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            rusqlite::params![thread_id, from_name],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(source) => source,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let now = chrono::Utc::now().timestamp();
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let deleted = conn.execute(
+            "DELETE FROM llm_office_edits WHERE thread_id=?1 AND output_name=?2",
+            rusqlite::params![thread_id, from_name],
+        );
+        if let Err(err) = deleted {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(err);
+        }
+        let inserted = conn.execute(
+            "INSERT INTO llm_office_edits(thread_id, output_name, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![thread_id, to_name, source, now],
+        );
+        if let Err(err) = inserted {
+            let _ = conn.execute("ROLLBACK", []);
+            return Err(err);
+        }
+        conn.execute("COMMIT", [])?;
+        Ok(1)
     }
 
     pub fn insert_llm_message(

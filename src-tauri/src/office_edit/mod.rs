@@ -11,6 +11,7 @@ mod xmlscan;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -30,6 +31,8 @@ const OVERWRITE_LINE: &str = "前回の編集済みファイルに上書きし�
 /// Shown when that file is open, so the edit is saved as a new file instead.
 const OPEN_FILE_LINE: &str = "前回のファイルが開かれていたため、新しいファイルに保存した";
 const EDIT_MARK: &str = "_編集済み（";
+const RENAME_ATTEMPTS: u32 = 3;
+const RENAME_PAUSE: Duration = Duration::from_millis(150);
 const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 80 * 1024 * 1024;
 const MAX_REPLACEMENTS: usize = 40;
@@ -80,6 +83,7 @@ pub struct EditOutcome {
     pub filename: String,
     pub path: PathBuf,
     pub report: String,
+    pub(crate) save: SaveNotice,
 }
 
 #[derive(Debug, Clone)]
@@ -165,39 +169,79 @@ pub(crate) fn replace_value(text: &str, req: &EditRequest, stats: &mut ChangeSta
 
 /// Run the chat tool. Errors are sentences the model can show or correct.
 pub fn edit_from_tool(state: &crate::state::AppState, thread_id: &str, args: &Value) -> String {
-    match edit_from_tool_inner(state, thread_id, args) {
+    let author = state.settings.read().office_revision_author.clone();
+    match edit_in_thread(&state.db, &state.data_dir, &author, thread_id, args) {
         Ok(outcome) => outcome.report,
         Err(message) => message,
     }
 }
 
-fn edit_from_tool_inner(
-    state: &crate::state::AppState,
+/// Edit one office file for a chat and remember the file that was written.
+pub(crate) fn edit_in_thread(
+    db: &crate::db::Db,
+    data_dir: &Path,
+    revision_author: &str,
     thread_id: &str,
     args: &Value,
 ) -> Result<EditOutcome, String> {
-    let sources = state
-        .db
+    let sources = db
         .list_llm_sources(thread_id)
         .map_err(|err| format!("添付を読めません（{err}）。"))?;
-    let path = resolve_edit_source(&sources, &state.data_dir, args)?;
+    let requested = resolve_edit_source(&sources, data_dir, args)?;
     let mut request = EditRequest::from_args(args)?;
-    request.revision_author = office_revision_author(&state.settings.read().office_revision_author);
+    request.revision_author = office_revision_author(revision_author);
     if request.revision_date.trim().is_empty() {
         request.revision_date = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     }
     let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
-    let output_dir = state.data_dir.join(OUTPUT_DIR_NAME);
-    let messages = state
-        .db
+    let output_dir = data_dir.join(OUTPUT_DIR_NAME);
+    let messages = db
         .list_llm_messages(thread_id)
         .map_err(|err| format!("会話を読めません（{err}）。"))?;
     let prior: Vec<(&str, &str)> = messages
         .iter()
         .map(|message| (message.tool_name.as_str(), message.content.as_str()))
         .collect();
-    let overwrite = replaces_chat_output(Path::new(&path), &output_dir, &prior);
-    edit_path_mode(Path::new(&path), &output_dir, &stamp, &request, overwrite)
+    let edits = db
+        .list_llm_office_edits(thread_id)
+        .map_err(|err| format!("編集の記録を読めません（{err}）。"))?;
+    let fresh = arg_bool(args.get("fresh"));
+    let (read_path, overwrite) = if fresh {
+        (requested.clone(), false)
+    } else {
+        edit_target(&requested, &output_dir, &prior, &edits)
+    };
+    let redirected = !fresh && !same_file(&requested, &read_path);
+    let edited_name = read_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut outcome = match edit_path_mode(&read_path, &output_dir, &stamp, &request, overwrite) {
+        Ok(outcome) => outcome,
+        Err(message) if redirected && message.contains("見つかりません") => {
+            return Err(format!(
+                "前回の編集済みファイル「{edited_name}」の中を探したが、指定した文字列は見つからなかった。fresh は、利用者が元の版からやり直すと頼んだときだけ指定する。\n{message}"
+            ));
+        }
+        Err(message) if redirected => {
+            return Err(format!(
+                "前回の編集済みファイル「{edited_name}」を対象にしました。\n{message}"
+            ));
+        }
+        Err(message) => return Err(message),
+    };
+    if redirected {
+        outcome.report.insert_str(
+            0,
+            &format!("前回の編集済みファイル「{edited_name}」を編集した\n"),
+        );
+    }
+    if let Err(err) = remember_office_edit(db, thread_id, &requested, &read_path, &outcome) {
+        outcome
+            .report
+            .push_str(&format!("編集の記録を保存できませんでした（{err}）。\n"));
+    }
+    Ok(outcome)
 }
 
 pub fn edit_path(
@@ -316,6 +360,7 @@ pub(crate) fn edit_path_mode(
         ),
         filename,
         path: dest,
+        save: notice,
     })
 }
 
@@ -1246,7 +1291,8 @@ fn read_zip(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(entries)
 }
 
-enum SaveNotice {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveNotice {
     New,
     Overwrote,
     Opened,
@@ -1282,30 +1328,58 @@ fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), PlaceErro
 }
 
 fn rename_onto(tmp: &Path, dest: &Path) -> Result<(), String> {
-    #[cfg(test)]
-    if take_forced_replace_failure(dest) {
-        return Err("出力を保存できません（os error 5）。".into());
+    let mut last = String::new();
+    for attempt in 0..RENAME_ATTEMPTS {
+        if forced_replace_failure(dest) {
+            last = "出力を保存できません（os error 5）。".into();
+        } else {
+            match fs::rename(tmp, dest) {
+                Ok(()) => return Ok(()),
+                Err(err) => last = format!("出力を保存できません（{err}）。"),
+            }
+        }
+        if attempt + 1 < RENAME_ATTEMPTS {
+            std::thread::sleep(RENAME_PAUSE);
+        }
     }
-    fs::rename(tmp, dest).map_err(|err| format!("出力を保存できません（{err}）。"))
+    Err(last)
+}
+
+fn forced_replace_failure(dest: &Path) -> bool {
+    #[cfg(test)]
+    {
+        return take_forced_replace_failure(dest);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = dest;
+        false
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    static FORCE_REPLACE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_REPLACE_FAILURE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// The next rename onto a file that already exists fails once, as if Word or
-/// Excel still had it open. The following save of a new file is unaffected.
+/// The next renames onto a file that already exists fail for every retry, as if
+/// Word or Excel kept it open. A later save of a new file is unaffected.
 #[cfg(test)]
 pub(crate) fn fail_next_replace_of_existing_file() {
-    FORCE_REPLACE_FAILURE.with(|flag| flag.set(true));
+    fail_replace_of_existing_file_times(RENAME_ATTEMPTS);
+}
+
+/// Fail the next `times` renames onto an existing file. One failure is retried.
+#[cfg(test)]
+pub(crate) fn fail_replace_of_existing_file_times(times: u32) {
+    FORCE_REPLACE_FAILURE.with(|left| left.set(times));
 }
 
 #[cfg(test)]
 fn take_forced_replace_failure(dest: &Path) -> bool {
-    FORCE_REPLACE_FAILURE.with(|flag| {
-        if flag.get() && dest.exists() {
-            flag.set(false);
+    FORCE_REPLACE_FAILURE.with(|left| {
+        if left.get() > 0 && dest.exists() {
+            left.set(left.get() - 1);
             true
         } else {
             false
@@ -1334,18 +1408,98 @@ fn write_zip_file(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), Stri
 /// `prior` is `(tool name, tool result)` from that chat only. A file saved by
 /// another tool, or named in another chat, does not qualify.
 pub(crate) fn replaces_chat_output(src: &Path, output_dir: &Path, prior: &[(&str, &str)]) -> bool {
-    if !is_direct_output_file(src, output_dir) {
-        return false;
-    }
-    let Some(name) = src.file_name().and_then(|item| item.to_str()) else {
+    let Some(name) = edited_output_name(src, output_dir) else {
         return false;
     };
-    if !name.contains(EDIT_MARK) {
-        return false;
-    }
     prior
         .iter()
         .any(|(tool, content)| *tool == "edit_office" && marker_names_file(content, name))
+}
+
+/// Where to read, and whether to write back over that file.
+///
+/// Passing one of this chat's edited files updates that file. Passing an
+/// original updates the newest edited file still on disk that was made from it.
+/// A newer edit of a different original does not hide that file.
+fn edit_target(
+    requested: &Path,
+    output_dir: &Path,
+    prior: &[(&str, &str)],
+    edits: &[crate::db::LlmOfficeEdit],
+) -> (PathBuf, bool) {
+    if replaces_chat_output(requested, output_dir, prior) {
+        return (requested.to_path_buf(), true);
+    }
+    if let Some(name) = edited_output_name(requested, output_dir) {
+        if edits
+            .iter()
+            .any(|edit| edit.output_name.eq_ignore_ascii_case(name))
+        {
+            return (requested.to_path_buf(), true);
+        }
+    }
+    for edit in edits.iter().rev() {
+        if !edit.output_name.contains(EDIT_MARK) {
+            continue;
+        }
+        let output = output_dir.join(&edit.output_name);
+        if !output.is_file() || same_file(requested, &output) {
+            continue;
+        }
+        if same_file(requested, Path::new(&edit.source_path)) {
+            return (output, true);
+        }
+    }
+    (requested.to_path_buf(), false)
+}
+
+fn edited_output_name<'a>(src: &'a Path, output_dir: &Path) -> Option<&'a str> {
+    if !is_direct_output_file(src, output_dir) {
+        return None;
+    }
+    let name = src.file_name().and_then(|item| item.to_str())?;
+    name.contains(EDIT_MARK).then_some(name)
+}
+
+fn remember_office_edit(
+    db: &crate::db::Db,
+    thread_id: &str,
+    requested: &Path,
+    read_path: &Path,
+    outcome: &EditOutcome,
+) -> Result<(), String> {
+    let read_name = read_path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("");
+    let source = path_key(requested);
+    let retargeted = match outcome.save {
+        SaveNotice::New => false,
+        SaveNotice::Overwrote | SaveNotice::Opened => {
+            db.retarget_llm_office_edit(thread_id, read_name, &outcome.filename)
+                .map_err(|err| err.to_string())?
+                > 0
+        }
+    };
+    if !retargeted {
+        db.insert_llm_office_edit(thread_id, &outcome.filename, &source)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn path_key(path: &Path) -> String {
+    fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (fs::canonicalize(left), fs::canonicalize(right)) {
+        return left == right;
+    }
+    pathutil::normalize_for_compare(&left.to_string_lossy())
+        .eq_ignore_ascii_case(&pathutil::normalize_for_compare(&right.to_string_lossy()))
 }
 
 fn is_direct_output_file(src: &Path, output_dir: &Path) -> bool {
