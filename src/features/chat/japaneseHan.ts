@@ -1,4 +1,5 @@
 import { HAN_BMP_A, HAN_BMP_A0, HAN_BMP_B, HAN_BMP_B0, HAN_EXTRA } from "./japaneseHanData";
+import { HAN_JP_PAIRS } from "./japaneseHanMap";
 
 const SHOWN_LIMIT = 12;
 
@@ -215,4 +216,312 @@ export function foreignCharNoticeForAssistant(
     }
   }
   return foreignCharNotice(...parts);
+}
+
+function loadHanMap(): Map<number, string> {
+  const bytes = decodeBase64(HAN_JP_PAIRS.replace(/\s+/g, ""));
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const map = new Map<number, string>();
+  for (let i = 0; i + 8 <= bytes.length; i += 8) {
+    map.set(view.getUint32(i, true), String.fromCodePoint(view.getUint32(i + 4, true)));
+  }
+  return map;
+}
+
+const hanMap = loadHanMap();
+
+/** One-to-one substitutions. Kana, Latin, and Greek are not in the table. */
+export function applyHanMap(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    const to = cp === undefined ? undefined : hanMap.get(cp);
+    if (cp !== undefined && to) {
+      const dst = to.codePointAt(0);
+      if (
+        dst !== undefined &&
+        isCjkIdeograph(cp) &&
+        !isJapaneseHan(cp) &&
+        isJapaneseHan(dst)
+      ) {
+        out += to;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+export type HanFix = { at: number; from: string; to: string };
+
+export type ScriptFix = {
+  fixes: HanFix[];
+  rewritten: boolean;
+  /** The user stopped the rewrite. The step-1 text is what is stored. */
+  rewriteStopped: boolean;
+  /**
+   * The user asked for a translation or for Chinese/Korean. The orange warning
+   * is hidden. Quotes and code are not corrected, but they still warn.
+   */
+  suppressWarning: boolean;
+};
+
+export function parseScriptFix(raw: string | undefined | null): ScriptFix | null {
+  const text = (raw ?? "").trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text) as {
+      fixes?: unknown;
+      rewritten?: unknown;
+      rewriteStopped?: unknown;
+      suppressWarning?: unknown;
+    };
+    const fixes: HanFix[] = [];
+    if (Array.isArray(parsed.fixes)) {
+      for (const item of parsed.fixes) {
+        if (!item || typeof item !== "object") continue;
+        const row = item as { at?: unknown; from?: unknown; to?: unknown };
+        if (
+          typeof row.at !== "number" ||
+          typeof row.from !== "string" ||
+          typeof row.to !== "string"
+        ) {
+          continue;
+        }
+        fixes.push({ at: row.at, from: row.from, to: row.to });
+      }
+    }
+    return {
+      fixes,
+      rewritten: parsed.rewritten === true,
+      rewriteStopped: parsed.rewriteStopped === true,
+      suppressWarning: parsed.suppressWarning === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Language names. A bare mention does not skip correction. Same list as Rust. */
+export const FOREIGN_SCRIPT_KEYWORDS = [
+  "中国語",
+  "韓国語",
+  "朝鮮語",
+  "中文",
+  "한국어",
+  "한국말",
+  "簡体字",
+  "繁体字",
+  "ハングル",
+  "chinese",
+  "korean",
+] as const;
+
+/** Generic translation words. They skip only when the reply is mostly foreign. */
+export const GENERIC_TRANSLATION_KEYWORDS = ["訳して", "翻訳", "translate", "和訳", "英訳"] as const;
+
+/** Same numbers as the Rust constants. */
+export const MOSTLY_FOREIGN_MIN_LETTERS = 24;
+export const MOSTLY_FOREIGN_MIN_FOREIGN = 6;
+export const MOSTLY_FOREIGN_MAX_KANA = 2;
+
+/** How many recent user turns are checked. Same as the Rust constant. */
+export const RECENT_USER_TURNS = 4;
+
+function containsKeyword(prompt: string, words: readonly string[]): boolean {
+  const lower = prompt.toLowerCase();
+  return words.some((word) => lower.includes(word.toLowerCase()));
+}
+
+/** Any mention. 「中国語にしてください」 and 「中国語の契約書」 both count. */
+export function namesForeignScript(prompt: string): boolean {
+  return containsKeyword(prompt, FOREIGN_SCRIPT_KEYWORDS);
+}
+
+export function asksGenericTranslation(prompt: string): boolean {
+  return containsKeyword(prompt, GENERIC_TRANSLATION_KEYWORDS);
+}
+
+export function recentUserText(messages: { role: string; content: string }[]): string {
+  const users = messages.filter((message) => message.role === "user");
+  return users
+    .slice(-RECENT_USER_TURNS)
+    .map((message) => message.content)
+    .join("\n");
+}
+
+function isKana(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  // U+30FB ・ and U+30FC ー are not kana. A line of only those is not Japanese.
+  if (cp === 0x30fb || cp === 0x30fc) return false;
+  return (
+    (cp >= 0x3040 && cp <= 0x309f) ||
+    (cp >= 0x30a0 && cp <= 0x30ff) ||
+    (cp >= 0x31f0 && cp <= 0x31ff) ||
+    (cp >= 0xff66 && cp <= 0xff9d)
+  );
+}
+
+/**
+ * Same threshold as the Rust check. A long reply with almost no kana and a
+ * real share of non-Japanese characters is left alone, warning included.
+ */
+export function replyIsMostlyForeign(text: string): boolean {
+  let kana = 0;
+  let foreign = 0;
+  let letters = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isKana(ch)) {
+      letters += 1;
+      kana += 1;
+    } else if (isForeignScript(cp) || (isCjkIdeograph(cp) && !isJapaneseHan(cp))) {
+      letters += 1;
+      foreign += 1;
+    } else if (isCjkIdeograph(cp) || /\p{L}/u.test(ch)) {
+      letters += 1;
+    }
+  }
+  if (letters < MOSTLY_FOREIGN_MIN_LETTERS || foreign < MOSTLY_FOREIGN_MIN_FOREIGN) return false;
+  if (kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters) return false;
+  return foreign * 6 >= letters;
+}
+
+/** More kana than the "almost none" bar. A normal Japanese sentence qualifies. */
+export function hasEnoughKana(text: string): boolean {
+  let kana = 0;
+  let letters = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (isKana(ch)) {
+      letters += 1;
+      kana += 1;
+    } else if (isForeignScript(cp) || isCjkIdeograph(cp) || /\p{L}/u.test(ch)) {
+      letters += 1;
+    }
+  }
+  if (kana === 0) return false;
+  return kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters;
+}
+
+/** Hiragana, U+3041–U+309F. Katakana, ー, ｰ, and ・ do not count. */
+function isHiragana(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  return cp >= 0x3041 && cp <= 0x309f;
+}
+
+/**
+ * Pieces kept for the orange warning when a foreign language was mentioned.
+ * A line or `|` cell counts only when it contains hiragana. Katakana company
+ * names stay with the translation and are not listed.
+ */
+export function foreignNoticeText(prompt: string, text: string): string {
+  if (!namesForeignScript(prompt)) return text;
+  const kept: string[] = [];
+  for (const line of text.split("\n")) {
+    if ((line.match(/\|/g) ?? []).length >= 2) {
+      for (const cell of line.split("|")) {
+        if ([...cell].some((ch) => isHiragana(ch))) kept.push(cell);
+      }
+    } else if ([...line].some((ch) => isHiragana(ch))) {
+      kept.push(line);
+    }
+  }
+  return kept.join("\n");
+}
+
+/**
+ * Generic translation words skip the whole reply only when it is mostly foreign.
+ * A mentioned language does not skip the reply; pieces without hiragana are
+ * left out of the warning instead.
+ */
+export function shouldSkipForeignFix(prompt: string, text: string): boolean {
+  if (hasEnoughKana(text)) return false;
+  return asksGenericTranslation(prompt) && replyIsMostlyForeign(text);
+}
+
+export function recentShouldSkipForeignFix(
+  messages: { role: string; content: string }[],
+  text: string,
+): boolean {
+  return shouldSkipForeignFix(recentUserText(messages), text);
+}
+
+/** 「现→現 など3か所を直しました」 */
+export function hanMapNote(fixes: HanFix[]): string | null {
+  const first = fixes[0];
+  if (!first) return null;
+  return `${first.from}→${first.to} など${fixes.length}か所を直しました`;
+}
+
+export const HAN_REWRITE_NOTE = "AIが外国文字を含む部分を書き直しました";
+
+export const HAN_REWRITE_STOPPED_NOTE = "書き直しを中止しました";
+
+const HAN_MARK_L = "\uE000";
+const HAN_MARK_R = "\uE001";
+
+function startsAt(chars: string[], index: number, needle: string): boolean {
+  for (let i = 0; i < needle.length; i += 1) {
+    if (chars[index + i] !== needle[i]) return false;
+  }
+  return true;
+}
+
+function urlIndexes(text: string): Set<number> {
+  const blocked = new Set<number>();
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    const https = startsAt(chars, i, "https://");
+    const http = !https && startsAt(chars, i, "http://");
+    if (!https && !http) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    i += https ? "https://".length : "http://".length;
+    while (i < chars.length && !/\s/.test(chars[i] ?? "")) i += 1;
+    for (let at = start; at < i; at += 1) blocked.add(at);
+  }
+  return blocked;
+}
+
+/** Wrap substituted characters so the markdown renderer can underline them. */
+export function markHanFixes(text: string, fixes: HanFix[] | undefined): string {
+  if (!fixes?.length) return text;
+  const blocked = urlIndexes(text);
+  const ats = new Set(fixes.map((fix) => fix.at).filter((at) => !blocked.has(at)));
+  let out = "";
+  let index = 0;
+  for (const ch of text) {
+    out += ats.has(index) ? `${HAN_MARK_L}${ch}${HAN_MARK_R}` : ch;
+    index += 1;
+  }
+  return out;
+}
+
+export function stripHanMarks(text: string): string {
+  return text.replace(/\uE000([^\uE001]*)\uE001/g, "$1");
+}
+
+/** Underline markers in text nodes only. Markers inside a tag or attribute are removed. */
+export function hanMarkedHtml(html: string): string {
+  let out = "";
+  let index = 0;
+  while (index < html.length) {
+    if (html[index] === "<") {
+      const end = html.indexOf(">", index);
+      const tag = end < 0 ? html.slice(index) : html.slice(index, end + 1);
+      out += tag.replace(/\uE000([^\uE001]*)\uE001/g, "$1");
+      index = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    const next = html.indexOf("<", index);
+    const chunk = next < 0 ? html.slice(index) : html.slice(index, next);
+    out += chunk.replace(/\uE000([^\uE001]*)\uE001/g, '<span class="chat-han-fix">$1</span>');
+    index = next < 0 ? html.length : next;
+  }
+  return out;
 }

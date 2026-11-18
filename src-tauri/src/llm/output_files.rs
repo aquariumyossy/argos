@@ -343,6 +343,8 @@ mod tests {
             tool_call_id: String::new(),
             tool_name: String::new(),
             kind: String::new(),
+            original_content: String::new(),
+            script_fix: String::new(),
             carries_summary: false,
         }
     }

@@ -253,6 +253,13 @@ pub struct LlmMessageRow {
     /// "retried", "continued", and "incomplete" are normal answers with a completeness flag. They are sent again.
     #[serde(default)]
     pub kind: String,
+    /// Assistant text before foreign-script correction. Empty when the stored text is unchanged.
+    /// Not sent back to the model; `content` is.
+    #[serde(default)]
+    pub original_content: String,
+    /// JSON `{fixes, rewritten}` for the chat notice. Empty when there is nothing to show.
+    #[serde(default)]
+    pub script_fix: String,
     /// Set by `prepare_model_history` on the injected summary. Not stored.
     #[serde(skip, default)]
     pub carries_summary: bool,
@@ -995,6 +1002,8 @@ impl Db {
               tool_call_id TEXT NOT NULL DEFAULT '',
               tool_name TEXT NOT NULL DEFAULT '',
               kind TEXT NOT NULL DEFAULT '',
+              original_content TEXT NOT NULL DEFAULT '',
+              script_fix TEXT NOT NULL DEFAULT '',
               created_at INTEGER NOT NULL,
               FOREIGN KEY(thread_id) REFERENCES llm_threads(id) ON DELETE CASCADE
             );
@@ -1139,6 +1148,14 @@ impl Db {
                 [],
             )
             .is_ok();
+        let _ = conn.execute(
+            "ALTER TABLE llm_messages ADD COLUMN original_content TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE llm_messages ADD COLUMN script_fix TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         // Stamp assistant rows written before `kind` existed. Only on the startup that
         // adds the column, so a later answer with the same opening stays a normal turn.
         if kind_col_added {
@@ -3740,7 +3757,8 @@ impl Db {
     ) -> Result<Vec<LlmMessageRow>, rusqlite::Error> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name, kind
+            "SELECT id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name, kind,
+                    original_content, script_fix
              FROM llm_messages WHERE thread_id=?1 ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map([thread_id], |row| {
@@ -3755,6 +3773,8 @@ impl Db {
                 tool_call_id: row.get(7)?,
                 tool_name: row.get(8)?,
                 kind: row.get(9)?,
+                original_content: row.get(10)?,
+                script_fix: row.get(11)?,
                 carries_summary: false,
             })
         })?;
@@ -3886,13 +3906,42 @@ impl Db {
         tool_name: &str,
         kind: &str,
     ) -> Result<LlmMessageRow, rusqlite::Error> {
+        self.insert_llm_message_stored(
+            thread_id,
+            role,
+            content,
+            reasoning,
+            tool_calls,
+            tool_call_id,
+            tool_name,
+            kind,
+            "",
+            "",
+        )
+    }
+
+    /// `original_content` is the reply before foreign-script correction. History reads `content`.
+    pub fn insert_llm_message_stored(
+        &self,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+        reasoning: &str,
+        tool_calls: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        kind: &str,
+        original_content: &str,
+        script_fix: &str,
+    ) -> Result<LlmMessageRow, rusqlite::Error> {
         let conn = self.conn.lock();
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO llm_messages(
-                id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name, kind
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                id, thread_id, role, content, created_at, reasoning, tool_calls, tool_call_id, tool_name, kind,
+                original_content, script_fix
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 id,
                 thread_id,
@@ -3903,7 +3952,9 @@ impl Db {
                 tool_calls,
                 tool_call_id,
                 tool_name,
-                kind
+                kind,
+                original_content,
+                script_fix
             ],
         )?;
         let now2 = now;
@@ -3922,6 +3973,8 @@ impl Db {
             tool_call_id: tool_call_id.to_string(),
             tool_name: tool_name.to_string(),
             kind: kind.to_string(),
+            original_content: original_content.to_string(),
+            script_fix: script_fix.to_string(),
             carries_summary: false,
         })
     }
@@ -5968,6 +6021,8 @@ mod folder_index_status_tests {
         let messages = db.list_llm_messages("t1").unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "こんにちは");
+        assert_eq!(messages[0].original_content, "");
+        assert_eq!(messages[0].script_fix, "");
         assert_eq!(messages[0].reasoning, "");
         assert_eq!(messages[0].tool_calls, "");
         assert_eq!(messages[0].tool_call_id, "");
@@ -6000,6 +6055,35 @@ mod folder_index_status_tests {
         assert_eq!(messages[2].content, "検索結果");
         assert_eq!(messages[2].tool_call_id, "c1");
         assert_eq!(messages[2].tool_name, "search_index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_message_keeps_the_original_reply_beside_the_corrected_one() {
+        let dir = temp_dir();
+        let db = Db::open(&dir.join("argos.db")).unwrap();
+        let thread = db.create_llm_thread("会話", true).unwrap();
+        let saved = db
+            .insert_llm_message_stored(
+                &thread.id,
+                "assistant",
+                "現在の契約です。",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "现在の契約です。",
+                r#"{"fixes":[{"at":0,"from":"现","to":"現"}],"rewritten":false}"#,
+            )
+            .unwrap();
+        assert_eq!(saved.content, "現在の契約です。");
+        assert_eq!(saved.original_content, "现在の契約です。");
+        let listed = db.list_llm_messages(&thread.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "現在の契約です。");
+        assert_eq!(listed[0].original_content, "现在の契約です。");
+        assert!(listed[0].script_fix.contains("现"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
