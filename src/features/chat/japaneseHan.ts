@@ -405,9 +405,16 @@ export function hasEnoughKana(text: string): boolean {
   return kana > MOSTLY_FOREIGN_MAX_KANA || kana * 20 > letters;
 }
 
+/** Hiragana, U+3041–U+309F. Katakana, ー, ｰ, and ・ do not count. */
+function isHiragana(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  return cp >= 0x3041 && cp <= 0x309f;
+}
+
 /**
- * Pieces kept for the orange warning after a named-script reply is left as-is.
- * A markdown table row is split on `|` and each cell is judged alone.
+ * Pieces kept for the orange warning when a foreign language was mentioned.
+ * A line or `|` cell counts only when it contains hiragana. Katakana company
+ * names stay with the translation and are not listed.
  */
 export function foreignNoticeText(prompt: string, text: string): string {
   if (!namesForeignScript(prompt)) return text;
@@ -415,9 +422,9 @@ export function foreignNoticeText(prompt: string, text: string): string {
   for (const line of text.split("\n")) {
     if ((line.match(/\|/g) ?? []).length >= 2) {
       for (const cell of line.split("|")) {
-        if ([...cell].some((ch) => isKana(ch))) kept.push(cell);
+        if ([...cell].some((ch) => isHiragana(ch))) kept.push(cell);
       }
-    } else if ([...line].some((ch) => isKana(ch))) {
+    } else if ([...line].some((ch) => isHiragana(ch))) {
       kept.push(line);
     }
   }
@@ -426,8 +433,8 @@ export function foreignNoticeText(prompt: string, text: string): string {
 
 /**
  * Generic translation words skip the whole reply only when it is mostly foreign.
- * A mentioned language does not skip the reply; kana-less pieces are left out
- * of the warning instead.
+ * A mentioned language does not skip the reply; pieces without hiragana are
+ * left out of the warning instead.
  */
 export function shouldSkipForeignFix(prompt: string, text: string): boolean {
   if (hasEnoughKana(text)) return false;

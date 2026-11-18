@@ -9,11 +9,12 @@
 //! implausible. Latin and Greek are not foreign script.
 //!
 //! If the recent user turns mention a foreign language (中国語, 한국어, Chinese, …),
-//! lines and table cells with no kana are left byte-for-byte alone: no mapping,
-//! no rewrite, and no orange warning. Lines and cells that contain kana are
-//! corrected as usual. `・` and `ー` are not kana. Generic words (訳して, 翻訳,
-//! translate, 和訳, 英訳) skip the whole reply only when it is mostly foreign.
-//! Quotes, code, and blockquotes stay excluded. A quote may span lines.
+//! lines and table cells with no hiragana are left byte-for-byte alone: no
+//! mapping, no rewrite, and no orange warning. Katakana, `ー`, `ｰ`, and `・`
+//! do not make a piece Japanese. Lines and cells that contain hiragana are
+//! corrected as usual. Generic words (訳して, 翻訳, translate, 和訳, 英訳) skip
+//! the whole reply only when it is mostly foreign. Quotes, code, and
+//! blockquotes stay excluded. A quote may span lines.
 
 #[path = "japanese_han_map.rs"]
 mod japanese_han_map;
@@ -222,8 +223,8 @@ fn contains_keyword(prompt: &str, words: &[&str]) -> bool {
 /// Any mention of a foreign language in the recent user text.
 ///
 /// The phrasing does not matter: 「中国語にしてください」「中国語の契約書」
-/// 「Chinese wall」「한국어로 번역」 all count. Kana-less lines are then left
-/// untouched, and lines that contain kana are corrected as usual.
+/// 「Chinese wall」「한국어로 번역」 all count. Lines without hiragana are then
+/// left untouched, and lines that contain hiragana are corrected as usual.
 pub fn names_foreign_script(prompt: &str) -> bool {
     contains_keyword(prompt, FOREIGN_SCRIPT_KEYWORDS)
 }
@@ -245,8 +246,15 @@ fn is_kana(ch: char) -> bool {
     )
 }
 
-fn line_has_kana(line: &str) -> bool {
-    line.chars().any(is_kana)
+/// Hiragana, U+3041..=U+309F. Katakana, 「ー」「ｰ」, and 「・」 do not count.
+fn is_hiragana(ch: char) -> bool {
+    matches!(ch, '\u{3041}'..='\u{309F}')
+}
+
+/// A line or table cell counts as Japanese in the language-mentioned mode only
+/// when it contains hiragana. Katakana company names stay with the translation.
+fn line_has_hiragana(line: &str) -> bool {
+    line.chars().any(is_hiragana)
 }
 
 /// A long reply that is mostly non-Japanese letters and has almost no kana.
@@ -302,12 +310,12 @@ pub fn has_enough_kana(text: &str) -> bool {
     kana > MOSTLY_FOREIGN_MAX_KANA || kana.saturating_mul(20) > letters
 }
 
-/// Pieces kept for the orange warning after a named-script reply is left as-is.
+/// Pieces kept for the orange warning when a foreign language was mentioned.
 ///
-/// A line with kana is kept. A line with no kana is dropped, so the translation
-/// itself is not listed. A markdown table row is split on `|` and each cell is
-/// judged alone: `| 当事者の義務 | 当事人的义务 |` warns only from the Japanese
-/// cell. `・` and `ー` do not count as kana.
+/// A line with hiragana is kept. A line with none is dropped, so the translation
+/// itself is not listed. Katakana, 「ー」「ｰ」, and 「・」 do not count. A
+/// markdown table row is split on `|` and each cell is judged alone:
+/// `| 当事者の義務 | 当事人的义务 |` warns only from the Japanese cell.
 pub fn foreign_notice_text(prompt: &str, text: &str) -> String {
     if !names_foreign_script(prompt) {
         return text.to_string();
@@ -316,11 +324,11 @@ pub fn foreign_notice_text(prompt: &str, text: &str) -> String {
     for line in text.split('\n') {
         if is_markdown_table_row(line) {
             for cell in line.split('|') {
-                if line_has_kana(cell) {
+                if line_has_hiragana(cell) {
                     kept.push(cell);
                 }
             }
-        } else if line_has_kana(line) {
+        } else if line_has_hiragana(line) {
             kept.push(line);
         }
     }
@@ -353,11 +361,11 @@ fn mask_kana_less_regions(text: &str, mask: &mut [bool]) {
                     j += 1;
                 }
                 let cell: String = chars[cell_start..j].iter().collect();
-                if !line_has_kana(&cell) {
+                if !line_has_hiragana(&cell) {
                     mask[cell_start..j].fill(true);
                 }
             }
-        } else if !line_has_kana(&line) {
+        } else if !line_has_hiragana(&line) {
             mask[start..line_end].fill(true);
         }
         if i < chars.len() {
@@ -369,8 +377,8 @@ fn mask_kana_less_regions(text: &str, mask: &mut [bool]) {
 /// Skip step 1 and step 2 for the whole reply.
 ///
 /// Only generic translation words do this, and only when the reply is mostly
-/// foreign. A mentioned language does not skip the reply: kana-less pieces are
-/// masked instead.
+/// foreign. A mentioned language does not skip the reply: pieces without
+/// hiragana are masked instead.
 pub fn should_skip_foreign_fix(prompt: &str, text: &str) -> bool {
     if has_enough_kana(text) {
         return false;
@@ -1620,6 +1628,37 @@ mod tests {
         });
         assert!(rewritten.content.contains("現在はその他です。"));
         assert!(rewritten.content.ends_with(chinese));
+
+        let toyota = "本合同由トヨタ自動車株式会社（以下称“甲方”）与上海某某有限公司…签订。";
+        let toyota_line = correct_reply(prompt, toyota, |_| {
+            panic!("katakana in a Chinese line is not Japanese")
+        });
+        assert_eq!(toyota_line.content, toyota);
+        assert!(foreign_notice_text(prompt, toyota).is_empty());
+        assert!(!toyota_line.rewritten);
+
+        let panasonic = "본 계약은 パナソニック株式会社와 체결합니다.";
+        let panasonic_line = correct_reply("한국어로 번역해 주세요", panasonic, |_| {
+            panic!("katakana in a Korean line is not Japanese")
+        });
+        assert_eq!(panasonic_line.content, panasonic);
+        assert!(foreign_notice_text("한국어로 번역해 주세요", panasonic).is_empty());
+        assert!(!panasonic_line.rewritten);
+
+        let contract = correct_reply(prompt, "现在の契約", |_| {
+            panic!("a hiragana line is corrected without step 2")
+        });
+        assert_eq!(contract.content, "現在の契約");
+
+        let katakana_cell = "| トヨタ现在 | 当事者の现在 |";
+        let cells_row = correct_reply(prompt, katakana_cell, |_| {
+            panic!("a katakana-only cell is not a segment")
+        });
+        assert_eq!(cells_row.content, "| トヨタ现在 | 当事者の現在 |");
+        let kept_cells = foreign_notice_text(prompt, &cells_row.content);
+        assert!(kept_cells.contains("当事者の現在"));
+        assert!(!kept_cells.contains("トヨタ"));
+        assert!(!kept_cells.contains('现'));
     }
 
     #[test]

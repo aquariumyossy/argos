@@ -203,6 +203,17 @@ describe("applyHanMap", () => {
     expect(cells).toContain("当事者の義務");
     expect(cells).not.toContain("义");
     expect(cells).not.toContain("务");
+    const toyota =
+      "本合同由トヨタ自動車株式会社（以下称“甲方”）与上海某某有限公司…签订。";
+    const panasonic = "본 계약은 パナソニック株式会社와 체결합니다.";
+    expect(foreignNoticeText("このメールを中国語にしてください", toyota)).toBe("");
+    expect(foreignNoticeText("한국어로 번역해 주세요", panasonic)).toBe("");
+    expect(foreignNoticeText("このメールを中国語にしてください", "现在の契約")).toBe("现在の契約");
+    const katakanaCell = "| トヨタ现在 | 当事者の现在 |";
+    const katakanaCells = foreignNoticeText("このメールを中国語にしてください", katakanaCell);
+    expect(katakanaCells).toContain("当事者の现在");
+    expect(katakanaCells).not.toContain("トヨタ");
+    expect(foreignNoticeText("", toyota)).toBe(toyota);
     expect(shouldSkipForeignFix("この中国語の契約書の要点を日本語で教えて", japanese)).toBe(
       false,
     );
