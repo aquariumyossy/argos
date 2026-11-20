@@ -54,6 +54,37 @@ describe("stream routing", () => {
     expect(reset).toEqual(live("thread-a"));
   });
 
+  it("clears a partial answer and shows the retry status", () => {
+    const partial = applyChatDelta(
+      applyChatDelta(live("thread-a", "途中まで"), {
+        threadId: "thread-a",
+        kind: "reasoning",
+        text: "考え",
+      }),
+      { threadId: "thread-a", kind: "tool", text: "search_index…" },
+    );
+    const cleared = applyChatDelta(partial, {
+      threadId: "thread-a",
+      kind: "reset",
+      text: "",
+    });
+    expect(cleared).toEqual(live("thread-a"));
+    const retrying = applyChatDelta(cleared, {
+      threadId: "thread-a",
+      kind: "status",
+      text: "再試行中…",
+    });
+    expect(retrying.status).toBe("再試行中…");
+    expect(retrying.stream).toBe("");
+    expect(retrying.thinking).toBe("");
+    const again = applyChatDelta(retrying, {
+      threadId: "thread-a",
+      text: "新しい答え",
+    });
+    expect(again.stream).toBe("新しい答え");
+    expect(again.status).toBe("");
+  });
+
   it("keeps a summary status out of the answer stream", () => {
     const status = applyChatDelta(live("thread-a", "途中"), {
       threadId: "thread-a",

@@ -106,8 +106,18 @@ fn round_limit_failure_reason(error: &str) -> String {
     {
         return "コンテキストが長すぎます".into();
     }
-    if l.contains("タイムアウト") || l.contains("timed out") || l.contains("timeout") {
+    if l.contains("タイムアウト")
+        || l.contains("時間切れ")
+        || l.contains("timed out")
+        || l.contains("timeout")
+    {
         return "応答が時間切れになりました".into();
+    }
+    if l.contains("接続が切れ") {
+        return "サーバとの接続が切れました".into();
+    }
+    if l.contains("混雑しています") {
+        return "サーバが混雑しています".into();
     }
     if l.contains("接続できません")
         || l.contains("届きません")
@@ -4891,6 +4901,21 @@ mod tests {
         assert!(!unknown.text.contains("api_key"));
         assert!(on.contains(TOOL_WRITE_NOTE));
         assert!(off.contains("ノートの id・題名・更新日時"));
+    }
+
+    #[test]
+    fn round_limit_names_a_drop_a_busy_server_and_a_timeout() {
+        let dropped = round_limit_failure(8, crate::llm::http_error::DROPPED_MID_MESSAGE);
+        assert!(dropped.text.contains("接続が切れました"), "{}", dropped.text);
+        assert!(
+            !dropped.text.contains("応答を受け取れませんでした"),
+            "{}",
+            dropped.text
+        );
+        let busy = round_limit_failure(8, crate::llm::http_error::BUSY_MESSAGE);
+        assert!(busy.text.contains("混雑しています"), "{}", busy.text);
+        let timed = round_limit_failure(8, crate::llm::http_error::TIMEOUT_MESSAGE);
+        assert!(timed.text.contains("時間切れ"), "{}", timed.text);
     }
 
     #[test]
