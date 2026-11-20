@@ -1494,6 +1494,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn http_status_chooses_a_fixed_message_and_drops_the_body() {
         let tokens = http_error::chat_failure(500, r#"{"message":"prompt is 14017 tokens"}"#);
         assert!(tokens.contains("HTTP 500"), "{tokens}");
