@@ -192,6 +192,7 @@ pub fn edit(entries: &mut [(String, Vec<u8>)], req: &EditRequest) -> Result<Chan
     }
     fill_near_misses(entries, &mut stats);
     super::note_unreachable_misses(entries, &mut stats);
+    super::note_remaining_authors(entries, req, &mut stats, true);
     Ok(stats)
 }
 

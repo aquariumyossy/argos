@@ -248,6 +248,27 @@ describe("saved prompts", () => {
     ]);
   });
 
+  it("returns the seeded list that was stored when the seeded flag cannot be written", () => {
+    localStorage.removeItem(SAVED_PROMPTS_SEEDED_KEY);
+    const existing = [prompt("u1", "先", "先の本文", 5)];
+    localStorage.setItem(SAVED_PROMPTS_KEY, JSON.stringify(existing));
+    const setItem = localStorage.setItem.bind(localStorage);
+    vi.spyOn(localStorage, "setItem").mockImplementation((key: string, value: string) => {
+      if (key === SAVED_PROMPTS_SEEDED_KEY) {
+        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+      }
+      setItem(key, value);
+    });
+
+    const expected = [
+      ...INITIAL_PROMPTS.map((spec) => prompt(spec.id, spec.title, spec.body, 0)),
+      ...existing,
+    ];
+    expect(loadSavedPrompts()).toEqual(expected);
+    expect(JSON.parse(localStorage.getItem(SAVED_PROMPTS_KEY) ?? "[]")).toEqual(expected);
+    expect(localStorage.getItem(SAVED_PROMPTS_SEEDED_KEY)).toBeNull();
+  });
+
   it("does not drop a saved prompt to make room for the initial four", () => {
     const users = Array.from({ length: 80 }, (_, index) =>
       prompt(`u${index}`, `名${index}`, `本文${index}`, index + 1),
@@ -307,6 +328,27 @@ describe("saved prompts", () => {
     expect(loadSavedPrompts().some((row) => row.id === INITIAL_PROMPTS[3].id)).toBe(false);
     expect(loadSavedPrompts().filter((row) => row.id === "copy")).toEqual([
       prompt("copy", "写し", "写しの本文", 4),
+    ]);
+  });
+
+  it("does not append an initial prompt when a saved row already has the same text", () => {
+    localStorage.setItem(
+      SAVED_PROMPTS_KEY,
+      JSON.stringify([
+        prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+        prompt(INITIAL_PROMPTS[2].id, "短い", "書き換えた要件", 7),
+        prompt("u1", "先", "先の本文", 5),
+      ]),
+    );
+    expect(restoreSavedPrompts(11)).toEqual([
+      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      prompt(INITIAL_PROMPTS[2].id, INITIAL_PROMPTS[2].title, INITIAL_PROMPTS[2].body, 11),
+      prompt("u1", "先", "先の本文", 5),
+      prompt(INITIAL_PROMPTS[1].id, INITIAL_PROMPTS[1].title, INITIAL_PROMPTS[1].body, 11),
+      prompt(INITIAL_PROMPTS[3].id, INITIAL_PROMPTS[3].title, INITIAL_PROMPTS[3].body, 11),
+    ]);
+    expect(restoreSavedPrompts(12).filter((row) => row.body === INITIAL_PROMPTS[0].body)).toEqual([
+      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
     ]);
   });
 });

@@ -1092,6 +1092,73 @@ pub(crate) fn is_document_author_leaf(part: &str, local: &str) -> bool {
     path == "docprops/core.xml" && matches!(local, "creator" | "lastModifiedBy")
 }
 
+/// Body replacement does not rewrite these two fields. When one still holds a
+/// replaced-from string, including a whitespace variant, add one line. The
+/// field itself stays as it was. `excel` is true for `.xlsx`, which cannot
+/// change these fields.
+pub(crate) fn note_remaining_authors(
+    entries: &[(String, Vec<u8>)],
+    req: &EditRequest,
+    stats: &mut ChangeStats,
+    excel: bool,
+) {
+    if req.replacements.is_empty() {
+        return;
+    }
+    let Some(xml) = entries.iter().find_map(|(name, bytes)| {
+        let path = name
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_lowercase();
+        if path != "docprops/core.xml" {
+            return None;
+        }
+        xmlscan::decode_xml_bytes(bytes)
+    }) else {
+        return;
+    };
+    let leaves = xmlscan::leaf_texts(&xml);
+    for (local, label) in [("creator", "作成者欄"), ("lastModifiedBy", "最終更新者欄")] {
+        let values: Vec<&str> = leaves
+            .iter()
+            .filter(|(name, _)| name == local)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        for item in &req.replacements {
+            if item.find.is_empty()
+                || !values
+                    .iter()
+                    .any(|value| author_field_holds(value, &item.find))
+            {
+                continue;
+            }
+            let guidance = if excel {
+                "このツールでは変えられません。"
+            } else if local == "creator" {
+                "変えるときは、利用者に確認してから creator を指定してください。"
+            } else {
+                "変えるときは、利用者に確認してから last_modified_by を指定してください。"
+            };
+            let line = format!(
+                "{label}に『{}』が残っています。{guidance}",
+                one_line(&item.find)
+            );
+            if !stats.notes.iter().any(|note| note == &line) {
+                stats.notes.push(line);
+            }
+        }
+    }
+}
+
+/// Exact text, or the same compact spelling the editor treats as that text
+/// when whitespace was inserted or swapped.
+fn author_field_holds(value: &str, find: &str) -> bool {
+    if find.is_empty() || value.is_empty() {
+        return false;
+    }
+    value.contains(find) || !text::ws_variant_slices(value, find, "").is_empty()
+}
+
 fn map_property_leaves(xml: &str, req: &EditRequest, stats: &mut ChangeStats) -> String {
     let mut locals = Vec::new();
     for (local, _) in xmlscan::leaf_texts(xml) {

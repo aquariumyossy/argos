@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
@@ -185,6 +186,17 @@ def http_json(url: str) -> dict:
 
 
 _TREE_CACHE: dict[tuple[str, str, str], list[str]] = {}
+# Real GitHub failures only. A 404 for a guessed tag is "missing", not a failure.
+_TREE_ERROR: dict[tuple[str, str, str], str] = {}
+# Crate name and version whose GitHub tree lookup failed and yielded no license text.
+_GITHUB_API_FAILED: set[tuple[str, str]] = set()
+
+
+def github_tree_error(err: BaseException) -> str:
+    """`missing` is a 404. Anything else is a real lookup failure."""
+    if isinstance(err, urllib.error.HTTPError) and err.code == 404:
+        return "missing"
+    return "failed"
 
 
 def github_license_paths(owner: str, repo: str, sha: str, path_in_vcs: str) -> list[str]:
@@ -198,8 +210,9 @@ def github_license_paths(owner: str, repo: str, sha: str, path_in_vcs: str) -> l
                 for item in data.get("tree", [])
                 if item.get("type") == "blob"
             ]
-        except Exception:
+        except Exception as err:
             _TREE_CACHE[key] = []
+            _TREE_ERROR[key] = github_tree_error(err)
     paths = _TREE_CACHE[key]
     prefix = path_in_vcs.strip("/")
     chosen: list[str] = []
@@ -252,11 +265,18 @@ def upstream_license_text(row: dict) -> str:
     )
     chunks: list[str] = []
     seen_refs: set[str] = set()
+    api_failed = False
+    api_ok = False
     for ref in refs:
         if not ref or ref in seen_refs:
             continue
         seen_refs.add(ref)
         paths = github_license_paths(owner, name, ref, path_in_vcs)
+        status = _TREE_ERROR.get((owner, name, ref))
+        if status == "failed":
+            api_failed = True
+        elif status != "missing":
+            api_ok = True
         if not paths and sha and ref == sha:
             for guess in (
                 "LICENSE",
@@ -280,6 +300,8 @@ def upstream_license_text(row: dict) -> str:
             chunks.append(f"----- {path} ({url}) -----\n{text}")
         if chunks:
             break
+    if not chunks and api_failed and not api_ok:
+        _GITHUB_API_FAILED.add((row["name"], row["version"]))
     return "\n\n".join(chunks)
 
 
@@ -398,6 +420,11 @@ def fill_rust_license_texts(rows: list[dict]) -> list[str]:
             continue
         authors = list(row.get("authors") or []) or manifest_authors(row["name"], row["version"])
         bundled = spdx_bundle(row["license"], authors)
+        if bundled and (row["name"], row["version"]) in _GITHUB_API_FAILED:
+            print(
+                f"warning: {row['name']} {row['version']}: GitHub API lookup failed; using SPDX standard text",
+                file=sys.stderr,
+            )
         if bundled and "could not" not in bundled.lower() and "Copyright holder was not present" not in bundled:
             row["text"] = bundled
             continue
@@ -567,6 +594,31 @@ def source_lines(row: dict) -> list[str]:
     return lines
 
 
+_XZ_REFERENCE_FILES = ("COPYING.GPLv2", "COPYING.GPLv3", "COPYING.LGPLv2.1")
+
+
+def xz_reference_note(text: str) -> str:
+    """Name the bundled xz GPL texts that this license section actually includes."""
+    included = [name for name in _XZ_REFERENCE_FILES if f"----- {name} -----" in text]
+    if not included:
+        included = list(_XZ_REFERENCE_FILES)
+    if len(included) == 1:
+        names = included[0]
+    else:
+        names = ", ".join(included[:-1]) + ", and " + included[-1]
+    return (
+        f"Note: The bundled xz {names} texts are included for reference. "
+        "liblzma itself is in the public domain. lzma-sys is MIT/Apache-2.0. "
+        "Argos is not GPL-licensed."
+    )
+
+
+def package_note(group: list[dict]) -> str:
+    if any(row["name"] == "lzma-sys" for row in group):
+        return xz_reference_note(group[0]["text"])
+    return ""
+
+
 def grouped_sections(rows: list[dict], ecosystem: str) -> list[str]:
     # Group by identical license text so the file is not one copy per crate.
     by_hash: dict[str, list[dict]] = defaultdict(list)
@@ -602,6 +654,10 @@ def grouped_sections(rows: list[dict], ecosystem: str) -> list[str]:
             else:
                 parts.extend(js_source_lines(row))
         parts.append("")
+        note = package_note(group)
+        if note:
+            parts.append(note)
+            parts.append("")
         parts.append(group[0]["text"])
         parts.append("")
     return parts
