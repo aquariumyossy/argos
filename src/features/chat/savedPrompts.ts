@@ -129,12 +129,17 @@ function initialRow(spec: (typeof INITIAL_PROMPTS)[number], updatedAt: number): 
   return { id: spec.id, title: spec.title, body: spec.body, updatedAt };
 }
 
-/** Missing initial prompts go in front, in template order. Rows already stored stay after them. */
+/**
+ * Missing initial prompts go in front, in template order.
+ * A stored row with the same id or the same text is kept, so an upgrade does not
+ * add a second copy of a template the user already saved.
+ */
 function seedInitialPrompts(list: SavedPrompt[]): SavedPrompt[] {
-  const have = new Set(list.map((row) => row.id));
-  const missing = INITIAL_PROMPTS.filter((spec) => !have.has(spec.id)).map((spec) =>
-    initialRow(spec, 0),
-  );
+  const haveId = new Set(list.map((row) => row.id));
+  const haveBody = new Set(list.map((row) => row.body));
+  const missing = INITIAL_PROMPTS.filter(
+    (spec) => !haveId.has(spec.id) && !haveBody.has(spec.body),
+  ).map((spec) => initialRow(spec, 0));
   if (missing.length === 0) return list;
   return [...missing, ...list];
 }
@@ -235,20 +240,27 @@ export function forgetPrompt(list: SavedPrompt[], id: string): SavedPrompt[] {
 }
 
 export function loadSavedPrompts(): SavedPrompt[] {
+  let stored: SavedPrompt[] = [];
   try {
-    const stored = parseSavedPrompts(localStorage.getItem(SAVED_PROMPTS_KEY));
+    stored = parseSavedPrompts(localStorage.getItem(SAVED_PROMPTS_KEY));
     if (localStorage.getItem(SAVED_PROMPTS_SEEDED_KEY) === "1") {
       return stored;
     }
-    const seeded = seedInitialPrompts(stored);
+  } catch {
+    return stored;
+  }
+  const seeded = seedInitialPrompts(stored);
+  try {
     if (seeded !== stored) {
       writeSavedPrompts(seeded);
     }
     localStorage.setItem(SAVED_PROMPTS_SEEDED_KEY, "1");
-    return seeded;
   } catch {
-    return [];
+    // The seeded list did not fit (quota). Returning [] would make the next
+    // save replace the stored prompts with a single new row.
+    return stored;
   }
+  return seeded;
 }
 
 function writeSavedPrompts(prompts: SavedPrompt[]): void {

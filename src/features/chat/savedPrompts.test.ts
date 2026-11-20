@@ -210,15 +210,42 @@ describe("saved prompts", () => {
       ]),
     );
     const loaded = loadSavedPrompts();
-    expect(loaded.slice(0, 4)).toEqual(
-      INITIAL_PROMPTS.map((spec) => prompt(spec.id, spec.title, spec.body, 0)),
+    expect(loaded.slice(0, 3)).toEqual(
+      INITIAL_PROMPTS.slice(1).map((spec) => prompt(spec.id, spec.title, spec.body, 0)),
     );
-    expect(loaded.slice(4)).toEqual([
+    expect(loaded.slice(3)).toEqual([
       prompt("u2", "後", "後の本文", 6),
       prompt("u1", "先", "先の本文", 5),
       prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
     ]);
+    expect(loaded.filter((row) => row.body === INITIAL_PROMPTS[0].body)).toEqual([
+      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+    ]);
     expect(loadSavedPrompts()).toEqual(loaded);
+  });
+
+  it("keeps stored prompts when writing the seeded list hits the quota", () => {
+    localStorage.removeItem(SAVED_PROMPTS_SEEDED_KEY);
+    const existing = [prompt("u1", "先", "先の本文", 5), prompt("u2", "後", "後の本文", 6)];
+    localStorage.setItem(SAVED_PROMPTS_KEY, JSON.stringify(existing));
+    const setItem = localStorage.setItem.bind(localStorage);
+    vi.spyOn(localStorage, "setItem").mockImplementation((key: string, value: string) => {
+      if (key === SAVED_PROMPTS_KEY && value.includes("argos.prompt.")) {
+        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+      }
+      setItem(key, value);
+    });
+
+    expect(loadSavedPrompts()).toEqual(existing);
+    expect(localStorage.getItem(SAVED_PROMPTS_SEEDED_KEY)).toBeNull();
+    expect(rememberSavedPrompt({ id: "new", title: "追加", body: "追加の本文", now: 8 })).toEqual({
+      ok: true,
+      prompts: [prompt("new", "追加", "追加の本文", 8), ...existing],
+    });
+    expect(JSON.parse(localStorage.getItem(SAVED_PROMPTS_KEY) ?? "[]")).toEqual([
+      prompt("new", "追加", "追加の本文", 8),
+      ...existing,
+    ]);
   });
 
   it("does not drop a saved prompt to make room for the initial four", () => {
@@ -245,7 +272,7 @@ describe("saved prompts", () => {
       JSON.stringify([
         prompt("u2", "後", "後の本文", 6),
         prompt("u1", "先", "先の本文", 5),
-        prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+        prompt("copy", "写し", "写しの本文", 4),
       ]),
     );
     loadSavedPrompts();
@@ -263,7 +290,7 @@ describe("saved prompts", () => {
         prompt(INITIAL_PROMPTS[3].id, INITIAL_PROMPTS[3].title, INITIAL_PROMPTS[3].body, 0),
         prompt("u2", "後", "後の本文", 6),
         prompt("u1", "先", "先の本文", 5),
-        prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+        prompt("copy", "写し", "写しの本文", 4),
       ],
     });
 
@@ -273,13 +300,13 @@ describe("saved prompts", () => {
       prompt(INITIAL_PROMPTS[3].id, INITIAL_PROMPTS[3].title, INITIAL_PROMPTS[3].body, 0),
       prompt("u2", "後", "後の本文", 6),
       prompt("u1", "先", "先の本文", 5),
-      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      prompt("copy", "写し", "写しの本文", 4),
       prompt(INITIAL_PROMPTS[1].id, "要点", INITIAL_PROMPTS[1].body, 11),
     ]);
     forgetSavedPrompt(INITIAL_PROMPTS[3].id);
     expect(loadSavedPrompts().some((row) => row.id === INITIAL_PROMPTS[3].id)).toBe(false);
     expect(loadSavedPrompts().filter((row) => row.id === "copy")).toEqual([
-      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      prompt("copy", "写し", "写しの本文", 4),
     ]);
   });
 });
