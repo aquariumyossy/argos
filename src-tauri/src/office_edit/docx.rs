@@ -228,6 +228,7 @@ pub fn edit(
         );
     }
     super::edit_doc_props(entries, req, &mut stats);
+    super::authors::apply(entries, &req.core_authors, &mut stats)?;
     fill_near_misses(entries, &mut stats);
     super::note_unreachable_misses(entries, &mut stats);
     Ok(stats)
@@ -299,7 +300,10 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
         let place = super::unreachable_kind(name)
             .map(super::unreachable_location)
             .unwrap_or_default();
-        for (_, text) in leaf_texts(&xml) {
+        for (local, text) in leaf_texts(&xml) {
+            if super::is_document_author_leaf(name, &local) {
+                continue;
+            }
             push_text(&mut texts, text, &place);
         }
         for author in collect_attr_local(&xml, "author") {
@@ -499,7 +503,10 @@ pub fn check(
             continue;
         }
         let label = other_label(name);
-        for (_, text) in leaf_texts(&xml) {
+        for (local, text) in leaf_texts(&xml) {
+            if super::is_document_author_leaf(name, &local) {
+                continue;
+            }
             for probe in probes {
                 consider(&mut leftovers, &mut truncated, probe, &text, &label);
             }

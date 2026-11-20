@@ -7,6 +7,7 @@ pub mod indexer;
 pub mod llm;
 pub mod mail;
 pub mod notes_md;
+pub mod notices;
 pub mod office_edit;
 pub mod pathutil;
 pub mod remote_server;
@@ -521,6 +522,7 @@ pub fn run() {
             llm::commands::llm_test_connection,
             llm::commands::llm_thinking_budget,
             llm::commands::llm_list_models,
+            notices::read_bundled_notice,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

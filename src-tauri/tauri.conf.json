@@ -86,6 +86,11 @@
     "category": "Utility",
     "shortDescription": "ローカル知識ベースを一瞬で検索するデスクトップアプリ",
     "longDescription": "ドラッグした文字列をローカル知識ベースから瞬時に検索する Windows デスクトップアプリ。ファイル監視・全文検索・LAN リモート検索に対応。",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../NOTICE": "NOTICE",
+      "../THIRD_PARTY_LICENSES": "THIRD_PARTY_LICENSES"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -460,6 +460,11 @@ export default function Settings() {
   const folderMenuBtnRef = useRef<HTMLButtonElement | null>(null);
   const folderMenuRef = useRef<HTMLDivElement | null>(null);
   const [message, setMessage] = useState("");
+  const [bundledNotice, setBundledNotice] = useState<{
+    name: string;
+    text: string;
+    error: string;
+  } | null>(null);
   const [indexing, setIndexing] = useState(false);
   const [busyFolderId, setBusyFolderId] = useState<number | null>(null);
   const [indexProgress, setIndexProgress] = useState<IndexProgressPayload | null>(
@@ -577,6 +582,16 @@ export default function Settings() {
       setLanIp(ip);
     } catch {
       setLanIp(null);
+    }
+  }
+
+  async function showBundledNotice(name: string) {
+    setBundledNotice({ name, text: "", error: "" });
+    try {
+      const text = await invoke<string>("read_bundled_notice", { name });
+      setBundledNotice({ name, text, error: "" });
+    } catch (e) {
+      setBundledNotice({ name, text: "", error: formatInvokeError(e) });
     }
   }
 
@@ -3555,6 +3570,33 @@ export default function Settings() {
                 </li>
               ))}
             </ul>
+          </section>
+
+          <section className="credits-block">
+            <h2>ライセンス文書</h2>
+            <p className="muted">
+              同梱の LICENSE、NOTICE、THIRD_PARTY_LICENSES です。NOTICE に IPADIC、Unicode、e-Gov（公共データ利用規約）、MPL-2.0 の表示があります。
+            </p>
+            <div className="credits-notice-actions">
+              <button type="button" onClick={() => void showBundledNotice("LICENSE")}>
+                LICENSE を表示
+              </button>
+              <button type="button" onClick={() => void showBundledNotice("NOTICE")}>
+                NOTICE を表示
+              </button>
+              <button type="button" onClick={() => void showBundledNotice("THIRD_PARTY_LICENSES")}>
+                THIRD_PARTY_LICENSES を表示
+              </button>
+            </div>
+            {bundledNotice ? (
+              <div className="credits-notice-view">
+                <h3>{bundledNotice.name}</h3>
+                {bundledNotice.error ? <p className="msg">{bundledNotice.error}</p> : null}
+                {bundledNotice.text ? (
+                  <pre className="credits-notice">{bundledNotice.text}</pre>
+                ) : null}
+              </div>
+            ) : null}
           </section>
         </div>
       ) : null}

@@ -2,5 +2,191 @@ Copyright 2026 Shuhei Yoshida / 半蔵門総合法律事務所
 
 This product includes software developed as Argos.
 See the LICENSE file for the Apache License, Version 2.0 terms.
-Third-party open source components are used under their respective licenses;
-see the Credits tab in the application settings.
+Third-party open source components and their license texts are listed in
+THIRD_PARTY_LICENSES. That file is regenerated before a release by
+scripts/generate_third_party_licenses.py.
+
+The notices below are required in addition to the dependency license list.
+
+
+IPADIC (via lindera-ipadic)
+
+Argos links Lindera with the embed-ipadic feature (crate lindera-ipadic).
+The lindera and lindera-ipadic crates are under their own crate licenses
+(see THIRD_PARTY_LICENSES). The morphological dictionary those crates embed
+is IPADIC. Argos distributes that dictionary data inside the application.
+The IPADIC terms require the following copyright notice and the no-warranty
+text to travel with the dictionary. The text below is the mecab-ipadic COPYING
+file (https://github.com/taku910/mecab/blob/master/mecab-ipadic/COPYING),
+without two trailing 0xF7 bytes that are not part of the notice.
+
+Copyright 2000, 2001, 2002, 2003 Nara Institute of Science
+and Technology.  All Rights Reserved.
+
+Use, reproduction, and distribution of this software is permitted.
+Any copy of this software, whether in its original form or modified,
+must include both the above copyright notice and the following
+paragraphs.
+
+Nara Institute of Science and Technology (NAIST),
+the copyright holders, disclaims all warranties with regard to this
+software, including all implied warranties of merchantability and
+fitness, in no event shall NAIST be liable for
+any special, indirect or consequential damages or any damages
+whatsoever resulting from loss of use, data or profits, whether in an
+action of contract, negligence or other tortuous action, arising out
+of or in connection with the use or performance of this software.
+
+A large portion of the dictionary entries
+originate from ICOT Free Software.  The following conditions for ICOT
+Free Software applies to the current dictionary as well.
+
+Each User may also freely distribute the Program, whether in its
+original form or modified, to any third party or parties, PROVIDED
+that the provisions of Section 3 ("NO WARRANTY") will ALWAYS appear
+on, or be attached to, the Program, which is distributed substantially
+in the same form as set out herein and that such intended
+distribution, if actually made, will neither violate or otherwise
+contravene any of the laws and regulations of the countries having
+jurisdiction over the User or the intended distribution itself.
+
+NO WARRANTY
+
+The program was produced on an experimental basis in the course of the
+research and development conducted during the project and is provided
+to users as so produced on an experimental basis.  Accordingly, the
+program is provided without any warranty whatsoever, whether express,
+implied, statutory or otherwise.  The term "warranty" used herein
+includes, but is not limited to, any warranty of the quality,
+performance, merchantability and fitness for a particular purpose of
+the program and the nonexistence of any infringement or violation of
+any right of any third party.
+
+Each user of the program will agree and understand, and be deemed to
+have agreed and understood, that there is no warranty whatsoever for
+the program and, accordingly, the entire risk arising from or
+otherwise connected with the program is assumed by the user.
+
+Therefore, neither ICOT, the copyright holder, or any other
+organization that participated in or was otherwise related to the
+development of the program and their respective officials, directors,
+officers and other employees shall be held liable for any and all
+damages, including, without limitation, general, special, incidental
+and consequential damages, arising out of or otherwise in connection
+with the use or inability to use the program or any product, material
+or result produced or otherwise obtained by using the program,
+regardless of whether they have been advised of, or otherwise had
+knowledge of, the possibility of such damages at any time during the
+project or thereafter.  Each user will be deemed to have agreed to the
+foregoing by his or her commencement of use of the program.  The term
+"use" as used herein includes, but is not limited to, the use,
+modification, copying and distribution of the program and the
+production of secondary products from the program.
+
+In the case where the program, whether in its original form or
+modified, was distributed or delivered to or received by a user from
+any person, organization or entity other than ICOT, unless it makes or
+grants independently of ICOT any specific warranty to the user in
+writing, such person, organization or entity, will also be exempted
+from and not be held liable to the user for any such damages as noted
+above as far as the program is concerned.
+
+
+Unicode License v3 (Unihan)
+
+src-tauri/src/llm/japanese_han_map.rs is generated by
+scripts/gen_han_jp_map.py from the Unicode 18.0.0 Unihan database
+(kSimplifiedVariant, kTraditionalVariant, and kZVariant). The same table
+is also stored in src/features/chat/japaneseHanMap.ts. It is a derived
+work of that Unicode data. The Unicode License v3 requires this copyright
+and permission notice to appear with the data or in the documentation.
+The notice below is the text published at https://www.unicode.org/license.txt
+when this file was written. The Unihan 18.0.0 zip itself was not in the
+repository cache, so this notice was not compared byte for byte with the
+copy inside that zip.
+
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2026 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+
+e-Gov 法令データ（公共データ利用規約（第1.0版） / PDL1.0）
+
+resources/statutes.db.gz（起動後にアプリデータへ展開する法令データベース）は、
+e-Gov 法令検索が公開する法令XMLを取得し、Argos 側で加工したものです。
+e-Gov 法令検索のコンテンツは、権利表記がない限り公共データ利用規約（第1.0版）
+（PDL1.0）が適用されます。
+
+出典：e-Gov法令検索（https://laws.e-gov.go.jp/）、PDL1.0（https://www.digital.go.jp/resources/open_data/public_data_license_v1.0）
+
+編集・加工：e-Gov法令検索の法令API Version 1（https://laws.e-gov.go.jp/api/1/lawlists/2 および https://laws.e-gov.go.jp/api/1/lawdata/{法令ID}）から取得した法令XMLを、条（附則を含む）に分割し、目次、削除された条、および改正規定の中の条を除いて SQLite に格納し、gzip 圧縮して resources/statutes.db.gz としました。この加工は半蔵門総合法律事務所が行ったものであり、デジタル庁その他の国の機関が作成した未加工の法令データそのものではありません。
+
+English summary: statute text in resources/statutes.db.gz is sourced from
+e-Gov Law Search (https://laws.e-gov.go.jp/) and was edited by 半蔵門総合法律事務所
+into a per-article SQLite database. Use is under the Public Data License 1.0
+(PDL1.0): https://www.digital.go.jp/resources/open_data/public_data_license_v1.0
+
+
+MPL-2.0 components (used unmodified)
+
+The following Mozilla Public License 2.0 components are linked unmodified.
+Argos does not modify their source. Source for each version resolved in
+src-tauri/Cargo.lock is available at the repository below and at the
+crates.io page for that version. THIRD_PARTY_LICENSES repeats this list
+from the dependency graph when the generator is re-run.
+
+- cssparser 0.36.0
+  https://github.com/servo/rust-cssparser
+  https://crates.io/crates/cssparser/0.36.0
+- cssparser-macros 0.6.1
+  https://github.com/servo/rust-cssparser
+  https://crates.io/crates/cssparser-macros/0.6.1
+- selectors 0.36.1
+  https://github.com/servo/stylo
+  https://crates.io/crates/selectors/0.36.1
+- dtoa-short 0.3.5
+  https://github.com/upsuper/dtoa-short
+  https://crates.io/crates/dtoa-short/0.3.5
+- option-ext 0.2.0
+  https://github.com/soc/option-ext
+  https://crates.io/crates/option-ext/0.2.0
+
+These components reach Argos through the Tauri / WRY stack. They are not
+JavaScript dependencies. No copyleft license was found on the JavaScript
+packages shipped in the application UI; see THIRD_PARTY_LICENSES.

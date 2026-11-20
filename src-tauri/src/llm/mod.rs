@@ -209,6 +209,14 @@ pub fn system_for_request(settings: &Settings) -> String {
         }
         s.push_str(crate::llm::create_office::LLM_OFFICE_HINT);
     }
+    if !s.contains(crate::office_edit::LLM_DOC_AUTHOR_SENTINEL)
+        && !s.contains(crate::office_edit::LLM_DOC_AUTHOR_HINT)
+    {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(crate::office_edit::LLM_DOC_AUTHOR_HINT);
+    }
     if !s.contains(crate::llm::create_html::LLM_HTML_SENTINEL)
         && !s.contains(crate::llm::create_html::LLM_HTML_HINT)
     {
@@ -2003,6 +2011,41 @@ mod tests {
         assert!(
             !summary.contains(LLM_JA_SENTINEL),
             "summary prompt must not carry the writing hint: {summary}"
+        );
+    }
+
+    #[test]
+    fn document_author_hint_asks_the_user_instead_of_guessing_a_name() {
+        let def = system_for_request(&Settings::default());
+        assert_eq!(
+            def.matches(crate::office_edit::LLM_DOC_AUTHOR_SENTINEL)
+                .count(),
+            1,
+            "{def}"
+        );
+        assert!(def.contains("チャットで利用者に聞いてください"), "{def}");
+        assert!(def.contains("dc:creator"), "{def}");
+        assert!(def.contains("推測"), "{def}");
+        assert!(def.contains("この2項目は変えません"), "{def}");
+        let mut custom = Settings::default();
+        custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
+        let sys = system_for_request(&custom);
+        assert_eq!(
+            sys.matches(crate::office_edit::LLM_DOC_AUTHOR_SENTINEL)
+                .count(),
+            1,
+            "{sys}"
+        );
+        let again = system_for_request(&Settings {
+            llm_system_prompt: sys,
+            ..Settings::default()
+        });
+        assert_eq!(
+            again
+                .matches(crate::office_edit::LLM_DOC_AUTHOR_SENTINEL)
+                .count(),
+            1,
+            "{again}"
         );
     }
 
