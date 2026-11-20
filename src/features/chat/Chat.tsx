@@ -232,15 +232,6 @@ function bannerFromResult(
   return { error: "", notice: "", restoreDraft: null };
 }
 
-const TPL_SUMMARY =
-  "添付した出典を日本語で要約してください。重要な結論と根拠を短く。";
-const TPL_POINTS =
-  "争点、結論、根拠を箇条書きで整理してください。根拠には出典番号 [n] を付けてください。";
-const TPL_FACTS =
-  "添付出典だけを根拠に、要件事実の関係を mermaid の flowchart LR でフェンス1本にまとめてください。左から右へ、請求原因 → 抗弁 → 再抗弁。請求原因はノードを1つだけにし、複数の主要事実は同じノード内に番号で書いてください。抗弁は種類ごとに分け、その右に対応する再抗弁を置いてください。ノードは短く。ラベルは A[\"請求原因 [n]\"] のように二重引用符で囲んでください。矢印は --> または -.-> で、途中に空白を入れないでください。添付出典にない事実はノードにしないでください。";
-const TPL_TIMELINE =
-  "添付出典に書かれた出来事だけを時系列で整理してください。図にする場合は mermaid の flowchart LR または timeline をフェンス1本にしてください。ノードラベルは二重引用符で囲み、出典番号 [n] をラベル内に書いてください。出典にない出来事は入れないでください。";
-
 const ATTACH_EXTENSIONS = [
   "pdf",
   "docx",
@@ -2764,38 +2755,6 @@ export default function Chat() {
               {webSearch ? "ウェブ検索オン" : "ウェブ検索オフ"}
             </button>
             <PromptLibrary text={draft} disabled={busy} onRecall={applyTemplate} />
-            <button
-              type="button"
-              className="chat-tpl"
-              disabled={busy}
-              onClick={() => applyTemplate(TPL_SUMMARY)}
-            >
-              要約
-            </button>
-            <button
-              type="button"
-              className="chat-tpl"
-              disabled={busy}
-              onClick={() => applyTemplate(TPL_POINTS)}
-            >
-              要点
-            </button>
-            <button
-              type="button"
-              className="chat-tpl"
-              disabled={busy}
-              onClick={() => applyTemplate(TPL_FACTS)}
-            >
-              要件事実
-            </button>
-            <button
-              type="button"
-              className="chat-tpl"
-              disabled={busy}
-              onClick={() => applyTemplate(TPL_TIMELINE)}
-            >
-              時系列
-            </button>
             <span className="chat-context-meter">
               <span
                 className={nearBudget ? "chat-char-meter warn" : "chat-char-meter"}

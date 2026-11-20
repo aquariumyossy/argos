@@ -1569,11 +1569,17 @@ body.md-col-resizing {
   font-size: 0.85em;
 }
 
-.chat-prompt-name input {
+.chat-prompt-name input,
+.chat-prompt-name textarea {
   font: inherit;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 4px 8px;
+}
+
+.chat-prompt-name textarea {
+  resize: vertical;
+  min-height: 6em;
 }
 
 .chat-prompt-actions {

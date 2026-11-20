@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  INITIAL_PROMPTS,
   SAVED_PROMPTS_KEY,
+  SAVED_PROMPTS_SEEDED_KEY,
   forgetSavedPrompt,
   loadSavedPrompts,
   needsReplaceConfirm,
   rememberSavedPrompt,
+  restoreSavedPrompts,
+  reviseSavedPrompt,
 } from "./savedPrompts";
 
 const memory = new Map<string, string>();
@@ -25,6 +29,7 @@ describe("saved prompts", () => {
         memory.delete(key);
       },
     });
+    localStorage.setItem(SAVED_PROMPTS_SEEDED_KEY, "1");
   });
 
   afterEach(() => {
@@ -179,5 +184,102 @@ describe("saved prompts", () => {
     expect(needsReplaceConfirm("   ", "本文")).toBe(false);
     expect(needsReplaceConfirm("  本文  ", "本文")).toBe(false);
     expect(needsReplaceConfirm("別の下書き", "本文")).toBe(true);
+  });
+
+  it("seeds the four initial prompts once and does not put a deleted one back", () => {
+    localStorage.removeItem(SAVED_PROMPTS_SEEDED_KEY);
+    expect(loadSavedPrompts()).toEqual(
+      INITIAL_PROMPTS.map((spec) => prompt(spec.id, spec.title, spec.body, 0)),
+    );
+    expect(localStorage.getItem(SAVED_PROMPTS_SEEDED_KEY)).toBe("1");
+    forgetSavedPrompt(INITIAL_PROMPTS[0].id);
+    expect(loadSavedPrompts().map((row) => row.id)).toEqual(
+      INITIAL_PROMPTS.slice(1).map((spec) => spec.id),
+    );
+    expect(loadSavedPrompts().map((row) => row.title)).toEqual(["要点", "要件事実", "時系列"]);
+  });
+
+  it("keeps prompts the user already saved when the initial four are added", () => {
+    localStorage.removeItem(SAVED_PROMPTS_SEEDED_KEY);
+    localStorage.setItem(
+      SAVED_PROMPTS_KEY,
+      JSON.stringify([
+        prompt("u2", "後", "後の本文", 6),
+        prompt("u1", "先", "先の本文", 5),
+        prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      ]),
+    );
+    const loaded = loadSavedPrompts();
+    expect(loaded.slice(0, 4)).toEqual(
+      INITIAL_PROMPTS.map((spec) => prompt(spec.id, spec.title, spec.body, 0)),
+    );
+    expect(loaded.slice(4)).toEqual([
+      prompt("u2", "後", "後の本文", 6),
+      prompt("u1", "先", "先の本文", 5),
+      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+    ]);
+    expect(loadSavedPrompts()).toEqual(loaded);
+  });
+
+  it("does not drop a saved prompt to make room for the initial four", () => {
+    const users = Array.from({ length: 80 }, (_, index) =>
+      prompt(`u${index}`, `名${index}`, `本文${index}`, index + 1),
+    );
+    localStorage.setItem(SAVED_PROMPTS_KEY, JSON.stringify(users));
+    localStorage.removeItem(SAVED_PROMPTS_SEEDED_KEY);
+    expect(loadSavedPrompts().slice(4)).toEqual(users);
+    expect(rememberSavedPrompt({ id: "new", title: "追加", body: "追加の本文", now: 100 })).toEqual({
+      ok: true,
+      prompts: [
+        prompt("new", "追加", "追加の本文", 100),
+        ...INITIAL_PROMPTS.map((spec) => prompt(spec.id, spec.title, spec.body, 0)),
+        ...users.slice(0, 79),
+      ],
+    });
+  });
+
+  it("restores deleted and edited initial prompts without changing prompts the user saved", () => {
+    localStorage.removeItem(SAVED_PROMPTS_SEEDED_KEY);
+    localStorage.setItem(
+      SAVED_PROMPTS_KEY,
+      JSON.stringify([
+        prompt("u2", "後", "後の本文", 6),
+        prompt("u1", "先", "先の本文", 5),
+        prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      ]),
+    );
+    loadSavedPrompts();
+    forgetSavedPrompt(INITIAL_PROMPTS[1].id);
+    expect(reviseSavedPrompt({
+      id: INITIAL_PROMPTS[0].id,
+      title: "短い要約",
+      body: "書き換えた要約",
+      now: 9,
+    })).toEqual({
+      ok: true,
+      prompts: [
+        prompt(INITIAL_PROMPTS[0].id, "短い要約", "書き換えた要約", 9),
+        prompt(INITIAL_PROMPTS[2].id, INITIAL_PROMPTS[2].title, INITIAL_PROMPTS[2].body, 0),
+        prompt(INITIAL_PROMPTS[3].id, INITIAL_PROMPTS[3].title, INITIAL_PROMPTS[3].body, 0),
+        prompt("u2", "後", "後の本文", 6),
+        prompt("u1", "先", "先の本文", 5),
+        prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      ],
+    });
+
+    expect(restoreSavedPrompts(11)).toEqual([
+      prompt(INITIAL_PROMPTS[0].id, "要約", INITIAL_PROMPTS[0].body, 11),
+      prompt(INITIAL_PROMPTS[2].id, INITIAL_PROMPTS[2].title, INITIAL_PROMPTS[2].body, 0),
+      prompt(INITIAL_PROMPTS[3].id, INITIAL_PROMPTS[3].title, INITIAL_PROMPTS[3].body, 0),
+      prompt("u2", "後", "後の本文", 6),
+      prompt("u1", "先", "先の本文", 5),
+      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+      prompt(INITIAL_PROMPTS[1].id, "要点", INITIAL_PROMPTS[1].body, 11),
+    ]);
+    forgetSavedPrompt(INITIAL_PROMPTS[3].id);
+    expect(loadSavedPrompts().some((row) => row.id === INITIAL_PROMPTS[3].id)).toBe(false);
+    expect(loadSavedPrompts().filter((row) => row.id === "copy")).toEqual([
+      prompt("copy", "写し", INITIAL_PROMPTS[0].body, 4),
+    ]);
   });
 });
