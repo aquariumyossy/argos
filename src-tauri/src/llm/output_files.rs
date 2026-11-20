@@ -171,9 +171,18 @@ fn read_output_file(data_dir: &Path, args: &Value, context_tokens: usize) -> Res
         .map(format_mtime)
         .unwrap_or_else(|| "不明".to_string());
     let mut out = format!(
-        "ファイル: {}\n種類: {kind}\n更新日時: {when}\n\n",
+        "ファイル: {}\n種類: {kind}\n更新日時: {when}\n",
         one_line(name)
     );
+    if kind == "Word" {
+        let lines = match crate::office_edit::read_docx_authors(&path) {
+            Ok(authors) => crate::office_edit::docx_author_lines(&authors),
+            Err(_) => "作成者: （読めませんでした）\n最終更新者: （読めませんでした）".to_string(),
+        };
+        out.push_str(&lines);
+        out.push('\n');
+    }
+    out.push('\n');
     if html {
         out.push_str(HTML_SOURCE_NOTE);
         out.push('\n');
@@ -309,7 +318,7 @@ fn read_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_READ_OUTPUT,
-            "description": "出力フォルダにある Word・Excel・HTML の中身を、添付なしで読む。filename は list_output_files で見たファイル名だけ。パスは渡さない。Word と Excel は本文、HTML はソースを返す。HTML が文脈に入りきらないときはソースを返さず、edit_html には渡させない。出力フォルダの外、シンボリックリンクで外へ出るパス、検索フォルダのファイルは読めない。対象が一つに決まってから、編集の前に呼ぶ。",
+            "description": "出力フォルダにある Word・Excel・HTML の中身を、添付なしで読む。filename は list_output_files で見たファイル名だけ。パスは渡さない。Word と Excel は本文、HTML はソースを返す。Word の結果には文書プロパティの作成者（dc:creator）と最終更新者（cp:lastModifiedBy）を含める。空なら（なし）。HTML が文脈に入りきらないときはソースを返さず、edit_html には渡させない。出力フォルダの外、シンボリックリンクで外へ出るパス、検索フォルダのファイルは読めない。対象が一つに決まってから、編集の前に呼ぶ。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -486,6 +495,8 @@ mod tests {
         let word = read_for_tool(&tmp.0, &json!({"filename": docx.name}), CONTEXT);
         assert!(word.contains("りんごが120個"), "{word}");
         assert!(word.contains("種類: Word"), "{word}");
+        assert!(word.contains("作成者: （なし）"), "{word}");
+        assert!(word.contains("最終更新者: （なし）"), "{word}");
         assert!(word.contains(&docx.name), "{word}");
         assert!(!word.contains(tmp.0.to_str().unwrap()), "{word}");
 
@@ -671,6 +682,38 @@ mod tests {
         let none = list_for_tool(&tmp.0, &json!({"name": "存在しない"}));
         assert!(none.contains("存在しない"), "{none}");
         assert!(!none.contains("古い売上表.xlsx"), "{none}");
+    }
+
+    #[test]
+    fn reading_a_docx_shows_the_core_author_and_does_not_write() {
+        let tmp = Tmp::new();
+        let dir = output_dir(&tmp.0);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("契約書.docx");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("word/document.xml", opts).unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:document><w:body><w:p><w:r><w:t>本文の当事者</w:t></w:r></w:p></w:body></w:document>"
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.start_file("docProps/core.xml", opts).unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator>山田太郎</dc:creator></cp:coreProperties>"
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let before = fs::read(&path).unwrap();
+        let word = read_for_tool(&tmp.0, &json!({"filename": "契約書.docx"}), CONTEXT);
+        assert!(word.contains("本文の当事者"), "{word}");
+        assert!(word.contains("作成者: 山田太郎"), "{word}");
+        assert!(word.contains("最終更新者: （なし）"), "{word}");
+        assert!(!word.contains(tmp.0.to_str().unwrap()), "{word}");
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

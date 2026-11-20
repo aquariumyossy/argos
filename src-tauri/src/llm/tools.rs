@@ -398,7 +398,7 @@ pub fn tools_schema(
         "function": {
             "name": TOOL_EDIT_OFFICE,
             "description": "添付の .docx / .xlsx、または出力フォルダにある .docx / .xlsx を編集する。元の添付は変えない。最初の編集は新しいファイルを保存し、同じ会話の続きは、元のファイル名を渡しても、その編集済みファイルに上書きする。前回のファイルが開かれていて上書きできないときは、新しいファイルを保存する。同じ会話で元のファイル名を渡すと、その元ファイルの最新の編集済みを続ける。元の版からやり直すときだけ fresh を true にする。確認は取らない。書式・表・フォントは残し、文字を変える。Excel の数値セルも置換できる。1回の呼び出しに編集をすべて入れる。前回の編集でファイルが保存されて残った箇所を直すときは、元の添付からやり直さず、この会話の前回の出力ファイル名を filename に渡して続きを編集する。そのファイルがこの会話の edit_office で保存した編集済みファイルなら、新しいファイルは作らず前回の編集済みファイルに上書きする。元の添付や別の会話のファイルは上書きしない。結果が「見つかりませんでした」でファイルが保存されていないときは、直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。まだ編集していない添付は、その添付から作る。出力フォルダのファイルを直すときは、選んだそのファイルを編集する。.doc と .xls は対象外。\
-replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・テキストボックス・図形・コメント・変更履歴の文字（複数のランに分かれた名前を含む。テキストボックスと図形は本文・ヘッダー・フッター・脚注・文末脚注の中）。tracked を true にすると、Word の置換は直接書き換えず変更履歴（削除と挿入）として残す。各 replacement の comment があれば、その置換箇所にコメントを付ける。作成者は設定の名前で、空なら Argos。Excel では tracked と comment は使えず、文字だけ置換したと結果に書く。グラフと SmartArt（図）は「このツールでは変更できない場所」のまま。Excel は全シートの文字セルとシート名に加え、数値のセルも置換できる。数値の検索と置換では桁区切りと円記号（, ， ¥ ￥）と全角数字を無視し、セル全体の数値と一致したときだけ数値のまま書き換える。計算式の入ったセルは変えない。\
+replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・テキストボックス・図形・コメント・変更履歴の文字（複数のランに分かれた名前を含む。テキストボックスと図形は本文・ヘッダー・フッター・脚注・文末脚注の中）。tracked を true にすると、Word の置換は直接書き換えず変更履歴（削除と挿入）として残す。各 replacement の comment があれば、その置換箇所にコメントを付ける。変更履歴とコメントの作成者は設定の名前で、空なら Argos。これは文書プロパティの作成者（dc:creator）や最終更新者（cp:lastModifiedBy）ではない。文書プロパティは creator、clear_creator、last_modified_by、clear_last_modified_by を渡したときだけ変え、渡さなければ元のままにする。今の値は、添付した .docx の出典と read_output_file の結果に出る。作成者と最終更新者を変えるか、何を書くかが利用者の指示から明らかでないときは、名前を推測して入れたり消したりせず、チャットで利用者に聞いてください。Excel では tracked と comment は使えず、文字だけ置換したと結果に書く。グラフと SmartArt（図）は「このツールでは変更できない場所」のまま。Excel は全シートの文字セルとシート名に加え、数値のセルも置換できる。数値の検索と置換では桁区切りと円記号（, ， ¥ ￥）と全角数字を無視し、セル全体の数値と一致したときだけ数値のまま書き換える。計算式の入ったセルは変えない。\
 paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
 cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダのファイルは filename にファイル名だけを渡す（例: 売上集計.xlsx）。filename があるときは、同じ名前の添付や別の cite_no よりそのファイルを優先する。filename と cite_no が別のファイルなら編集しない。パスは渡さない。候補が複数あるときはこのツールを呼ばず、名前・種類・更新日時を挙げて利用者に聞く。検索フォルダのファイルは編集できない。残った旧文字列は結果に場所が付く。結果に出た別表記は、同じ語・名前の表記だと判断したものだけを、その文字列のまま別の find にする。署名欄の「甲　　　乙」や、日付と語にまたがる「日　本」のように別の文脈だと分かるものは送らない。「このツールでは変更できない場所」とあるものも送らない。直前の呼び出しでファイルが保存されていれば前回の出力を filename にし、保存されていなければ直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。保存したファイル名を答えに書く。",
             "parameters": {
@@ -409,6 +409,10 @@ cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダ�
                     "path": { "type": "string", "description": "出典に書かれたフルパス。この会話の添付だけ。出力フォルダのファイルには使わない。" },
                     "tracked": { "type": "boolean", "description": "true のとき Word の置換を変更履歴（削除と挿入）として記録する。Excel では使えない。" },
                     "fresh": { "type": "boolean", "description": "true のとき元のファイルから新しい編集済みファイルを作る。同じ会話の続きを上書きしない。利用者が元の版からやり直すときだけ。" },
+                    "creator": { "type": "string", "description": "Word の作成者（dc:creator）に書く名前。渡したときだけ上書きする。空にはしない。消すときは clear_creator を使う。何を書くか不明なときは推測せず、チャットで利用者に聞く。" },
+                    "clear_creator": { "type": "boolean", "description": "true のとき Word の作成者（dc:creator）を空にする。creator と同時には指定しない。変えるべきか不明なときは指定せず、チャットで利用者に聞く。" },
+                    "last_modified_by": { "type": "string", "description": "Word の最終更新者（cp:lastModifiedBy）に書く名前。渡したときだけ上書きする。空にはしない。消すときは clear_last_modified_by を使う。" },
+                    "clear_last_modified_by": { "type": "boolean", "description": "true のとき Word の最終更新者（cp:lastModifiedBy）を空にする。last_modified_by と同時には指定しない。" },
                     "replacements": {
                         "type": "array",
                         "description": "文字列置換。find を replace にすべて置き換える。comment があればその箇所にコメントを付ける。",
@@ -5166,6 +5170,15 @@ mod tests {
         assert!(schema.contains("tracked"), "{schema}");
         assert!(schema.contains("comment"), "{schema}");
         assert!(schema.contains("Argos"), "{schema}");
+        assert!(schema.contains("dc:creator"), "{schema}");
+        assert!(schema.contains("cp:lastModifiedBy"), "{schema}");
+        assert!(schema.contains("clear_creator"), "{schema}");
+        assert!(schema.contains("clear_last_modified_by"), "{schema}");
+        assert!(
+            schema.contains(crate::office_edit::LLM_DOC_AUTHOR_SENTINEL),
+            "{schema}"
+        );
+        assert!(schema.contains("チャットで利用者に聞いてください"), "{schema}");
         assert!(schema.contains("Excel では tracked と comment は使えず"), "{schema}");
         assert!(schema.contains("数値のセルも置換できる"), "{schema}");
         assert!(schema.contains("計算式の入ったセルは変えない"), "{schema}");

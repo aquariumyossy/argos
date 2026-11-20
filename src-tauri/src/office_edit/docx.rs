@@ -228,6 +228,7 @@ pub fn edit(
         );
     }
     super::edit_doc_props(entries, req, &mut stats);
+    super::authors::apply(entries, &req.core_authors, &mut stats)?;
     fill_near_misses(entries, &mut stats);
     super::note_unreachable_misses(entries, &mut stats);
     Ok(stats)

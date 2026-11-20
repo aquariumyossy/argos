@@ -2,6 +2,7 @@
 //! An original file is never overwritten. A follow-up edit of a file this chat's
 //! `edit_office` already saved replaces that output in place. Search-folder files stay closed.
 
+mod authors;
 pub(crate) mod docx;
 mod revise;
 mod text;
@@ -17,6 +18,9 @@ use serde_json::Value;
 
 use crate::db::LlmSourceRow;
 use crate::pathutil;
+
+pub use authors::{docx_author_lines, read_docx_authors, DocxAuthors};
+pub use authors::{LLM_DOC_AUTHOR_HINT, LLM_DOC_AUTHOR_SENTINEL};
 
 /// Same folder as chat file creation (`data_dir/output`).
 pub const OUTPUT_DIR_NAME: &str = "output";
@@ -66,6 +70,8 @@ pub struct EditRequest {
     pub revision_author: String,
     /// `w:date` for those revisions and comments. Empty until the edit starts.
     pub revision_date: String,
+    /// `dc:creator` and `cp:lastModifiedBy`. Unchanged unless the tool asked.
+    pub(crate) core_authors: authors::CoreAuthorEdit,
 }
 
 /// Blank settings use this author on revisions and comments.
@@ -114,11 +120,13 @@ pub(crate) struct ChangeStats {
     pub exact_hits: Vec<usize>,
     /// Parallel to `hits`: pasteable near-misses for a find that missed entirely.
     pub near_misses: Vec<Vec<text::NearMiss>>,
+    /// `dc:creator` or `cp:lastModifiedBy` was written to a different value.
+    pub core_authors: bool,
 }
 
 impl ChangeStats {
     fn changed(&self) -> bool {
-        self.paragraphs > 0 || self.hits.iter().any(|(_, _, count)| *count > 0)
+        self.core_authors || self.paragraphs > 0 || self.hits.iter().any(|(_, _, count)| *count > 0)
     }
 
     pub(crate) fn from_request(req: &EditRequest) -> Self {
@@ -135,6 +143,7 @@ impl ChangeStats {
             ws_sources: vec![Vec::new(); count],
             exact_hits: vec![0; count],
             near_misses: vec![Vec::new(); count],
+            core_authors: false,
         }
     }
 }
@@ -263,7 +272,10 @@ pub(crate) fn edit_path_mode(
     request: &EditRequest,
     overwrite: bool,
 ) -> Result<EditOutcome, String> {
-    if request.replacements.is_empty() && request.paragraphs.is_empty() {
+    if request.replacements.is_empty()
+        && request.paragraphs.is_empty()
+        && !request.core_authors.requested()
+    {
         return Err("replacements か paragraphs を指定してください。".into());
     }
     let mut request = request.clone();
@@ -284,6 +296,9 @@ pub(crate) fn edit_path_mode(
         }
         _ => return Err("編集できるのは .docx と .xlsx だけです。".into()),
     }
+    if request.core_authors.requested() && ext != "docx" {
+        return Err("作成者と最終更新者を変えられるのは Word (.docx) だけです。".into());
+    }
     let meta = fs::metadata(src).map_err(|_| "ファイルが見つかりません。".to_string())?;
     if !meta.is_file() {
         return Err("ファイルが見つかりません。".into());
@@ -298,6 +313,15 @@ pub(crate) fn edit_path_mode(
         _ => return Err("編集できるのは .docx と .xlsx だけです。".into()),
     };
     if !stats.changed() {
+        if request.core_authors.requested()
+            && request.replacements.is_empty()
+            && request.paragraphs.is_empty()
+        {
+            return Err(
+                "作成者と最終更新者は、指定した内容と同じでした。ファイルは保存していません。"
+                    .into(),
+            );
+        }
         let mut message = String::from("指定した文字列は見つかりませんでした。");
         let detail = format_replacement_lines(&stats);
         if !detail.is_empty() {
@@ -557,7 +581,8 @@ impl EditRequest {
             }
             push_paragraph(&mut paragraphs, match_text, text)?;
         }
-        if replacements.is_empty() && paragraphs.is_empty() {
+        let core_authors = authors::core_authors_from_args(args)?;
+        if replacements.is_empty() && paragraphs.is_empty() && !core_authors.requested() {
             return Err("replacements か paragraphs を指定してください。".into());
         }
         if replacements.len() > MAX_REPLACEMENTS {
@@ -576,6 +601,7 @@ impl EditRequest {
             track_changes: arg_bool(args.get("tracked")),
             revision_author: office_revision_author(""),
             revision_date: String::new(),
+            core_authors,
         })
     }
 }
