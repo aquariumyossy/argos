@@ -13,6 +13,9 @@ use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
 pub const TOOL_SEARCH: &str = "search_index";
+/// Public web only. Offered when this thread's index search is off and web search is on.
+/// `search_index` must not be offered then, and web search otherwise runs only as its sidecar.
+pub const TOOL_SEARCH_WEB: &str = "search_web";
 pub const TOOL_LAW: &str = "law_article";
 /// Articles accepted in one `law_article` call.
 pub const MAX_LAW_ARTICLES: usize = 10;
@@ -145,11 +148,60 @@ const UNITS_PER_FILE: usize = 3;
 /// Cap on simultaneous thread folder scopes (each prefix is a separate index search).
 pub const MAX_THREAD_SCOPES: usize = 8;
 
+fn calendar_tool_description(index_search: bool) -> &'static str {
+    if index_search {
+        "このPCの予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。search_index の「直近は過去」は予定に使わない。資料が要るときは、返った件名や当事者名を search_index の query にする。"
+    } else {
+        "このPCの予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。"
+    }
+}
+
+fn read_url_tool_description(index_search: bool) -> &'static str {
+    if index_search {
+        "公開ウェブの1件の URL の本文を読む。search_index の（ウェブ）スニペットでは足りないときだけ使う。ユーザーがメッセージに貼った URL は既に出典に付いているので呼ばない。一度に複数呼ぶときは重要なものから最大2件。"
+    } else {
+        "公開ウェブの1件の URL の本文を読む。search_web のスニペットでは足りないときだけ使う。ユーザーがメッセージに貼った URL は既に出典に付いているので呼ばない。一度に複数呼ぶときは重要なものから最大2件。"
+    }
+}
+
+fn search_web_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_SEARCH_WEB,
+            "description": "公開ウェブだけを検索する。索引・ファイル・メールは検索しない。添付出典で足りるときは呼ばない。\
+クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
+結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。\
+公開情報が必要な質問ではこのツールを呼ぶ。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "検索語（単語を空白区切り。\"...\" で完全一致、-語 で除外）" }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+/// Index search on. Same schema as before this toggle existed.
 pub fn tools_schema(
     web_search: bool,
     remote_index: bool,
     remote_only: bool,
     look_image: bool,
+) -> Value {
+    tools_schema_with(web_search, remote_index, remote_only, look_image, true)
+}
+
+/// `index_search` is the per-thread flag. When it is false, `search_index` is left out.
+/// Web search then uses one `search_web` tool instead of the `search_index` sidecar.
+pub fn tools_schema_with(
+    web_search: bool,
+    remote_index: bool,
+    remote_only: bool,
+    look_image: bool,
+    index_search: bool,
 ) -> Value {
     let mut search_desc = if remote_only && web_search {
         "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
@@ -192,8 +244,10 @@ pub fn tools_schema(
             "別PCの共有フォルダも検索する。その出典には（リモート）が付く。メールと送信者はこのPCだけ。期間はホストが対応しているときだけ別PCにも効く。",
         );
     }
-    let mut tools = vec![
-        json!({
+    let calendar_desc = calendar_tool_description(index_search);
+    let mut tools = Vec::new();
+    if index_search {
+        tools.push(json!({
             "type": "function",
             "function": {
                 "name": TOOL_SEARCH,
@@ -229,8 +283,11 @@ pub fn tools_schema(
                     "required": ["query"]
                 }
             }
-        }),
-        json!({
+        }));
+    } else if web_search {
+        tools.push(search_web_tool());
+    }
+    tools.push(json!({
             "type": "function",
             "function": {
                 "name": TOOL_LAW,
@@ -254,12 +311,12 @@ pub fn tools_schema(
                     "required": ["articles"]
                 }
             }
-        }),
-        json!({
+        }));
+    tools.push(json!({
             "type": "function",
             "function": {
                 "name": TOOL_LIST_CALENDAR,
-                "description": "このPCの予定表から、期間内の予定を日付の早い順に返す。予定・期日・会議・今日・今週・明日はこちらを使う。search_index の「直近は過去」は予定に使わない。資料が要るときは、返った件名や当事者名を search_index の query にする。",
+                "description": calendar_desc,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -269,8 +326,8 @@ pub fn tools_schema(
                     }
                 }
             }
-        }),
-        json!({
+        }));
+    tools.push(json!({
             "type": "function",
             "function": {
                 "name": TOOL_READ,
@@ -309,8 +366,7 @@ pub fn tools_schema(
                     }
                 }
             }
-        }),
-    ];
+        }));
     if look_image {
         tools.push(json!({
             "type": "function",
@@ -334,8 +390,7 @@ pub fn tools_schema(
             "type": "function",
             "function": {
                 "name": TOOL_READ_URL,
-                "description": "公開ウェブの1件の URL の本文を読む。search_index の（ウェブ）スニペットでは足りないときだけ使う。\
-ユーザーがメッセージに貼った URL は既に出典に付いているので呼ばない。一度に複数呼ぶときは重要なものから最大2件。",
+                "description": read_url_tool_description(index_search),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -767,6 +822,14 @@ pub fn format_calendar_system_line() -> String {
     "\n予定・期日・会議・今日・今週・明日は list_calendar を使う。資料が要るときだけ、返った件名や当事者名を search_index の query にする。search_index の「直近は30日前」はファイルとメール用で、予定には使わない。".into()
 }
 
+pub fn format_calendar_system_line_for(index_search: bool) -> String {
+    if index_search {
+        format_calendar_system_line()
+    } else {
+        "\n予定・期日・会議・今日・今週・明日は list_calendar を使う。".into()
+    }
+}
+
 pub fn format_search_date_system_line(mail_days_back: u32) -> String {
     format!(
         "\n本日は {}（ローカル日付）です。時期や「直近」「最近」があるときだけ search_index の after / before を YYYY-MM-DD で渡してください。無いときは期間で絞らないでください。送信者は from に表示名を入れてください。「直近」は after を今日の30日前、sort は date にしてください。0件や件数不足なら after を90日前、次に1年前へ広げて再検索してください。新着をスコアで優遇しないでください。メールの同期範囲は過去{}日です。",
@@ -777,6 +840,40 @@ pub fn format_search_date_system_line(mail_days_back: u32) -> String {
 
 pub fn format_web_search_system_line() -> String {
     "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。添付出典とインデックスを優先してください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_index を呼んでください。".into()
+}
+
+const INDEX_SEARCH_PROMPT_SENTENCE: &str =
+    "インデックスを検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。";
+const LEGACY_INDEX_SEARCH_PROMPT_SENTENCE: &str =
+    "索引を検索するツールがあります。添付出典で足りるときは検索しないでください。検索したら結果を [n] で引用してください。";
+pub const INDEX_SEARCH_OFF_SENTENCE: &str =
+    "この会話ではインデックス検索はオフです。索引のファイルやメールは検索しません。添付・ノート・渡された出典は読めます。";
+
+/// Drop the stored "you have an index search tool" sentence when this thread has it off.
+pub fn apply_index_search_off(system: &mut String) {
+    let replaced = if system.contains(INDEX_SEARCH_PROMPT_SENTENCE) {
+        *system = system.replace(INDEX_SEARCH_PROMPT_SENTENCE, INDEX_SEARCH_OFF_SENTENCE);
+        true
+    } else if system.contains(LEGACY_INDEX_SEARCH_PROMPT_SENTENCE) {
+        *system = system.replace(
+            LEGACY_INDEX_SEARCH_PROMPT_SENTENCE,
+            INDEX_SEARCH_OFF_SENTENCE,
+        );
+        true
+    } else {
+        false
+    };
+    if !replaced && !system.contains(INDEX_SEARCH_OFF_SENTENCE) {
+        if !system.is_empty() && !system.ends_with('\n') {
+            system.push('\n');
+        }
+        system.push_str(INDEX_SEARCH_OFF_SENTENCE);
+    }
+}
+
+/// Web search without the index. Does not name `search_index`.
+pub fn format_web_only_system_line() -> String {
+    "\nウェブ検索が有効です。インデックス検索はオフです。公開ウェブは search_web で検索します。索引・ファイル・メールは検索しません。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_web を呼んでください。".into()
 }
 
 pub fn thread_has_relook_image(sources: &[crate::db::LlmSourceRow]) -> bool {
@@ -2616,6 +2713,78 @@ fn office_tool_exec(wrote: crate::llm::create_office::OfficeToolResult) -> ToolE
     }
 }
 
+fn thread_index_search_enabled(state: &AppState, thread_id: &str) -> bool {
+    state
+        .db
+        .get_llm_thread(thread_id)
+        .ok()
+        .flatten()
+        .map(|thread| thread.search_enabled)
+        .unwrap_or(true)
+}
+
+/// Web hits only. Does not query the file or mail index.
+fn tool_search_web(
+    state: &AppState,
+    thread_id: &str,
+    args: &Value,
+    web_search: bool,
+) -> Result<ToolExec, String> {
+    if !web_search {
+        return Ok(ToolExec::text("ウェブ検索がオフです。"));
+    }
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Ok(ToolExec::text("query が空です。"));
+    }
+    let settings = state.settings.read().clone();
+    let web_hits = match crate::llm::searxng::search(&settings, &query) {
+        Ok(hits) => hits,
+        Err(e) => return Ok(ToolExec::text(format!("ウェブ検索に失敗: {e}"))),
+    };
+    if web_hits.is_empty() {
+        return Ok(ToolExec::text("ウェブ検索のヒットはありませんでした。"));
+    }
+    let mut new_rows = Vec::new();
+    let mut already = Vec::new();
+    let mut consumed = Vec::new();
+    for hit in &web_hits {
+        persist_web_hit(
+            state,
+            thread_id,
+            hit,
+            &query,
+            &mut new_rows,
+            &mut already,
+            &mut consumed,
+        )?;
+    }
+    let mut content = String::new();
+    if !new_rows.is_empty() {
+        content.push_str(&format_sources(&new_rows));
+    }
+    if !already.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&already.join("\n"));
+    }
+    if content.trim().is_empty() {
+        content = "使える本文のあるヒットはありませんでした。".into();
+    }
+    Ok(ToolExec {
+        content,
+        consumed,
+        saved_file: None,
+        wrote_note_id: None,
+    })
+}
+
 pub fn execute_tool(
     state: &AppState,
     thread_id: &str,
@@ -2659,7 +2828,13 @@ fn execute_tool_inner(
     match name {
         TOOL_LAW => Ok(tool_law_article(state, &args)),
         TOOL_LIST_CALENDAR => Ok(tool_list_calendar(state, &args)),
+        TOOL_SEARCH_WEB => tool_search_web(state, thread_id, &args, web_search),
         TOOL_SEARCH => {
+            if !thread_index_search_enabled(state, thread_id) {
+                return Ok(ToolExec::text(
+                    "インデックス検索はオフです。添付・ノート・出典は読めます。",
+                ));
+            }
             let query = args
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -5238,5 +5413,114 @@ mod tests {
         assert!(!schema.contains("前回の出力には重ねない"), "{schema}");
         assert!(counts_toward_tool_round(&[TOOL_EDIT_OFFICE]));
         assert!(!counts_toward_tool_round(&[TOOL_LAW]));
+    }
+
+    fn tool_names(schema: &Value) -> Vec<String> {
+        schema
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn both_on_schema_matches_the_index_search_tool() {
+        for args in [
+            (true, false, false, false),
+            (true, true, false, true),
+            (true, false, true, false),
+            (false, true, true, false),
+            (false, false, false, true),
+        ] {
+            assert_eq!(
+                tools_schema(args.0, args.1, args.2, args.3),
+                tools_schema_with(args.0, args.1, args.2, args.3, true),
+                "index on must keep the previous schema"
+            );
+        }
+        let both = tools_schema(true, false, false, false).to_string();
+        assert!(both.contains("Argosの索引を検索する（ファイルとメール）。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。"));
+        assert!(both.contains("search_index の（ウェブ）スニペット"));
+        assert!(both.contains("search_index の query"));
+        assert!(!both.contains(TOOL_SEARCH_WEB));
+        let line = format_web_search_system_line();
+        assert!(line.contains("search_index を呼ぶと同じ語で公開ウェブも検索します"));
+        assert!(line.contains("公開情報が必要な質問では search_index を呼んでください"));
+        assert_eq!(
+            format_calendar_system_line_for(true),
+            format_calendar_system_line()
+        );
+    }
+
+    #[test]
+    fn search_tools_follow_the_four_toggle_combinations() {
+        let both = tools_schema_with(true, false, false, false, true);
+        let index_only = tools_schema_with(false, false, false, false, true);
+        let web_only = tools_schema_with(true, false, false, false, false);
+        let neither = tools_schema_with(false, false, false, false, false);
+        let both_names = tool_names(&both);
+        let index_names = tool_names(&index_only);
+        let web_names = tool_names(&web_only);
+        let neither_names = tool_names(&neither);
+
+        assert!(both_names.contains(&TOOL_SEARCH.to_string()));
+        assert!(!both_names.contains(&TOOL_SEARCH_WEB.to_string()));
+        assert!(both_names.contains(&TOOL_READ_URL.to_string()));
+        assert_eq!(
+            index_names,
+            tool_names(&tools_schema(false, false, false, false))
+        );
+
+        let mut web_expected = both_names.clone();
+        let at = web_expected
+            .iter()
+            .position(|name| name == TOOL_SEARCH)
+            .unwrap();
+        web_expected[at] = TOOL_SEARCH_WEB.to_string();
+        assert_eq!(web_names, web_expected);
+        let web_text = web_only.to_string();
+        assert!(!web_text.contains(TOOL_SEARCH), "{web_text}");
+        assert!(web_text.contains("公開ウェブだけを検索する"));
+        assert!(web_text.contains("search_web のスニペット"));
+        assert!(web_text.contains(TOOL_READ));
+        assert!(web_text.contains(TOOL_READ_URL));
+        assert!(web_text.contains(TOOL_LIST_NOTES));
+        assert!(web_text.contains(TOOL_READ_NOTE));
+        assert!(web_text.contains(TOOL_LAW));
+        assert!(web_text.contains(TOOL_LIST_CALENDAR));
+
+        let mut off_expected = index_names.clone();
+        off_expected.retain(|name| name != TOOL_SEARCH);
+        assert_eq!(neither_names, off_expected);
+        let neither_text = neither.to_string();
+        assert!(!neither_text.contains(TOOL_SEARCH), "{neither_text}");
+        assert!(!neither_text.contains(TOOL_SEARCH_WEB), "{neither_text}");
+        assert!(!neither_text.contains(TOOL_READ_URL), "{neither_text}");
+        assert!(neither_text.contains(TOOL_READ));
+        assert!(neither_text.contains(TOOL_LIST_NOTES));
+        assert!(neither_text.contains("予定・期日・会議・今日・今週・明日はこちらを使う"));
+        assert!(!neither_text.contains("search_index"));
+
+        let only_web_line = format_web_only_system_line();
+        assert!(!only_web_line.contains("search_index"));
+        assert!(only_web_line.contains("search_web で検索します"));
+        assert!(!format_calendar_system_line_for(false).contains("search_index"));
+        assert!(counts_toward_tool_round(&[TOOL_SEARCH_WEB]));
+
+        let mut custom = "事務所のルールだけ。".to_string();
+        apply_index_search_off(&mut custom);
+        assert!(custom.contains(INDEX_SEARCH_OFF_SENTENCE));
+        assert!(!custom.contains("search_index"));
+        let mut legacy = crate::db::LEGACY_TOOL_LLM_SYSTEM_PROMPT.to_string();
+        apply_index_search_off(&mut legacy);
+        assert!(!legacy.contains("索引を検索するツールがあります"));
+        assert!(legacy.contains("添付・ノート・渡された出典は読めます"));
+        let mut current = crate::db::DEFAULT_LLM_SYSTEM_PROMPT.to_string();
+        assert!(current.contains("インデックスを検索するツールがあります"));
+        apply_index_search_off(&mut current);
+        assert!(!current.contains("インデックスを検索するツールがあります"));
+        assert!(current.contains("出典ブロックがあるときは"));
+        assert!(current.contains(INDEX_SEARCH_OFF_SENTENCE));
     }
 }

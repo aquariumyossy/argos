@@ -11,6 +11,7 @@ export function useChatContextMeter(args: {
   pathPrefix: string;
   draft: string;
   webSearch: boolean;
+  searchEnabled: boolean;
   maxContextTokens: number;
   searchMode: string;
   messages: unknown;
@@ -66,6 +67,7 @@ export function useChatContextMeter(args: {
     args.pathPrefix,
     args.draft,
     args.webSearch,
+    args.searchEnabled,
     args.maxContextTokens,
     args.searchMode,
     args.messages,

@@ -1531,6 +1531,7 @@ fn tool_result_lists_sources(name: Option<&str>) -> bool {
         name,
         Some(
             crate::llm::tools::TOOL_SEARCH
+                | crate::llm::tools::TOOL_SEARCH_WEB
                 | crate::llm::tools::TOOL_READ
                 | crate::llm::tools::TOOL_READ_URL
         )

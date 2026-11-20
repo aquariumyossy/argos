@@ -293,6 +293,11 @@ beforeEach(() => {
       }
       case "llm_context_meter":
         return args?.threadId === threadB.id ? 1111 : 2222;
+      case "llm_set_thread_search": {
+        const enabled = Boolean(args?.searchEnabled);
+        const base = args?.id === threadB.id ? threadB : threadA;
+        return { ...base, searchEnabled: enabled };
+      }
       case "llm_attach_pasted_image":
         return pastedAttachResult;
       case "llm_send": {
@@ -1680,5 +1685,30 @@ describe("Ctrl+V image paste", () => {
     expect(mockInvoke.mock.calls.some((entry) => entry[0] === "llm_attach_pasted_image")).toBe(
       false,
     );
+  });
+});
+
+describe("index search toggle", () => {
+  it("starts on and persists the next state on this thread only", async () => {
+    await renderChat();
+    const on = screen.getByRole("button", { name: "インデックス検索オン" });
+    expect(on.getAttribute("aria-pressed")).toBe("true");
+    expect(on.className).toContain("chat-web-toggle");
+    expect(on.className).toContain("is-active");
+    fireEvent.click(on);
+    await screen.findByRole("button", { name: "インデックス検索オフ" });
+    expect(mockInvoke).toHaveBeenCalledWith("llm_set_thread_search", {
+      id: "thread-a",
+      searchEnabled: false,
+    });
+    const off = screen.getByRole("button", { name: "インデックス検索オフ" });
+    expect(off.getAttribute("aria-pressed")).toBe("false");
+    expect(off.className).not.toContain("is-active");
+
+    fireEvent.click(screen.getByRole("button", { name: "別の会話" }));
+    await screen.findByText("別スレッドの発言");
+    expect(
+      screen.getByRole("button", { name: "インデックス検索オン" }).getAttribute("aria-pressed"),
+    ).toBe("true");
   });
 });

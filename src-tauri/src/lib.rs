@@ -489,6 +489,7 @@ pub fn run() {
             llm::commands::llm_create_thread,
             llm::commands::llm_rename_thread,
             llm::commands::llm_set_thread_scope,
+            llm::commands::llm_set_thread_search,
             llm::commands::llm_set_thread_note,
             llm::commands::get_note_review,
             llm::commands::ack_note_review,

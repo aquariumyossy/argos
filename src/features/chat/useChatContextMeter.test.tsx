@@ -18,6 +18,7 @@ const base = {
   pathPrefix: "",
   draft: "",
   webSearch: false,
+  searchEnabled: true,
   maxContextTokens: 120_000,
   searchMode: "local",
   messages: [],
@@ -190,5 +191,21 @@ describe("chat context meter", () => {
     });
     expect(result.current.used).toBeNull();
     expect(result.current.warn).toBe(false);
+  });
+
+  it("measures again when this thread's index search changes", async () => {
+    const { rerender } = renderHook(
+      (props: typeof base) => useChatContextMeter(props),
+      { initialProps: base },
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
+    });
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    rerender({ ...base, searchEnabled: false });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(METER_DEBOUNCE_MS);
+    });
+    expect(mockInvoke).toHaveBeenCalledTimes(2);
   });
 });

@@ -95,6 +95,8 @@ const SCROLL_KEYS = new Set([
 type LlmThreadRow = {
   id: string;
   title: string;
+  /** Per-thread index search. Missing means on, including threads saved before the toggle. */
+  searchEnabled?: boolean;
   /** Folder scope for index searches in this thread. Empty means the whole index. */
   pathPrefix?: string;
   noteId?: string;
@@ -1306,12 +1308,14 @@ export default function Chat() {
     scrollLog();
   }, [messages, stream, thinking, toolHint, showLive, scrollLog]);
 
+  const indexSearch = active?.searchEnabled !== false;
   const meter = useChatContextMeter({
     threadId: active?.id ?? "",
     noteId: active?.noteId ?? "",
     pathPrefix: active?.pathPrefix ?? "",
     draft,
     webSearch: webSearch && !!searxngUrl,
+    searchEnabled: indexSearch,
     maxContextTokens,
     searchMode,
     messages,
@@ -1470,6 +1474,22 @@ export default function Chat() {
     setActive((prev) => (prev?.id === t.id ? { ...prev, ...t } : prev));
     if (t.noteId) void loadNoteReview(t.noteId);
   }, [loadNoteReview]);
+
+  async function toggleIndexSearch() {
+    if (busy || !active) return;
+    const id = active.id;
+    const next = active.searchEnabled === false;
+    try {
+      const t = await invoke<LlmThreadRow>("llm_set_thread_search", {
+        id,
+        searchEnabled: next,
+      });
+      setThreads((prev) => prev.map((x) => (x.id === t.id ? t : x)));
+      setActive((prev) => (prev?.id === t.id ? t : prev));
+    } catch (e) {
+      setError(formatInvokeError(e));
+    }
+  }
 
   async function appendAnswerToNote(content: string, noteId: "new" | string) {
     const text = content.trim();
@@ -2742,7 +2762,9 @@ export default function Chat() {
               title={
                 searxngUrl
                   ? webSearch
-                    ? "インデックス検索時に公開ウェブも使う"
+                    ? indexSearch
+                      ? "インデックス検索時に公開ウェブも使う"
+                      : "公開ウェブだけを検索する"
                     : "オフ。クリックでウェブ検索を足す"
                   : "設定のローカルLLMで SearXNG の URL を入れてください"
               }
@@ -2753,6 +2775,20 @@ export default function Chat() {
               }}
             >
               {webSearch ? "ウェブ検索オン" : "ウェブ検索オフ"}
+            </button>
+            <button
+              type="button"
+              className={`chat-tpl chat-web-toggle${indexSearch ? " is-active" : ""}`}
+              disabled={busy || !active}
+              title={
+                indexSearch
+                  ? "この会話のインデックスを検索する"
+                  : "オフ。クリックでインデックス検索を足す"
+              }
+              aria-pressed={indexSearch}
+              onClick={() => void toggleIndexSearch()}
+            >
+              {indexSearch ? "インデックス検索オン" : "インデックス検索オフ"}
             </button>
             <PromptLibrary text={draft} disabled={busy} onRecall={applyTemplate} />
             <span className="chat-context-meter">
