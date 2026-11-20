@@ -153,4 +153,62 @@ describe("officeCardsByMessage", () => {
     ]);
     expect(cards.get("reply")).toEqual([{ kind: "docx", name: "out.docx" }]);
   });
+
+  it("keeps the last card when one turn writes the same output file more than once", () => {
+    const name = "契約書_編集済み（2026-11-12 09-30-00）.docx";
+    const first = [
+      `出力ファイル: ${name}`,
+      `[[argos-office]]\tdocx\t${name}`,
+      "元ファイル: 契約書.docx",
+    ].join("\n");
+    const second = [
+      `出力ファイル: ${name}`,
+      `[[argos-office]]\tdocx\t${name}`,
+      "元ファイル: 契約書_下書き.docx",
+      String.raw`保存先: C:\Users\me\AppData\Roaming\Argos\output\${name}`,
+    ].join("\n");
+    const saved = officeCardsByMessage([
+      msg("u", "user", "直して"),
+      msg("t1", "tool", first, { toolName: "edit_office" }),
+      msg("t2", "tool", second, { toolName: "edit_office" }),
+      msg("reply", "assistant", "直しました。"),
+    ]);
+    expect(saved.get("reply")).toEqual([
+      { kind: "docx", name, sourceName: "契約書_下書き.docx" },
+    ]);
+    expect(saved.has("t1")).toBe(false);
+    expect(saved.has("t2")).toBe(false);
+
+    const cancelled = officeCardsByMessage([
+      msg("u", "user", "直して"),
+      msg("t1", "tool", first, { toolName: "edit_office" }),
+      msg("t2", "tool", second, { toolName: "edit_office" }),
+    ]);
+    expect(cancelled.has("t1")).toBe(false);
+    expect(cancelled.get("t2")).toEqual([
+      { kind: "docx", name, sourceName: "契約書_下書き.docx" },
+    ]);
+  });
+
+  it("keeps a card for each distinct output file in the turn", () => {
+    const htmlNotice = [
+      "HTMLファイルを保存しました（Argos の出力フォルダ）",
+      "[[argos-office]]\thtml\t手数料.html",
+    ].join("\n");
+    const cards = officeCardsByMessage([
+      msg("u", "user", "作って"),
+      msg("n1", "assistant", docxNotice, { kind: "notice" }),
+      msg("n2", "assistant", xlsxNotice, { kind: "notice" }),
+      msg("n3", "assistant", htmlNotice, { kind: "notice" }),
+      msg("n4", "assistant", docxNotice, { kind: "notice" }),
+      msg("reply", "assistant", "できました。"),
+    ]);
+    expect(cards.get("reply")).toEqual([
+      { kind: "xlsx", name: "売上集計.xlsx" },
+      { kind: "html", name: "手数料.html" },
+      { kind: "docx", name: "契約メモ.docx" },
+    ]);
+    expect(cards.has("n1")).toBe(false);
+    expect(cards.has("n4")).toBe(false);
+  });
 });

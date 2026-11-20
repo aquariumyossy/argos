@@ -272,7 +272,10 @@ fn package_texts(entries: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
         let place = super::unreachable_kind(name)
             .map(super::unreachable_location)
             .unwrap_or_default();
-        for (_, text) in leaf_texts(&xml) {
+        for (local, text) in leaf_texts(&xml) {
+            if super::is_document_author_leaf(name, &local) {
+                continue;
+            }
             push_text(&mut texts, text, &place);
         }
     }
@@ -815,7 +818,10 @@ pub fn check(entries: &[(String, Vec<u8>)], probes: &[Probe]) -> (Vec<Leftover>,
         } else {
             format!("その他（{path}）")
         };
-        for (_, text) in leaf_texts(&xml) {
+        for (local, text) in leaf_texts(&xml) {
+            if super::is_document_author_leaf(name, &local) {
+                continue;
+            }
             for probe in probes {
                 push_leftover(
                     &mut leftovers,

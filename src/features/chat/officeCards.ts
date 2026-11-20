@@ -18,8 +18,10 @@ export type OfficeCardMessage = {
 
 /**
  * One card per output file, on the assistant reply that follows those files.
- * If that reply was never stored, the card stays on the notice or tool row
- * that announced the file, so a cancelled turn can still be opened.
+ * The same output file (its bare name; the card has no path) keeps only the
+ * last card in that turn. If the reply was never stored, that last card stays
+ * on the notice or tool row that announced it, so a cancelled turn can still
+ * be opened.
  */
 export function officeCardsByMessage(
   messages: readonly OfficeCardMessage[],
@@ -50,8 +52,9 @@ function assignTurn(
     const file = officeCardFromMessage(message);
     if (file) found.push({ index, id: message.id, file });
   });
-  if (found.length === 0) return;
-  const lastFile = found[found.length - 1].index;
+  const unique = keepLastOutputFile(found);
+  if (unique.length === 0) return;
+  const lastFile = unique[unique.length - 1].index;
   let replyId = "";
   for (let index = turn.length - 1; index > lastFile; index -= 1) {
     const message = turn[index];
@@ -63,15 +66,26 @@ function assignTurn(
   if (replyId) {
     assigned.set(
       replyId,
-      found.map((item) => item.file),
+      unique.map((item) => item.file),
     );
     return;
   }
-  for (const item of found) {
+  for (const item of unique) {
     const list = assigned.get(item.id) ?? [];
     list.push(item.file);
     assigned.set(item.id, list);
   }
+}
+
+/** Later result for the same output name wins. Its place in the turn is kept. */
+function keepLastOutputFile(
+  found: readonly { index: number; id: string; file: OfficeCardFile }[],
+): { index: number; id: string; file: OfficeCardFile }[] {
+  const lastAt = new Map<string, number>();
+  found.forEach((item, index) => {
+    lastAt.set(item.file.name, index);
+  });
+  return found.filter((item, index) => lastAt.get(item.file.name) === index);
 }
 
 function officeCardFromMessage(message: OfficeCardMessage): OfficeCardFile | null {

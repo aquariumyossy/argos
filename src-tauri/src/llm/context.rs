@@ -552,6 +552,20 @@ pub(crate) fn source_header_lines(source: &LlmSourceRow) -> [String; 2] {
     ]
 }
 
+/// Author lines for a docx the model may edit. Search hits stay unchanged.
+fn docx_attachment_authors(seed: &LlmSourceRow) -> Option<String> {
+    if !seed.origin.eq_ignore_ascii_case("attach") {
+        return None;
+    }
+    let path = seed.path.trim();
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    if !ext.eq_ignore_ascii_case("docx") {
+        return None;
+    }
+    let authors = crate::office_edit::read_docx_authors(std::path::Path::new(path)).ok()?;
+    Some(crate::office_edit::docx_author_lines(&authors))
+}
+
 fn push_cite_prefix(out: &mut String, n: i64) {
     if n > 0 {
         out.push_str(&format!("[{n}] "));
@@ -805,6 +819,10 @@ pub fn format_sources_with_pool(shown: &[LlmSourceRow], pool: &[LlmSourceRow]) -
         let n = cite_no_of(seed);
         out.push_str(&citation_header_line(seed, n, false));
         out.push('\n');
+        if let Some(lines) = docx_attachment_authors(seed) {
+            out.push_str(&lines);
+            out.push('\n');
+        }
         if seed.is_image() {
             out.push_str(IMAGE_TRANSCRIPT_NOTE);
             out.push('\n');
@@ -2785,6 +2803,48 @@ mod tests {
             !file.contains("paragraph_id"),
             "file grain must not advertise a paragraph id: {file}"
         );
+    }
+
+    #[test]
+    fn an_attached_docx_shows_its_author_to_the_model() {
+        let dir = std::env::temp_dir().join(format!("argos-docx-author-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("契約書.docx");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("word/document.xml", opts).unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            "<w:document><w:body><w:p><w:r><w:t>本文の原告</w:t></w:r></w:p></w:body></w:document>"
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.start_file("docProps/core.xml", opts).unwrap();
+        std::io::Write::write_all(
+            &mut zip,
+            "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator>山田 太郎</dc:creator><cp:lastModifiedBy>佐藤</cp:lastModifiedBy></cp:coreProperties>"
+                .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let mut attached = src_file("契約書.docx", "attach", 0, "本文の原告");
+        attached.path = path.to_string_lossy().into_owned();
+        attached.cite_no = 1;
+        let shown = format_sources(&[attached.clone()]);
+        assert!(shown.contains("作成者: 山田 太郎"), "{shown}");
+        assert!(shown.contains("最終更新者: 佐藤"), "{shown}");
+        assert!(shown.contains("本文の原告"), "{shown}");
+        let header_at = shown.find("作成者:").unwrap();
+        let body_at = shown.find("本文の原告").unwrap();
+        assert!(header_at < body_at, "{shown}");
+
+        let mut searched = attached;
+        searched.origin = "tool".into();
+        let hidden = format_sources(&[searched]);
+        assert!(!hidden.contains("作成者:"), "{hidden}");
+        assert!(hidden.contains("本文の原告"), "{hidden}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

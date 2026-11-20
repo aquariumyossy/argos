@@ -160,6 +160,8 @@ export function authoredToolTexts(name: string, args: Json): string[] {
   const obj = asObject(args) ?? {};
   const out: string[] = [];
   if (name === "edit_office") {
+    pushString(out, obj.creator);
+    pushString(out, obj.last_modified_by);
     for (const item of objectsOf(obj.replacements)) {
       pushString(out, item.replace);
       pushString(out, item.comment);

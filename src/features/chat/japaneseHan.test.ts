@@ -113,6 +113,14 @@ describe("foreignCharNotice", () => {
         replacements: [{ find: "这个", replace: "本文" }],
       }),
     ).toEqual(["本文"]);
+    expect(
+      authoredToolTexts("edit_office", {
+        creator: "確認者",
+        last_modified_by: "更新者",
+        clear_creator: true,
+        replacements: [{ find: "这个", replace: "本文" }],
+      }),
+    ).toEqual(["確認者", "更新者", "本文"]);
   });
 });
 

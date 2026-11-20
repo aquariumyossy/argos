@@ -39,6 +39,29 @@ $CargoToml = Join-Path $Root "src-tauri\Cargo.toml"
 if (-not (Test-Path -LiteralPath $CargoToml)) {
     throw "Cargo.toml not found: $CargoToml"
 }
+
+# LICENSE, NOTICE, and THIRD_PARTY_LICENSES.
+# Regenerate THIRD_PARTY_LICENSES before a release:
+#   python3 scripts/generate_third_party_licenses.py
+# src-tauri/tauri.conf.json bundle.resources puts the same files inside the
+# NSIS installer. The copies after the build put them in the zip, next to the
+# setup exe and next to the portable exe.
+$LicenseNames = @("LICENSE", "NOTICE", "THIRD_PARTY_LICENSES")
+$TauriConfPath = Join-Path $Root "src-tauri\tauri.conf.json"
+if (-not (Test-Path -LiteralPath $TauriConfPath)) {
+    throw "tauri.conf.json not found: $TauriConfPath"
+}
+$TauriConf = Get-Content -LiteralPath $TauriConfPath -Raw
+foreach ($LicenseName in $LicenseNames) {
+    $LicenseSrc = Join-Path $Root $LicenseName
+    if (-not (Test-Path -LiteralPath $LicenseSrc)) {
+        throw "License file not found: $LicenseSrc"
+    }
+    if ($TauriConf -notlike "*$LicenseName*") {
+        throw "src-tauri/tauri.conf.json bundle resources must include $LicenseName so the installer ships it"
+    }
+}
+
 $CargoTomlBackup = Join-Path ([System.IO.Path]::GetTempPath()) ("argos-Cargo.toml." + [guid]::NewGuid().ToString("n") + ".bak")
 [System.IO.File]::Copy($CargoToml, $CargoTomlBackup, $true)
 
@@ -70,10 +93,18 @@ try {
 
     # Also include portable exe
     $Exe = Join-Path $Root "src-tauri\target\release\argos.exe"
+    $PortableDir = Join-Path $OutDir "portable"
     if (Test-Path $Exe) {
-        $PortableDir = Join-Path $OutDir "portable"
         New-Item -ItemType Directory -Path $PortableDir -Force | Out-Null
         Copy-Item $Exe (Join-Path $PortableDir "Argos.exe")
+    }
+
+    foreach ($LicenseName in $LicenseNames) {
+        $LicenseSrc = Join-Path $Root $LicenseName
+        Copy-Item -LiteralPath $LicenseSrc -Destination (Join-Path $OutDir $LicenseName)
+        if (Test-Path -LiteralPath $PortableDir) {
+            Copy-Item -LiteralPath $LicenseSrc -Destination (Join-Path $PortableDir $LicenseName)
+        }
     }
 
     # Japanese install guide (template with version placeholder)

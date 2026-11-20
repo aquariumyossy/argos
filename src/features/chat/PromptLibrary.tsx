@@ -6,13 +6,15 @@ import {
   loadSavedPrompts,
   needsReplaceConfirm,
   rememberSavedPrompt,
+  restoreSavedPrompts,
+  reviseSavedPrompt,
   saveBlockReason,
   saveWasTooLong,
   titleFromBody,
 } from "./savedPrompts";
 import { isImeEnter } from "./imeEnter";
 
-type LibraryMode = "list" | "name" | "confirm";
+type LibraryMode = "list" | "name" | "edit" | "confirm";
 
 type PromptLibraryProps = {
   text: string;
@@ -25,6 +27,7 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
   const [prompts, setPrompts] = useState<SavedPrompt[]>([]);
   const [mode, setMode] = useState<LibraryMode>("list");
   const [draftTitle, setDraftTitle] = useState("");
+  const [draftBody, setDraftBody] = useState("");
   const [pending, setPending] = useState<SavedPrompt | null>(null);
   const [tooLong, setTooLong] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -56,6 +59,7 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
     setMode("list");
     setPending(null);
     setDraftTitle("");
+    setDraftBody("");
   }
 
   function openPanel() {
@@ -90,6 +94,38 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
     showList();
   }
 
+  function startEdit(prompt: SavedPrompt) {
+    setTooLong(false);
+    setPending(prompt);
+    setDraftTitle(prompt.title);
+    setDraftBody(prompt.body);
+    setMode("edit");
+  }
+
+  function commitEdit() {
+    if (!pending) return;
+    const result = reviseSavedPrompt({
+      id: pending.id,
+      title: draftTitle,
+      body: draftBody,
+    });
+    if (!result.ok) {
+      setTooLong(saveWasTooLong(result));
+      setPrompts(loadSavedPrompts());
+      showList();
+      return;
+    }
+    setPrompts(result.prompts);
+    setTooLong(false);
+    showList();
+  }
+
+  function restoreDefaults() {
+    setTooLong(false);
+    setPrompts(restoreSavedPrompts());
+    showList();
+  }
+
   function pick(prompt: SavedPrompt) {
     if (needsReplaceConfirm(text, prompt.body)) {
       setPending(prompt);
@@ -120,10 +156,10 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
           else openPanel();
         }}
       >
-        保存した文章
+        プロンプト
       </button>
       {open ? (
-        <div className="chat-prompt-panel" role="dialog" aria-label="保存した文章">
+        <div className="chat-prompt-panel" role="dialog" aria-label="プロンプト">
           {mode === "name" ? (
             <>
               <label className="chat-prompt-name">
@@ -149,9 +185,48 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
                 </button>
               </div>
             </>
+          ) : mode === "edit" && pending ? (
+            <>
+              <label className="chat-prompt-name">
+                <span>名前</span>
+                <input
+                  value={draftTitle}
+                  autoFocus
+                  aria-label="名前"
+                  onChange={(e) => setDraftTitle(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key !== "Enter" || isImeEnter(e)) return;
+                    e.preventDefault();
+                    commitEdit();
+                  }}
+                />
+              </label>
+              <label className="chat-prompt-name">
+                <span>プロンプト</span>
+                <textarea
+                  value={draftBody}
+                  aria-label="プロンプト"
+                  rows={6}
+                  onChange={(e) => setDraftBody(e.target.value)}
+                />
+              </label>
+              <div className="chat-prompt-actions">
+                <button
+                  type="button"
+                  className="chat-btn primary"
+                  disabled={draftBody.trim().length === 0}
+                  onClick={commitEdit}
+                >
+                  保存
+                </button>
+                <button type="button" className="chat-btn" onClick={showList}>
+                  戻る
+                </button>
+              </div>
+            </>
           ) : mode === "confirm" && pending ? (
             <>
-              <p className="chat-prompt-title">今の文章を置き換えます</p>
+              <p className="chat-prompt-title">今のプロンプトを置き換えます</p>
               <p className="chat-prompt-preview">{pending.title}</p>
               <div className="chat-prompt-actions">
                 <button type="button" className="chat-btn primary" onClick={confirmRecall}>
@@ -170,14 +245,14 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
                 disabled={text.trim().length === 0}
                 onClick={startSave}
               >
-                この文章を保存
+                このプロンプトを保存
               </button>
               {tooLong ? (
                 <p className="chat-prompt-warn">2万字を超えるので保存できません。</p>
               ) : null}
               <div className="chat-prompt-list">
                 {prompts.length === 0 ? (
-                  <p className="chat-prompt-empty">保存した文章はまだありません。</p>
+                  <p className="chat-prompt-empty">保存したプロンプトはまだありません。</p>
                 ) : (
                   prompts.map((prompt) => {
                     const preview = firstLine(prompt.body);
@@ -196,6 +271,14 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
                         <button
                           type="button"
                           className="chat-prompt-drop"
+                          aria-label={`${prompt.title} を編集`}
+                          onClick={() => startEdit(prompt)}
+                        >
+                          編集
+                        </button>
+                        <button
+                          type="button"
+                          className="chat-prompt-drop"
                           aria-label={`${prompt.title} を削除`}
                           onClick={() => {
                             setPrompts(forgetSavedPrompt(prompt.id));
@@ -209,6 +292,14 @@ export default function PromptLibrary({ text, disabled, onRecall }: PromptLibrar
                   })
                 )}
               </div>
+              <button
+                type="button"
+                className="chat-btn"
+                title="要約・要点・要件事実・時系列を元の文に戻します。自分で保存したプロンプトはそのままです。"
+                onClick={restoreDefaults}
+              >
+                初期状態に戻す
+              </button>
             </>
           )}
         </div>

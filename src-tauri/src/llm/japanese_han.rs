@@ -171,6 +171,8 @@ pub fn foreign_char_tool_error(name: &str, args: &Value) -> Option<String> {
 
 fn edit_office_authored(args: &Value) -> Vec<String> {
     let mut out = Vec::new();
+    push_field(&mut out, args, "creator");
+    push_field(&mut out, args, "last_modified_by");
     for item in objects_of(args.get("replacements")) {
         push_field(&mut out, &item, "replace");
         push_field(&mut out, &item, "comment");
@@ -371,6 +373,15 @@ mod tests {
         assert!(error.contains('这'));
         assert!(error.contains('확'));
         assert!(error.contains("書き直してください"));
+        let author = json!({"creator": "这个", "clear_creator": false});
+        assert!(foreign_char_tool_error("edit_office", &author)
+            .unwrap()
+            .contains('这'));
+        assert!(foreign_char_tool_error(
+            "edit_office",
+            &json!({"last_modified_by": "確認者", "replacements": [{"find": "甲", "replace": "乙"}]})
+        )
+        .is_none());
     }
 
     #[test]
