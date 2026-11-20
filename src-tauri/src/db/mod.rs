@@ -1298,6 +1298,24 @@ impl Db {
         )?;
         // Ensure FK is on for this connection (WAL batch may not stick across all cases)
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // `search_enabled` was stored but ignored. New chats from an attachment wrote 0,
+        // while search still ran. The first open that honors the flag turns every existing
+        // thread on. A later toggle is kept, because this key is already present.
+        let honored: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM settings WHERE key='llm_index_search_honored'",
+            [],
+            |row| row.get(0),
+        )?;
+        if honored == 0 {
+            conn.execute(
+                "UPDATE llm_threads SET search_enabled=1 WHERE search_enabled!=1",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES('llm_index_search_honored', '1')",
+                [],
+            )?;
+        }
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
         })
@@ -3726,6 +3744,27 @@ impl Db {
         let n = conn.execute(
             "UPDATE llm_threads SET note_id=?1, updated_at=?2 WHERE id=?3",
             rusqlite::params![note_id.trim(), now, id],
+        )?;
+        drop(conn);
+        if n == 0 {
+            Ok(None)
+        } else {
+            self.get_llm_thread(id)
+        }
+    }
+
+    /// Per-thread index search. New rows start on. Web search is a separate toggle.
+    pub fn set_llm_thread_search(
+        &self,
+        id: &str,
+        search_enabled: bool,
+    ) -> Result<Option<LlmThreadRow>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let enabled = if search_enabled { 1 } else { 0 };
+        let n = conn.execute(
+            "UPDATE llm_threads SET search_enabled=?1, updated_at=?2 WHERE id=?3",
+            rusqlite::params![enabled, now, id],
         )?;
         drop(conn);
         if n == 0 {
@@ -6694,6 +6733,62 @@ mod last_used_chat_tests {
         assert!(!created_again);
         assert_eq!(again.id, thread.id);
         assert_eq!(db.list_llm_threads().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thread_search_defaults_on_persists_and_keeps_existing_rows_on() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-db-search-flag-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("argos.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE llm_threads (
+                   id TEXT PRIMARY KEY,
+                   title TEXT NOT NULL DEFAULT '',
+                   search_enabled INTEGER NOT NULL DEFAULT 1,
+                   path_prefix TEXT NOT NULL DEFAULT '',
+                   created_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO llm_threads(id, title, search_enabled, path_prefix, created_at, updated_at)
+                   VALUES ('old-off', '添付で作った会話', 0, '', 1, 1);
+                 INSERT INTO llm_threads(id, title, path_prefix, created_at, updated_at)
+                   VALUES ('old-default', '列を省略した会話', '', 2, 2);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(db.get_llm_thread("old-off").unwrap().unwrap().search_enabled);
+        assert!(
+            db.get_llm_thread("old-default")
+                .unwrap()
+                .unwrap()
+                .search_enabled
+        );
+        let created = db.create_llm_thread("新しい", true).unwrap();
+        assert!(created.search_enabled);
+        assert!(db.get_llm_thread(&created.id).unwrap().unwrap().search_enabled);
+        let off = db
+            .set_llm_thread_search(&created.id, false)
+            .unwrap()
+            .unwrap();
+        assert!(!off.search_enabled);
+        assert!(db.set_llm_thread_search("missing", false).unwrap().is_none());
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(!db.get_llm_thread(&created.id).unwrap().unwrap().search_enabled);
+        assert!(db.get_llm_thread("old-off").unwrap().unwrap().search_enabled);
+        let on = db.set_llm_thread_search(&created.id, true).unwrap().unwrap();
+        assert!(on.search_enabled);
+        assert!(db.get_llm_thread(&created.id).unwrap().unwrap().search_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

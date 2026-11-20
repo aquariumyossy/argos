@@ -430,6 +430,20 @@ pub fn llm_set_thread_scope(
         .ok_or_else(|| "会話が見つかりません".into())
 }
 
+/// Turn this conversation's index search on or off. New threads start on.
+#[tauri::command]
+pub fn llm_set_thread_search(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    search_enabled: bool,
+) -> Result<LlmThreadRow, String> {
+    state
+        .db
+        .set_llm_thread_search(&id, search_enabled)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "会話が見つかりません".into())
+}
+
 /// Bind this conversation to a note. Empty `note_id` clears the binding.
 #[tauri::command]
 pub fn llm_set_thread_note(
@@ -772,12 +786,18 @@ fn plan_chat_request(
     sources: &[LlmSourceRow],
     extra_system: Option<&str>,
 ) -> ChatRequestPlan {
+    let index_search = thread.search_enabled;
     let mut system = llm::system_for_request(settings);
+    if !index_search {
+        tools::apply_index_search_off(&mut system);
+    }
     llm::append_diagram_hint(&mut system, content);
     // Without this the model reads an empty result as "nothing exists" and keeps
     // rephrasing, instead of reporting that the folder does not contain the answer.
-    if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
-        system.push_str(&line);
+    if index_search {
+        if let Some(line) = tools::format_thread_scope_system_line(&thread.path_prefix) {
+            system.push_str(&line);
+        }
     }
     let bound_note = {
         let nid = thread.note_id.trim();
@@ -793,17 +813,21 @@ fn plan_chat_request(
             &note.memo,
         ));
     }
-    system.push_str(&tools::format_search_date_system_line(
-        settings.mail_days_back,
-    ));
-    system.push_str(&tools::format_calendar_system_line());
+    if index_search {
+        system.push_str(&tools::format_search_date_system_line(
+            settings.mail_days_back,
+        ));
+    }
+    system.push_str(&tools::format_calendar_system_line_for(index_search));
     let web_search = web_search && !settings.searxng_url.trim().is_empty();
-    if web_search {
+    if web_search && index_search {
         system.push_str(&tools::format_web_search_system_line());
+    } else if web_search {
+        system.push_str(&tools::format_web_only_system_line());
     }
     let remote_index =
         tools::include_hybrid_remote_system_line(&settings.search_mode, &thread.path_prefix);
-    if remote_index {
+    if remote_index && index_search {
         system.push_str(&tools::format_remote_index_system_line());
     }
     if let Some(line) = extra_system {
@@ -814,7 +838,13 @@ fn plan_chat_request(
     if look_image {
         system.push_str(&tools::format_look_image_system_line());
     }
-    let tools_schema = tools::tools_schema(web_search, remote_index, remote_only, look_image);
+    let tools_schema = tools::tools_schema_with(
+        web_search,
+        remote_index,
+        remote_only,
+        look_image,
+        index_search,
+    );
     let schema_tokens = tool_schema_tokens(&tools_schema);
     let full_limit = settings.llm_max_context_tokens as usize;
     let required = required_prompt_tokens(&system, content, sources);
@@ -2655,7 +2685,7 @@ pub async fn llm_attach_sources(
         created_thread = true;
         state
             .db
-            .create_llm_thread(&title, false)
+            .create_llm_thread(&title, true)
             .map_err(|e| e.to_string())?
     } else {
         created_thread = false;
@@ -2802,7 +2832,7 @@ fn resolve_attach_thread(
         };
         let thread = state
             .db
-            .create_llm_thread(t, false)
+            .create_llm_thread(t, true)
             .map_err(|e| e.to_string())?;
         Ok((thread, true))
     } else {
@@ -5264,6 +5294,202 @@ mod tests {
         let plain = meter_parts(&state, &created.id, "見て", true);
         assert!(!plain.system.contains("言語タグ mermaid"));
         assert!(plain.system.contains("ウェブ検索が有効です"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn schema_names(schema: &serde_json::Value) -> Vec<String> {
+        schema
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn index_search_toggle_keeps_both_on_and_offers_web_alone() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-index-toggle-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 18091, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_system_prompt = crate::db::DEFAULT_LLM_SYSTEM_PROMPT.into();
+            settings.searxng_url = "http://127.0.0.1:8888".into();
+            settings.search_mode = "local".into();
+            settings.mail_days_back = 45;
+        }
+        let created = state.db.create_llm_thread("調査", true).unwrap();
+        assert!(created.search_enabled);
+        state
+            .db
+            .set_llm_thread_scope(&created.id, r"C:\docs\案件")
+            .unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        state
+            .db
+            .update_note_memo(&note.id, "## 請求原因\n売買代金")
+            .unwrap();
+        state.db.set_llm_thread_note(&created.id, &note.id).unwrap();
+        state
+            .db
+            .insert_llm_source(
+                &created.id,
+                "attach",
+                r"C:\docs\契約.txt",
+                "契約.txt",
+                "p1",
+                "条項本文",
+                "",
+            )
+            .unwrap();
+        let settings = state.settings.read().clone();
+        let thread = state.db.get_llm_thread(&created.id).unwrap().unwrap();
+        let note = state.db.get_note(&note.id).unwrap().unwrap();
+        let sources = state.db.list_llm_sources(&created.id).unwrap();
+        let question = "質問です";
+        let mut expected = llm::system_for_request(&settings);
+        llm::append_diagram_hint(&mut expected, question);
+        expected.push_str(&tools::format_thread_scope_system_line(&thread.path_prefix).unwrap());
+        expected.push_str(&tools::format_note_target_system_line(
+            &note.title,
+            &note.memo,
+        ));
+        expected.push_str(&tools::format_search_date_system_line(
+            settings.mail_days_back,
+        ));
+        expected.push_str(&tools::format_calendar_system_line());
+        expected.push_str(&tools::format_web_search_system_line());
+
+        let both = plan_chat_request(&state, &settings, &thread, question, true, &sources, None);
+        assert_eq!(both.system, expected);
+        assert!(both.web_search);
+        assert_eq!(
+            both.tools_schema,
+            tools::tools_schema(true, false, false, false)
+        );
+        assert!(schema_names(&both.tools_schema).contains(&tools::TOOL_SEARCH.to_string()));
+        assert!(!schema_names(&both.tools_schema).contains(&tools::TOOL_SEARCH_WEB.to_string()));
+
+        let index_only =
+            plan_chat_request(&state, &settings, &thread, question, false, &sources, None);
+        assert!(!index_only.system.contains("ウェブ検索が有効です"));
+        assert!(index_only
+            .system
+            .contains("インデックスを検索するツールがあります"));
+        assert_eq!(
+            index_only.tools_schema,
+            tools::tools_schema(false, false, false, false)
+        );
+
+        state.db.set_llm_thread_search(&created.id, false).unwrap();
+        let thread = state.db.get_llm_thread(&created.id).unwrap().unwrap();
+        assert!(!thread.search_enabled);
+        let web_only =
+            plan_chat_request(&state, &settings, &thread, question, true, &sources, None);
+        assert!(
+            !web_only.system.contains("search_index"),
+            "{}",
+            web_only.system
+        );
+        assert!(web_only.system.contains("search_web で検索します"));
+        assert!(web_only.system.contains(tools::INDEX_SEARCH_OFF_SENTENCE));
+        assert!(web_only.system.contains(crate::db::LLM_REREAD_SENTINEL));
+        assert!(web_only.system.contains("準備書面"));
+        assert!(!web_only.system.contains("配下に限定"));
+        assert_eq!(schema_names(&web_only.tools_schema), {
+            let mut names = schema_names(&tools::tools_schema(true, false, false, false));
+            let at = names
+                .iter()
+                .position(|name| name == tools::TOOL_SEARCH)
+                .unwrap();
+            names[at] = tools::TOOL_SEARCH_WEB.to_string();
+            names
+        });
+        assert!(!web_only.tools_schema.to_string().contains("search_index"));
+
+        let neither =
+            plan_chat_request(&state, &settings, &thread, question, false, &sources, None);
+        assert!(!neither.web_search);
+        assert!(!neither.system.contains("search_index"));
+        assert!(!neither.system.contains("search_web"));
+        assert!(neither.system.contains(tools::INDEX_SEARCH_OFF_SENTENCE));
+        assert!(neither.system.contains(crate::db::LLM_REREAD_SENTINEL));
+        let neither_names = schema_names(&neither.tools_schema);
+        assert!(!neither_names.contains(&tools::TOOL_SEARCH.to_string()));
+        assert!(!neither_names.contains(&tools::TOOL_SEARCH_WEB.to_string()));
+        assert!(!neither_names.contains(&tools::TOOL_READ_URL.to_string()));
+        assert!(neither_names.contains(&tools::TOOL_READ.to_string()));
+        assert!(neither_names.contains(&tools::TOOL_LIST_NOTES.to_string()));
+        assert!(neither_names.contains(&tools::TOOL_READ_NOTE.to_string()));
+        assert!(!neither.tools_schema.to_string().contains("search_index"));
+
+        {
+            let mut settings = state.settings.write();
+            settings.searxng_url.clear();
+        }
+        state.db.set_llm_thread_search(&created.id, true).unwrap();
+        let searched = tools::execute_tool(
+            &state,
+            &created.id,
+            tools::TOOL_SEARCH,
+            r#"{"query":"民法"}"#,
+            None,
+            true,
+            "req",
+        );
+        assert!(
+            searched.content.contains("索引"),
+            "both on still searches the index: {}",
+            searched.content
+        );
+        assert!(searched.content.contains("ウェブ検索に失敗"));
+        assert!(!searched.content.contains("インデックス検索はオフです"));
+
+        state.db.set_llm_thread_search(&created.id, false).unwrap();
+        let blocked = tools::execute_tool(
+            &state,
+            &created.id,
+            tools::TOOL_SEARCH,
+            r#"{"query":"民法"}"#,
+            None,
+            true,
+            "req",
+        );
+        assert!(blocked.content.contains("インデックス検索はオフです"));
+        assert!(blocked.consumed.is_empty());
+        let web = tools::execute_tool(
+            &state,
+            &created.id,
+            tools::TOOL_SEARCH_WEB,
+            r#"{"query":"民法"}"#,
+            None,
+            true,
+            "req",
+        );
+        assert!(web.content.contains("ウェブ検索に失敗"));
+        assert!(!web.content.contains("索引ヒット"), "{}", web.content);
+        assert!(web.consumed.is_empty());
+        let cite = sources[0].cite_no;
+        let read = tools::execute_tool(
+            &state,
+            &created.id,
+            tools::TOOL_READ,
+            &format!(r#"{{"cite_no":{cite}}}"#),
+            None,
+            false,
+            "req",
+        );
+        assert!(read.content.contains("条項本文"), "{}", read.content);
+        let left = state.db.list_llm_sources(&created.id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].origin, "attach");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
