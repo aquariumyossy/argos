@@ -1086,6 +1086,12 @@ enum PropKind {
     People,
 }
 
+/// `dc:creator` and `cp:lastModifiedBy` in the core properties part.
+pub(crate) fn is_document_author_leaf(part: &str, local: &str) -> bool {
+    let path = part.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase();
+    path == "docprops/core.xml" && matches!(local, "creator" | "lastModifiedBy")
+}
+
 fn map_property_leaves(xml: &str, req: &EditRequest, stats: &mut ChangeStats) -> String {
     let mut locals = Vec::new();
     for (local, _) in xmlscan::leaf_texts(xml) {
@@ -1095,6 +1101,12 @@ fn map_property_leaves(xml: &str, req: &EditRequest, stats: &mut ChangeStats) ->
     }
     let mut xml = xml.to_string();
     for local in locals {
+        // dc:creator and cp:lastModifiedBy change only through the explicit
+        // author arguments. A body replacement of the same name must not
+        // rewrite them. Other property leaves stay in the replacement.
+        if is_document_author_leaf("docprops/core.xml", &local) {
+            continue;
+        }
         xml = xmlscan::map_leaf_local(&xml, &local, |value| replace_value(value, req, stats));
     }
     xml

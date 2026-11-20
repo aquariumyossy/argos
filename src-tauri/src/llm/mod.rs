@@ -2026,6 +2026,7 @@ mod tests {
         assert!(def.contains("チャットで利用者に聞いてください"), "{def}");
         assert!(def.contains("dc:creator"), "{def}");
         assert!(def.contains("推測"), "{def}");
+        assert!(def.contains("この2項目は変えません"), "{def}");
         let mut custom = Settings::default();
         custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
         let sys = system_for_request(&custom);

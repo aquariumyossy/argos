@@ -292,8 +292,7 @@ fn docx_edits_split_runs_stories_comments_and_properties() {
     assert!(comments.contains(r#"w:author="佐藤花子""#), "{comments}");
     let core = read_entry(&edited.path, "docProps/core.xml");
     assert!(core.contains("佐藤花子事件"), "{core}");
-    assert!(core.contains("<dc:creator>佐藤花子</dc:creator>"), "{core}");
-    assert!(!core.contains("山田太郎"), "{core}");
+    assert!(core.contains("<dc:creator>山田太郎</dc:creator>"), "{core}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1396,13 +1395,13 @@ fn properties_people_and_initials_are_replaced_and_revisions_stay() {
         core.contains("<dc:subject>件名は佐藤花子</dc:subject>"),
         "{core}"
     );
-    assert!(core.contains("<dc:creator>佐藤花子</dc:creator>"), "{core}");
+    assert!(core.contains("<dc:creator>山田 太郎</dc:creator>"), "{core}");
     assert!(
         core.contains("<cp:keywords>佐藤花子</cp:keywords>"),
         "{core}"
     );
     assert!(
-        core.contains("<cp:lastModifiedBy>佐藤花子</cp:lastModifiedBy>"),
+        core.contains("<cp:lastModifiedBy>山田　太郎</cp:lastModifiedBy>"),
         "{core}"
     );
     assert!(
@@ -1410,7 +1409,6 @@ fn properties_people_and_initials_are_replaced_and_revisions_stay() {
         "{core}"
     );
     assert!(core.contains("<cp:revision>3</cp:revision>"), "{core}");
-    assert!(!core.contains("山田"), "{core}");
 
     let app = read_entry(&edited.path, "docProps/app.xml");
     assert!(app.contains("<Company>佐藤花子</Company>"), "{app}");
@@ -1528,8 +1526,7 @@ fn xlsx_replacements_follow_whitespace_and_properties_and_mark_charts() {
     assert!(workbook.contains(r#"name="新シート""#), "{workbook}");
     assert!(!workbook.contains("旧"), "{workbook}");
     let core = read_entry(&edited.path, "docProps/core.xml");
-    assert!(core.contains("<dc:creator>佐藤花子</dc:creator>"), "{core}");
-    assert!(!core.contains("山田"), "{core}");
+    assert!(core.contains("<dc:creator>山田　太郎</dc:creator>"), "{core}");
     let app = read_entry(&edited.path, "docProps/app.xml");
     assert!(app.contains("<Company>佐藤花子</Company>"), "{app}");
     assert!(app.contains("<Manager>担当</Manager>"), "{app}");
@@ -2750,7 +2747,7 @@ fn tracked_replacement_records_deletion_and_insertion() {
     assert!(
         edited
             .report
-            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所"),
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 1 箇所"),
         "{}",
         edited.report
     );
@@ -2763,8 +2760,8 @@ fn tracked_replacement_records_deletion_and_insertion() {
     );
     assert!(edited.report.contains("残存: なし"), "{}", edited.report);
     let core = read_entry(&edited.path, "docProps/core.xml");
-    assert!(core.contains("佐藤花子"), "{core}");
-    assert!(!core.contains("山田太郎"), "{core}");
+    assert!(core.contains("<dc:creator>山田太郎</dc:creator>"), "{core}");
+    assert!(!core.contains("佐藤花子"), "{core}");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -3326,12 +3323,12 @@ fn revision_author_matching_the_find_is_not_rewritten() {
     assert!(comments.contains("w:author=\"山田太郎\""), "{comments}");
     assert!(comments.contains("確認"), "{comments}");
     let core = read_entry(&edited.path, "docProps/core.xml");
-    assert!(core.contains("佐藤花子"), "{core}");
-    assert!(!core.contains("山田太郎"), "{core}");
+    assert!(core.contains("<dc:creator>山田太郎</dc:creator>"), "{core}");
+    assert!(!core.contains("佐藤花子"), "{core}");
     assert!(
         edited
             .report
-            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 2 箇所"),
+            .contains("文字列置換: 「山田太郎」→「佐藤花子」を 1 箇所"),
         "{}",
         edited.report
     );
@@ -3775,6 +3772,33 @@ fn author_arguments_are_rejected_when_they_conflict_or_target_excel() {
     let err = edit_path(&src, &dir.join("out"), "2026-11-20 01-40-00", &req).unwrap_err();
     assert!(err.contains("Word"), "{err}");
     assert!(!dir.join("out").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn replacement_of_a_name_does_not_change_the_document_author() {
+    let dir = temp_dir("author-untouched");
+    let src = docx_with_core(&dir, &core_props("山田", "山田"));
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-20 02-00-00",
+        &request(&[("山田", "佐藤")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("原告は残る。"), "{document}");
+    let core = read_entry(&edited.path, "docProps/core.xml");
+    assert!(core.contains("<dc:title>題名の佐藤</dc:title>"), "{core}");
+    assert!(core.contains("<dc:creator>山田</dc:creator>"), "{core}");
+    assert!(
+        core.contains("<cp:lastModifiedBy>山田</cp:lastModifiedBy>"),
+        "{core}"
+    );
+    assert!(!core.contains("佐藤</dc:creator>"), "{core}");
+    assert!(!core.contains("佐藤</cp:lastModifiedBy>"), "{core}");
+    assert!(edited.report.contains("残存: なし"), "{}", edited.report);
+    assert!(!edited.report.contains("作成者を"), "{}", edited.report);
     let _ = fs::remove_dir_all(&dir);
 }
 

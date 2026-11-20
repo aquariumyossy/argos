@@ -21,9 +21,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
@@ -110,11 +112,301 @@ def license_files_for(name: str, version: str) -> list[Path]:
         crate = root / folder
         if not crate.is_dir():
             continue
-        for path in crate.iterdir():
-            if path.is_file() and is_license_filename(path.name):
+        for path in crate.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(crate)
+            if any(part in {".git", "target"} for part in rel.parts):
+                continue
+            in_licenses = any(part.upper() == "LICENSES" for part in rel.parts)
+            if in_licenses or is_license_filename(path.name):
                 found.append(path)
         break
     return sorted(found)
+
+
+def crate_dir(name: str, version: str) -> Path | None:
+    folder = f"{name}-{version}"
+    for root in registry_roots():
+        crate = root / folder
+        if crate.is_dir():
+            return crate
+    return None
+
+
+def vcs_info(name: str, version: str) -> tuple[str, str]:
+    crate = crate_dir(name, version)
+    if crate is None:
+        return "", ""
+    path = crate / ".cargo_vcs_info.json"
+    if not path.is_file():
+        return "", ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", ""
+    sha = str((data.get("git") or {}).get("sha1") or "")
+    rel = str(data.get("path_in_vcs") or "")
+    return sha, rel
+
+
+def github_repo(url: str) -> tuple[str, str] | None:
+    text = url.strip()
+    if not text:
+        return None
+    text = re.sub(r"^git\+", "", text)
+    text = text.removesuffix(".git")
+    match = re.search(r"github\.com[:/]([^/]+)/([^/#\s]+)", text)
+    if match:
+        return match.group(1), match.group(2)
+    match = re.fullmatch(r"([^/\s]+)/([^/\s]+)", text)
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
+
+def http_text(url: str) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "argos-license-audit"})
+    with urllib.request.urlopen(request, timeout=25) as response:
+        data = response.read()
+    return data.decode("utf-8", "replace").replace("\r\n", "\n").strip()
+
+
+def http_json(url: str) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "argos-license-audit",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        return json.load(response)
+
+
+_TREE_CACHE: dict[tuple[str, str, str], list[str]] = {}
+
+
+def github_license_paths(owner: str, repo: str, sha: str, path_in_vcs: str) -> list[str]:
+    key = (owner, repo, sha)
+    if key not in _TREE_CACHE:
+        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{sha}?recursive=1"
+        try:
+            data = http_json(url)
+            _TREE_CACHE[key] = [
+                item["path"]
+                for item in data.get("tree", [])
+                if item.get("type") == "blob"
+            ]
+        except Exception:
+            _TREE_CACHE[key] = []
+    paths = _TREE_CACHE[key]
+    prefix = path_in_vcs.strip("/")
+    chosen: list[str] = []
+    for path in paths:
+        parts = path.split("/")
+        if any(part in {"target", "third_party", "third-party", "vendor"} for part in parts):
+            continue
+        name = parts[-1]
+        in_licenses = any(part.upper() == "LICENSES" for part in parts)
+        if not in_licenses and not is_license_filename(name):
+            continue
+        at_root = len(parts) == 1
+        under_crate = bool(prefix) and (path == prefix or path.startswith(prefix + "/"))
+        under_root_licenses = len(parts) == 2 and parts[0].upper() == "LICENSES"
+        if at_root or under_crate or under_root_licenses:
+            chosen.append(path)
+    return chosen
+
+
+_RAW_CACHE: dict[str, str] = {}
+
+
+def raw_github(owner: str, repo: str, sha: str, path: str) -> str:
+    url = f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}"
+    if url in _RAW_CACHE:
+        return _RAW_CACHE[url]
+    try:
+        text = http_text(url)
+    except Exception:
+        text = ""
+    _RAW_CACHE[url] = text
+    return text
+
+
+def upstream_license_text(row: dict) -> str:
+    repo = github_repo(row.get("repository") or "")
+    if repo is None:
+        return ""
+    owner, name = repo
+    sha, path_in_vcs = vcs_info(row["name"], row["version"])
+    refs = [sha] if sha else []
+    version = row["version"]
+    refs.extend(
+        [
+            f"v{version}",
+            version,
+            f"{row['name']}-v{version}",
+            f"{row['name']}-{version}",
+        ]
+    )
+    chunks: list[str] = []
+    seen_refs: set[str] = set()
+    for ref in refs:
+        if not ref or ref in seen_refs:
+            continue
+        seen_refs.add(ref)
+        paths = github_license_paths(owner, name, ref, path_in_vcs)
+        if not paths and sha and ref == sha:
+            for guess in (
+                "LICENSE",
+                "LICENSE-MIT",
+                "LICENSE-APACHE",
+                "LICENSE-APACHE-2.0",
+                "COPYING",
+                "LICENSES/MIT.txt",
+                "LICENSES/Apache-2.0.txt",
+            ):
+                text = raw_github(owner, name, ref, guess)
+                if text:
+                    paths.append(guess)
+        if not paths:
+            continue
+        for path in paths:
+            text = raw_github(owner, name, ref, path)
+            if not text:
+                continue
+            url = f"https://github.com/{owner}/{name}/blob/{ref}/{path}"
+            chunks.append(f"----- {path} ({url}) -----\n{text}")
+        if chunks:
+            break
+    return "\n\n".join(chunks)
+
+
+def copyright_notice(authors: list[str]) -> str:
+    holders = []
+    for author in authors:
+        text = str(author).strip().strip('"').strip()
+        if text:
+            holders.append(text)
+    if not holders:
+        return ""
+    return "Copyright (c) " + ", ".join(holders)
+
+
+_SPDX_CACHE: dict[str, str] = {}
+
+SPDX_IDS = {
+    "MIT": "MIT",
+    "APACHE-2.0": "Apache-2.0",
+    "BSD-3-CLAUSE": "BSD-3-Clause",
+    "BSD-2-CLAUSE": "BSD-2-Clause",
+    "MPL-2.0": "MPL-2.0",
+    "BSL-1.0": "BSL-1.0",
+    "ISC": "ISC",
+    "ZLIB": "Zlib",
+    "0BSD": "0BSD",
+    "UNLICENSE": "Unlicense",
+    "CC0-1.0": "CC0-1.0",
+}
+
+
+def spdx_text(identifier: str) -> str:
+    canonical = SPDX_IDS.get(identifier.upper())
+    if canonical is None:
+        return ""
+    if canonical in _SPDX_CACHE:
+        return _SPDX_CACHE[canonical]
+    url = (
+        "https://raw.githubusercontent.com/spdx/license-list-data/"
+        f"v3.27.0/text/{canonical}.txt"
+    )
+    try:
+        text = http_text(url)
+    except Exception:
+        text = ""
+    _SPDX_CACHE[canonical] = text
+    return text
+
+
+def license_identifiers(expression: str) -> list[str]:
+    parts = re.split(r"\s+(?:OR|AND|WITH)\s+|/", expression, flags=re.IGNORECASE)
+    found = []
+    for part in parts:
+        token = part.strip().strip("()")
+        if token.upper() in SPDX_IDS and token.upper() not in {item.upper() for item in found}:
+            found.append(SPDX_IDS[token.upper()])
+    return found
+
+
+def spdx_bundle(expression: str, authors: list[str]) -> str:
+    notice = copyright_notice(authors)
+    chunks = []
+    for identifier in license_identifiers(expression):
+        body = spdx_text(identifier)
+        if not body:
+            continue
+        if notice:
+            body = body.replace("<year> <copyright holders>", notice.removeprefix("Copyright (c) "))
+            body = body.replace("<year> <owner>", notice.removeprefix("Copyright (c) "))
+            if notice not in body:
+                body = notice + "\n\n" + body
+        else:
+            body = (
+                "Copyright holder was not present in the crate metadata or repository.\n\n"
+                + body
+            )
+        chunks.append(
+            f"----- {identifier} (SPDX standard text; copyright from crate metadata) -----\n{body}"
+        )
+    return "\n\n".join(chunks)
+
+
+def manifest_authors(name: str, version: str) -> list[str]:
+    crate = crate_dir(name, version)
+    if crate is None:
+        return []
+    path = crate / "Cargo.toml"
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"(?m)^authors\s*=\s*(\[[^\]]*\]|\".*?\")", text)
+    if not match:
+        return []
+    raw = match.group(1).strip()
+    if raw.startswith("["):
+        return [item.strip().strip('"') for item in re.findall(r"\"([^\"]+)\"", raw)]
+    return [raw.strip().strip('"')]
+
+
+def fill_rust_license_texts(rows: list[dict]) -> list[str]:
+    """Crates whose license text still could not be obtained."""
+    missing = []
+    for row in rows:
+        if row["text"].strip():
+            continue
+        fetched = upstream_license_text(row)
+        if fetched:
+            if not re.search(r"(?im)copyright\s*(\(c\)|©|\d{4})", fetched):
+                authors = list(row.get("authors") or []) or manifest_authors(
+                    row["name"], row["version"]
+                )
+                notice = copyright_notice(authors)
+                if notice:
+                    fetched = notice + "\n\n" + fetched
+            row["text"] = fetched
+            continue
+        authors = list(row.get("authors") or []) or manifest_authors(row["name"], row["version"])
+        bundled = spdx_bundle(row["license"], authors)
+        if bundled and "could not" not in bundled.lower() and "Copyright holder was not present" not in bundled:
+            row["text"] = bundled
+            continue
+        if bundled:
+            row["text"] = bundled
+            missing.append(f"{row['name']} {row['version']} ({row['license']}; copyright holder missing)")
+            continue
+        missing.append(f"{row['name']} {row['version']} ({row['license']}; no license text)")
+    return missing
 
 
 def read_text(path: Path) -> str:
@@ -171,6 +463,8 @@ def packages_from_license_checker(payload: dict) -> list[dict]:
         name, _, version = key.rpartition("@")
         if not name:
             name, version = key, info.get("version") or ""
+        if name.lower() == "argos":
+            continue
         license_file = info.get("licenseFile") or ""
         text = ""
         if license_file and Path(license_file).is_file():
@@ -203,6 +497,8 @@ def packages_from_node_modules() -> list[dict]:
             continue
         name = data.get("name")
         if not isinstance(name, str) or not name or name.startswith("."):
+            continue
+        if name.lower() == "argos":
             continue
         license_field = data.get("license") or data.get("licenses") or "unknown"
         if isinstance(license_field, dict):
@@ -255,6 +551,7 @@ def crate_rows(meta: dict, ids: set[str]) -> list[dict]:
                 "version": version,
                 "license": pkg.get("license") or "unspecified",
                 "repository": pkg.get("repository") or "",
+                "authors": [str(item) for item in (pkg.get("authors") or [])],
                 "text": text,
             }
         )
@@ -384,8 +681,13 @@ def main() -> None:
     args = parser.parse_args()
     meta = run_metadata(args.platform)
     rust = crate_rows(meta, runtime_package_ids(meta))
+    missing = fill_rust_license_texts(rust)
     javascript = js_packages()
     OUT.write_text(render(args.platform, rust, javascript), encoding="utf-8")
+    if missing:
+        print("license text still missing:")
+        for item in missing:
+            print("  " + item)
     mpl = [row["name"] for row in rust if mpl_obligated(row["license"])]
     choice = [
         row["name"]
