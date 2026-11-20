@@ -698,9 +698,10 @@ fn answer_started(parse: &StreamParse) -> bool {
     !parse.content.is_empty()
 }
 
-/// Something already shown. A retry clears it so the next attempt does not append.
+/// Something already shown. A retry clears it, including a tool hint, before the next attempt.
+/// A tool call does not by itself count as answer text.
 fn partial_on_screen(parse: &StreamParse) -> bool {
-    answer_started(parse) || !parse.reasoning.is_empty()
+    answer_started(parse) || !parse.reasoning.is_empty() || !parse.tool_calls.is_empty()
 }
 
 /// Tests keep the real [`http_error::retry_plan`] durations and only shorten the sleep.
@@ -1513,7 +1514,8 @@ mod tests {
             arguments: "{}".into(),
         });
         assert!(!answer_started(&parse));
-        assert!(!partial_on_screen(&parse));
+        // The tool hint is already on screen. Reset clears it; the wait stays short.
+        assert!(partial_on_screen(&parse));
         let stop = StreamStop::from_transport(
             "os error 10054",
             answer_started(&parse),
@@ -1524,7 +1526,7 @@ mod tests {
                 class, saw_text, ..
             } => {
                 assert_eq!(class, http_error::FailureClass::DroppedBeforeText);
-                assert!(!saw_text);
+                assert!(saw_text);
                 assert_eq!(
                     http_error::retry_plan(class, 1, None),
                     http_error::RetryPlan::Wait(std::time::Duration::from_secs(1))

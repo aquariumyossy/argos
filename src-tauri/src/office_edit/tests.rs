@@ -3823,6 +3823,25 @@ fn replacement_of_a_name_does_not_change_the_document_author() {
         "{}",
         edited.report
     );
+    assert!(
+        edited
+            .report
+            .contains("変えるときは、利用者に確認してから creator を指定してください。"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("変えるときは、利用者に確認してから last_modified_by を指定してください。"),
+        "{}",
+        edited.report
+    );
+    assert!(
+        !edited.report.contains("このツールでは変えられません"),
+        "{}",
+        edited.report
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -3874,8 +3893,67 @@ fn xlsx_body_replacement_notes_an_author_field_that_still_holds_the_old_text() {
         "{}",
         edited.report
     );
+    assert!(
+        edited.report.contains("このツールでは変えられません。"),
+        "{}",
+        edited.report
+    );
+    assert!(!edited.report.contains("creator を指定"), "{}", edited.report);
     assert!(!edited.report.contains("最終更新者欄"), "{}", edited.report);
     assert!(edited.report.contains("残存: なし"), "{}", edited.report);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_fullwidth_space_in_the_author_field_still_counts_as_the_old_text() {
+    let dir = temp_dir("author-ws");
+    let src = dir.join("契約書.docx");
+    let document = word_body(r#"<w:p><w:r><w:t>本文の山田です。</w:t></w:r></w:p>"#);
+    let core = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:title>題名</dc:title>
+  <dc:creator>山　田</dc:creator>
+  <cp:lastModifiedBy>経理</cp:lastModifiedBy>
+</cp:coreProperties>"#;
+    write_zip(
+        &src,
+        &[
+            ("word/document.xml", document.as_str()),
+            ("docProps/core.xml", core),
+        ],
+    );
+    let edited = edit_path(
+        &src,
+        &dir.join("out"),
+        "2026-11-20 02-30-00",
+        &request(&[("山田", "佐藤")], &[]),
+    )
+    .unwrap();
+    let document = read_entry(&edited.path, "word/document.xml");
+    assert!(document.contains("本文の佐藤です。"), "{document}");
+    let core = read_entry(&edited.path, "docProps/core.xml");
+    assert!(core.contains("<dc:creator>山　田</dc:creator>"), "{core}");
+    assert!(
+        core.contains("<cp:lastModifiedBy>経理</cp:lastModifiedBy>"),
+        "{core}"
+    );
+    assert_eq!(
+        edited
+            .report
+            .matches("作成者欄に『山田』が残っています。")
+            .count(),
+        1,
+        "{}",
+        edited.report
+    );
+    assert!(
+        edited
+            .report
+            .contains("変えるときは、利用者に確認してから creator を指定してください。"),
+        "{}",
+        edited.report
+    );
+    assert!(!edited.report.contains("最終更新者欄"), "{}", edited.report);
     let _ = fs::remove_dir_all(&dir);
 }
 
