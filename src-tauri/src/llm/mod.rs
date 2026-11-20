@@ -635,15 +635,15 @@ impl StreamStop {
         }
     }
 
-    fn from_transport(raw: &str, saw_text: bool) -> Self {
-        let classified = http_error::classify_transport(raw, saw_text);
+    fn from_transport(raw: &str, answer_started: bool, reset_partial: bool) -> Self {
+        let classified = http_error::classify_transport(raw, answer_started);
         match classified.class {
             http_error::FailureClass::DroppedBeforeText
             | http_error::FailureClass::DroppedMidAnswer => Self::Retryable {
                 message: classified.message,
                 class: classified.class,
                 retry_after: None,
-                saw_text,
+                saw_text: reset_partial,
             },
             _ => Self::Terminal(classified.message),
         }
@@ -651,15 +651,21 @@ impl StreamStop {
 
     fn from_http(status: u16, body: &str, retry_after: Option<Duration>) -> Self {
         let message = http_error::chat_failure(status, body);
-        if http_error::is_busy_failure(status, body) {
-            Self::Retryable {
+        let class = if status == 503 {
+            Some(http_error::FailureClass::Loading)
+        } else if http_error::is_busy_failure(status, body) {
+            Some(http_error::FailureClass::Busy)
+        } else {
+            None
+        };
+        match class {
+            Some(class) => Self::Retryable {
                 message,
-                class: http_error::FailureClass::Busy,
+                class,
                 retry_after,
                 saw_text: false,
-            }
-        } else {
-            Self::Terminal(message)
+            },
+            None => Self::Terminal(message),
         }
     }
 
@@ -678,8 +684,14 @@ impl StreamStop {
     }
 }
 
-fn saw_model_output(parse: &StreamParse) -> bool {
-    !parse.content.is_empty() || !parse.reasoning.is_empty() || !parse.tool_calls.is_empty()
+/// Answer text or a tool call. Reasoning alone is not an answer yet.
+fn answer_started(parse: &StreamParse) -> bool {
+    !parse.content.is_empty() || !parse.tool_calls.is_empty()
+}
+
+/// Something already shown. A retry clears it so the next attempt does not append.
+fn partial_on_screen(parse: &StreamParse) -> bool {
+    answer_started(parse) || !parse.reasoning.is_empty()
 }
 
 /// Tests keep the real [`http_error::retry_plan`] durations and only shorten the sleep.
@@ -821,7 +833,11 @@ async fn stream_chat_once(
                 if cancel.load(Ordering::SeqCst) {
                     return Err(StreamStop::terminal("cancelled"));
                 }
-                return Err(StreamStop::from_transport(&error_chain(&error), false));
+                return Err(StreamStop::from_transport(
+                    &error_chain(&error),
+                    false,
+                    false,
+                ));
             }
         };
         if resp.status() == reqwest::StatusCode::BAD_REQUEST && include_thinking {
@@ -857,11 +873,15 @@ async fn stream_chat_once(
                 if cancel.load(Ordering::SeqCst) {
                     return Err(StreamStop::terminal("cancelled"));
                 }
-                return Err(StreamStop::from_transport(&error_chain(&error), false));
+                return Err(StreamStop::from_transport(
+                    &error_chain(&error),
+                    false,
+                    false,
+                ));
             }
         };
         if let Err(stop) = ingest_payload(&text, &mut parse, runaway_chars, on_delta) {
-            return Err(stop.with_saw_text(saw_model_output(&parse)));
+            return Err(stop.with_saw_text(partial_on_screen(&parse)));
         }
         return Ok(parse.into_outcome());
     }
@@ -897,13 +917,14 @@ async fn stream_chat_once(
                         }
                         return Err(StreamStop::from_transport(
                             &error_chain(&error),
-                            saw_model_output(&parse),
+                            answer_started(&parse),
+                            partial_on_screen(&parse),
                         ));
                     }
                 };
                 buf.push_str(&String::from_utf8_lossy(&bytes));
                 if let Err(stop) = drain_sse_lines(&mut buf, &mut parse, runaway_chars, on_delta) {
-                    return Err(stop.with_saw_text(saw_model_output(&parse)));
+                    return Err(stop.with_saw_text(partial_on_screen(&parse)));
                 }
                 last = Instant::now();
             }
@@ -916,12 +937,12 @@ async fn stream_chat_once(
         let rest = buf.trim();
         if rest.starts_with('{') {
             if let Err(stop) = ingest_payload(rest, &mut parse, runaway_chars, on_delta) {
-                return Err(stop.with_saw_text(saw_model_output(&parse)));
+                return Err(stop.with_saw_text(partial_on_screen(&parse)));
             }
         } else {
             for line in buf.split('\n') {
                 if let Err(stop) = take_sse_data_line(line, &mut parse, runaway_chars, on_delta) {
-                    return Err(stop.with_saw_text(saw_model_output(&parse)));
+                    return Err(stop.with_saw_text(partial_on_screen(&parse)));
                 }
             }
         }
@@ -1436,6 +1457,43 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_without_answer_text_retries_on_the_short_backoff() {
+        let mut parse = StreamParse::default();
+        parse.reasoning.push_str("考えている");
+        assert!(!answer_started(&parse));
+        assert!(partial_on_screen(&parse));
+        let stop = StreamStop::from_transport(
+            "既存の接続はリモート ホストに強制的に切断されました (os error 10054)",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match stop {
+            StreamStop::Retryable {
+                class, saw_text, ..
+            } => {
+                assert_eq!(class, http_error::FailureClass::DroppedBeforeText);
+                assert!(saw_text);
+                assert_eq!(
+                    http_error::retry_plan(class, 1, None),
+                    http_error::RetryPlan::Wait(std::time::Duration::from_secs(1))
+                );
+            }
+            other => panic!("reasoning-only drop must retry: {other:?}"),
+        }
+        parse.content.push_str("答え");
+        let answered = StreamStop::from_transport(
+            "os error 10054",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match answered {
+            StreamStop::Retryable { class, .. } => {
+                assert_eq!(class, http_error::FailureClass::DroppedMidAnswer);
+            }
+            other => panic!("answer text is a mid-answer drop: {other:?}"),
+        }
+    }
+
     fn http_status_chooses_a_fixed_message_and_drops_the_body() {
         let tokens = http_error::chat_failure(500, r#"{"message":"prompt is 14017 tokens"}"#);
         assert!(tokens.contains("HTTP 500"), "{tokens}");
@@ -2002,7 +2060,12 @@ mod tests {
     #[tokio::test]
     async fn stream_chat_gives_up_on_a_busy_server_without_the_body() {
         let body = r#"{"error":"overloaded","api_key":"sk-live-secret"}"#;
-        let port = serve_http(503, "Service Unavailable", body, 3);
+        let port = serve_http(
+            503,
+            "Service Unavailable",
+            body,
+            http_error::MAX_LOADING_ATTEMPTS as usize,
+        );
         let err = stream_chat_err(port, false).await;
         assert_eq!(err, http_error::BUSY_MESSAGE);
         assert!(!err.contains("sk-live-secret"), "{err}");

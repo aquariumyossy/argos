@@ -51,6 +51,9 @@ pub(crate) const RETRY_STATUS: &str = "再試行中…";
 /// First try plus two retries. Each `stream_chat` call has its own budget.
 pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
+/// HTTP 503 while a model is still loading. Four tries, waits of 8s, 16s, and 32s.
+pub(crate) const MAX_LOADING_ATTEMPTS: u32 = 4;
+
 /// Engine restart. The middle of the 1–2 minute window, once per retry.
 pub(crate) const MID_ANSWER_RETRY_WAIT: Duration = Duration::from_secs(90);
 
@@ -92,6 +95,8 @@ const OVERLOAD_PHRASES: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureClass {
     Busy,
+    /// HTTP 503. The server accepted the port but the model is not ready yet.
+    Loading,
     Unreachable,
     DroppedBeforeText,
     DroppedMidAnswer,
@@ -218,20 +223,38 @@ pub(crate) fn in_stream_failure(value: &Value) -> (String, bool) {
 }
 
 /// `attempt` is how many tries have already failed, starting at 1.
-/// `Retry-After` replaces the short backoff. A mid-answer drop always waits
-/// [`MID_ANSWER_RETRY_WAIT`], because that pause is for the engine to come back.
+/// `Retry-After` replaces the computed backoff and is capped at [`RETRY_AFTER_CAP`].
+/// A mid-answer drop always waits [`MID_ANSWER_RETRY_WAIT`].
+/// HTTP 503 uses a longer backoff so a model can finish loading.
 pub(crate) fn retry_plan(
     class: FailureClass,
     attempt: u32,
     retry_after: Option<Duration>,
 ) -> RetryPlan {
-    if attempt == 0 || attempt >= MAX_ATTEMPTS {
+    if attempt == 0 {
+        return RetryPlan::Stop;
+    }
+    let limit = match class {
+        FailureClass::Busy | FailureClass::DroppedBeforeText | FailureClass::DroppedMidAnswer => {
+            MAX_ATTEMPTS
+        }
+        FailureClass::Loading => MAX_LOADING_ATTEMPTS,
+        FailureClass::Unreachable
+        | FailureClass::InStream
+        | FailureClass::Timeout
+        | FailureClass::Other => return RetryPlan::Stop,
+    };
+    if attempt >= limit {
         return RetryPlan::Stop;
     }
     let wait = match class {
         FailureClass::Busy | FailureClass::DroppedBeforeText => match retry_after {
             Some(given) => given.min(RETRY_AFTER_CAP),
             None => backoff(attempt),
+        },
+        FailureClass::Loading => match retry_after {
+            Some(given) => given.min(RETRY_AFTER_CAP),
+            None => loading_backoff(attempt),
         },
         FailureClass::DroppedMidAnswer => MID_ANSWER_RETRY_WAIT,
         FailureClass::Unreachable
@@ -257,7 +280,9 @@ pub(crate) fn parse_retry_after(raw: &str, now: SystemTime) -> Option<Duration> 
     }
     if let Ok(secs) = raw.parse::<f64>() {
         if secs.is_finite() && secs >= 0.0 {
-            return Some(Duration::from_secs_f64(secs));
+            // `1e30` overflows `Duration` and panics. Cap first, then convert.
+            let capped = secs.min(RETRY_AFTER_CAP.as_secs_f64());
+            return Duration::try_from_secs_f64(capped).ok();
         }
     }
     let dt = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
@@ -302,6 +327,12 @@ pub fn owned_status_clause(error: &str) -> Option<String> {
 fn backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(3);
     Duration::from_secs(1_u64 << shift)
+}
+
+/// 8s, 16s, 32s. Three waits, 56s in all, inside the 30–60s window.
+fn loading_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(2);
+    Duration::from_secs(8_u64 << shift)
 }
 
 fn body_is_overload(body: &str) -> bool {
@@ -577,6 +608,41 @@ mod tests {
             RetryPlan::Wait(Duration::from_secs(1))
         );
         assert_eq!(
+            retry_plan(FailureClass::Loading, 1, None),
+            RetryPlan::Wait(Duration::from_secs(8))
+        );
+        assert_eq!(
+            retry_plan(FailureClass::Loading, 2, None),
+            RetryPlan::Wait(Duration::from_secs(16))
+        );
+        assert_eq!(
+            retry_plan(FailureClass::Loading, 3, None),
+            RetryPlan::Wait(Duration::from_secs(32))
+        );
+        assert_eq!(
+            retry_plan(FailureClass::Loading, MAX_LOADING_ATTEMPTS, None),
+            RetryPlan::Stop
+        );
+        let mut loading_total = Duration::ZERO;
+        let mut loading_attempt = 1u32;
+        while let RetryPlan::Wait(wait) = retry_plan(FailureClass::Loading, loading_attempt, None) {
+            loading_total += wait;
+            loading_attempt += 1;
+        }
+        assert!(
+            loading_total >= Duration::from_secs(30) && loading_total <= Duration::from_secs(60),
+            "{loading_total:?}"
+        );
+        assert_eq!(loading_attempt, MAX_LOADING_ATTEMPTS);
+        assert_eq!(
+            retry_plan(FailureClass::Loading, 1, Some(Duration::from_secs(45))),
+            RetryPlan::Wait(Duration::from_secs(45))
+        );
+        assert_eq!(
+            retry_plan(FailureClass::Loading, 1, Some(Duration::from_secs(10_000))),
+            RetryPlan::Wait(RETRY_AFTER_CAP)
+        );
+        assert_eq!(
             retry_plan(
                 FailureClass::DroppedMidAnswer,
                 1,
@@ -615,6 +681,12 @@ mod tests {
             Some(Duration::from_secs(30))
         );
         assert_eq!(parse_retry_after("not-a-header", now), None);
+        assert_eq!(parse_retry_after("1e30", now), Some(RETRY_AFTER_CAP));
+        assert_eq!(parse_retry_after("1e309", now), None);
+        assert_eq!(
+            parse_retry_after("1e2", now),
+            Some(Duration::from_secs(100))
+        );
 
         let now_dt = chrono::DateTime::parse_from_rfc3339("2023-11-14T22:13:20Z").unwrap();
         let later = now_dt + chrono::Duration::seconds(30);
