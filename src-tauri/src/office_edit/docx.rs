@@ -231,6 +231,7 @@ pub fn edit(
     super::authors::apply(entries, &req.core_authors, &mut stats)?;
     fill_near_misses(entries, &mut stats);
     super::note_unreachable_misses(entries, &mut stats);
+    super::note_remaining_authors(entries, req, &mut stats);
     Ok(stats)
 }
 

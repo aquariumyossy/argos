@@ -692,9 +692,10 @@ impl StreamStop {
     }
 }
 
-/// Answer text or a tool call. Reasoning alone is not an answer yet.
+/// Visible answer text. A tool call or reasoning alone is not an answer yet,
+/// so a disconnect there uses the short backoff. The long wait stays for answer text.
 fn answer_started(parse: &StreamParse) -> bool {
-    !parse.content.is_empty() || !parse.tool_calls.is_empty()
+    !parse.content.is_empty()
 }
 
 /// Something already shown. A retry clears it so the next attempt does not append.
@@ -1499,6 +1500,72 @@ mod tests {
                 assert_eq!(class, http_error::FailureClass::DroppedMidAnswer);
             }
             other => panic!("answer text is a mid-answer drop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_without_answer_text_retries_on_the_short_backoff() {
+        let mut parse = StreamParse::default();
+        parse.tool_calls.push(ToolCallAcc {
+            index: 0,
+            id: "c1".into(),
+            name: "search_index".into(),
+            arguments: "{}".into(),
+        });
+        assert!(!answer_started(&parse));
+        assert!(!partial_on_screen(&parse));
+        let stop = StreamStop::from_transport(
+            "os error 10054",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match stop {
+            StreamStop::Retryable {
+                class, saw_text, ..
+            } => {
+                assert_eq!(class, http_error::FailureClass::DroppedBeforeText);
+                assert!(!saw_text);
+                assert_eq!(
+                    http_error::retry_plan(class, 1, None),
+                    http_error::RetryPlan::Wait(std::time::Duration::from_secs(1))
+                );
+                assert_eq!(
+                    http_error::retry_plan(class, 2, None),
+                    http_error::RetryPlan::Wait(std::time::Duration::from_secs(2))
+                );
+            }
+            other => panic!("a tool call before answer text must use the short backoff: {other:?}"),
+        }
+        parse.reasoning.push_str("考えている");
+        let reasoning = StreamStop::from_transport(
+            "os error 10054",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match reasoning {
+            StreamStop::Retryable {
+                class, saw_text, ..
+            } => {
+                assert_eq!(class, http_error::FailureClass::DroppedBeforeText);
+                assert!(saw_text);
+            }
+            other => panic!("reasoning plus a tool call is still before the answer: {other:?}"),
+        }
+        parse.content.push_str("答え");
+        let answered = StreamStop::from_transport(
+            "os error 10054",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match answered {
+            StreamStop::Retryable { class, .. } => {
+                assert_eq!(class, http_error::FailureClass::DroppedMidAnswer);
+                assert_eq!(
+                    http_error::retry_plan(class, 1, None),
+                    http_error::RetryPlan::Wait(http_error::MID_ANSWER_RETRY_WAIT)
+                );
+            }
+            other => panic!("answer text keeps the mid-answer wait: {other:?}"),
         }
     }
 

@@ -185,6 +185,9 @@ def http_json(url: str) -> dict:
 
 
 _TREE_CACHE: dict[tuple[str, str, str], list[str]] = {}
+_TREE_FAILED: set[tuple[str, str, str]] = set()
+# Crate name and version whose GitHub tree lookup failed and yielded no license text.
+_GITHUB_API_FAILED: set[tuple[str, str]] = set()
 
 
 def github_license_paths(owner: str, repo: str, sha: str, path_in_vcs: str) -> list[str]:
@@ -200,6 +203,7 @@ def github_license_paths(owner: str, repo: str, sha: str, path_in_vcs: str) -> l
             ]
         except Exception:
             _TREE_CACHE[key] = []
+            _TREE_FAILED.add(key)
     paths = _TREE_CACHE[key]
     prefix = path_in_vcs.strip("/")
     chosen: list[str] = []
@@ -252,11 +256,17 @@ def upstream_license_text(row: dict) -> str:
     )
     chunks: list[str] = []
     seen_refs: set[str] = set()
+    api_failed = False
+    api_ok = False
     for ref in refs:
         if not ref or ref in seen_refs:
             continue
         seen_refs.add(ref)
         paths = github_license_paths(owner, name, ref, path_in_vcs)
+        if (owner, name, ref) in _TREE_FAILED:
+            api_failed = True
+        else:
+            api_ok = True
         if not paths and sha and ref == sha:
             for guess in (
                 "LICENSE",
@@ -280,6 +290,8 @@ def upstream_license_text(row: dict) -> str:
             chunks.append(f"----- {path} ({url}) -----\n{text}")
         if chunks:
             break
+    if not chunks and api_failed and not api_ok:
+        _GITHUB_API_FAILED.add((row["name"], row["version"]))
     return "\n\n".join(chunks)
 
 
@@ -398,6 +410,11 @@ def fill_rust_license_texts(rows: list[dict]) -> list[str]:
             continue
         authors = list(row.get("authors") or []) or manifest_authors(row["name"], row["version"])
         bundled = spdx_bundle(row["license"], authors)
+        if bundled and (row["name"], row["version"]) in _GITHUB_API_FAILED:
+            print(
+                f"warning: {row['name']} {row['version']}: GitHub API lookup failed; using SPDX standard text",
+                file=sys.stderr,
+            )
         if bundled and "could not" not in bundled.lower() and "Copyright holder was not present" not in bundled:
             row["text"] = bundled
             continue
@@ -567,6 +584,19 @@ def source_lines(row: dict) -> list[str]:
     return lines
 
 
+LZMA_SYS_NOTE = (
+    "Note: The bundled xz COPYING.GPLv2 and COPYING.LGPLv2.1 texts are included "
+    "for reference. liblzma itself is in the public domain. lzma-sys is MIT/Apache-2.0. "
+    "Argos is not GPL-licensed."
+)
+
+
+def package_note(group: list[dict]) -> str:
+    if any(row["name"] == "lzma-sys" for row in group):
+        return LZMA_SYS_NOTE
+    return ""
+
+
 def grouped_sections(rows: list[dict], ecosystem: str) -> list[str]:
     # Group by identical license text so the file is not one copy per crate.
     by_hash: dict[str, list[dict]] = defaultdict(list)
@@ -602,6 +632,10 @@ def grouped_sections(rows: list[dict], ecosystem: str) -> list[str]:
             else:
                 parts.extend(js_source_lines(row))
         parts.append("")
+        note = package_note(group)
+        if note:
+            parts.append(note)
+            parts.append("")
         parts.append(group[0]["text"])
         parts.append("")
     return parts

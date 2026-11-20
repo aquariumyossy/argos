@@ -25573,6 +25573,8 @@ Packages:
   https://github.com/alexcrichton/xz2-rs
   https://crates.io/crates/lzma-sys/0.1.20
 
+Note: The bundled xz COPYING.GPLv2 and COPYING.LGPLv2.1 texts are included for reference. liblzma itself is in the public domain. lzma-sys is MIT/Apache-2.0. Argos is not GPL-licensed.
+
 ----- LICENSE-APACHE -----
 Apache License
                         Version 2.0, January 2004

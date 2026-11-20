@@ -146,7 +146,8 @@ function seedInitialPrompts(list: SavedPrompt[]): SavedPrompt[] {
 
 /**
  * Edited initial prompts take their original text in place. Deleted ones are
- * added at the end, in template order. Prompts the user saved stay put.
+ * added at the end, in template order, unless a row already has that text.
+ * Prompts the user saved stay put.
  */
 function restoreInitialPrompts(list: SavedPrompt[], now: number): SavedPrompt[] {
   const specs = new Map(INITIAL_PROMPTS.map((spec) => [spec.id, spec]));
@@ -158,10 +159,11 @@ function restoreInitialPrompts(list: SavedPrompt[], now: number): SavedPrompt[] 
     changed = true;
     return initialRow(spec, now);
   });
-  const have = new Set(next.map((row) => row.id));
-  const missing = INITIAL_PROMPTS.filter((spec) => !have.has(spec.id)).map((spec) =>
-    initialRow(spec, now),
-  );
+  const haveId = new Set(next.map((row) => row.id));
+  const haveBody = new Set(next.map((row) => row.body));
+  const missing = INITIAL_PROMPTS.filter(
+    (spec) => !haveId.has(spec.id) && !haveBody.has(spec.body),
+  ).map((spec) => initialRow(spec, now));
   if (missing.length === 0) return changed ? next : list;
   return [...next, ...missing];
 }
@@ -250,15 +252,20 @@ export function loadSavedPrompts(): SavedPrompt[] {
     return stored;
   }
   const seeded = seedInitialPrompts(stored);
-  try {
-    if (seeded !== stored) {
+  if (seeded !== stored) {
+    try {
       writeSavedPrompts(seeded);
+    } catch {
+      // The seeded list did not fit (quota). Returning [] would make the next
+      // save replace the stored prompts with a single new row.
+      return stored;
     }
+  }
+  try {
     localStorage.setItem(SAVED_PROMPTS_SEEDED_KEY, "1");
   } catch {
-    // The seeded list did not fit (quota). Returning [] would make the next
-    // save replace the stored prompts with a single new row.
-    return stored;
+    // The prompt list is already what storage holds. Return that list so the
+    // panel matches it when the seeded flag could not be written.
   }
   return seeded;
 }
