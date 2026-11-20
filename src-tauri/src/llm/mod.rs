@@ -601,6 +601,139 @@ fn requested_thinking(settings: &Settings, thinking: Option<bool>) -> bool {
     thinking.unwrap_or_else(|| thinking::thinking_enabled(settings))
 }
 
+/// One attempt's failure. Retries stay inside [`stream_chat`], so the caller's
+/// single `AppState.llm_job` lock is held and the same cancel flag stops the wait.
+#[derive(Debug)]
+enum StreamStop {
+    Terminal(String),
+    Retryable {
+        message: String,
+        class: http_error::FailureClass,
+        retry_after: Option<Duration>,
+        saw_text: bool,
+    },
+}
+
+impl StreamStop {
+    fn terminal(message: impl Into<String>) -> Self {
+        Self::Terminal(message.into())
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Terminal(message) => message,
+            Self::Retryable { message, .. } => message,
+        }
+    }
+
+    fn with_saw_text(self, saw_text: bool) -> Self {
+        match self {
+            Self::Retryable {
+                message,
+                class,
+                retry_after,
+                ..
+            } => Self::Retryable {
+                message,
+                class,
+                retry_after,
+                saw_text,
+            },
+            other => other,
+        }
+    }
+
+    fn from_transport(raw: &str, answer_started: bool, reset_partial: bool) -> Self {
+        let classified = http_error::classify_transport(raw, answer_started);
+        match classified.class {
+            http_error::FailureClass::DroppedBeforeText
+            | http_error::FailureClass::DroppedMidAnswer => Self::Retryable {
+                message: classified.message,
+                class: classified.class,
+                retry_after: None,
+                saw_text: reset_partial,
+            },
+            _ => Self::Terminal(classified.message),
+        }
+    }
+
+    fn from_http(status: u16, body: &str, retry_after: Option<Duration>) -> Self {
+        let message = http_error::chat_failure(status, body);
+        let class = if status == 503 {
+            Some(http_error::FailureClass::Loading)
+        } else if http_error::is_busy_failure(status, body) {
+            Some(http_error::FailureClass::Busy)
+        } else {
+            None
+        };
+        match class {
+            Some(class) => Self::Retryable {
+                message,
+                class,
+                retry_after,
+                saw_text: false,
+            },
+            None => Self::Terminal(message),
+        }
+    }
+
+    fn from_in_stream(value: &Value) -> Self {
+        let (message, busy) = http_error::in_stream_failure(value);
+        if busy {
+            Self::Retryable {
+                message,
+                class: http_error::FailureClass::Busy,
+                retry_after: None,
+                saw_text: false,
+            }
+        } else {
+            Self::Terminal(message)
+        }
+    }
+}
+
+/// Answer text or a tool call. Reasoning alone is not an answer yet.
+fn answer_started(parse: &StreamParse) -> bool {
+    !parse.content.is_empty() || !parse.tool_calls.is_empty()
+}
+
+/// Something already shown. A retry clears it so the next attempt does not append.
+fn partial_on_screen(parse: &StreamParse) -> bool {
+    answer_started(parse) || !parse.reasoning.is_empty()
+}
+
+/// Tests keep the real [`http_error::retry_plan`] durations and only shorten the sleep.
+fn paced_retry_wait(wait: Duration) -> Duration {
+    if cfg!(test) {
+        if wait.is_zero() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(1)
+        }
+    } else {
+        wait
+    }
+}
+
+async fn wait_for_retry(cancel: &AtomicBool, wait: Duration) -> bool {
+    if cancel.load(Ordering::SeqCst) {
+        return false;
+    }
+    let wait = paced_retry_wait(wait);
+    let start = Instant::now();
+    while start.elapsed() < wait {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        let slice = Duration::from_millis(50).min(wait.saturating_sub(start.elapsed()));
+        if slice.is_zero() {
+            break;
+        }
+        tokio::time::sleep(slice).await;
+    }
+    !cancel.load(Ordering::SeqCst)
+}
+
 pub async fn stream_chat(
     settings: &Settings,
     turns: &[ChatTurn],
@@ -627,8 +760,64 @@ pub async fn stream_chat(
         return Err("送信するユーザーメッセージがありません。".into());
     }
 
-    let url = join_url(&base, "chat/completions");
     let client = client_for_stream()?;
+    let mut attempt = 0u32;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        attempt += 1;
+        match stream_chat_once(
+            &client,
+            settings,
+            model,
+            &messages,
+            &cancel,
+            tools,
+            runaway_chars,
+            thinking,
+            max_tokens,
+            &mut on_delta,
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(StreamStop::Terminal(message)) => return Err(message),
+            Err(StreamStop::Retryable {
+                message,
+                class,
+                retry_after,
+                saw_text,
+            }) => match http_error::retry_plan(class, attempt, retry_after) {
+                http_error::RetryPlan::Stop => return Err(message),
+                http_error::RetryPlan::Wait(wait) => {
+                    // A partial answer is not kept. The next attempt starts empty.
+                    if saw_text {
+                        on_delta("reset", "");
+                    }
+                    on_delta("status", http_error::RETRY_STATUS);
+                    if !wait_for_retry(&cancel, wait).await {
+                        return Err("cancelled".into());
+                    }
+                }
+            },
+        }
+    }
+}
+
+async fn stream_chat_once(
+    client: &reqwest::Client,
+    settings: &Settings,
+    model: &str,
+    messages: &[Value],
+    cancel: &AtomicBool,
+    tools: Option<&Value>,
+    runaway_chars: usize,
+    thinking: Option<bool>,
+    max_tokens: Option<u32>,
+    on_delta: &mut impl FnMut(&str, &str),
+) -> Result<StreamOutcome, StreamStop> {
+    let url = join_url(&settings.llm_base_url, "chat/completions");
     let thinking_on = requested_thinking(settings, thinking);
     let mut include_thinking = true;
     let resp = loop {
@@ -637,7 +826,7 @@ pub async fn stream_chat(
         } else {
             None
         };
-        let body = build_chat_body(model, &messages, tools, thinking, max_tokens);
+        let body = build_chat_body(model, messages, tools, thinking, max_tokens);
         let req = apply_auth(
             client
                 .post(&url)
@@ -646,12 +835,19 @@ pub async fn stream_chat(
                 .json(&body),
             &settings.llm_api_key,
         );
-        let resp = req.send().await.map_err(|e| {
-            if cancel.load(Ordering::SeqCst) {
-                return "cancelled".into();
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(StreamStop::terminal("cancelled"));
+                }
+                return Err(StreamStop::from_transport(
+                    &error_chain(&error),
+                    false,
+                    false,
+                ));
             }
-            map_reqwest_error(&e)
-        })?;
+        };
         if resp.status() == reqwest::StatusCode::BAD_REQUEST && include_thinking {
             // Servers that do not understand the thinking fields reject them.
             let _ = resp.text().await;
@@ -662,8 +858,13 @@ pub async fn stream_chat(
     };
     let status = resp.status();
     if !status.is_success() {
+        let retry_after = http_error::retry_after_header(
+            resp.headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+        );
         let text = resp.text().await.unwrap_or_default();
-        return Err(http_error::chat_failure(status.as_u16(), &text));
+        return Err(StreamStop::from_http(status.as_u16(), &text, retry_after));
     }
 
     let content_type = resp
@@ -674,8 +875,22 @@ pub async fn stream_chat(
         .to_ascii_lowercase();
     let mut parse = StreamParse::default();
     if content_type.contains("application/json") && !content_type.contains("event-stream") {
-        let text = resp.text().await.map_err(|e| map_reqwest_error(&e))?;
-        ingest_payload(&text, &mut parse, runaway_chars, &mut on_delta)?;
+        let text = match resp.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(StreamStop::terminal("cancelled"));
+                }
+                return Err(StreamStop::from_transport(
+                    &error_chain(&error),
+                    false,
+                    false,
+                ));
+            }
+        };
+        if let Err(stop) = ingest_payload(&text, &mut parse, runaway_chars, on_delta) {
+            return Err(stop.with_saw_text(partial_on_screen(&parse)));
+        }
         return Ok(parse.into_outcome());
     }
 
@@ -685,46 +900,58 @@ pub async fn stream_chat(
     let mut last = Instant::now();
     loop {
         if cancel.load(Ordering::SeqCst) {
-            return Err("cancelled".into());
+            return Err(StreamStop::terminal("cancelled"));
         }
         let remaining = idle.saturating_sub(last.elapsed());
         if remaining.is_zero() {
-            return Err(
-                "応答が止まりました（タイムアウト）。指示を分けるか、設定の「思考」をオフにしてください。"
-                    .into(),
-            );
+            return Err(StreamStop::terminal(
+                "応答が止まりました（タイムアウト）。指示を分けるか、設定の「思考」をオフにしてください。",
+            ));
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(200).min(remaining)) => {}
             chunk = stream.next() => {
                 if cancel.load(Ordering::SeqCst) {
-                    return Err("cancelled".into());
+                    return Err(StreamStop::terminal("cancelled"));
                 }
                 let Some(chunk) = chunk else {
                     break;
                 };
-                let bytes = chunk.map_err(|e| {
-                    if cancel.load(Ordering::SeqCst) {
-                        return "cancelled".into();
+                let bytes = match chunk {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Err(StreamStop::terminal("cancelled"));
+                        }
+                        return Err(StreamStop::from_transport(
+                            &error_chain(&error),
+                            answer_started(&parse),
+                            partial_on_screen(&parse),
+                        ));
                     }
-                    map_reqwest_error(&e)
-                })?;
+                };
                 buf.push_str(&String::from_utf8_lossy(&bytes));
-                drain_sse_lines(&mut buf, &mut parse, runaway_chars, &mut on_delta)?;
+                if let Err(stop) = drain_sse_lines(&mut buf, &mut parse, runaway_chars, on_delta) {
+                    return Err(stop.with_saw_text(partial_on_screen(&parse)));
+                }
                 last = Instant::now();
             }
         }
     }
     if cancel.load(Ordering::SeqCst) {
-        return Err("cancelled".into());
+        return Err(StreamStop::terminal("cancelled"));
     }
     if !buf.trim().is_empty() {
         let rest = buf.trim();
         if rest.starts_with('{') {
-            ingest_payload(rest, &mut parse, runaway_chars, &mut on_delta)?;
+            if let Err(stop) = ingest_payload(rest, &mut parse, runaway_chars, on_delta) {
+                return Err(stop.with_saw_text(partial_on_screen(&parse)));
+            }
         } else {
             for line in buf.split('\n') {
-                take_sse_data_line(line, &mut parse, runaway_chars, &mut on_delta)?;
+                if let Err(stop) = take_sse_data_line(line, &mut parse, runaway_chars, on_delta) {
+                    return Err(stop.with_saw_text(partial_on_screen(&parse)));
+                }
             }
         }
     }
@@ -736,7 +963,7 @@ fn drain_sse_lines(
     parse: &mut StreamParse,
     runaway_chars: usize,
     on_delta: &mut impl FnMut(&str, &str),
-) -> Result<(), String> {
+) -> Result<(), StreamStop> {
     while let Some(idx) = buf.find('\n') {
         let line = buf[..idx].to_string();
         buf.drain(..=idx);
@@ -750,7 +977,7 @@ fn take_sse_data_line(
     parse: &mut StreamParse,
     runaway_chars: usize,
     on_delta: &mut impl FnMut(&str, &str),
-) -> Result<(), String> {
+) -> Result<(), StreamStop> {
     let line = line.trim_end_matches('\r').trim();
     let Some(data) = line.strip_prefix("data:") else {
         return Ok(());
@@ -818,9 +1045,9 @@ fn ingest_payload(
     parse: &mut StreamParse,
     runaway_chars: usize,
     on_delta: &mut impl FnMut(&str, &str),
-) -> Result<(), String> {
-    let v: Value =
-        serde_json::from_str(data).map_err(|_| "応答の解釈に失敗しました。".to_string())?;
+) -> Result<(), StreamStop> {
+    let v: Value = serde_json::from_str(data)
+        .map_err(|_| StreamStop::terminal("応答の解釈に失敗しました。"))?;
     if let Some(id) = v.get("id").and_then(|value| value.as_str()) {
         if !id.is_empty() {
             parse.request_id = id.to_string();
@@ -835,7 +1062,7 @@ fn ingest_payload(
         }
     }
     if v.get("error").is_some() {
-        return Err("LLM の呼び出しに失敗しました。".into());
+        return Err(StreamStop::from_in_stream(&v));
     }
     if let Some(arr) = v
         .pointer("/choices/0/delta/tool_calls")
@@ -864,10 +1091,10 @@ fn ingest_payload(
             parse.content.push_str(&text);
             on_delta(kind, &text);
         } else if kind == "reasoning" {
-            push_reasoning(parse, &text, runaway_chars, on_delta)?;
+            push_reasoning(parse, &text, runaway_chars, on_delta).map_err(StreamStop::terminal)?;
         }
     }
-    guard_stream(parse, runaway_chars)
+    guard_stream(parse, runaway_chars).map_err(StreamStop::terminal)
 }
 
 /// Keep reasoning up to the cap. The character that would pass it stops the stream.
@@ -1218,17 +1445,61 @@ mod tests {
         let lan = http_error::transport_failure(
             "error sending request for url (http://100.65.231.111:8000/v1/models)",
         );
-        assert!(
-            lan.contains("127.0.0.1") || lan.contains("届きません"),
-            "{lan}"
-        );
+        assert!(lan.contains("接続できません"), "{lan}");
+        assert!(lan.contains("設定の URL"), "{lan}");
+        assert!(!lan.contains("MTPLX") && !lan.contains("mtplx"), "{lan}");
+        assert!(!lan.contains("127.0.0.1"), "{lan}");
         let refused = http_error::transport_failure("tcp connect error: os error 10061");
         assert!(refused.contains("接続できません"), "{refused}");
         let timed_out = http_error::transport_failure("os error 10060");
-        assert!(timed_out.contains("接続できません"), "{timed_out}");
+        assert!(timed_out.contains("時間切れ"), "{timed_out}");
+        assert!(!timed_out.contains("接続できません"), "{timed_out}");
+        let reset = http_error::transport_failure(
+            "既存の接続はリモート ホストに強制的に切断されました (os error 10054)",
+        );
+        assert!(reset.contains("接続が切れました"), "{reset}");
+        assert!(!reset.contains("接続できません"), "{reset}");
         let unknown = http_error::transport_failure("invalid api key sk-live-secret");
         assert!(!unknown.contains("sk-live-secret"), "{unknown}");
         assert!(!unknown.contains("invalid api key"), "{unknown}");
+    }
+
+    #[test]
+    fn reasoning_without_answer_text_retries_on_the_short_backoff() {
+        let mut parse = StreamParse::default();
+        parse.reasoning.push_str("考えている");
+        assert!(!answer_started(&parse));
+        assert!(partial_on_screen(&parse));
+        let stop = StreamStop::from_transport(
+            "既存の接続はリモート ホストに強制的に切断されました (os error 10054)",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match stop {
+            StreamStop::Retryable {
+                class, saw_text, ..
+            } => {
+                assert_eq!(class, http_error::FailureClass::DroppedBeforeText);
+                assert!(saw_text);
+                assert_eq!(
+                    http_error::retry_plan(class, 1, None),
+                    http_error::RetryPlan::Wait(std::time::Duration::from_secs(1))
+                );
+            }
+            other => panic!("reasoning-only drop must retry: {other:?}"),
+        }
+        parse.content.push_str("答え");
+        let answered = StreamStop::from_transport(
+            "os error 10054",
+            answer_started(&parse),
+            partial_on_screen(&parse),
+        );
+        match answered {
+            StreamStop::Retryable { class, .. } => {
+                assert_eq!(class, http_error::FailureClass::DroppedMidAnswer);
+            }
+            other => panic!("answer text is a mid-answer drop: {other:?}"),
+        }
     }
 
     #[test]
@@ -1275,8 +1546,9 @@ mod tests {
         assert!(big.contains("HTTP 413"), "{big}");
         assert!(!big.contains("secret-body"), "{big}");
         let limited = http_error::chat_failure(429, "secret-body");
-        assert!(limited.contains("HTTP 429"), "{limited}");
+        assert_eq!(limited, http_error::BUSY_MESSAGE);
         assert!(!limited.contains("secret-body"), "{limited}");
+        assert!(!limited.contains("MTPLX"), "{limited}");
         let other = http_error::chat_failure(422, "secret-body");
         assert!(other.contains("HTTP 422"), "{other}");
         assert!(!other.contains("secret-body"), "{other}");
@@ -1417,7 +1689,10 @@ mod tests {
         assert_eq!(seen, "あいうえ");
         assert_eq!(parse.reasoning, "あいうえ");
         assert!(parse.content.is_empty(), "{}", parse.content);
-        assert_eq!(err, format!("{}4", thinking::THINKING_RUNAWAY_PREFIX));
+        assert_eq!(
+            err.message(),
+            format!("{}4", thinking::THINKING_RUNAWAY_PREFIX)
+        );
     }
 
     #[test]
@@ -1587,6 +1862,66 @@ mod tests {
         (port, captured)
     }
 
+    fn read_one_request(sock: &mut std::net::TcpStream) {
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            match std::io::Read::read(sock, &mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    value.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() - (header_end + 4) >= len {
+                            break;
+                        }
+                    }
+                    if buf.len() > 2_000_000 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn json_http(status: u16, reason: &str, body: &str, extra_headers: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    fn serve_raw(responses: Vec<Vec<u8>>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                read_one_request(&mut sock);
+                let _ = std::io::Write::write_all(&mut sock, &response);
+                let _ = std::io::Write::flush(&mut sock);
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        port
+    }
+
     async fn stream_chat_err(port: u16, tools: bool) -> String {
         stream_chat_err_model(port, "test-model", tools).await
     }
@@ -1652,11 +1987,7 @@ mod tests {
             "a generic 400 must not look like a tools fallback: {err_400}"
         );
 
-        for (code, reason) in [
-            (413u16, "Payload Too Large"),
-            (422, "Unprocessable Entity"),
-            (429, "Too Many Requests"),
-        ] {
+        for (code, reason) in [(413u16, "Payload Too Large"), (422, "Unprocessable Entity")] {
             let body = format!(r#"{{"error":"marker-{code}","api_key":"sk-live-secret"}}"#);
             let port = serve_http(code, reason, &body, 1);
             let err = stream_chat_err(port, false).await;
@@ -1698,6 +2029,145 @@ mod tests {
             assert!(!err.contains(model), "{model}: {err}");
             assert!(!err.to_lowercase().contains("not found"), "{model}: {err}");
         }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_a_busy_server_then_keeps_the_recovered_answer() {
+        let overloaded =
+            r#"{"error":{"message":"The server is overloaded","api_key":"sk-live-secret"}}"#;
+        let recovered = r#"{"choices":[{"message":{"content":"直った"}}]}"#;
+        let port = serve_raw(vec![
+            json_http(503, "Service Unavailable", overloaded, "Retry-After: 2\r\n"),
+            json_http(200, "OK", recovered, ""),
+        ]);
+        let mut settings = local_llm_settings(port);
+        settings.llm_model = "test-model".into();
+        let turns = [ChatTurn::text("user", "こんにちは")];
+        let mut events = Vec::new();
+        let out = stream_chat(
+            &settings,
+            &turns,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            0,
+            None,
+            None,
+            |kind, text| events.push((kind.to_string(), text.to_string())),
+        )
+        .await
+        .expect("the second attempt is the answer");
+        assert_eq!(out.content, "直った");
+        assert!(
+            events
+                .iter()
+                .any(|(kind, text)| kind == "status" && text == "再試行中…"),
+            "{events:?}"
+        );
+        assert!(!out.content.contains("sk-live-secret"));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_gives_up_on_a_busy_server_without_the_body() {
+        let body = r#"{"error":"overloaded","api_key":"sk-live-secret"}"#;
+        let port = serve_http(
+            503,
+            "Service Unavailable",
+            body,
+            http_error::MAX_LOADING_ATTEMPTS as usize,
+        );
+        let err = stream_chat_err(port, false).await;
+        assert_eq!(err, http_error::BUSY_MESSAGE);
+        assert!(!err.contains("sk-live-secret"), "{err}");
+        assert!(!err.contains("overload"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_shows_an_in_stream_error_message() {
+        let body = r#"{"error":{"message":"モデルを読み込めません","api_key":"sk-live-secret"}}"#;
+        let port = serve_http(200, "OK", body, 1);
+        let err = stream_chat_err(port, false).await;
+        assert!(err.contains("モデルを読み込めません"), "{err}");
+        assert!(!err.contains("呼び出しに失敗しました"), "{err}");
+        assert!(!err.contains("sk-live-secret"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_cancel_during_the_retry_wait_stops_the_call() {
+        let body = r#"{"error":{"message":"overloaded"}}"#;
+        let port = serve_http(503, "Service Unavailable", body, 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let mut settings = local_llm_settings(port);
+        settings.llm_model = "test-model".into();
+        let turns = [ChatTurn::text("user", "こんにちは")];
+        let err = stream_chat(
+            &settings,
+            &turns,
+            cancel,
+            None,
+            0,
+            None,
+            None,
+            move |kind, text| {
+                if kind == "status" && text == "再試行中…" {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            },
+        )
+        .await
+        .expect_err("stop during the wait");
+        assert!(is_cancelled_error(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_retries_a_drop_after_text_without_keeping_the_partial() {
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"途中\"}}]}\n\n";
+        let cut = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{partial}"
+        );
+        let recovered = r#"{"choices":[{"message":{"content":"最初から"}}]}"#;
+        let port = serve_raw(vec![cut.into_bytes(), json_http(200, "OK", recovered, "")]);
+        let mut settings = local_llm_settings(port);
+        settings.llm_model = "test-model".into();
+        let turns = [ChatTurn::text("user", "こんにちは")];
+        let mut events = Vec::new();
+        let out = stream_chat(
+            &settings,
+            &turns,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            0,
+            None,
+            None,
+            |kind, text| events.push((kind.to_string(), text.to_string())),
+        )
+        .await
+        .expect("a dropped answer is requested again");
+        assert_eq!(out.content, "最初から", "{events:?}");
+        assert!(!out.content.contains("途中"));
+        assert!(
+            events
+                .iter()
+                .any(|(kind, text)| kind == "reset" && text.is_empty()),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(kind, text)| kind == "status" && text == "再試行中…"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_does_not_retry_when_the_server_is_not_reachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = stream_chat_err(port, false).await;
+        assert_eq!(err, http_error::UNREACHABLE_MESSAGE);
+        assert!(!err.contains("MTPLX"), "{err}");
+        assert!(!err.contains("127.0.0.1"), "{err}");
     }
 
     #[tokio::test]

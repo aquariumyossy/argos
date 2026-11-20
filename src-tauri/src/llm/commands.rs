@@ -1031,6 +1031,9 @@ async fn llm_send_inner<R: Runtime>(
             }
             // Thinking off and tools off. The closure drops summary tokens.
             let call = summary::summary_call(&chunk.transcript);
+            let app_status = app.clone();
+            let req_status = request_id.clone();
+            let tid_status = thread.id.clone();
             let summarized = llm::stream_chat(
                 &settings,
                 &call.turns,
@@ -1039,7 +1042,19 @@ async fn llm_send_inner<R: Runtime>(
                 llm::runaway_chars_for(&settings.llm_base_url),
                 call.thinking,
                 Some(call.max_tokens),
-                |_, _| {},
+                move |kind, delta| {
+                    if kind == "status" || kind == "reset" {
+                        let _ = app_status.emit(
+                            "llm-chat-delta",
+                            LlmChatDelta {
+                                request_id: req_status.clone(),
+                                thread_id: tid_status.clone(),
+                                text: delta.to_string(),
+                                kind: kind.to_string(),
+                            },
+                        );
+                    }
+                },
             )
             .await;
             match summarized {
@@ -3648,6 +3663,9 @@ async fn rewrite_foreign_reply<R: Runtime>(
     thinking_off.llm_thinking = "off".into();
     let prompt = crate::llm::han_fix::foreign_rewrite_request(&segments);
     let turns = vec![ChatTurn::text("user", prompt)];
+    let app_status = app.clone();
+    let req_status = request_id.to_string();
+    let tid_status = thread_id.to_string();
     let call = llm::stream_chat(
         &thinking_off,
         &turns,
@@ -3656,7 +3674,20 @@ async fn rewrite_foreign_reply<R: Runtime>(
         llm::runaway_chars_for(&settings.llm_base_url),
         Some(false),
         None,
-        |_kind, _delta| {},
+        move |kind, delta| {
+            // Status only. A reset would clear the answer already on screen.
+            if kind == "status" {
+                let _ = app_status.emit(
+                    "llm-chat-delta",
+                    LlmChatDelta {
+                        request_id: req_status.clone(),
+                        thread_id: tid_status.clone(),
+                        text: delta.to_string(),
+                        kind: kind.to_string(),
+                    },
+                );
+            }
+        },
     );
     let streamed = match tokio::time::timeout(
         std::time::Duration::from_secs(crate::llm::han_fix::REWRITE_TIMEOUT_SECS),

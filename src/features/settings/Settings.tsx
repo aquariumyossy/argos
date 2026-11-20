@@ -1815,20 +1815,17 @@ export default function Settings() {
           <section>
             <h2>ローカルLLM</h2>
             <p className="muted">
-              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（MTPLX / Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります（「Aさんの直近メール」のように時期や送信者を指定できます）。回答は Markdown で表示し、図や表（列幅はドラッグで調整）、選択肢も出せます。
+              トレイの「チャットを開く」から、OpenAI 互換のローカルサーバ（Ollama / LM Studio / llama.cpp など）と会話できます。本文は、あなたが送ったメッセージと添付した出典がサーバに渡ります。モデルが対応していれば、会話中にインデックスを検索することもあります（「Aさんの直近メール」のように時期や送信者を指定できます）。回答は Markdown で表示し、図や表（列幅はドラッグで調整）、選択肢も出せます。
             </p>
             <ol className="howto-steps">
-              <li>MTPLX 等を起動し、使いたいモデルを読み込みます</li>
+              <li>LLM サーバを起動し、使いたいモデルを読み込みます</li>
               <li>
-                ベース URL は <code>/v1</code> まで含めます。例:{" "}
-                <code>http://127.0.0.1:8000/v1</code>
-                。ホストとポートだけ入力した場合は保存時に自動で付きます
+                ベース URL は <code>/v1</code>{" "}
+                まで含めます。ホストとポートだけ入力した場合は保存時に自動で付きます
               </li>
               <li>
-                別の PC から Tailscale / LAN で使うときは、Mac 側が{" "}
-                <code>127.0.0.1</code> だけではなく外向きに待っている必要があります（
-                <code>mtplx serve --host 0.0.0.0 --port 8000 --api-key 任意</code>
-                、または <code>tailscale serve 8000</code>）
+                別の PC から Tailscale / LAN で使うときは、LLM
+                サーバがこの PC の中だけではなく、外向きにも待っている必要があります
               </li>
               <li>
                 サーバ側のコンテキスト長（Ollama なら <code>num_ctx</code>）を{" "}
@@ -1844,7 +1841,7 @@ export default function Settings() {
               </li>
               <li>
                 根拠には出典番号 <code>[n]</code>{" "}
-                が付きます。図は「プロンプト」の「要件事実」など。Qwen の思考が長いときは、MTPLX の起動オプション（--agent-thinking-budget）で上限を指定するか、左の「ローカルLLM」の思考を「オフ」にしてください
+                が付きます。図は「プロンプト」の「要件事実」など。Qwen の思考が長いときは、LLM サーバの思考トークン設定で上限を指定するか、左の「ローカルLLM」の思考を「オフ」にしてください
               </li>
               <li>
                 入力欄上の「ウェブ検索オフ／オン」でウェブ検索を足せます。オンのとき、モデルがインデックスを検索すると同じ語で
@@ -3159,7 +3156,7 @@ export default function Settings() {
                 </select>
               </label>
               <p className="field-hint">
-                オンのとき、思考の長さは MTPLX の起動設定（--agent-thinking-budget）に従います。オフは思考そのものを止めます。オフにすると、モデルがツールを呼ばずに出典番号だけ書いてターンを切ることがあります。
+                オンのとき、思考の長さは LLM サーバの思考トークン設定に従います。オフは思考そのものを止めます。オフにすると、モデルがツールを呼ばずに出典番号だけ書いてターンを切ることがあります。
               </p>
               <label>
                 <span className="field-label">ツール往復の上限</span>
