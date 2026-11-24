@@ -528,6 +528,16 @@ fn citation_header_line(seed: &LlmSourceRow, cite: i64, grouped_image: bool) -> 
     } else {
         seed.title.as_str()
     };
+    if seed.is_note() {
+        line.push_str(title);
+        line.push_str("（ノート）");
+        if let Some(id) = seed.path.trim().strip_prefix("note:") {
+            if !id.is_empty() {
+                line.push_str(&format!(" note_id: {id}"));
+            }
+        }
+        return line;
+    }
     line.push_str(title);
     if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
         line.push_str(" — ");

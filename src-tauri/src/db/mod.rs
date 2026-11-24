@@ -106,7 +106,7 @@ pub const LLM_JA_HINT: &str =
     "書き言葉はすべて日本語にします。簡体字・繁体字・旧字体や日本語にない漢字、ハングル・キリル文字などの他の文字体系は、本文・コメント・チャットの報告・ツールの引数にも使いません。「기타」のような他言語の単語を日本語の文の中に混ぜません。";
 pub const LLM_JA_SENTINEL: &str = "書き言葉はすべて日本語にします";
 pub const LLM_NOTE_HINT: &str =
-    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。書いたと報告してよいです。採否はユーザーがノートで行います。読む前に消さないでください。全文を書き換えるときは、変えない箇所もそのまま含めてください。対象ノートが無いときは list_notes か create_note を使います。";
+    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。版の履歴に残ります。調査の質問では、先に list_notes の query で関連ノートを探し、ノートで足りないときだけ索引やウェブを検索してください。ノートを答えに使ったら、その出典番号を付けてください。読む前に消さないでください。全文を書き換えるときは、変えない箇所もそのまま含めてください。対象ノートが無いときは list_notes か create_note を使います。";
 pub const LLM_NOTE_SENTINEL: &str = "書いた内容はすぐメモに反映されます";
 /// Appended on each request, including a prompt the user edited.
 pub const LLM_REREAD_HINT: &str =
@@ -325,6 +325,10 @@ impl LlmSourceRow {
 
     pub fn is_remote(&self) -> bool {
         self.kind.eq_ignore_ascii_case("remote")
+    }
+
+    pub fn is_note(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("note") || self.path.trim().starts_with("note:")
     }
 
     /// Ready to put into an LLM 出典 block (OCR finished, body present).
@@ -980,6 +984,17 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_note_items_note_id
               ON note_items(note_id, sort_order);
+            CREATE TABLE IF NOT EXISTS note_versions (
+              id TEXT PRIMARY KEY,
+              note_id TEXT NOT NULL,
+              memo TEXT NOT NULL,
+              title TEXT NOT NULL DEFAULT '',
+              source TEXT NOT NULL DEFAULT 'manual',
+              created_at INTEGER NOT NULL,
+              FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_note_versions_note
+              ON note_versions(note_id, created_at);
             CREATE TABLE IF NOT EXISTS llm_threads (
               id TEXT PRIMARY KEY,
               title TEXT NOT NULL DEFAULT '',
@@ -1265,6 +1280,11 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN llm_review_base TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN ai_notice_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        import_legacy_note_reviews(&conn)?;
         let _ = conn.execute(
             "UPDATE llm_note_proposals SET status='dismissed' WHERE status='pending'",
             [],
@@ -3114,22 +3134,16 @@ impl Db {
     }
 
     pub fn rename_note(&self, id: &str, title: &str) -> Result<Option<NoteRow>, rusqlite::Error> {
-        let title = if title.trim().is_empty() {
-            "無題のノート"
-        } else {
-            title.trim()
-        };
-        let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock();
-        let n = conn.execute(
-            "UPDATE notes SET title=?1, updated_at=?2 WHERE id=?3",
-            rusqlite::params![title, now, id],
-        )?;
-        if n == 0 {
+        let Some(note) = self.get_note(id)? else {
             return Ok(None);
-        }
-        drop(conn);
-        self.get_note(id)
+        };
+        self.save_note_content_at(
+            id,
+            &note.memo,
+            Some(title),
+            NOTE_ORIGIN_MANUAL,
+            chrono::Utc::now().timestamp(),
+        )
     }
 
     pub fn update_note_memo(
@@ -3137,55 +3151,147 @@ impl Db {
         id: &str,
         memo: &str,
     ) -> Result<Option<NoteRow>, rusqlite::Error> {
-        let now = chrono::Utc::now().timestamp();
+        self.save_note_content_at(
+            id,
+            memo,
+            None,
+            NOTE_ORIGIN_MANUAL,
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// Memo and optional title change, recorded as one version.
+    /// `origin` is `ai`, `manual`, or `revert`. Rapid manual saves of the same
+    /// editing burst update the latest manual version instead of adding a row.
+    pub fn apply_direct_note_text(
+        &self,
+        id: &str,
+        memo: &str,
+        title: Option<&str>,
+        origin: &str,
+    ) -> Result<NoteRow, String> {
+        self.save_note_content_at(
+            id,
+            memo,
+            title,
+            origin,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".to_string())
+    }
+
+    fn save_note_content_at(
+        &self,
+        id: &str,
+        memo: &str,
+        title: Option<&str>,
+        origin: &str,
+        now: i64,
+    ) -> Result<Option<NoteRow>, rusqlite::Error> {
+        let origin = match origin {
+            NOTE_ORIGIN_AI | NOTE_ORIGIN_REVERT => origin,
+            _ => NOTE_ORIGIN_MANUAL,
+        };
         let conn = self.conn.lock();
-        let n = conn.execute(
-            "UPDATE notes SET memo=?1, updated_at=?2 WHERE id=?3",
-            rusqlite::params![memo, now, id],
-        )?;
-        if n == 0 {
+        let Some(current) = read_note_conn(&conn, id)? else {
             return Ok(None);
+        };
+        let title = match title {
+            Some(raw) => {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    "無題のノート".to_string()
+                } else {
+                    raw.to_string()
+                }
+            }
+            None => current.title.clone(),
+        };
+        if memo == current.memo && title == current.title {
+            return Ok(Some(current));
         }
-        let _ = conn.execute(
-            "UPDATE notes SET llm_review_base=NULL
-             WHERE id=?1 AND llm_review_base IS NOT NULL AND llm_review_base = memo",
-            [id],
-        );
+        let latest = latest_note_version_conn(&conn, id)?;
+        let pending: i64 = if origin == NOTE_ORIGIN_AI { 1 } else { 0 };
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let wrote = (|| -> Result<(), rusqlite::Error> {
+            let latest_matches = latest
+                .as_ref()
+                .map(|v| v.memo == current.memo && v.title == current.title)
+                .unwrap_or(false);
+            let coalesce = origin == NOTE_ORIGIN_MANUAL
+                && latest_matches
+                && latest
+                    .as_ref()
+                    .map(|v| {
+                        v.source == NOTE_ORIGIN_MANUAL
+                            && now.saturating_sub(v.created_at) < NOTE_VERSION_COALESCE_SECS
+                    })
+                    .unwrap_or(false);
+            if coalesce {
+                let version_id = &latest.as_ref().unwrap().id;
+                conn.execute(
+                    "UPDATE note_versions SET memo=?1, title=?2, created_at=?3 WHERE id=?4",
+                    rusqlite::params![memo, title, now, version_id],
+                )?;
+            } else {
+                if !latest_matches {
+                    let snapshot = origin != NOTE_ORIGIN_MANUAL
+                        || latest.is_some()
+                        || !current.memo.is_empty();
+                    if snapshot {
+                        let snap_at = if current.updated_at < now {
+                            current.updated_at
+                        } else {
+                            now.saturating_sub(1)
+                        };
+                        insert_note_version_conn(
+                            &conn,
+                            id,
+                            &current.memo,
+                            &current.title,
+                            NOTE_ORIGIN_MANUAL,
+                            snap_at,
+                        )?;
+                    }
+                }
+                insert_note_version_conn(&conn, id, memo, &title, origin, now)?;
+            }
+            conn.execute(
+                "UPDATE notes
+                 SET memo=?1, title=?2, updated_at=?3, ai_notice_pending=?4, llm_review_base=NULL
+                 WHERE id=?5",
+                rusqlite::params![memo, title, now, pending, id],
+            )?;
+            Ok(())
+        })();
+        match wrote {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
         drop(conn);
         self.get_note(id)
     }
 
-    fn llm_review_base(&self, id: &str) -> Result<Option<Option<String>>, rusqlite::Error> {
+    fn ai_notice_pending(&self, id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT llm_review_base FROM notes WHERE id=?1")?;
-        let mut rows = stmt.query_map([id], |row| row.get::<_, Option<String>>(0))?;
-        match rows.next() {
-            Some(Ok(v)) => Ok(Some(v)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
-        }
+        conn.query_row(
+            "SELECT ai_notice_pending FROM notes WHERE id=?1",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n != 0)
     }
 
-    fn set_llm_review_base(
-        &self,
-        id: &str,
-        base: Option<&str>,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn clear_note_ai_notice(&self, id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock();
-        match base {
-            Some(b) => {
-                conn.execute(
-                    "UPDATE notes SET llm_review_base=?1 WHERE id=?2",
-                    rusqlite::params![b, id],
-                )?;
-            }
-            None => {
-                conn.execute(
-                    "UPDATE notes SET llm_review_base=NULL WHERE id=?1",
-                    [id],
-                )?;
-            }
-        }
+        conn.execute(
+            "UPDATE notes SET ai_notice_pending=0 WHERE id=?1",
+            [id],
+        )?;
         Ok(())
     }
 
@@ -3194,11 +3300,155 @@ impl Db {
             Some(n) => n,
             None => return Ok(None),
         };
-        let stored = match self.llm_review_base(id)? {
-            Some(v) => v,
-            None => return Ok(None),
+        let pending = self.ai_notice_pending(id)?;
+        Ok(Some(note_review_from(&note, pending)))
+    }
+
+    pub fn list_note_history(&self, id: &str) -> Result<Option<NoteHistory>, rusqlite::Error> {
+        if self.get_note(id)?.is_none() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, source, created_at, memo FROM note_versions
+             WHERE note_id=?1 ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([id], |row| {
+            let memo: String = row.get(4)?;
+            Ok(NoteVersionMeta {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                source: row.get(2)?,
+                created_at: row.get(3)?,
+                memo_len: memo.chars().count() as u32,
+            })
+        })?;
+        let versions: Vec<NoteVersionMeta> = rows.collect::<Result<Vec<_>, _>>()?;
+        let ai_updated_at = versions
+            .last()
+            .filter(|v| v.source == NOTE_ORIGIN_AI)
+            .map(|v| v.created_at);
+        Ok(Some(NoteHistory {
+            versions,
+            ai_updated_at,
+        }))
+    }
+
+    pub fn note_version_diff(
+        &self,
+        note_id: &str,
+        version_id: &str,
+    ) -> Result<NoteVersionDiff, String> {
+        let note = self
+            .get_note(note_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let version = self
+            .get_note_version(version_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "版が見つかりません".to_string())?;
+        if version.note_id != note.id {
+            return Err("版が見つかりません".into());
+        }
+        let latest = {
+            let conn = self.conn.lock();
+            latest_note_version_conn(&conn, note_id).map_err(|e| e.to_string())?
         };
-        Ok(Some(note_review_from(&note, stored)))
+        let is_latest = latest.as_ref().map(|v| v.id == version.id).unwrap_or(false);
+        let hunks = if is_latest {
+            Vec::new()
+        } else {
+            notes_md::diff_hunks(&version.memo, &note.memo)
+        };
+        Ok(NoteVersionDiff {
+            version_id: version.id,
+            source: version.source,
+            created_at: version.created_at,
+            memo: note.memo,
+            hunks,
+        })
+    }
+
+    pub fn revert_note_to_version(&self, note_id: &str, version_id: &str) -> Result<NoteRow, String> {
+        let version = self
+            .get_note_version(version_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "版が見つかりません".to_string())?;
+        if version.note_id != note_id {
+            return Err("版が見つかりません".into());
+        }
+        self.apply_direct_note_text(note_id, &version.memo, Some(&version.title), NOTE_ORIGIN_REVERT)
+    }
+
+    fn get_note_version(&self, id: &str) -> Result<Option<NoteVersionStored>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, note_id, memo, title, source, created_at FROM note_versions WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map([id], |row| {
+            Ok(NoteVersionStored {
+                id: row.get(0)?,
+                note_id: row.get(1)?,
+                memo: row.get(2)?,
+                title: row.get(3)?,
+                source: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn search_note_memos(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<(Vec<NoteSnippet>, bool), rusqlite::Error> {
+        let mut hits = Vec::new();
+        let mut extra = false;
+        for note in self.list_notes()? {
+            let Some(snippet) =
+                crate::notes_search::match_snippet(&note.title, &note.memo, query)
+            else {
+                continue;
+            };
+            if hits.len() >= limit {
+                extra = true;
+                break;
+            }
+            hits.push(NoteSnippet {
+                id: note.id,
+                title: note.title,
+                updated_at: note.updated_at,
+                snippet,
+            });
+        }
+        Ok((hits, extra))
+    }
+
+    pub fn insert_keep_json(
+        &self,
+        note_id: &str,
+        query: &str,
+        paragraph_id: &str,
+        item_json: &str,
+    ) -> Result<crate::note_keep::KeepInsert, rusqlite::Error> {
+        if !paragraph_id.is_empty() {
+            if let Some(existing) = self.find_note_item_by_paragraph(note_id, paragraph_id)? {
+                return Ok(crate::note_keep::KeepInsert {
+                    item: existing,
+                    created: false,
+                });
+            }
+        }
+        let item = self.insert_note_item(note_id, query, paragraph_id, item_json)?;
+        Ok(crate::note_keep::KeepInsert {
+            item,
+            created: true,
+        })
     }
 
     pub fn apply_llm_note_write(
@@ -3246,116 +3496,48 @@ impl Db {
             memo.to_string()
         };
         let title = title.map(str::trim).filter(|s| !s.is_empty());
-        let memo_changed = next != note.memo;
-        if memo_changed {
-            let stored = self.llm_review_base(id).map_err(|e| e.to_string())?;
-            if stored == Some(None) {
-                self.set_llm_review_base(id, Some(&note.memo))
-                    .map_err(|e| e.to_string())?;
-            }
-            self.update_note_memo(id, &next)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        if next == note.memo && title.map(|t| t == note.title).unwrap_or(true) {
+            return Ok(note);
         }
-        if let Some(t) = title {
-            if t != note.title {
-                self.rename_note(id, t)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "ノートが見つかりません".to_string())?;
-            }
-        }
-        self.get_note(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())
+        self.apply_direct_note_text(id, &next, title, NOTE_ORIGIN_AI)
     }
 
-    fn review_lock_ok(review: &NoteReview, base_len: u32, memo_len: u32) -> Result<(), String> {
-        if !review.has_review {
-            return Err("未確認の変更はありません。".into());
-        }
-        if review.base_len != base_len || review.memo_len != memo_len {
-            return Err("メモが変わっています。差分を読み直してください。".into());
-        }
-        Ok(())
-    }
-
-    pub fn ack_note_review(&self, id: &str, memo_len: u32) -> Result<NoteReview, String> {
-        let review = self
-            .get_note_review(id)
+    pub fn ack_note_review(&self, id: &str, _memo_len: u32) -> Result<NoteReview, String> {
+        if self
+            .get_note(id)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        Self::review_lock_ok(&review, review.base_len, memo_len)?;
-        self.set_llm_review_base(id, None)
-            .map_err(|e| e.to_string())?;
+            .is_none()
+        {
+            return Err("ノートが見つかりません".into());
+        }
+        self.clear_note_ai_notice(id).map_err(|e| e.to_string())?;
         self.get_note_review(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "ノートが見つかりません".to_string())
     }
 
-    pub fn revert_note_review(&self, id: &str, memo_len: u32) -> Result<NoteReview, String> {
-        let review = self
-            .get_note_review(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        Self::review_lock_ok(&review, review.base_len, memo_len)?;
-        self.update_note_memo(id, &review.base)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        self.set_llm_review_base(id, None)
-            .map_err(|e| e.to_string())?;
-        self.get_note_review(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())
+    pub fn revert_note_review(&self, _id: &str, _memo_len: u32) -> Result<NoteReview, String> {
+        Err("未確認の変更はありません。戻すときは履歴の「この版に戻す」を使ってください。".into())
     }
 
     pub fn keep_note_hunk(
         &self,
-        id: &str,
-        hunk_index: u32,
-        base_len: u32,
-        memo_len: u32,
+        _id: &str,
+        _hunk_index: u32,
+        _base_len: u32,
+        _memo_len: u32,
     ) -> Result<NoteReview, String> {
-        let review = self
-            .get_note_review(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        Self::review_lock_ok(&review, base_len, memo_len)?;
-        let next_base = notes_md::keep_hunk(&review.base, &review.memo, hunk_index as usize)?;
-        if next_base == review.memo {
-            self.set_llm_review_base(id, None)
-                .map_err(|e| e.to_string())?;
-        } else {
-            self.set_llm_review_base(id, Some(&next_base))
-                .map_err(|e| e.to_string())?;
-        }
-        self.get_note_review(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())
+        Err("未確認の変更はありません。戻すときは履歴の「この版に戻す」を使ってください。".into())
     }
 
     pub fn revert_note_hunk(
         &self,
-        id: &str,
-        hunk_index: u32,
-        base_len: u32,
-        memo_len: u32,
+        _id: &str,
+        _hunk_index: u32,
+        _base_len: u32,
+        _memo_len: u32,
     ) -> Result<NoteReview, String> {
-        let review = self
-            .get_note_review(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        Self::review_lock_ok(&review, base_len, memo_len)?;
-        let next_memo = notes_md::revert_hunk(&review.base, &review.memo, hunk_index as usize)?;
-        self.update_note_memo(id, &next_memo)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        if next_memo == review.base {
-            self.set_llm_review_base(id, None)
-                .map_err(|e| e.to_string())?;
-        }
-        self.get_note_review(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "ノートが見つかりません".to_string())
+        Err("未確認の変更はありません。戻すときは履歴の「この版に戻す」を使ってください。".into())
     }
 
     pub fn set_note_view_mode(
@@ -5251,43 +5433,187 @@ pub struct NoteReview {
     pub heavy_delete: bool,
 }
 
-fn note_review_from(note: &NoteRow, stored: Option<String>) -> NoteReview {
+fn note_review_from(note: &NoteRow, pending: bool) -> NoteReview {
     let memo_len = note.memo.chars().count() as u32;
-    let Some(base) = stored else {
-        return NoteReview {
-            note_id: note.id.clone(),
-            note_title: note.title.clone(),
-            has_review: false,
-            base: String::new(),
-            memo: note.memo.clone(),
-            base_len: 0,
-            memo_len,
-            hunks: Vec::new(),
-            heavy_delete: false,
-        };
-    };
-    let has_review = base != note.memo;
-    let diff = if has_review {
-        notes_md::line_diff(&base, &note.memo)
-    } else {
-        Vec::new()
-    };
-    let hunks = if has_review {
-        notes_md::diff_hunks(&base, &note.memo)
-    } else {
-        Vec::new()
-    };
     NoteReview {
         note_id: note.id.clone(),
         note_title: note.title.clone(),
-        has_review,
-        base_len: base.chars().count() as u32,
-        base,
+        has_review: pending,
+        base: note.memo.clone(),
         memo: note.memo.clone(),
+        base_len: memo_len,
         memo_len,
-        hunks,
-        heavy_delete: has_review && notes_md::heavy_delete(&diff),
+        hunks: Vec::new(),
+        heavy_delete: false,
     }
+}
+
+const NOTE_ORIGIN_AI: &str = "ai";
+const NOTE_ORIGIN_MANUAL: &str = "manual";
+const NOTE_ORIGIN_REVERT: &str = "revert";
+/// Typing pauses shorter than this update the latest manual version.
+const NOTE_VERSION_COALESCE_SECS: i64 = 120;
+
+#[derive(Debug, Clone)]
+struct NoteVersionStored {
+    id: String,
+    note_id: String,
+    memo: String,
+    title: String,
+    source: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteVersionMeta {
+    pub id: String,
+    pub title: String,
+    pub source: String,
+    pub created_at: i64,
+    pub memo_len: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteHistory {
+    pub versions: Vec<NoteVersionMeta>,
+    pub ai_updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteVersionDiff {
+    pub version_id: String,
+    pub source: String,
+    pub created_at: i64,
+    pub memo: String,
+    pub hunks: Vec<notes_md::DiffHunk>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSnippet {
+    pub id: String,
+    pub title: String,
+    pub updated_at: i64,
+    pub snippet: String,
+}
+
+fn map_note_row(row: &rusqlite::Row<'_>) -> Result<NoteRow, rusqlite::Error> {
+    Ok(NoteRow {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        memo: row.get(2)?,
+        view_mode: row.get(3)?,
+        sort_order: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn read_note_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<Option<NoteRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, memo, view_mode, sort_order, created_at, updated_at
+         FROM notes WHERE id=?1",
+    )?;
+    let mut rows = stmt.query_map([id], map_note_row)?;
+    match rows.next() {
+        Some(Ok(n)) => Ok(Some(n)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+fn latest_note_version_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<Option<NoteVersionStored>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, note_id, memo, title, source, created_at FROM note_versions
+         WHERE note_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([id], |row| {
+        Ok(NoteVersionStored {
+            id: row.get(0)?,
+            note_id: row.get(1)?,
+            memo: row.get(2)?,
+            title: row.get(3)?,
+            source: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    match rows.next() {
+        Some(Ok(v)) => Ok(Some(v)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+fn insert_note_version_conn(
+    conn: &rusqlite::Connection,
+    note_id: &str,
+    memo: &str,
+    title: &str,
+    source: &str,
+    created_at: i64,
+) -> Result<(), rusqlite::Error> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO note_versions(id, note_id, memo, title, source, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![id, note_id, memo, title, source, created_at],
+    )?;
+    Ok(())
+}
+
+fn import_legacy_note_reviews(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    let pending: Vec<(String, String, String, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, memo, llm_review_base, updated_at FROM notes
+             WHERE llm_review_base IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, title, memo, base, updated_at) in pending {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM note_versions WHERE note_id=?1",
+            [&id],
+            |row| row.get(0),
+        )?;
+        if count == 0 && base != memo {
+            insert_note_version_conn(
+                conn,
+                &id,
+                &base,
+                &title,
+                NOTE_ORIGIN_MANUAL,
+                updated_at.saturating_sub(1),
+            )?;
+            insert_note_version_conn(conn, &id, &memo, &title, NOTE_ORIGIN_AI, updated_at)?;
+            conn.execute(
+                "UPDATE notes SET ai_notice_pending=1 WHERE id=?1",
+                [&id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE notes SET llm_review_base=NULL WHERE id=?1",
+            [&id],
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5837,7 +6163,7 @@ mod llm_source_pending_tests {
 }
 
 #[cfg(test)]
-mod note_review_tests {
+mod note_version_tests {
     use super::*;
 
     fn temp_db() -> (std::path::PathBuf, Db) {
@@ -5853,6 +6179,34 @@ mod note_review_tests {
         (dir, db)
     }
 
+    fn memos(db: &Db, id: &str) -> Vec<String> {
+        let history = db.list_note_history(id).unwrap().unwrap();
+        history
+            .versions
+            .iter()
+            .map(|v| {
+                let diff = db.note_version_diff(id, &v.id).unwrap();
+                // The stored memo is the version itself when it is latest, and
+                // otherwise we read it back through revert's source of truth.
+                let _ = diff;
+                v.source.clone()
+            })
+            .collect()
+    }
+
+    fn version_memos(db: &Db, id: &str) -> Vec<(String, String)> {
+        let conn = db.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, memo FROM note_versions WHERE note_id=?1 ORDER BY created_at ASC, rowid ASC",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
     #[test]
     fn create_note_starts_empty() {
         let (dir, db) = temp_db();
@@ -5860,61 +6214,107 @@ mod note_review_tests {
         assert!(note.memo.is_empty());
         let review = db.get_note_review(&note.id).unwrap().unwrap();
         assert!(!review.has_review);
+        assert!(db.list_note_history(&note.id).unwrap().unwrap().versions.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn first_write_sets_base_second_keeps_it() {
+    fn ai_write_is_final_and_keeps_the_previous_version() {
         let (dir, db) = temp_db();
         let note = db.create_note("事件A").unwrap();
         db.update_note_memo(&note.id, "元の本文\n").unwrap();
         db.apply_llm_note_write(&note.id, "一回目\n", None, None)
             .unwrap();
-        let r1 = db.get_note_review(&note.id).unwrap().unwrap();
-        assert!(r1.has_review);
-        assert_eq!(r1.base, "元の本文\n");
-        assert_eq!(r1.memo, "一回目\n");
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(note.memo, "一回目\n");
+        assert!(db.get_note_review(&note.id).unwrap().unwrap().has_review);
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        assert!(history.ai_updated_at.is_some());
+        assert_eq!(history.versions.last().unwrap().source, NOTE_ORIGIN_AI);
         db.apply_llm_note_write(&note.id, "二回目\n", None, None)
             .unwrap();
-        let r2 = db.get_note_review(&note.id).unwrap().unwrap();
-        assert_eq!(r2.base, "元の本文\n");
-        assert_eq!(r2.memo, "二回目\n");
+        let stored = version_memos(&db, &note.id);
+        assert_eq!(stored.last().unwrap().1, "二回目\n");
+        assert!(stored.iter().any(|(_, memo)| memo == "元の本文\n"));
+        assert!(stored.iter().any(|(_, memo)| memo == "一回目\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn ack_clears_base_revert_restores_memo() {
+    fn manual_saves_coalesce_and_a_later_one_is_its_own_version() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        let t0 = 1_700_000_000;
+        db.save_note_content_at(&note.id, "one", None, NOTE_ORIGIN_MANUAL, t0)
+            .unwrap();
+        db.save_note_content_at(&note.id, "two", None, NOTE_ORIGIN_MANUAL, t0 + 30)
+            .unwrap();
+        let stored = version_memos(&db, &note.id);
+        assert_eq!(stored, vec![(NOTE_ORIGIN_MANUAL.to_string(), "two".into())]);
+        db.save_note_content_at(
+            &note.id,
+            "later",
+            None,
+            NOTE_ORIGIN_MANUAL,
+            t0 + 30 + NOTE_VERSION_COALESCE_SECS + 1,
+        )
+        .unwrap();
+        let stored = version_memos(&db, &note.id);
+        assert_eq!(
+            stored,
+            vec![
+                (NOTE_ORIGIN_MANUAL.to_string(), "two".into()),
+                (NOTE_ORIGIN_MANUAL.to_string(), "later".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_keeps_the_pre_revert_version_so_it_can_be_undone() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
         db.update_note_memo(&note.id, "before\n").unwrap();
         db.apply_llm_note_write(&note.id, "after\n", None, None)
             .unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        db.ack_note_review(&note.id, r.memo_len).unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        assert!(!r.has_review);
-        assert_eq!(r.memo, "after\n");
-
-        db.apply_llm_note_write(&note.id, "third\n", None, None)
+        db.ack_note_review(&note.id, 0).unwrap();
+        assert!(!db.get_note_review(&note.id).unwrap().unwrap().has_review);
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        let before = history
+            .versions
+            .iter()
+            .find(|v| v.memo_len == "before\n".chars().count() as u32)
             .unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        db.revert_note_review(&note.id, r.memo_len).unwrap();
+        let after = history.versions.last().unwrap().id.clone();
+        db.revert_note_to_version(&note.id, &before.id).unwrap();
         let note = db.get_note(&note.id).unwrap().unwrap();
-        assert_eq!(note.memo, "after\n");
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        assert!(!r.has_review);
+        assert_eq!(note.memo, "before\n");
+        assert!(version_memos(&db, &note.id)
+            .iter()
+            .any(|(source, memo)| source == NOTE_ORIGIN_REVERT && memo == "before\n"));
+        assert!(version_memos(&db, &note.id)
+            .iter()
+            .any(|(_, memo)| memo == "after\n"));
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        assert!(history.ai_updated_at.is_none());
+        db.revert_note_to_version(&note.id, &after).unwrap();
+        assert_eq!(db.get_note(&note.id).unwrap().unwrap().memo, "after\n");
+        let diff = db.note_version_diff(&note.id, &before.id).unwrap();
+        assert!(!diff.hunks.is_empty());
+        let _ = memos(&db, &note.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn same_memo_does_not_open_review() {
+    fn same_memo_does_not_add_a_version() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
         db.update_note_memo(&note.id, "同じ\n").unwrap();
+        let before = version_memos(&db, &note.id).len();
         db.apply_llm_note_write(&note.id, "同じ\n", None, None)
             .unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        assert!(!r.has_review);
+        assert_eq!(version_memos(&db, &note.id).len(), before);
+        assert!(!db.get_note_review(&note.id).unwrap().unwrap().has_review);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5922,29 +6322,15 @@ mod note_review_tests {
     fn empty_memo_is_rejected() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
-        let err = db.apply_llm_note_write(&note.id, "  \n", None, None).unwrap_err();
+        let err = db
+            .apply_llm_note_write(&note.id, "  \n", None, None)
+            .unwrap_err();
         assert!(err.contains("空"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn stale_hunk_lock_errors() {
-        let (dir, db) = temp_db();
-        let note = db.create_note("n").unwrap();
-        db.update_note_memo(&note.id, "a\nx\nb\nc\nd\ny\ne\n")
-            .unwrap();
-        db.apply_llm_note_write(&note.id, "a\nX\nb\nc\nd\nY\ne\n", None, None)
-            .unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        let err = db
-            .keep_note_hunk(&note.id, 0, r.base_len, r.memo_len + 1)
-            .unwrap_err();
-        assert!(err.contains("変わって"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn long_note_requires_heading() {
+    fn long_note_requires_heading_and_the_section_is_versioned() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
         let long = "あ".repeat(notes_md::NOTE_FULL_CHAR_CAP + 1);
@@ -5957,24 +6343,58 @@ mod note_review_tests {
             .unwrap();
         let note = db.get_note(&note.id).unwrap().unwrap();
         assert!(note.memo.contains("新見出し"));
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        assert_eq!(history.versions.last().unwrap().source, NOTE_ORIGIN_AI);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn keep_hunk_shrinks_review() {
+    fn legacy_pending_review_becomes_two_versions() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
-        db.update_note_memo(&note.id, "a\nx\nb\nc\nd\ny\ne\n")
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "UPDATE notes SET memo=?1, llm_review_base=?2 WHERE id=?3",
+                rusqlite::params!["新しい\n", "元\n", note.id],
+            )
             .unwrap();
-        db.apply_llm_note_write(&note.id, "a\nX\nb\nc\nd\nY\ne\n", None, None)
+            import_legacy_note_reviews(&conn).unwrap();
+        }
+        let note = db.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(note.memo, "新しい\n");
+        let stored = version_memos(&db, &note.id);
+        assert_eq!(
+            stored,
+            vec![
+                (NOTE_ORIGIN_MANUAL.to_string(), "元\n".into()),
+                (NOTE_ORIGIN_AI.to_string(), "新しい\n".into()),
+            ]
+        );
+        assert!(db.get_note_review(&note.id).unwrap().unwrap().has_review);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_matches_title_and_memo_not_keeps() {
+        let (dir, db) = temp_db();
+        let hit = db.create_note("解除").unwrap();
+        db.update_note_memo(&hit.id, "本文は別").unwrap();
+        let body = db.create_note("別件").unwrap();
+        db.update_note_memo(&body.id, "ＡＢＣの契約").unwrap();
+        let keep_only = db.create_note("キープだけ").unwrap();
+        db.insert_note_item(&keep_only.id, "カタカナ", "", r#"{"body":"カタカナ"}"#)
             .unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        assert_eq!(r.hunks.len(), 2);
-        db.keep_note_hunk(&note.id, 0, r.base_len, r.memo_len)
-            .unwrap();
-        let r = db.get_note_review(&note.id).unwrap().unwrap();
-        assert_eq!(r.hunks.len(), 1);
-        assert_eq!(r.base, "a\nX\nb\nc\nd\ny\ne\n");
+        let (found, extra) = db.search_note_memos("abc", 8).unwrap();
+        assert!(!extra);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, body.id);
+        assert!(found[0].snippet.contains("ＡＢＣ"));
+        let (by_title, _) = db.search_note_memos("解除", 8).unwrap();
+        assert_eq!(by_title.len(), 1);
+        assert_eq!(by_title[0].id, hit.id);
+        let (none, _) = db.search_note_memos("カタカナ", 8).unwrap();
+        assert!(none.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

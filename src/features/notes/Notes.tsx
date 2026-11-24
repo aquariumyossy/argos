@@ -31,8 +31,12 @@ import { openPreview } from "../preview/openPreview";
 import MemoMdHelper from "./MemoMdHelper";
 import { applyMemoMdInsert, type MemoMdKind } from "./memoMdInsert";
 import NoteMemoView from "./NoteMemoView";
-import { NoteInlineDiff, NoteReviewBar } from "./NoteInlineReview";
-import { ackNoteReview, waitForNoteReviewCommands, type NoteReview } from "./noteReview";
+import {
+  NoteHistoryControls,
+  NoteVersionDiffView,
+  type NoteHistory,
+} from "./NoteHistory";
+import type { NoteDiffHunk } from "./noteReview";
 import {
   memoHasOpenWork,
   parseNoteTasks,
@@ -256,6 +260,7 @@ type NoteItemSnapshot = {
   mailFrom?: string;
   mailDate?: string;
   mailFolder?: string;
+  badge?: boolean;
 };
 
 function parseSnapshot(raw: string): NoteItemSnapshot {
@@ -274,6 +279,7 @@ function parseSnapshot(raw: string): NoteItemSnapshot {
       mailFrom: v.mailFrom ?? "",
       mailDate: v.mailDate ?? "",
       mailFolder: v.mailFolder ?? "",
+      badge: v.badge === true,
     };
   } catch {
     return {
@@ -479,9 +485,14 @@ export default function Notes() {
   const [resizingSplit, setResizingSplit] = useState(false);
   const [memoEdit, setMemoEdit] = useState(loadMemoEdit);
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>(loadSidebarFilter);
-  const [noteReview, setNoteReview] = useState<NoteReview | null>(null);
-  const noteReviewRef = useRef<NoteReview | null>(null);
-  noteReviewRef.current = noteReview;
+  const [history, setHistory] = useState<NoteHistory | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [diffVersionId, setDiffVersionId] = useState<string | null>(null);
+  const [versionDiff, setVersionDiff] = useState<{
+    memo: string;
+    hunks: NoteDiffHunk[];
+  } | null>(null);
+  const [historyBusy, setHistoryBusy] = useState(false);
   const printMenuRef = useRef<HTMLDivElement | null>(null);
   const chatNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -493,7 +504,7 @@ export default function Notes() {
   const memoDirtyRef = useRef(false);
   const pendingMemoRef = useRef<{ id: string; memo: string } | null>(null);
   const skipMemoReloadRef = useRef<{ id: string; at: number } | null>(null);
-  const loadReviewRef = useRef<(id: string | undefined) => Promise<void>>(
+  const loadHistoryRef = useRef<(id: string | undefined) => Promise<void>>(
     async () => {},
   );
   const activeRef = useRef<NoteRow | null>(null);
@@ -527,7 +538,6 @@ export default function Notes() {
       clearTimeout(noteMemoTimer.current);
       noteMemoTimer.current = null;
     }
-    await waitForNoteReviewCommands().catch(() => undefined);
     const pending = pendingMemoRef.current;
     if (!pending) return;
     pendingMemoRef.current = null;
@@ -548,7 +558,7 @@ export default function Notes() {
           n.id === row.id ? { ...n, memo: row.memo, updatedAt: row.updatedAt } : n,
         ),
       );
-      void loadReviewRef.current(pending.id);
+      void loadHistoryRef.current(pending.id);
     } catch (e) {
       memoDirtyRef.current = true;
       pendingMemoRef.current = pending;
@@ -585,30 +595,35 @@ export default function Notes() {
     }
   }, []);
 
-  const loadReview = useCallback(async (noteId: string | undefined) => {
+  const loadHistory = useCallback(async (noteId: string | undefined) => {
     if (!noteId) {
-      setNoteReview(null);
+      setHistory(null);
+      setDiffVersionId(null);
+      setVersionDiff(null);
       return;
     }
     try {
-      const row = await invoke<NoteReview | null>("get_note_review", { noteId });
-      setNoteReview(row && row.hasReview ? row : null);
+      const row = await invoke<NoteHistory>("list_note_versions", { noteId });
+      setHistory(row);
+      setDiffVersionId((cur) =>
+        cur && row.versions.some((v) => v.id === cur) ? cur : null,
+      );
     } catch {
-      setNoteReview(null);
+      setHistory(null);
     }
   }, []);
-  loadReviewRef.current = loadReview;
+  loadHistoryRef.current = loadHistory;
 
   const refresh = useCallback(async () => {
     try {
       await loadNotes();
       notesReadyRef.current = true;
       setError("");
-      await loadReview(activeRef.current?.id);
+      await loadHistory(activeRef.current?.id);
     } catch (e) {
       setError(formatInvokeError(e));
     }
-  }, [loadNotes, loadReview]);
+  }, [loadNotes, loadHistory]);
 
   const bootstrapNotes = useCallback(async () => {
     if (bootstrappingRef.current || notesReadyRef.current) return;
@@ -624,7 +639,7 @@ export default function Notes() {
           await loadNotes();
           notesReadyRef.current = true;
           setError("");
-          await loadReview(activeRef.current?.id);
+          await loadHistory(activeRef.current?.id);
           return;
         } catch (e) {
           lastError = e;
@@ -634,7 +649,7 @@ export default function Notes() {
     } finally {
       bootstrappingRef.current = false;
     }
-  }, [loadNotes, loadReview]);
+  }, [loadNotes, loadHistory]);
 
   useEffect(() => {
     void bootstrapNotes();
@@ -750,7 +765,8 @@ export default function Notes() {
         void (async () => {
           await loadNotes();
           if (cancelled) return;
-          await loadReview(activeRef.current?.id);
+          setDiffVersionId(null);
+          await loadHistory(activeRef.current?.id);
         })();
         return;
       }
@@ -790,7 +806,7 @@ export default function Notes() {
       cancelled = true;
       unlisten?.();
     };
-  }, [flushNoteMemo, refresh, loadNotes, loadReview]);
+  }, [flushNoteMemo, refresh, loadNotes, loadHistory]);
 
   useEffect(() => {
     let cancelled = false;
@@ -800,7 +816,8 @@ export default function Notes() {
       if (noteId && activeRef.current && noteId !== activeRef.current.id) {
         return;
       }
-      void loadReview(activeRef.current?.id);
+      setDiffVersionId(null);
+      void loadHistory(activeRef.current?.id);
     }).then((fn) => {
       if (cancelled) fn();
       else unlisten = fn;
@@ -809,7 +826,30 @@ export default function Notes() {
       cancelled = true;
       unlisten?.();
     };
-  }, [loadReview]);
+  }, [loadHistory]);
+
+  useEffect(() => {
+    const noteId = active?.id;
+    const versionId = diffVersionId;
+    if (!noteId || !versionId) {
+      setVersionDiff(null);
+      return;
+    }
+    let cancelled = false;
+    void invoke<{ memo: string; hunks: NoteDiffHunk[] }>("note_version_diff", {
+      noteId,
+      versionId,
+    })
+      .then((row) => {
+        if (!cancelled) setVersionDiff({ memo: row.memo, hunks: row.hunks ?? [] });
+      })
+      .catch((e) => {
+        if (!cancelled) setError(formatInvokeError(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [diffVersionId, active?.id]);
 
   useEffect(() => {
     return () => {
@@ -1067,77 +1107,36 @@ export default function Notes() {
     [flushNoteMemo],
   );
 
-  const confirmReview = useCallback(async (): Promise<boolean> => {
-    const review = noteReviewRef.current;
-    if (!review?.hasReview) return true;
-    try {
-      const next = await ackNoteReview(review);
-      noteReviewRef.current = next.hasReview ? next : null;
-      setNoteReview(noteReviewRef.current);
-      return !next.hasReview;
-    } catch (e) {
-      setError(formatInvokeError(e));
-      return false;
-    }
-  }, []);
-
-  const applyReview = useCallback((row: NoteReview) => {
-    noteReviewRef.current = row.hasReview ? row : null;
-    setNoteReview(noteReviewRef.current);
-    const pending = pendingMemoRef.current;
-    const keepTyped =
-      !row.hasReview &&
-      pending?.id === row.noteId &&
-      pending.memo !== row.memo &&
-      pending.memo.startsWith(row.memo);
-    if (keepTyped) return;
-    setActive((prev) => {
-      if (!prev || prev.id !== row.noteId || prev.memo === row.memo) return prev;
-      return { ...prev, memo: row.memo };
-    });
-    setNotes((prev) =>
-      prev.map((n) =>
-        n.id === row.noteId && n.memo !== row.memo ? { ...n, memo: row.memo } : n,
-      ),
-    );
-    if (pending?.id === row.noteId && pending.memo !== row.memo) {
-      pendingMemoRef.current = null;
-      memoDirtyRef.current = false;
-      if (noteMemoTimer.current) {
-        clearTimeout(noteMemoTimer.current);
-        noteMemoTimer.current = null;
-      }
-    }
-  }, []);
-
   const onNoteMemoChange = useCallback(
     (memo: string) => {
-      if (noteReviewRef.current?.hasReview) {
-        void (async () => {
-          const ok = await confirmReview();
-          if (!ok) return;
-          applyMemoLocal(memo);
-        })();
-        return;
-      }
+      setDiffVersionId(null);
       applyMemoLocal(memo);
-    },
-    [applyMemoLocal, confirmReview],
-  );
-
-  const beginEditFromReview = useCallback(
-    (extra: string, baseMemo: string) => {
-      // The diff calls this inside flushSync, so the textarea is mounted and
-      // focused before the key or IME composition continues.
-      setMemoEdit(true);
-      const next = extra ? baseMemo + extra : baseMemo;
-      pendingMemoCaretRef.current = next.length;
-      if (extra) applyMemoLocal(next);
-      noteReviewRef.current = null;
-      setNoteReview(null);
     },
     [applyMemoLocal],
   );
+
+  const restoreVersion = useCallback(async () => {
+    const noteId = activeRef.current?.id;
+    const versionId = diffVersionId;
+    if (!noteId || !versionId || historyBusy) return;
+    setHistoryBusy(true);
+    try {
+      const row = await invoke<NoteRow>("revert_note_to_version", {
+        noteId,
+        versionId,
+      });
+      setDiffVersionId(null);
+      setVersionDiff(null);
+      setActive((prev) => (prev && prev.id === row.id ? row : prev));
+      setNotes((prev) => prev.map((n) => (n.id === row.id ? row : n)));
+      await loadHistory(row.id);
+      setError("");
+    } catch (e) {
+      setError(formatInvokeError(e));
+    } finally {
+      setHistoryBusy(false);
+    }
+  }, [diffVersionId, historyBusy, loadHistory]);
 
   const captureMemoView = useCallback((el?: HTMLTextAreaElement | null) => {
     const t = el ?? memoTextareaRef.current;
@@ -1171,7 +1170,7 @@ export default function Notes() {
         });
       });
     }
-  }, [active?.memo, memoEdit, noteReview?.hasReview]);
+  }, [active?.memo, memoEdit, diffVersionId]);
 
   const onInsertMemoMd = useCallback(
     (kind: MemoMdKind) => {
@@ -1253,6 +1252,22 @@ export default function Notes() {
     },
     [active],
   );
+
+  const openKeepBadge = useCallback(async (path: string) => {
+    const target = path.trim();
+    if (!target) return;
+    try {
+      const lower = target.toLowerCase();
+      if (lower.startsWith("http://") || lower.startsWith("https://")) {
+        await invoke("open_web_url", { url: target });
+      } else {
+        await invoke("open_hit", { path: target });
+      }
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
 
   const openPath = useCallback(async (path: string) => {
     if (!path) return;
@@ -1970,13 +1985,6 @@ export default function Notes() {
 
             {error ? <p className="notes-error">{error}</p> : null}
             {chatNotice ? <p className="notes-chat-notice">{chatNotice}</p> : null}
-            {noteReview?.hasReview ? (
-              <NoteReviewBar
-                review={noteReview}
-                onChange={applyReview}
-                onError={setError}
-              />
-            ) : null}
 
             <div
               className={
@@ -1994,6 +2002,16 @@ export default function Notes() {
                 <div className="notes-pane-head">
                   <span className="notes-pane-head-title">メモ</span>
                   <div className="notes-pane-head-actions">
+                    <NoteHistoryControls
+                      history={history}
+                      open={historyOpen}
+                      selectedId={diffVersionId}
+                      onToggleOpen={() => setHistoryOpen((v) => !v)}
+                      onSelect={(id) => {
+                        setDiffVersionId(id);
+                        if (id) setHistoryOpen(true);
+                      }}
+                    />
                     <MemoMdHelper
                       key={active.id}
                       onPick={onInsertMemoMd}
@@ -2011,17 +2029,8 @@ export default function Notes() {
                         type="button"
                         className={memoEdit ? "active" : ""}
                         onClick={() => {
-                          if (!noteReviewRef.current?.hasReview) {
-                            setMemoEdit(true);
-                            return;
-                          }
-                          const memo = noteReviewRef.current.memo;
-                          void (async () => {
-                            const ok = await confirmReview();
-                            if (!ok) return;
-                            pendingMemoCaretRef.current = memo.length;
-                            setMemoEdit(true);
-                          })();
+                          setDiffVersionId(null);
+                          setMemoEdit(true);
                         }}
                       >
                         編集
@@ -2030,12 +2039,13 @@ export default function Notes() {
                   </div>
                 </div>
                 <div className="notes-pane-body">
-                  {noteReview?.hasReview ? (
-                    <NoteInlineDiff
-                      review={noteReview}
-                      onChange={applyReview}
-                      onError={setError}
-                      onBeginEdit={beginEditFromReview}
+                  {diffVersionId && versionDiff ? (
+                    <NoteVersionDiffView
+                      memo={versionDiff.memo}
+                      hunks={versionDiff.hunks}
+                      busy={historyBusy}
+                      onRestore={() => void restoreVersion()}
+                      onClose={() => setDiffVersionId(null)}
                     />
                   ) : memoEdit ? (
                     <textarea
@@ -2115,7 +2125,7 @@ export default function Notes() {
                 <div className="notes-pane-body">
             {parsedItems.length === 0 ? (
               <p className="notes-empty-items">
-                まだキープがありません。検索ポップアップの段落からキープできます。
+                まだキープがありません。検索の段落と、チャットの出典からキープできます。
               </p>
             ) : (
               <ul
@@ -2125,6 +2135,30 @@ export default function Notes() {
               >
                 {parsedItems.map(({ row, snap }) => {
                   const legal = legalFormattedById.get(row.id);
+                  if (snap.badge) {
+                    const label = snap.title.trim() || snap.path.trim() || "出典";
+                    return (
+                      <li key={row.id} className="notes-item notes-item--badge">
+                        <button
+                          type="button"
+                          className="notes-keep-badge"
+                          title={snap.path}
+                          onClick={() => void openKeepBadge(snap.path)}
+                        >
+                          {label}
+                        </button>
+                        <button
+                          type="button"
+                          className="notes-icon-btn danger"
+                          title="キープを削除"
+                          aria-label="キープを削除"
+                          onClick={() => void removeItem(row.id)}
+                        >
+                          <IconTrash />
+                        </button>
+                      </li>
+                    );
+                  }
                   return (
                   <li
                     key={row.id}

@@ -169,10 +169,10 @@ fn search_web_tool() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_SEARCH_WEB,
-            "description": "公開ウェブだけを検索する。索引・ファイル・メールは検索しない。添付出典で足りるときは呼ばない。\
+            "description": "公開ウェブだけを検索する。索引・ファイル・メールは検索しない。調査では先に list_notes の query で関連ノートを探す。ノートと添付出典で足りるときは呼ばない。\
 クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
 結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。\
-公開情報が必要な質問ではこのツールを呼ぶ。",
+公開情報が必要で、ノートで足りないときはこのツールを呼ぶ。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -239,6 +239,14 @@ pub fn tools_schema_with(
 送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
     }
     .to_string();
+    search_desc.insert_str(
+        0,
+        "調査では先に list_notes の query で関連ノートを探す。ノートで足りないときだけ使う。",
+    );
+    search_desc = search_desc.replace(
+        "公開情報が必要な質問ではこのツールを呼ぶ。",
+        "公開情報が必要で、ノートで足りないときはこのツールを呼ぶ。",
+    );
     if remote_index && !remote_only {
         search_desc.push_str(
             "別PCの共有フォルダも検索する。その出典には（リモート）が付く。メールと送信者はこのPCだけ。期間はホストが対応しているときだけ別PCにも効く。",
@@ -405,8 +413,13 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_LIST_NOTES,
-            "description": "ノートの id・題名・更新日時。対象ノートが未設定のとき、どれを対象にするか確認するために使う。メモ本文は返さない。",
-            "parameters": { "type": "object", "properties": {} }
+            "description": "ノートの題名とメモ本文を検索する。query に調べたい語を渡すと、一致したノートの id・題名・更新日時と短い抜粋を返す。query が空なら一覧だけ（本文なし）。調査の質問では、索引やウェブを検索するより先に、質問の語でこれを呼ぶ。使ったノートは返った出典番号 [n] を答えに付ける。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "題名とメモを検索する語。空なら一覧。" }
+                }
+            }
         }
     }));
     tools.push(json!({
@@ -430,12 +443,24 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_CREATE_NOTE,
-            "description": "ノートを新規作成してメモを書き、この会話の対象にする。書いた内容はすぐ反映される。",
+            "description": "ノートを新規作成してメモを書き、この会話の対象にする。書いた内容はすぐ反映され、版の履歴に残る。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "題名" },
-                    "memo": { "type": "string", "description": "メモ本文（Markdown）" }
+                    "memo": { "type": "string", "description": "メモ本文（Markdown）" },
+                    "keeps": {
+                        "type": "array",
+                        "description": "一緒にキープする出典。索引は id（paragraph_id）。ウェブは url と title。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "索引ヒットの id（paragraph_id）" },
+                                "url": { "type": "string", "description": "ウェブページの URL" },
+                                "title": { "type": "string", "description": "ウェブページの題名" }
+                            }
+                        }
+                    }
                 },
                 "required": ["memo"]
             }
@@ -445,14 +470,26 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_WRITE_NOTE,
-            "description": "ノートのメモを書き換える。書いた内容はすぐ反映される。採否はユーザーが行う。note_id を省略したら対象ノート。heading があればその区画だけ置換（無ければ新設）。全文置換するときは変えない箇所も残してメモ全体を渡す。長いノートは heading 必須。",
+            "description": "ノートのメモを書き換える。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。heading があればその区画だけ置換（無ければ新設）。全文置換するときは変えない箇所も残してメモ全体を渡す。長いノートは heading 必須。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "note_id": { "type": "string", "description": "ノート id。空なら対象ノート。" },
                     "title": { "type": "string", "description": "題名を変えるとき" },
                     "heading": { "type": "string", "description": "対象の見出し。空なら全文置換。" },
-                    "memo": { "type": "string", "description": "新しい本文（Markdown）。全文置換ならメモ全体。" }
+                    "memo": { "type": "string", "description": "新しい本文（Markdown）。全文置換ならメモ全体。" },
+                    "keeps": {
+                        "type": "array",
+                        "description": "一緒にキープする出典。索引は id（paragraph_id）。ウェブは url と title。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "索引ヒットの id（paragraph_id）" },
+                                "url": { "type": "string", "description": "ウェブページの URL" },
+                                "title": { "type": "string", "description": "ウェブページの題名" }
+                            }
+                        }
+                    }
                 },
                 "required": ["memo"]
             }
@@ -839,7 +876,7 @@ pub fn format_search_date_system_line(mail_days_back: u32) -> String {
 }
 
 pub fn format_web_search_system_line() -> String {
-    "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。添付出典とインデックスを優先してください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_index を呼んでください。".into()
+    "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。調査では先に list_notes で関連ノートを探し、ノートと添付出典で足りるときはインデックスもウェブも検索しないでください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要で、ノートで足りないときは search_index を呼んでください。".into()
 }
 
 const INDEX_SEARCH_PROMPT_SENTENCE: &str =
@@ -873,7 +910,7 @@ pub fn apply_index_search_off(system: &mut String) {
 
 /// Web search without the index. Does not name `search_index`.
 pub fn format_web_only_system_line() -> String {
-    "\nウェブ検索が有効です。インデックス検索はオフです。公開ウェブは search_web で検索します。索引・ファイル・メールは検索しません。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要な質問では search_web を呼んでください。".into()
+    "\nウェブ検索が有効です。インデックス検索はオフです。公開ウェブは search_web で検索します。索引・ファイル・メールは検索しません。調査では先に list_notes で関連ノートを探し、ノートで足りるときはウェブも検索しないでください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要で、ノートで足りないときは search_web を呼んでください。".into()
 }
 
 pub fn thread_has_relook_image(sources: &[crate::db::LlmSourceRow]) -> bool {
@@ -1462,7 +1499,7 @@ pub fn format_note_target_system_line(title: &str, memo: &str) -> String {
         format!("見出し: {}。", heads.join("、"))
     };
     format!(
-        "\n対象ノートは「{title}」。{outline}create_note / read_note / write_note でメモを読めます。書いた内容はすぐ反映されます。採否はユーザーがノートで行います。"
+        "\n対象ノートは「{title}」。{outline}create_note / read_note / write_note でメモを読めます。書いた内容はすぐ反映され、版の履歴に残ります。"
     )
 }
 
@@ -1748,23 +1785,289 @@ fn bind_thread_note(state: &AppState, thread_id: &str, note_id: &str) {
     let _ = state.db.set_llm_thread_note(thread_id, note_id);
 }
 
-fn tool_list_notes(state: &AppState) -> ToolExec {
-    match state.db.list_notes() {
-        Ok(list) if list.is_empty() => ToolExec::text("ノートはありません。"),
-        Ok(list) => {
-            let mut lines = vec!["id\t題名\tupdated_at".to_string()];
-            for n in list {
-                lines.push(format!(
-                    "{}\t{}\t{}",
-                    n.id,
-                    n.title.replace(['\t', '\n'], " "),
-                    n.updated_at
-                ));
-            }
-            ToolExec::text(lines.join("\n"))
+fn note_source_path(id: &str) -> String {
+    format!("note:{id}")
+}
+
+fn persist_note_source(
+    state: &AppState,
+    thread_id: &str,
+    note_id: &str,
+    title: &str,
+    body: &str,
+    new_rows: &mut Vec<LlmSourceRow>,
+    already: &mut Vec<String>,
+    consumed: &mut Vec<(String, i64)>,
+) -> Result<(), String> {
+    let path = note_source_path(note_id);
+    let body = cap_chars(body.trim(), TOOL_BODY_CAP);
+    let stored_body = if body.trim().is_empty() {
+        "（抜粋なし）".to_string()
+    } else {
+        body
+    };
+    if let Some(existing) = state
+        .db
+        .find_llm_source_by_path(thread_id, &path)
+        .map_err(|e| e.to_string())?
+    {
+        if existing.injected_user_message_id.trim().is_empty() {
+            consumed.push((existing.id.clone(), existing.cite_no));
+            new_rows.push(existing);
+        } else {
+            already.push(already_line(&existing));
         }
-        Err(e) => ToolExec::text(format!("ツールエラー: {e}")),
+        return Ok(());
     }
+    let title = if title.trim().is_empty() {
+        "無題のノート"
+    } else {
+        title.trim()
+    };
+    let (row, _) = state
+        .db
+        .insert_llm_source_full(
+            thread_id,
+            "tool",
+            &path,
+            title,
+            "",
+            &stored_body,
+            "",
+            "unit",
+            "note",
+            "",
+            "",
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    consumed.push((row.id.clone(), row.cite_no));
+    new_rows.push(row);
+    Ok(())
+}
+
+fn tool_list_notes(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if query.is_empty() {
+        return match state.db.list_notes() {
+            Ok(list) if list.is_empty() => ToolExec::text("ノートはありません。"),
+            Ok(list) => {
+                let mut lines = vec!["id\t題名\tupdated_at".to_string()];
+                for n in list {
+                    lines.push(format!(
+                        "{}\t{}\t{}",
+                        n.id,
+                        n.title.replace(['\t', '\n'], " "),
+                        n.updated_at
+                    ));
+                }
+                ToolExec::text(lines.join("\n"))
+            }
+            Err(e) => ToolExec::text(format!("ツールエラー: {e}")),
+        };
+    }
+    let (hits, extra) = match state
+        .db
+        .search_note_memos(query, crate::notes_search::NOTE_SEARCH_LIMIT)
+    {
+        Ok(v) => v,
+        Err(e) => return ToolExec::text(format!("ツールエラー: {e}")),
+    };
+    if hits.is_empty() {
+        return ToolExec::text("一致するノートはありません。");
+    }
+    let mut new_rows = Vec::new();
+    let mut already = Vec::new();
+    let mut consumed = Vec::new();
+    for hit in &hits {
+        if let Err(e) = persist_note_source(
+            state,
+            thread_id,
+            &hit.id,
+            &hit.title,
+            &hit.snippet,
+            &mut new_rows,
+            &mut already,
+            &mut consumed,
+        ) {
+            return ToolExec::text(format!("ツールエラー: {e}"));
+        }
+    }
+    let mut content = String::new();
+    if !new_rows.is_empty() {
+        content.push_str(&format_sources(&new_rows));
+    }
+    if !already.is_empty() {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&already.join("\n"));
+        content.push('\n');
+    }
+    content.push_str("使ったノートは出典番号 [n] を付けてください。\n");
+    for hit in &hits {
+        content.push_str(&format!(
+            "note_id={}\t{}\n",
+            hit.id,
+            hit.title.replace(['\t', '\n'], " ")
+        ));
+    }
+    if extra {
+        content.push_str("他にも一致があります。query を狭めてください。\n");
+    }
+    ToolExec {
+        content,
+        consumed,
+        saved_file: None,
+        wrote_note_id: None,
+    }
+}
+
+fn with_note_cite(state: &AppState, thread_id: &str, note_id: &str, title: &str, body: &str, text: String) -> ToolExec {
+    let mut new_rows = Vec::new();
+    let mut already = Vec::new();
+    let mut consumed = Vec::new();
+    if let Err(e) = persist_note_source(
+        state,
+        thread_id,
+        note_id,
+        title,
+        body,
+        &mut new_rows,
+        &mut already,
+        &mut consumed,
+    ) {
+        return ToolExec::text(format!("{text}\nツールエラー: {e}"));
+    }
+    let mut content = text;
+    if let Some(row) = new_rows.first() {
+        content = format!(
+            "[{}] {content}\n答えに使うときは [{}] を付けてください。",
+            row.cite_no, row.cite_no
+        );
+    } else if let Some(line) = already.first() {
+        content = format!("{line}\n{content}");
+    }
+    ToolExec {
+        content,
+        consumed,
+        saved_file: None,
+        wrote_note_id: None,
+    }
+}
+
+fn apply_note_keeps(state: &AppState, note_id: &str, args: &Value) -> String {
+    let Some(value) = args.get("keeps") else {
+        return String::new();
+    };
+    let Some(items) = value.as_array() else {
+        return "\nkeeps は配列で指定してください。".into();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    for item in items {
+        match keep_one(state, note_id, item) {
+            Ok(line) => lines.push(line),
+            Err(e) => lines.push(e),
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", lines.join("\n"))
+    }
+}
+
+fn keep_one(state: &AppState, note_id: &str, item: &Value) -> Result<String, String> {
+    let id = item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let url = item
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let title = item
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let badge = if !id.is_empty() {
+        keep_from_index_id(state, id)?
+    } else if !url.is_empty() {
+        keep_from_web(url, title)?
+    } else {
+        return Err("キープには id か url が必要です。".into());
+    };
+    let title = badge.title.clone();
+    let added = crate::note_keep::add_badge(&state.db, note_id, &badge)?;
+    if added.created {
+        Ok(format!("キープに追加しました: {title}"))
+    } else {
+        Ok(format!("すでにキープ済みです: {title}"))
+    }
+}
+
+fn keep_from_web(url: &str, title: &str) -> Result<crate::note_keep::KeepBadge, String> {
+    if !crate::note_keep::is_http_url(url) {
+        return Err("url は http(s) で指定してください。".into());
+    }
+    let url = url.trim();
+    let title = title.trim();
+    let title = if title.is_empty() {
+        url.to_string()
+    } else {
+        title.to_string()
+    };
+    Ok(crate::note_keep::KeepBadge {
+        path: url.to_string(),
+        title,
+        source: "web".into(),
+        paragraph_id: url.to_string(),
+        body: String::new(),
+        query: String::new(),
+    })
+}
+
+fn keep_from_index_id(state: &AppState, id: &str) -> Result<crate::note_keep::KeepBadge, String> {
+    let id = id.trim();
+    let mut path = crate::note_keep::path_before_unit(id);
+    let mut title = crate::note_keep::file_title(&path);
+    let mut body = String::new();
+    let mut source = "index".to_string();
+    if let Ok(Some(hit)) = preview_hit(state, id, true) {
+        if !hit.path.trim().is_empty() {
+            path = hit.path.clone();
+        }
+        if !hit.title.trim().is_empty() {
+            title = hit.title.clone();
+        }
+        let text = hit_body_capped(&hit, 400);
+        if !text.trim().is_empty() {
+            body = text;
+        }
+        if hit.source.eq_ignore_ascii_case("remote") {
+            source = "remote".into();
+        }
+    }
+    if path.trim().is_empty() {
+        return Err(format!("索引に id がありません: {id}"));
+    }
+    Ok(crate::note_keep::KeepBadge {
+        path,
+        title,
+        source,
+        paragraph_id: id.to_string(),
+        body,
+        query: String::new(),
+    })
 }
 
 fn tool_read_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
@@ -1797,14 +2100,28 @@ fn tool_read_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
             }
         };
         let body = cap_chars(&text, crate::notes_md::NOTE_FULL_CHAR_CAP);
-        return ToolExec::text(format!("{head}\n\n{body}"));
+        return with_note_cite(
+            state,
+            thread_id,
+            &note.id,
+            &note.title,
+            &body,
+            format!("{head}\n\n{body}"),
+        );
     }
     if chars > crate::notes_md::NOTE_FULL_CHAR_CAP {
         return ToolExec::text(format!(
             "{head}\n\nノートが長いため全文は返しません。heading を指定して区画ごとに読み、write_note も heading 付きで書いてください。"
         ));
     }
-    ToolExec::text(format!("{head}\n\n{}", note.memo))
+    with_note_cite(
+        state,
+        thread_id,
+        &note.id,
+        &note.title,
+        &note.memo,
+        format!("{head}\n\n{}", note.memo),
+    )
 }
 
 fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
@@ -1828,9 +2145,10 @@ fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec
     match state.db.apply_llm_note_write(&note.id, memo, None, None) {
         Ok(note) => {
             bind_thread_note(state, thread_id, &note.id);
+            let keeps = apply_note_keeps(state, &note.id, args);
             ToolExec {
                 content: format!(
-                    "ノート『{}』を作成してメモに書きました。id={}。反映済みです。採否はユーザーがノートで行います。",
+                    "ノート『{}』を作成してメモに書きました。id={}。反映済みです。履歴に残っています。{keeps}",
                     note.title, note.id
                 ),
                 consumed: Vec::new(),
@@ -1870,8 +2188,9 @@ fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
     {
         Ok(note) => {
             bind_thread_note(state, thread_id, &note.id);
+            let keeps = apply_note_keeps(state, &note.id, args);
             let content = format!(
-                "ノート『{}』のメモを更新しました。id={}。反映済みです。採否はユーザーがノートで行います。",
+                "ノート『{}』のメモを更新しました。id={}。反映済みです。履歴に残っています。{keeps}",
                 note.title, note.id
             );
             ToolExec {
@@ -3266,7 +3585,7 @@ fn execute_tool_inner(
                 saved_file: None, wrote_note_id: None,
             })
         }
-        TOOL_LIST_NOTES => Ok(tool_list_notes(state)),
+        TOOL_LIST_NOTES => Ok(tool_list_notes(state, thread_id, &args)),
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
         TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
@@ -5446,7 +5765,8 @@ mod tests {
         assert!(!both.contains(TOOL_SEARCH_WEB));
         let line = format_web_search_system_line();
         assert!(line.contains("search_index を呼ぶと同じ語で公開ウェブも検索します"));
-        assert!(line.contains("公開情報が必要な質問では search_index を呼んでください"));
+        assert!(line.contains("公開情報が必要で、ノートで足りないときは search_index を呼んでください"));
+        assert!(line.contains("先に list_notes で関連ノートを探し"));
         assert_eq!(
             format_calendar_system_line_for(true),
             format_calendar_system_line()

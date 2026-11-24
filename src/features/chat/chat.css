@@ -880,6 +880,13 @@ body.md-col-resizing {
   margin-top: 8px;
 }
 
+.chat-cite-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+}
+
 .chat-cite-badge {
   border: 1px solid var(--line);
   background: var(--bg-elevated);

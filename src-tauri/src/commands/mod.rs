@@ -5,8 +5,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 use crate::db::{
-    EmailFolderRow, ExcludePathRow, FolderRow, NoteItemRow, NoteRow, SearchHistoryTermRow,
-    SearchWordImport, SearchWordImportResult, SearchWordRow, Settings,
+    EmailFolderRow, ExcludePathRow, FolderRow, NoteHistory, NoteItemRow, NoteRow, NoteVersionDiff,
+    SearchHistoryTermRow, SearchWordImport, SearchWordImportResult, SearchWordRow, Settings,
 };
 use crate::indexer::{IndexProgress, IndexStats};
 use crate::mail::{self, MailSyncProgress, MailSyncStats, OutlookFolderInfo};
@@ -1273,6 +1273,9 @@ pub struct NoteItemSnapshot {
     pub mail_date: String,
     #[serde(default)]
     pub mail_folder: String,
+    /// Compact keep. Clicking it opens the file or the web page.
+    #[serde(default)]
+    pub badge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1311,6 +1314,9 @@ pub struct KeepToNotePayload {
     /// `"new"` creates a note. A note id keeps to that note. Empty uses the active note.
     #[serde(default)]
     pub note_id: Option<String>,
+    /// Store as a badge that opens the file or the page, instead of a paragraph card.
+    #[serde(default)]
+    pub badge: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1417,7 +1423,44 @@ pub fn set_active_note(
         .db
         .set_active_note_id(Some(&note.id))
         .map_err(|e| e.to_string())?;
+    state
+        .db
+        .clear_note_ai_notice(&note.id)
+        .map_err(|e| e.to_string())?;
     emit_note_updated(&app, &note.id, "active");
+    Ok(note)
+}
+
+#[tauri::command]
+pub fn list_note_versions(
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+) -> Result<NoteHistory, String> {
+    state
+        .db
+        .list_note_history(&note_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "ノートが見つかりません".to_string())
+}
+
+#[tauri::command]
+pub fn note_version_diff(
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+    version_id: String,
+) -> Result<NoteVersionDiff, String> {
+    state.db.note_version_diff(&note_id, &version_id)
+}
+
+#[tauri::command]
+pub fn revert_note_to_version(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    note_id: String,
+    version_id: String,
+) -> Result<NoteRow, String> {
+    let note = state.db.revert_note_to_version(&note_id, &version_id)?;
+    emit_note_updated(&app, &note.id, "memo");
     Ok(note)
 }
 
@@ -1599,11 +1642,14 @@ fn insert_keep_item(
         }
     };
 
-    let paragraph_id = if payload.paragraph_id.trim().is_empty() {
+    let mut paragraph_id = if payload.paragraph_id.trim().is_empty() {
         String::new()
     } else {
         payload.paragraph_id.trim().to_string()
     };
+    if payload.badge && paragraph_id.is_empty() {
+        paragraph_id = payload.path.trim().to_string();
+    }
 
     if !paragraph_id.is_empty() {
         if let Some(existing) = state
@@ -1629,7 +1675,7 @@ fn insert_keep_item(
 
     let mut highlight_terms = payload.highlight_terms.clone();
 
-    if !paragraph_id.is_empty() {
+    if !paragraph_id.is_empty() && !payload.badge {
         let settings = state.settings.read().clone();
         if let Ok(Some(hit)) = search::run_preview(
             &settings,
@@ -1673,6 +1719,7 @@ fn insert_keep_item(
         mail_from: payload.mail_from,
         mail_date: payload.mail_date,
         mail_folder: payload.mail_folder,
+        badge: payload.badge,
     };
     let item_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
     let item = state
@@ -1789,6 +1836,7 @@ pub async fn keep_path_matches(
                         },
                         silent: true,
                         note_id: None,
+                        badge: false,
                     },
                 )?;
                 if result.created {

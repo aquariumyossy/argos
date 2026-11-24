@@ -486,6 +486,31 @@ pub struct NoteReviewEvent {
     pub note_id: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummarizeNoteResult {
+    pub note: crate::db::NoteRow,
+}
+
+#[tauri::command]
+pub async fn summarize_chat_to_note(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    thread_id: String,
+    note_id: String,
+    through_message_id: Option<String>,
+) -> Result<SummarizeNoteResult, String> {
+    let note = crate::llm::note_summary::summarize_into_note(
+        state.inner(),
+        &thread_id,
+        &note_id,
+        through_message_id.as_deref(),
+    )
+    .await?;
+    after_llm_note_write(&app, state.inner(), &thread_id, &note.id);
+    Ok(SummarizeNoteResult { note })
+}
+
 fn emit_note_review<R: Runtime>(app: &AppHandle<R>, thread_id: &str, note_id: &str) {
     let _ = app.emit(
         "llm-note-review",
@@ -6934,5 +6959,62 @@ mod tests {
         assert_eq!(answer.kind, llm::completeness::KIND_INCOMPLETE);
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn summarize_chat_to_note_writes_the_model_summary_as_an_ai_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-sum-flow-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (port, seen) = serve_script(vec![content_stop("重大な不履行なら解除できる。")]);
+        let state = test_state(&dir, port, 8);
+        let thread = state.db.create_llm_thread("相談", true).unwrap();
+        state
+            .db
+            .insert_llm_message(&thread.id, "user", "解除の要件は？")
+            .unwrap();
+        let answer = state
+            .db
+            .insert_llm_message(&thread.id, "assistant", "重大な不履行のときです。")
+            .unwrap();
+        state
+            .db
+            .insert_llm_message(&thread.id, "tool", "検索結果の本文")
+            .unwrap();
+        let note = state.db.create_note("事件メモ").unwrap();
+        state
+            .db
+            .update_note_memo(&note.id, "既存のメモ")
+            .unwrap();
+        let saved = crate::llm::note_summary::summarize_into_note(
+            &state,
+            &thread.id,
+            &note.id,
+            Some(&answer.id),
+        )
+        .await
+        .unwrap();
+        assert!(saved.memo.contains("既存のメモ"), "{}", saved.memo);
+        assert!(saved.memo.contains("## 会話の要約"), "{}", saved.memo);
+        assert!(
+            saved.memo.contains("重大な不履行なら解除できる。"),
+            "{}",
+            saved.memo
+        );
+        assert!(!saved.memo.contains("検索結果の本文"), "{}", saved.memo);
+        let history = state.db.list_note_history(&note.id).unwrap().unwrap();
+        assert_eq!(history.versions.last().unwrap().source, "ai");
+        assert!(history.ai_updated_at.is_some());
+        let body = seen.lock().unwrap().join("\n");
+        assert!(body.contains("解除の要件は？"), "{body}");
+        assert!(body.contains("重大な不履行のときです。"), "{body}");
+        assert!(!body.contains("検索結果の本文"), "{body}");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

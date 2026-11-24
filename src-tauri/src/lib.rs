@@ -6,7 +6,9 @@ pub mod html_preview;
 pub mod indexer;
 pub mod llm;
 pub mod mail;
+pub mod note_keep;
 pub mod notes_md;
+pub mod notes_search;
 pub mod notices;
 pub mod office_edit;
 pub mod pathutil;
@@ -471,6 +473,9 @@ pub fn run() {
             commands::delete_note,
             commands::get_active_note,
             commands::set_active_note,
+            commands::list_note_versions,
+            commands::note_version_diff,
+            commands::revert_note_to_version,
             commands::update_note_memo,
             commands::append_note_memo,
             commands::undo_append_note_memo,
@@ -491,6 +496,7 @@ pub fn run() {
             llm::commands::llm_set_thread_scope,
             llm::commands::llm_set_thread_search,
             llm::commands::llm_set_thread_note,
+            llm::commands::summarize_chat_to_note,
             llm::commands::get_note_review,
             llm::commands::ack_note_review,
             llm::commands::revert_note_review,
