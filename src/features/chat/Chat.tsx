@@ -62,7 +62,7 @@ import {
   pastedImageSizeError,
   pastedImageTypeError,
 } from "./pasteImage";
-import NoteDestPicker from "../notes/NoteDestPicker";
+import NoteDestPicker, { keepToNote } from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/noteReview";
 import { openPreview } from "../preview/openPreview";
 import { highlightText } from "../search/highlightText";
@@ -319,7 +319,22 @@ function sourceCanExpand(s: LlmSourceRow): boolean {
   return true;
 }
 
+function isNoteSource(s: { kind?: string; path: string }): boolean {
+  return (s.kind ?? "").toLowerCase() === "note" || s.path.trim().startsWith("note:");
+}
+
+function noteIdOf(s: { path: string }): string {
+  const path = s.path.trim();
+  return path.startsWith("note:") ? path.slice("note:".length) : "";
+}
+
+function canKeepSource(s: LlmSourceRow): boolean {
+  if (isNoteSource(s) || isImageSource(s)) return false;
+  return s.path.trim().length > 0;
+}
+
 function sourceOpenTitle(s: LlmSourceRow): string {
+  if (isNoteSource(s)) return "ノートを開く";
   return isWebSource(s) ? "ブラウザで開く" : "プレビュー";
 }
 
@@ -349,6 +364,48 @@ function chipLabel(s: LlmSourceRow): string {
 
 function citePrefix(n: number): string {
   return n > 0 ? `[${n}] ` : "";
+}
+
+function CiteChip({
+  source,
+  citeNo,
+  label,
+  onOpen,
+  onKeep,
+}: {
+  source: LlmSourceRow;
+  citeNo: number;
+  label: string;
+  onOpen: (source: LlmSourceRow) => void;
+  onKeep: (source: LlmSourceRow, noteId: "new" | string) => void;
+}) {
+  const path = source.path.trim();
+  const text = `${citePrefix(citeNo)}${label}`;
+  return (
+    <span className="chat-cite-row">
+      {path ? (
+        <button
+          type="button"
+          className="chat-cite-badge clickable"
+          title={sourceOpenTitle(source)}
+          onClick={() => onOpen(source)}
+        >
+          {text}
+        </button>
+      ) : (
+        <span className="chat-cite-badge">{text}</span>
+      )}
+      {canKeepSource(source) ? (
+        <NoteDestPicker
+          buttonClassName="chat-tpl"
+          title="この出典をノートにキープ"
+          onPick={(id) => onKeep(source, id)}
+        >
+          キープ
+        </NoteDestPicker>
+      ) : null}
+    </span>
+  );
 }
 
 function IconOpenFile() {
@@ -657,10 +714,7 @@ export default function Chat() {
   const [followBottom, setFollowBottom] = useState(true);
   const [detailsHold, setDetailsHold] = useState(false);
   const [noteReviews, setNoteReviews] = useState<NoteReview[]>([]);
-  const [appendUndo, setAppendUndo] = useState<{
-    noteId: string;
-    chunk: string;
-  } | null>(null);
+  const [summarizing, setSummarizing] = useState(false);
   const [fontSize, setFontSize] = useState(14);
   const [maxContextTokens, setMaxContextTokens] = useState(131_072);
   const [thinkingBudget, setThinkingBudget] = useState<ThinkingBudgetStatus>({
@@ -1491,38 +1545,53 @@ export default function Chat() {
     }
   }
 
-  async function appendAnswerToNote(content: string, noteId: "new" | string) {
-    const text = content.trim();
-    if (!text) {
-      setError("追記する本文が空です。");
-      return;
-    }
+  async function summarizeToNote(throughMessageId: string, noteId: "new" | string) {
+    if (!active || summarizing) return;
+    setSummarizing(true);
+    setError("");
+    setNotice("会話を要約しています…");
     try {
-      const result = await invoke<{
-        note: { id: string; title: string };
-        chunk: string;
-      }>("append_note_memo", {
-        id: noteId === "new" ? "new" : noteId,
-        chunk: text,
-      });
-      setAppendUndo({ noteId: result.note.id, chunk: result.chunk });
-      setNotice(
-        `ノート『${result.note.title.trim() || "無題のノート"}』に追記しました`,
+      const result = await invoke<{ note: { id: string; title: string } }>(
+        "summarize_chat_to_note",
+        {
+          threadId: active.id,
+          noteId: noteId === "new" ? "new" : noteId,
+          throughMessageId,
+        },
       );
+      setNotice(
+        `ノート『${result.note.title.trim() || "無題のノート"}』に要約を書きました`,
+      );
+      if (result.note.id) void loadNoteReview(result.note.id);
     } catch (e) {
+      setNotice("");
       setError(formatInvokeError(e));
+    } finally {
+      setSummarizing(false);
     }
   }
 
-  async function undoAppendToNote() {
-    if (!appendUndo) return;
+  async function keepSource(source: LlmSourceRow, noteId: "new" | string) {
+    const web = isWebSource(source);
     try {
-      await invoke("undo_append_note_memo", {
-        id: appendUndo.noteId,
-        chunk: appendUndo.chunk,
-      });
-      setAppendUndo(null);
-      setNotice("追記を取り消しました");
+      const result = await keepToNote(
+        {
+          query: source.query ?? "",
+          snippet: (source.body ?? "").slice(0, 280),
+          path: source.path,
+          title: sourceLabel(source),
+          source: web ? "web" : source.kind || "index",
+          docKind: web ? "web" : "",
+          paragraphId: web ? source.path : source.paragraphId || source.path,
+          badge: true,
+          silent: true,
+        },
+        noteId,
+      );
+      const name = result.note?.title?.trim() || "無題のノート";
+      setNotice(
+        result.created ? `『${name}』にキープした` : `『${name}』にすでにキープ済み`,
+      );
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1532,6 +1601,7 @@ export default function Chat() {
     try {
       await invoke("set_active_note", { id: noteId });
       await invoke("show_notes_window");
+      setNoteReviews((prev) => prev.filter((r) => r.noteId !== noteId));
     } catch (e) {
       setError(formatInvokeError(e));
     }
@@ -1565,6 +1635,13 @@ export default function Chat() {
     const path = s.path.trim();
     if (!path) return;
     try {
+      if (isNoteSource(s)) {
+        const id = noteIdOf(s);
+        if (!id) return;
+        await invoke("set_active_note", { id });
+        await invoke("show_notes_window");
+        return;
+      }
       if (isWebSource(s)) {
         await invoke("open_web_url", { url: path });
         return;
@@ -2484,37 +2561,25 @@ export default function Chat() {
                   ) : null}
                   {citeGroups.length > 0 ? (
                     <div className="chat-msg-cites" aria-label="出典">
-                      {citeGroups.map((g) => {
-                        const s = g.representative;
-                        const path = s.path.trim();
-                        if (!path) {
-                          return (
-                            <span key={g.key} className="chat-cite-badge">
-                              {citePrefix(g.citeNo)}{chipLabel(s)}
-                            </span>
-                          );
-                        }
-                        return (
-                          <button
-                            key={g.key}
-                            type="button"
-                            className="chat-cite-badge clickable"
-                            title={sourceOpenTitle(s)}
-                            onClick={() => void openSource(s)}
-                          >
-                            {citePrefix(g.citeNo)}{chipLabel(s)}
-                          </button>
-                        );
-                      })}
+                      {citeGroups.map((g) => (
+                        <CiteChip
+                          key={g.key}
+                          source={g.representative}
+                          citeNo={g.citeNo}
+                          label={chipLabel(g.representative)}
+                          onOpen={(s) => void openSource(s)}
+                          onKeep={(s, id) => void keepSource(s, id)}
+                        />
+                      ))}
                     </div>
                   ) : null}
                   {m.role === "assistant" && !isNotice && m.content.trim() ? (
                     <div className="chat-msg-actions">
                       <NoteDestPicker
                         buttonClassName="chat-tpl"
-                        title="この回答をノートのメモ末尾へ追記"
-                        disabled={blocked}
-                        onPick={(id) => void appendAnswerToNote(m.content, id)}
+                        title="ここまでの会話を要約してノートへ"
+                        disabled={blocked || summarizing}
+                        onPick={(id) => void summarizeToNote(m.id, id)}
                       >
                         ノートへ
                       </NoteDestPicker>
@@ -2558,28 +2623,16 @@ export default function Chat() {
               ) : null}
               {liveCiteGroups.length > 0 ? (
                 <div className="chat-msg-cites" aria-label="今回の出典">
-                  {liveCiteGroups.map((g) => {
-                    const s = g.representative;
-                    const path = s.path.trim();
-                    if (!path) {
-                      return (
-                        <span key={g.key} className="chat-cite-badge">
-                          {citePrefix(g.citeNo)}{chipLabel(s)}
-                        </span>
-                      );
-                    }
-                    return (
-                      <button
-                        key={g.key}
-                        type="button"
-                        className="chat-cite-badge clickable"
-                        title={sourceOpenTitle(s)}
-                        onClick={() => void openSource(s)}
-                      >
-                        {citePrefix(g.citeNo)}{chipLabel(s)}
-                      </button>
-                    );
-                  })}
+                  {liveCiteGroups.map((g) => (
+                    <CiteChip
+                      key={g.key}
+                      source={g.representative}
+                      citeNo={g.citeNo}
+                      label={chipLabel(g.representative)}
+                      onOpen={(s) => void openSource(s)}
+                      onKeep={(s, id) => void keepSource(s, id)}
+                    />
+                  ))}
                 </div>
               ) : null}
             </article>
@@ -2609,23 +2662,7 @@ export default function Chat() {
             </button>
           </p>
         ))}
-        {notice ? (
-          <p className="chat-notice">
-            {notice}
-            {appendUndo ? (
-              <>
-                {" "}
-                <button
-                  type="button"
-                  className="chat-notice-undo"
-                  onClick={() => void undoAppendToNote()}
-                >
-                  取り消し
-                </button>
-              </>
-            ) : null}
-          </p>
-        ) : null}
+        {notice ? <p className="chat-notice">{notice}</p> : null}
         <form
           className={dropActive ? "chat-composer drop-active" : "chat-composer"}
           onSubmit={(e) => {

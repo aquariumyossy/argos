@@ -8,6 +8,7 @@ pub mod create_html;
 pub mod create_office;
 pub mod fetch_url;
 pub mod files;
+pub mod note_summary;
 pub mod grain;
 pub mod han_fix;
 pub mod http_error;

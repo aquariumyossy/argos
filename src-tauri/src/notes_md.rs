@@ -36,6 +36,7 @@ pub struct DiffLine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DiffHunk {
     pub gap_before: usize,
     pub lines: Vec<DiffLine>,

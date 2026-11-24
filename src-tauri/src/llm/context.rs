@@ -528,6 +528,16 @@ fn citation_header_line(seed: &LlmSourceRow, cite: i64, grouped_image: bool) -> 
     } else {
         seed.title.as_str()
     };
+    if seed.is_note() {
+        line.push_str(title);
+        line.push_str("（ノート）");
+        if let Some(id) = seed.path.trim().strip_prefix("note:") {
+            if !id.is_empty() {
+                line.push_str(&format!(" note_id: {id}"));
+            }
+        }
+        return line;
+    }
     line.push_str(title);
     if !seed.path.trim().is_empty() && seed.path.trim() != title.trim() {
         line.push_str(" — ");
@@ -715,6 +725,37 @@ pub fn consumed_cited_in_answer(consumed: &[(String, i64)], answer: &str) -> Vec
         .filter(|(_, n)| nos.contains(n))
         .cloned()
         .collect()
+}
+
+/// Note reads stay citation badges. They do not, by themselves, make an answer
+/// retry for a missing `[n]`. Search hits and other sources still do.
+pub fn sources_for_citation_retry(
+    consumed: &[(String, i64)],
+    sources: &[LlmSourceRow],
+) -> Vec<(String, i64)> {
+    let note_ids: HashSet<&str> = sources
+        .iter()
+        .filter(|source| source.is_note())
+        .map(|source| source.id.as_str())
+        .collect();
+    consumed
+        .iter()
+        .filter(|(id, _)| !note_ids.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Retry only when a non-note source was used and the answer cites nothing.
+/// A `[n]` that points at a note counts: unused index hits do not reset that answer.
+pub fn citation_retry_warranted(
+    consumed: &[(String, i64)],
+    sources: &[LlmSourceRow],
+    answer: &str,
+) -> bool {
+    if sources_for_citation_retry(consumed, sources).is_empty() {
+        return false;
+    }
+    consumed_cited_in_answer(consumed, answer).is_empty()
 }
 
 pub const FINAL_CITE_HINT: &str =
@@ -2787,6 +2828,64 @@ mod tests {
         let mut s = src(id, origin, sort, body);
         s.grain = "file".into();
         s
+    }
+
+    fn note_src(id: &str, cite: i64) -> LlmSourceRow {
+        let mut s = src(id, "tool", cite, "ノート本文");
+        s.kind = "note".into();
+        s.path = format!("note:{id}");
+        s.cite_no = cite;
+        s
+    }
+
+    #[test]
+    fn note_sources_do_not_force_a_missing_citation_retry() {
+        let note = note_src("n1", 1);
+        let mut by_path = src("n2", "tool", 3, "本文");
+        by_path.path = "note:abc".into();
+        by_path.cite_no = 3;
+        assert!(sources_for_citation_retry(&[("n1".into(), 1)], &[note.clone()]).is_empty());
+        assert!(sources_for_citation_retry(&[("n2".into(), 3)], &[by_path]).is_empty());
+
+        let mut web = src("w1", "tool", 2, "ウェブ本文");
+        web.cite_no = 2;
+        let mixed = vec![("n1".into(), 1i64), ("w1".into(), 2)];
+        let retry = sources_for_citation_retry(&mixed, &[note, web]);
+        assert_eq!(retry, vec![("w1".into(), 2)]);
+        assert!(consumed_cited_in_answer(&retry, "更新しました").is_empty());
+        assert_eq!(
+            consumed_cited_in_answer(&retry, "根拠は [2] です"),
+            vec![("w1".into(), 2)]
+        );
+        assert_eq!(
+            consumed_cited_in_answer(&mixed, "ノート [1]"),
+            vec![("n1".into(), 1)]
+        );
+        assert!(!citation_retry_warranted(
+            &[("n1".into(), 1)],
+            &[note_src("n1", 1)],
+            "更新しました"
+        ));
+    }
+
+    #[test]
+    fn citing_only_a_note_does_not_retry_when_index_hits_were_unused() {
+        let note = note_src("n1", 1);
+        let mut index = src("h1", "tool", 2, "索引本文");
+        index.cite_no = 2;
+        let consumed = vec![("n1".into(), 1i64), ("h1".into(), 2)];
+        let sources = [note, index];
+        assert!(!citation_retry_warranted(
+            &consumed,
+            &sources,
+            "ノートに沿って更新しました [1]"
+        ));
+        assert!(citation_retry_warranted(&consumed, &sources, "更新しました"));
+        assert!(!citation_retry_warranted(
+            &consumed,
+            &sources,
+            "索引の記載は [2] です"
+        ));
     }
 
     /// Without the id in the block, `read_unit` cannot be called and a shortened tool hit
