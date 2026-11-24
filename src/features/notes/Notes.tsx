@@ -37,6 +37,7 @@ import {
   type NoteHistory,
 } from "./NoteHistory";
 import type { NoteDiffHunk } from "./noteReview";
+import { finishMemoWrite, type PendingMemo } from "./memoSave";
 import {
   memoHasOpenWork,
   parseNoteTasks,
@@ -502,7 +503,12 @@ export default function Notes() {
     new Map(),
   );
   const memoDirtyRef = useRef(false);
-  const pendingMemoRef = useRef<{ id: string; memo: string } | null>(null);
+  const pendingMemoRef = useRef<PendingMemo | null>(null);
+  const flushingMemoRef = useRef<PendingMemo | null>(null);
+  const flushChainRef = useRef<Promise<void>>(Promise.resolve());
+  const memoEpochRef = useRef(0);
+  const restoredMemoRef = useRef<PendingMemo | null>(null);
+  const aiHoldRef = useRef(false);
   const skipMemoReloadRef = useRef<{ id: string; at: number } | null>(null);
   const loadHistoryRef = useRef<(id: string | undefined) => Promise<void>>(
     async () => {},
@@ -533,38 +539,83 @@ export default function Notes() {
     chatNoticeTimer.current = setTimeout(() => setChatNotice(""), 2200);
   }, []);
 
+  const applySavedMemo = useCallback((row: NoteRow) => {
+    setActive((prev) =>
+      prev && prev.id === row.id
+        ? { ...prev, memo: row.memo, updatedAt: row.updatedAt }
+        : prev,
+    );
+    setNotes((prev) =>
+      prev.map((n) =>
+        n.id === row.id ? { ...n, memo: row.memo, updatedAt: row.updatedAt } : n,
+      ),
+    );
+  }, []);
+
   const flushNoteMemo = useCallback(async () => {
     if (noteMemoTimer.current) {
       clearTimeout(noteMemoTimer.current);
       noteMemoTimer.current = null;
     }
     const pending = pendingMemoRef.current;
-    if (!pending) return;
-    pendingMemoRef.current = null;
-    memoDirtyRef.current = false;
-    skipMemoReloadRef.current = { id: pending.id, at: Date.now() };
-    try {
-      const row = await invoke<NoteRow>("update_note_memo", {
-        id: pending.id,
-        memo: pending.memo,
-      });
-      setActive((prev) =>
-        prev && prev.id === row.id
-          ? { ...prev, memo: row.memo, updatedAt: row.updatedAt }
-          : prev,
+    if (pending) {
+      pendingMemoRef.current = null;
+      memoDirtyRef.current = false;
+      flushingMemoRef.current = pending;
+      const epoch = memoEpochRef.current;
+      skipMemoReloadRef.current = { id: pending.id, at: Date.now() };
+      const run = async () => {
+        if (aiHoldRef.current) {
+          flushingMemoRef.current = null;
+          return;
+        }
+        try {
+          const row = await invoke<NoteRow>("update_note_memo", {
+            id: pending.id,
+            memo: pending.memo,
+          });
+          const outcome = await finishMemoWrite(
+            epoch,
+            memoEpochRef.current,
+            pending,
+            restoredMemoRef.current,
+            async (memo) => {
+              const fixed = await invoke<NoteRow>("update_note_memo", {
+                id: memo.id,
+                memo: memo.memo,
+              });
+              const guard = restoredMemoRef.current;
+              if (guard && guard.id === fixed.id && guard.memo === fixed.memo) {
+                applySavedMemo(fixed);
+              }
+            },
+          );
+          flushingMemoRef.current = null;
+          if (outcome !== "apply" || aiHoldRef.current) return;
+          applySavedMemo(row);
+          void loadHistoryRef.current(pending.id);
+        } catch (e) {
+          flushingMemoRef.current = null;
+          if (
+            memoEpochRef.current !== epoch ||
+            aiHoldRef.current ||
+            restoredMemoRef.current
+          ) {
+            return;
+          }
+          memoDirtyRef.current = true;
+          pendingMemoRef.current = pending;
+          setError(formatInvokeError(e));
+        }
+      };
+      const job = flushChainRef.current.then(run, run);
+      flushChainRef.current = job.then(
+        () => undefined,
+        () => undefined,
       );
-      setNotes((prev) =>
-        prev.map((n) =>
-          n.id === row.id ? { ...n, memo: row.memo, updatedAt: row.updatedAt } : n,
-        ),
-      );
-      void loadHistoryRef.current(pending.id);
-    } catch (e) {
-      memoDirtyRef.current = true;
-      pendingMemoRef.current = pending;
-      setError(formatInvokeError(e));
     }
-  }, []);
+    await flushChainRef.current;
+  }, [applySavedMemo]);
 
   const loadNotes = useCallback(async () => {
     const list = await invoke<NoteRow[]>("list_notes");
@@ -755,14 +806,35 @@ export default function Notes() {
       const pending = pendingMemoRef.current;
       const llm = payload.source === "llm";
       if (llm && (!noteId || noteId === pending?.id || noteId === activeRef.current?.id)) {
+        const draft = pending ?? flushingMemoRef.current;
         if (noteMemoTimer.current) {
           clearTimeout(noteMemoTimer.current);
           noteMemoTimer.current = null;
         }
-        pendingMemoRef.current = null;
-        memoDirtyRef.current = false;
-        skipMemoReloadRef.current = null;
+        restoredMemoRef.current = null;
+        aiHoldRef.current = true;
+        memoEpochRef.current += 1;
         void (async () => {
+          try {
+            await flushNoteMemo();
+            if (draft) {
+              try {
+                await invoke("keep_unsaved_note_memo", {
+                  id: draft.id,
+                  memo: draft.memo,
+                });
+              } catch (e) {
+                if (!pendingMemoRef.current) {
+                  pendingMemoRef.current = draft;
+                  memoDirtyRef.current = true;
+                }
+                setError(formatInvokeError(e));
+              }
+            }
+          } finally {
+            aiHoldRef.current = false;
+          }
+          if (cancelled) return;
           await loadNotes();
           if (cancelled) return;
           setDiffVersionId(null);
@@ -1099,6 +1171,7 @@ export default function Notes() {
       setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, memo } : n)));
       memoDirtyRef.current = true;
       pendingMemoRef.current = { id, memo };
+      restoredMemoRef.current = null;
       if (noteMemoTimer.current) clearTimeout(noteMemoTimer.current);
       noteMemoTimer.current = setTimeout(() => {
         void flushNoteMemo();
@@ -1121,10 +1194,18 @@ export default function Notes() {
     if (!noteId || !versionId || historyBusy) return;
     setHistoryBusy(true);
     try {
+      // Finish the blur save first. A save still on the wire can land after
+      // the revert and replace the restored memo.
+      await flushNoteMemo();
+      const epoch = memoEpochRef.current + 1;
+      memoEpochRef.current = epoch;
+      restoredMemoRef.current = null;
       const row = await invoke<NoteRow>("revert_note_to_version", {
         noteId,
         versionId,
       });
+      restoredMemoRef.current = { id: row.id, memo: row.memo };
+      if (memoEpochRef.current !== epoch) return;
       setDiffVersionId(null);
       setVersionDiff(null);
       setActive((prev) => (prev && prev.id === row.id ? row : prev));
@@ -1136,7 +1217,7 @@ export default function Notes() {
     } finally {
       setHistoryBusy(false);
     }
-  }, [diffVersionId, historyBusy, loadHistory]);
+  }, [diffVersionId, historyBusy, loadHistory, flushNoteMemo]);
 
   const captureMemoView = useCallback((el?: HTMLTextAreaElement | null) => {
     const t = el ?? memoTextareaRef.current;

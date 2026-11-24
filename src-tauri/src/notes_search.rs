@@ -72,32 +72,47 @@ fn window(text: &str, start: usize, end: usize) -> String {
     body
 }
 
-/// `Some` when `query` occurs in the title or the memo. The string is a short
+fn query_terms(query: &str) -> Vec<String> {
+    fold_note_text(query)
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn term_in_note(title: &str, memo: &str, term: &str) -> bool {
+    folded_span(memo, term).is_some() || fold_note_text(title).contains(term)
+}
+
+/// `Some` when every whitespace-separated term occurs in the title or the memo.
+/// Fullwidth spaces fold to ASCII spaces before the split. The string is a short
 /// excerpt of the memo, or a title-only note when the memo has no match.
 pub fn match_snippet(title: &str, memo: &str, query: &str) -> Option<String> {
-    let needle = fold_note_text(query.trim());
-    if needle.is_empty() {
+    let terms = query_terms(query);
+    if terms.is_empty() {
         return None;
     }
-    if let Some((start, end)) = folded_span(memo, &needle) {
-        let snippet = window(memo, start, end);
-        if snippet.is_empty() {
-            return Some("本文が一致".into());
-        }
-        return Some(snippet);
+    if !terms.iter().all(|term| term_in_note(title, memo, term)) {
+        return None;
     }
-    if fold_note_text(title).contains(&needle) {
-        let chars: Vec<char> = memo.chars().collect();
-        if chars.is_empty() {
-            return Some("題名が一致".into());
+    for term in &terms {
+        if let Some((start, end)) = folded_span(memo, term) {
+            let snippet = window(memo, start, end);
+            if snippet.is_empty() {
+                return Some("本文が一致".into());
+            }
+            return Some(snippet);
         }
-        let head = window(memo, 0, chars.len().min(SNIPPET_RADIUS));
-        if head.is_empty() {
-            return Some("題名が一致".into());
-        }
-        return Some(head);
     }
-    None
+    let chars: Vec<char> = memo.chars().collect();
+    if chars.is_empty() {
+        return Some("題名が一致".into());
+    }
+    let head = window(memo, 0, chars.len().min(SNIPPET_RADIUS));
+    if head.is_empty() {
+        return Some("題名が一致".into());
+    }
+    Some(head)
 }
 
 #[cfg(test)]
@@ -128,6 +143,19 @@ mod tests {
     fn a_miss_and_an_empty_query_are_none() {
         assert!(match_snippet("事件", "本文", "存在しない").is_none());
         assert!(match_snippet("事件", "本文", "  ").is_none());
+        assert!(match_snippet("事件", "本文", "\u{3000}").is_none());
+    }
+
+    #[test]
+    fn space_separated_terms_must_all_match_across_title_and_memo() {
+        let memo = "通知は書面で行い、要件を満たすこと。";
+        let hit = match_snippet("解除", memo, "解除 要件").unwrap();
+        assert!(hit.contains("要件"), "{hit}");
+        let fullwidth = match_snippet("解除", memo, "解除\u{3000}要件").unwrap();
+        assert!(fullwidth.contains("要件"), "{fullwidth}");
+        assert!(match_snippet("解除", memo, "要件 解除").is_some());
+        assert!(match_snippet("解除", "本文は別の話", "解除 要件").is_none());
+        assert!(match_snippet("別件", memo, "解除 要件").is_none());
     }
 
     #[test]

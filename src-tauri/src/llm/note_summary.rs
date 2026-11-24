@@ -5,16 +5,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::db::{Db, LlmMessageRow, NoteRow};
-use crate::llm::context::ChatTurn;
+use crate::llm::context::{estimate_tokens, reply_headroom_tokens, ChatTurn};
 use crate::state::AppState;
 
 pub const SUMMARY_HEADING: &str = "会話の要約";
 const SUMMARY_MAX_TOKENS: u32 = 1_500;
 
-pub fn transcript_through(
+pub fn transcript_lines(
     messages: &[LlmMessageRow],
     through_id: Option<&str>,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let through_id = through_id.map(str::trim).filter(|s| !s.is_empty());
     let mut lines = Vec::new();
     let mut saw = through_id.is_none();
@@ -50,7 +50,61 @@ pub fn transcript_through(
     if lines.is_empty() {
         return Err("要約する会話がありません。".into());
     }
-    Ok(lines.join("\n\n"))
+    Ok(lines)
+}
+
+pub fn transcript_through(
+    messages: &[LlmMessageRow],
+    through_id: Option<&str>,
+) -> Result<String, String> {
+    Ok(transcript_lines(messages, through_id)?.join("\n\n"))
+}
+
+/// Tokens the summary request may spend on input: the context limit, minus the
+/// reply reserve, minus the summary output cap.
+pub fn summary_input_budget(limit_tokens: usize) -> usize {
+    limit_tokens
+        .saturating_sub(reply_headroom_tokens(limit_tokens))
+        .saturating_sub(SUMMARY_MAX_TOKENS as usize)
+}
+
+/// Drop oldest lines until `summary_prompt` fits in `budget_tokens`.
+/// The newest line is kept, clipped from its start when it alone is too long.
+pub fn fit_transcript(lines: &[String], budget_tokens: usize) -> String {
+    if lines.is_empty() || budget_tokens == 0 {
+        return String::new();
+    }
+    for start in 0..lines.len() {
+        let joined = lines[start..].join("\n\n");
+        if estimate_tokens(&summary_prompt(&joined)) <= budget_tokens {
+            return joined;
+        }
+    }
+    clip_line_from_oldest_side(&lines[lines.len() - 1], budget_tokens)
+}
+
+fn clip_line_from_oldest_side(line: &str, budget_tokens: usize) -> String {
+    if estimate_tokens(&summary_prompt(line)) <= budget_tokens {
+        return line.to_string();
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let tail: String = chars[mid..].iter().collect();
+        if estimate_tokens(&summary_prompt(&tail)) <= budget_tokens {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let tail: String = chars[lo..].iter().collect();
+    if estimate_tokens(&summary_prompt(&tail)) <= budget_tokens {
+        tail
+    } else {
+        String::new()
+    }
 }
 
 pub fn summary_prompt(transcript: &str) -> String {
@@ -115,8 +169,15 @@ pub async fn summarize_into_note(
         .db
         .list_llm_messages(thread_id)
         .map_err(|e| e.to_string())?;
-    let transcript = transcript_through(&messages, through_message_id)?;
+    let lines = transcript_lines(&messages, through_message_id)?;
     let settings = state.settings.read().clone();
+    let transcript = fit_transcript(
+        &lines,
+        summary_input_budget(settings.llm_max_context_tokens as usize),
+    );
+    if transcript.trim().is_empty() {
+        return Err("要約する会話がありません。".into());
+    }
     let turns = vec![ChatTurn::text("user", summary_prompt(&transcript))];
     let cancel = Arc::new(AtomicBool::new(false));
     let outcome = crate::llm::stream_chat(
@@ -164,6 +225,7 @@ fn resolve_summary_note(db: &Db, thread_id: &str, note_id: &str) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::context::estimate_tokens;
 
     fn message(id: &str, role: &str, content: &str, kind: &str) -> LlmMessageRow {
         LlmMessageRow {
@@ -235,5 +297,45 @@ mod tests {
         assert_eq!(history.versions.last().unwrap().source, "ai");
         assert!(history.ai_updated_at.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summary_input_budget_reserves_the_reply_and_the_summary() {
+        let limit = 20_000;
+        let budget = summary_input_budget(limit);
+        assert_eq!(
+            budget,
+            limit
+                - crate::llm::context::reply_headroom_tokens(limit)
+                - SUMMARY_MAX_TOKENS as usize
+        );
+        assert!(budget < limit);
+    }
+
+    #[test]
+    fn long_transcript_drops_the_oldest_lines_and_keeps_the_newest() {
+        let old = format!("利用者: {}", "あ".repeat(4_000));
+        let middle = "回答: 中間の結論です".to_string();
+        let newest = "利用者: 一番新しい質問です".to_string();
+        let kept = format!("{middle}\n\n{newest}");
+        let budget = estimate_tokens(&summary_prompt(&kept)) + 8;
+        let fitted = fit_transcript(&[old.clone(), middle.clone(), newest.clone()], budget);
+        assert!(fitted.contains("一番新しい質問です"), "{fitted}");
+        assert!(fitted.contains("中間の結論です"), "{fitted}");
+        assert!(!fitted.contains('あ'), "{fitted}");
+        assert!(fitted.ends_with("一番新しい質問です"), "{fitted}");
+        assert!(estimate_tokens(&summary_prompt(&fitted)) <= budget);
+    }
+
+    #[test]
+    fn a_huge_newest_message_is_clipped_from_the_oldest_side() {
+        let newest = format!("{}最新の文", "古".repeat(4_000));
+        let older = "利用者: 古いやり取り".repeat(200);
+        let budget = 180;
+        let fitted = fit_transcript(&[older, newest], budget);
+        assert!(fitted.ends_with("最新の文"), "{fitted}");
+        assert!(!fitted.contains("古いやり取り"), "{fitted}");
+        assert!(estimate_tokens(&summary_prompt(&fitted)) <= budget);
+        assert!(fitted.chars().count() < 4_000);
     }
 }

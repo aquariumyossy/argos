@@ -1465,6 +1465,18 @@ pub fn revert_note_to_version(
 }
 
 #[tauri::command]
+pub fn keep_unsaved_note_memo(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    memo: String,
+) -> Result<bool, String> {
+    state
+        .db
+        .keep_unsaved_note_memo(&id, &memo)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn update_note_memo(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,

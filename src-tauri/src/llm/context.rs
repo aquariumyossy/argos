@@ -727,6 +727,24 @@ pub fn consumed_cited_in_answer(consumed: &[(String, i64)], answer: &str) -> Vec
         .collect()
 }
 
+/// Note reads stay citation badges. They do not, by themselves, make an answer
+/// retry for a missing `[n]`. Search hits and other sources still do.
+pub fn sources_for_citation_retry(
+    consumed: &[(String, i64)],
+    sources: &[LlmSourceRow],
+) -> Vec<(String, i64)> {
+    let note_ids: HashSet<&str> = sources
+        .iter()
+        .filter(|source| source.is_note())
+        .map(|source| source.id.as_str())
+        .collect();
+    consumed
+        .iter()
+        .filter(|(id, _)| !note_ids.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
 pub const FINAL_CITE_HINT: &str =
     "使った出典にだけ [n] を付けて答えてください。使っていない番号は本文に並べないでください。";
 pub const STOP_TOOLS_HINT: &str =
@@ -2797,6 +2815,39 @@ mod tests {
         let mut s = src(id, origin, sort, body);
         s.grain = "file".into();
         s
+    }
+
+    fn note_src(id: &str, cite: i64) -> LlmSourceRow {
+        let mut s = src(id, "tool", cite, "ノート本文");
+        s.kind = "note".into();
+        s.path = format!("note:{id}");
+        s.cite_no = cite;
+        s
+    }
+
+    #[test]
+    fn note_sources_do_not_force_a_missing_citation_retry() {
+        let note = note_src("n1", 1);
+        let mut by_path = src("n2", "tool", 3, "本文");
+        by_path.path = "note:abc".into();
+        by_path.cite_no = 3;
+        assert!(sources_for_citation_retry(&[("n1".into(), 1)], &[note.clone()]).is_empty());
+        assert!(sources_for_citation_retry(&[("n2".into(), 3)], &[by_path]).is_empty());
+
+        let mut web = src("w1", "tool", 2, "ウェブ本文");
+        web.cite_no = 2;
+        let mixed = vec![("n1".into(), 1i64), ("w1".into(), 2)];
+        let retry = sources_for_citation_retry(&mixed, &[note, web]);
+        assert_eq!(retry, vec![("w1".into(), 2)]);
+        assert!(consumed_cited_in_answer(&retry, "更新しました").is_empty());
+        assert_eq!(
+            consumed_cited_in_answer(&retry, "根拠は [2] です"),
+            vec![("w1".into(), 2)]
+        );
+        assert_eq!(
+            consumed_cited_in_answer(&mixed, "ノート [1]"),
+            vec![("n1".into(), 1)]
+        );
     }
 
     /// Without the id in the block, `read_unit` cannot be called and a shortened tool hit

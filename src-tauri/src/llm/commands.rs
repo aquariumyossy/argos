@@ -11,7 +11,8 @@ use crate::llm::context::{
     answer_has_phantom_cites, assemble_turns, cap_chars, consumed_cited_in_answer, context_budget,
     estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
     meter_request_tokens, meter_usage_tokens, parse_cited_nos, sent_usage_tokens,
-    silent_end_notice, sources_for_consumed, summary_trigger_reached, tool_schema_tokens, ChatTurn,
+    silent_end_notice, sources_for_citation_retry, sources_for_consumed, summary_trigger_reached,
+    tool_schema_tokens, ChatTurn,
     ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
     STOP_TOOLS_HINT,
 };
@@ -1824,15 +1825,16 @@ async fn llm_send_inner<R: Runtime>(
                 }
                 // Search hits live in `role: tool`. The citation guide only fires for a
                 // user-turn 出典 block, so inject one before accepting a tool-only answer
-                // that did not copy [n].
+                // that did not copy [n]. Note reads stay badges and do not force this.
                 if rounds > 0 && !consumed.is_empty() && !source_turn_injected {
-                    let already_cited = consumed_cited_in_answer(&consumed, &out.content);
-                    if already_cited.is_empty() {
-                        let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                    let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                    let retry_consumed = sources_for_citation_retry(&consumed, &all);
+                    let already_cited = consumed_cited_in_answer(&retry_consumed, &out.content);
+                    if !retry_consumed.is_empty() && already_cited.is_empty() {
                         if inject_final_source_turn(
                             &mut current_turns,
                             &all,
-                            &consumed,
+                            &retry_consumed,
                             true,
                             inject_budget,
                         ) {

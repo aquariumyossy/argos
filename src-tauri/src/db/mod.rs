@@ -3160,6 +3160,98 @@ impl Db {
         )
     }
 
+    /// Keep an editor draft in history without leaving it as the latest memo.
+    /// An AI write may already have replaced the open note. A flush that landed
+    /// on top of that write is moved back in front of it, and the AI text
+    /// becomes the memo again.
+    pub fn keep_unsaved_note_memo(&self, id: &str, memo: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock();
+        if read_note_conn(&conn, id)?.is_none() {
+            return Ok(false);
+        }
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let wrote = (|| -> Result<bool, rusqlite::Error> {
+            let Some(current) = read_note_conn(&conn, id)? else {
+                return Ok(false);
+            };
+            let versions = note_versions_asc(&conn, id)?;
+            let Some(ai_idx) = versions.iter().rposition(|v| v.source == NOTE_ORIGIN_AI) else {
+                if memo == current.memo || versions.iter().any(|v| v.memo == memo) {
+                    return Ok(false);
+                }
+                let now = chrono::Utc::now().timestamp();
+                let draft_at = versions
+                    .last()
+                    .map(|v| v.created_at.saturating_sub(1))
+                    .unwrap_or_else(|| now.saturating_sub(1));
+                insert_note_version_conn(
+                    &conn,
+                    id,
+                    memo,
+                    &current.title,
+                    NOTE_ORIGIN_MANUAL,
+                    draft_at,
+                )?;
+                return Ok(true);
+            };
+            let ai = versions[ai_idx].clone();
+            let after = versions[ai_idx + 1..].to_vec();
+            let already = versions.iter().any(|v| v.memo == memo) || memo == ai.memo;
+            let slots = after.len() + if already { 0 } else { 1 };
+            let mut changed = false;
+            if slots > 0 {
+                let mut start = ai.created_at.saturating_sub(slots as i64);
+                if start == ai.created_at {
+                    let bumped = ai.created_at.saturating_add(slots as i64);
+                    conn.execute(
+                        "UPDATE note_versions SET created_at=?1 WHERE id=?2",
+                        rusqlite::params![bumped, ai.id],
+                    )?;
+                    start = ai.created_at;
+                }
+                for (i, version) in after.iter().enumerate() {
+                    conn.execute(
+                        "UPDATE note_versions SET created_at=?1 WHERE id=?2",
+                        rusqlite::params![start + i as i64, version.id],
+                    )?;
+                    changed = true;
+                }
+                if !already {
+                    insert_note_version_conn(
+                        &conn,
+                        id,
+                        memo,
+                        &ai.title,
+                        NOTE_ORIGIN_MANUAL,
+                        start + after.len() as i64,
+                    )?;
+                    changed = true;
+                }
+            }
+            if current.memo != ai.memo || current.title != ai.title {
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE notes
+                     SET memo=?1, title=?2, updated_at=?3, ai_notice_pending=1
+                     WHERE id=?4",
+                    rusqlite::params![ai.memo, ai.title, now, id],
+                )?;
+                changed = true;
+            }
+            Ok(changed)
+        })();
+        match wrote {
+            Ok(changed) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(changed)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
     /// Memo and optional title change, recorded as one version.
     /// `origin` is `ai`, `manual`, or `revert`. Rapid manual saves of the same
     /// editing burst update the latest manual version instead of adding a row.
@@ -5553,6 +5645,27 @@ fn latest_note_version_conn(
     }
 }
 
+fn note_versions_asc(
+    conn: &rusqlite::Connection,
+    note_id: &str,
+) -> Result<Vec<NoteVersionStored>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, note_id, memo, title, source, created_at FROM note_versions
+         WHERE note_id=?1 ORDER BY created_at ASC, rowid ASC",
+    )?;
+    let rows = stmt.query_map([note_id], |row| {
+        Ok(NoteVersionStored {
+            id: row.get(0)?,
+            note_id: row.get(1)?,
+            memo: row.get(2)?,
+            title: row.get(3)?,
+            source: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
 fn insert_note_version_conn(
     conn: &rusqlite::Connection,
     note_id: &str,
@@ -6395,6 +6508,97 @@ mod note_version_tests {
         assert_eq!(by_title[0].id, hit.id);
         let (none, _) = db.search_note_memos("カタカナ", 8).unwrap();
         assert!(none.is_empty());
+        let (both, _) = db.search_note_memos("解除 別", 8).unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].id, hit.id);
+        let (missing_term, _) = db.search_note_memos("解除 要件", 8).unwrap();
+        assert!(missing_term.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsaved_draft_stays_in_history_behind_the_ai_write() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件").unwrap();
+        db.update_note_memo(&note.id, "保存済み\n").unwrap();
+        db.apply_llm_note_write(&note.id, "AIの本文\n", None, None)
+            .unwrap();
+        assert!(db
+            .keep_unsaved_note_memo(&note.id, "保存済み\n下書き")
+            .unwrap());
+        assert_eq!(
+            db.get_note(&note.id).unwrap().unwrap().memo,
+            "AIの本文\n"
+        );
+        let stored = version_memos(&db, &note.id);
+        let draft_at = stored
+            .iter()
+            .position(|(_, memo)| memo == "保存済み\n下書き")
+            .unwrap();
+        let ai_at = stored
+            .iter()
+            .position(|(_, memo)| memo == "AIの本文\n")
+            .unwrap();
+        assert!(draft_at < ai_at, "{stored:?}");
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        assert_eq!(history.versions.last().unwrap().source, NOTE_ORIGIN_AI);
+        assert!(history.ai_updated_at.is_some());
+        assert!(!db
+            .keep_unsaved_note_memo(&note.id, "保存済み\n下書き")
+            .unwrap());
+        assert!(!db.keep_unsaved_note_memo(&note.id, "AIの本文\n").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flush_that_overwrote_the_ai_write_is_put_back_in_history() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件").unwrap();
+        db.update_note_memo(&note.id, "保存済み\n").unwrap();
+        db.apply_llm_note_write(&note.id, "AIの本文\n", None, None)
+            .unwrap();
+        db.update_note_memo(&note.id, "保存済み\n下書き").unwrap();
+        assert_eq!(
+            db.get_note(&note.id).unwrap().unwrap().memo,
+            "保存済み\n下書き"
+        );
+        assert!(db
+            .keep_unsaved_note_memo(&note.id, "保存済み\n下書き")
+            .unwrap());
+        assert_eq!(
+            db.get_note(&note.id).unwrap().unwrap().memo,
+            "AIの本文\n"
+        );
+        let stored = version_memos(&db, &note.id);
+        let draft_at = stored
+            .iter()
+            .position(|(_, memo)| memo == "保存済み\n下書き")
+            .unwrap();
+        let ai_at = stored
+            .iter()
+            .position(|(_, memo)| memo == "AIの本文\n")
+            .unwrap();
+        assert!(draft_at < ai_at, "{stored:?}");
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        assert_eq!(history.versions.last().unwrap().source, NOTE_ORIGIN_AI);
+        assert!(db.get_note_review(&note.id).unwrap().unwrap().has_review);
+        db.update_note_memo(&note.id, "途中の下書き").unwrap();
+        assert!(db.keep_unsaved_note_memo(&note.id, "さらに入力").unwrap());
+        assert_eq!(db.get_note(&note.id).unwrap().unwrap().memo, "AIの本文\n");
+        let stored = version_memos(&db, &note.id);
+        let ai_at = stored
+            .iter()
+            .position(|(_, memo)| memo == "AIの本文\n")
+            .unwrap();
+        let mid = stored
+            .iter()
+            .position(|(_, memo)| memo == "途中の下書き")
+            .unwrap();
+        let more = stored
+            .iter()
+            .position(|(_, memo)| memo == "さらに入力")
+            .unwrap();
+        assert!(mid < ai_at && more < ai_at, "{stored:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

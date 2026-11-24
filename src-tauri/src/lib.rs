@@ -476,6 +476,7 @@ pub fn run() {
             commands::list_note_versions,
             commands::note_version_diff,
             commands::revert_note_to_version,
+            commands::keep_unsaved_note_memo,
             commands::update_note_memo,
             commands::append_note_memo,
             commands::undo_append_note_memo,
