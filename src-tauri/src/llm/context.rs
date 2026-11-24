@@ -745,6 +745,19 @@ pub fn sources_for_citation_retry(
         .collect()
 }
 
+/// Retry only when a non-note source was used and the answer cites nothing.
+/// A `[n]` that points at a note counts: unused index hits do not reset that answer.
+pub fn citation_retry_warranted(
+    consumed: &[(String, i64)],
+    sources: &[LlmSourceRow],
+    answer: &str,
+) -> bool {
+    if sources_for_citation_retry(consumed, sources).is_empty() {
+        return false;
+    }
+    consumed_cited_in_answer(consumed, answer).is_empty()
+}
+
 pub const FINAL_CITE_HINT: &str =
     "使った出典にだけ [n] を付けて答えてください。使っていない番号は本文に並べないでください。";
 pub const STOP_TOOLS_HINT: &str =
@@ -2848,6 +2861,31 @@ mod tests {
             consumed_cited_in_answer(&mixed, "ノート [1]"),
             vec![("n1".into(), 1)]
         );
+        assert!(!citation_retry_warranted(
+            &[("n1".into(), 1)],
+            &[note_src("n1", 1)],
+            "更新しました"
+        ));
+    }
+
+    #[test]
+    fn citing_only_a_note_does_not_retry_when_index_hits_were_unused() {
+        let note = note_src("n1", 1);
+        let mut index = src("h1", "tool", 2, "索引本文");
+        index.cite_no = 2;
+        let consumed = vec![("n1".into(), 1i64), ("h1".into(), 2)];
+        let sources = [note, index];
+        assert!(!citation_retry_warranted(
+            &consumed,
+            &sources,
+            "ノートに沿って更新しました [1]"
+        ));
+        assert!(citation_retry_warranted(&consumed, &sources, "更新しました"));
+        assert!(!citation_retry_warranted(
+            &consumed,
+            &sources,
+            "索引の記載は [2] です"
+        ));
     }
 
     /// Without the id in the block, `read_unit` cannot be called and a shortened tool hit
