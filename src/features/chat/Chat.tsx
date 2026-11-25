@@ -62,7 +62,7 @@ import {
   pastedImageSizeError,
   pastedImageTypeError,
 } from "./pasteImage";
-import NoteDestPicker, { keepToNote } from "../notes/NoteDestPicker";
+import NoteDestPicker from "../notes/NoteDestPicker";
 import type { NoteReview } from "../notes/noteReview";
 import { openPreview } from "../preview/openPreview";
 import { highlightText } from "../search/highlightText";
@@ -328,11 +328,6 @@ function noteIdOf(s: { path: string }): string {
   return path.startsWith("note:") ? path.slice("note:".length) : "";
 }
 
-function canKeepSource(s: LlmSourceRow): boolean {
-  if (isNoteSource(s) || isImageSource(s)) return false;
-  return s.path.trim().length > 0;
-}
-
 function sourceOpenTitle(s: LlmSourceRow): string {
   if (isNoteSource(s)) return "ノートを開く";
   return isWebSource(s) ? "ブラウザで開く" : "プレビュー";
@@ -371,13 +366,11 @@ function CiteChip({
   citeNo,
   label,
   onOpen,
-  onKeep,
 }: {
   source: LlmSourceRow;
   citeNo: number;
   label: string;
   onOpen: (source: LlmSourceRow) => void;
-  onKeep: (source: LlmSourceRow, noteId: "new" | string) => void;
 }) {
   const path = source.path.trim();
   const text = `${citePrefix(citeNo)}${label}`;
@@ -395,15 +388,6 @@ function CiteChip({
       ) : (
         <span className="chat-cite-badge">{text}</span>
       )}
-      {canKeepSource(source) ? (
-        <NoteDestPicker
-          buttonClassName="chat-tpl"
-          title="この出典をノートにキープ"
-          onPick={(id) => onKeep(source, id)}
-        >
-          キープ
-        </NoteDestPicker>
-      ) : null}
     </span>
   );
 }
@@ -1571,32 +1555,6 @@ export default function Chat() {
     }
   }
 
-  async function keepSource(source: LlmSourceRow, noteId: "new" | string) {
-    const web = isWebSource(source);
-    try {
-      const result = await keepToNote(
-        {
-          query: source.query ?? "",
-          snippet: (source.body ?? "").slice(0, 280),
-          path: source.path,
-          title: sourceLabel(source),
-          source: web ? "web" : source.kind || "index",
-          docKind: web ? "web" : "",
-          paragraphId: web ? source.path : source.paragraphId || source.path,
-          badge: true,
-          silent: true,
-        },
-        noteId,
-      );
-      const name = result.note?.title?.trim() || "無題のノート";
-      setNotice(
-        result.created ? `『${name}』にキープした` : `『${name}』にすでにキープ済み`,
-      );
-    } catch (e) {
-      setError(formatInvokeError(e));
-    }
-  }
-
   async function openReviewedNote(noteId: string) {
     try {
       await invoke("set_active_note", { id: noteId });
@@ -2568,7 +2526,6 @@ export default function Chat() {
                           citeNo={g.citeNo}
                           label={chipLabel(g.representative)}
                           onOpen={(s) => void openSource(s)}
-                          onKeep={(s, id) => void keepSource(s, id)}
                         />
                       ))}
                     </div>
@@ -2630,7 +2587,6 @@ export default function Chat() {
                       citeNo={g.citeNo}
                       label={chipLabel(g.representative)}
                       onOpen={(s) => void openSource(s)}
-                      onKeep={(s, id) => void keepSource(s, id)}
                     />
                   ))}
                 </div>

@@ -2081,6 +2081,18 @@ async fn llm_send_inner<R: Runtime>(
                 .consume_llm_sources(&cited, &user_message.id, &assistant.id)
                 .map_err(|e| e.to_string())?;
         }
+        if !wrote_note_ids.is_empty() && !cited.is_empty() {
+            let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+            let _ = crate::note_keep::keep_cited_on_notes(
+                &state.db,
+                &wrote_note_ids,
+                &all,
+                &cited,
+            );
+            for id in &wrote_note_ids {
+                crate::commands::emit_note_updated_from(app, id, "items", "");
+            }
+        }
     }
     let _ = state.db.delete_uncited_tool_sources(&thread.id);
     emit_sources_updated(&app, &thread.id);

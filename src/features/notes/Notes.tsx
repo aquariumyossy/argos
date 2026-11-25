@@ -14,13 +14,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { highlightText } from "../search/highlightText";
 import {
-  applyLegalMdHighlights,
-  clearLegalMdHighlights,
-  formatLegalDisplayHtml,
-  legalMdHighlightTerms,
-  type LegalDisplayKind,
-} from "./legalMdFormat";
-import {
   buildNoteExportMarkdown,
   formatExportBody,
   noteExportFilename,
@@ -51,32 +44,16 @@ const SIDEBAR_MAX = 420;
 const SIDEBAR_DEFAULT = 220;
 const SIDEBAR_WIDTH_KEY = "argos.notes.sidebarWidth";
 
-const BODY_HEIGHT_MIN = 72;
-const BODY_HEIGHT_MAX = 800;
-const BODY_HEIGHTS_KEY = "argos.notes.bodyHeights";
-
-const LEGAL_MD_FORMAT_KEY = "argos.notes.legalMdFormat";
 const PRINT_OPTS_KEY = "argos.notes.printOpts";
-const SPLIT_DIR_KEY = "argos.notes.splitDir";
 const SPLIT_RATIO_KEY = "argos.notes.splitRatio";
 const MEMO_EDIT_KEY = "argos.notes.memoEdit";
 const SIDEBAR_FILTER_KEY = "argos.notes.sidebarFilter";
 const SPLIT_RATIO_MIN = 0.22;
 const SPLIT_RATIO_MAX = 0.78;
-const SPLIT_FORCE_COL_PX = 560;
 const MEMO_ATTACH_FULL_MAX = 4000;
 
-type SplitDir = "col" | "row";
 type SidebarFilter = "notes" | "tasks";
 type NoteUpdatedPayload = { noteId?: string; kind?: string; source?: string };
-
-function loadSplitDir(): SplitDir {
-  try {
-    return localStorage.getItem(SPLIT_DIR_KEY) === "row" ? "row" : "col";
-  } catch {
-    return "col";
-  }
-}
 
 function loadSplitRatio(): number {
   try {
@@ -165,36 +142,6 @@ function loadSidebarWidth(): number {
     return clampSidebarWidth(n);
   } catch {
     return SIDEBAR_DEFAULT;
-  }
-}
-
-function clampBodyHeight(h: number): number {
-  return Math.min(BODY_HEIGHT_MAX, Math.max(BODY_HEIGHT_MIN, Math.round(h)));
-}
-
-function loadBodyHeights(): Record<string, number> {
-  try {
-    const raw = localStorage.getItem(BODY_HEIGHTS_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== "object") return {};
-    const out: Record<string, number> = {};
-    for (const [k, v] of Object.entries(parsed)) {
-      if (typeof v === "number" && Number.isFinite(v)) {
-        out[k] = clampBodyHeight(v);
-      }
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-function loadLegalMdFormat(): boolean {
-  try {
-    return localStorage.getItem(LEGAL_MD_FORMAT_KEY) === "1";
-  } catch {
-    return false;
   }
 }
 
@@ -296,46 +243,6 @@ function parseSnapshot(raw: string): NoteItemSnapshot {
   }
 }
 
-function isOutlookPath(path: string): boolean {
-  return path.startsWith("outlook:") || path.includes("outlook:");
-}
-
-function isOutlookSnapshot(snap: NoteItemSnapshot): boolean {
-  return (
-    snap.source === "outlook" ||
-    snap.docKind === "email" ||
-    isOutlookPath(snap.path)
-  );
-}
-
-/** Compact folder meta: `受信トレイ（半蔵門総合法律事務所）`. */
-function formatMailFolderMeta(pathLabel: string): string {
-  const parts = pathLabel
-    .split("/")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (parts.length === 0) return pathLabel.trim();
-  const store = parts[0];
-  let i = 1;
-  while (
-    i < parts.length &&
-    parts[i].localeCompare(store, undefined, { sensitivity: "accent" }) === 0
-  ) {
-    i += 1;
-  }
-  const folderParts = parts.slice(i);
-  if (folderParts.length === 0) return store;
-  return `${folderParts.join("／")}（${store}）`;
-}
-
-function noteItemSourceLabel(snap: NoteItemSnapshot): string {
-  if (!isOutlookSnapshot(snap)) return snap.path;
-  const from = (snap.mailFrom ?? "").trim();
-  const folder = (snap.mailFolder ?? "").trim();
-  const folderLabel = folder ? formatMailFolderMeta(folder) : "";
-  return [from, folderLabel].filter(Boolean).join(" · ") || "Outlook メール";
-}
-
 function ActionIcon({ children }: { children: ReactNode }) {
   return (
     <svg
@@ -352,33 +259,6 @@ function ActionIcon({ children }: { children: ReactNode }) {
     >
       {children}
     </svg>
-  );
-}
-
-function IconOpenFile() {
-  return (
-    <ActionIcon>
-      <path d="M9 2.5h4.5V7" />
-      <path d="M13.5 2.5 7 9" />
-      <path d="M7.5 3.5H3.75A1.25 1.25 0 0 0 2.5 4.75v7.5A1.25 1.25 0 0 0 3.75 13.5h7.5a1.25 1.25 0 0 0 1.25-1.25V8.5" />
-    </ActionIcon>
-  );
-}
-
-function IconPreview() {
-  return (
-    <ActionIcon>
-      <path d="M1.75 8s2.25-4 6.25-4 6.25 4 6.25 4-2.25 4-6.25 4-6.25-4-6.25-4Z" />
-      <circle cx="8" cy="8" r="1.75" />
-    </ActionIcon>
-  );
-}
-
-function IconFolder() {
-  return (
-    <ActionIcon>
-      <path d="M2.5 5.25A1.25 1.25 0 0 1 3.75 4h2.3l1.2 1.5h5A1.25 1.25 0 0 1 13.5 6.75v4.5A1.25 1.25 0 0 1 12.25 12.5H3.75A1.25 1.25 0 0 1 2.5 11.25v-6Z" />
-    </ActionIcon>
   );
 }
 
@@ -466,23 +346,16 @@ export default function Notes() {
   const [error, setError] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
-  const [dragId, setDragId] = useState<string | null>(null);
-  const [draggableId, setDraggableId] = useState<string | null>(null);
   const [noteDragId, setNoteDragId] = useState<string | null>(null);
   const [noteDraggableId, setNoteDraggableId] = useState<string | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [listQuery, setListQuery] = useState("");
   const [contentHitIds, setContentHitIds] = useState<string[] | null>(null);
-  const [bodyHeights, setBodyHeights] = useState<Record<string, number>>(loadBodyHeights);
-  const [resizingBodyId, setResizingBodyId] = useState<string | null>(null);
-  const [legalMdFormat, setLegalMdFormat] = useState(loadLegalMdFormat);
   const [printOpts, setPrintOpts] = useState(loadPrintOpts);
   const [printMenuOpen, setPrintMenuOpen] = useState(false);
   const [chatNotice, setChatNotice] = useState("");
-  const [splitDirPref, setSplitDirPref] = useState<SplitDir>(loadSplitDir);
   const [splitRatio, setSplitRatio] = useState(loadSplitRatio);
-  const [forceCol, setForceCol] = useState(false);
   const [resizingSplit, setResizingSplit] = useState(false);
   const [memoEdit, setMemoEdit] = useState(loadMemoEdit);
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>(loadSidebarFilter);
@@ -497,11 +370,7 @@ export default function Notes() {
   const printMenuRef = useRef<HTMLDivElement | null>(null);
   const chatNoticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const bodyRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const noteMemoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const itemMemoTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
-    new Map(),
-  );
   const memoDirtyRef = useRef(false);
   const pendingMemoRef = useRef<PendingMemo | null>(null);
   const flushingMemoRef = useRef<PendingMemo | null>(null);
@@ -528,8 +397,6 @@ export default function Notes() {
     left: number;
   } | null>(null);
 
-  const viewMode = active?.viewMode === "grid" ? "grid" : "list";
-  const splitDir: SplitDir = forceCol ? "col" : splitDirPref;
   const notesReadyRef = useRef(false);
   const bootstrappingRef = useRef(false);
 
@@ -926,7 +793,6 @@ export default function Notes() {
   useEffect(() => {
     return () => {
       if (noteMemoTimer.current) clearTimeout(noteMemoTimer.current);
-      for (const t of itemMemoTimers.current.values()) clearTimeout(t);
     };
   }, []);
 
@@ -940,35 +806,11 @@ export default function Notes() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(BODY_HEIGHTS_KEY, JSON.stringify(bodyHeights));
-    } catch {
-      /* ignore */
-    }
-  }, [bodyHeights]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(LEGAL_MD_FORMAT_KEY, legalMdFormat ? "1" : "0");
-    } catch {
-      /* ignore */
-    }
-  }, [legalMdFormat]);
-
-  useEffect(() => {
-    try {
       localStorage.setItem(PRINT_OPTS_KEY, JSON.stringify(printOpts));
     } catch {
       /* ignore */
     }
   }, [printOpts]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(SPLIT_DIR_KEY, splitDirPref);
-    } catch {
-      /* ignore */
-    }
-  }, [splitDirPref]);
 
   useEffect(() => {
     try {
@@ -996,17 +838,6 @@ export default function Notes() {
 
   useEffect(() => {
     activeRef.current = active;
-  }, [active]);
-
-  useEffect(() => {
-    const el = mainRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width ?? 0;
-      setForceCol(w > 0 && w < SPLIT_FORCE_COL_PX);
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
   }, [active]);
 
   useEffect(() => {
@@ -1051,67 +882,32 @@ export default function Notes() {
     window.addEventListener("mouseup", onUp);
   }, [sidebarWidth]);
 
-  const onBodyResizeStart = useCallback(
-    (e: ReactMouseEvent, itemId: string) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      setDraggableId(null);
-      const el = bodyRefs.current.get(itemId);
-      const startH = bodyHeights[itemId] ?? el?.offsetHeight ?? 160;
-      const startY = e.clientY;
-      setResizingBodyId(itemId);
+  const onSplitResizeStart = useCallback((e: ReactMouseEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const main = mainRef.current;
+    if (!main) return;
+    setResizingSplit(true);
+    const rect = main.getBoundingClientRect();
+    const size = rect.width;
+    const head = main.querySelector(".notes-main-head") as HTMLElement | null;
+    const extra = (head?.offsetHeight ?? 0) + 24;
 
-      const onMove = (ev: MouseEvent) => {
-        setBodyHeights((prev) => ({
-          ...prev,
-          [itemId]: clampBodyHeight(startH + (ev.clientY - startY)),
-        }));
-      };
-      const onUp = () => {
-        setResizingBodyId(null);
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
-      };
-      window.addEventListener("mousemove", onMove);
-      window.addEventListener("mouseup", onUp);
-    },
-    [bodyHeights],
-  );
-
-  const onSplitResizeStart = useCallback(
-    (e: ReactMouseEvent) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      const main = mainRef.current;
-      if (!main) return;
-      setResizingSplit(true);
-      const rect = main.getBoundingClientRect();
-      const col = splitDir === "col";
-      const size = col ? rect.height : rect.width;
-      const head = main.querySelector(".notes-main-head") as HTMLElement | null;
-      const extra = (head?.offsetHeight ?? 0) + 24;
-
-      const onMove = (ev: MouseEvent) => {
-        const pos = col ? ev.clientY : ev.clientX;
-        const origin = col ? rect.top + extra : rect.left;
-        const usable = Math.max(80, size - extra);
-        const next = (pos - origin) / usable;
-        if (!Number.isFinite(next)) return;
-        setSplitRatio(
-          Math.min(SPLIT_RATIO_MAX, Math.max(SPLIT_RATIO_MIN, next)),
-        );
-      };
-      const onUp = () => {
-        setResizingSplit(false);
-        window.removeEventListener("mousemove", onMove);
-        window.removeEventListener("mouseup", onUp);
-      };
-      window.addEventListener("mousemove", onMove);
-      window.addEventListener("mouseup", onUp);
-    },
-    [splitDir],
-  );
+    const onMove = (ev: MouseEvent) => {
+      const origin = rect.left;
+      const usable = Math.max(80, size - extra);
+      const next = (ev.clientX - origin) / usable;
+      if (!Number.isFinite(next)) return;
+      setSplitRatio(Math.min(SPLIT_RATIO_MAX, Math.max(SPLIT_RATIO_MIN, next)));
+    };
+    const onUp = () => {
+      setResizingSplit(false);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
 
   const createNote = useCallback(async () => {
     try {
@@ -1302,64 +1098,6 @@ export default function Notes() {
     [active, notes, onNoteMemoChange],
   );
 
-  const onItemMemoChange = useCallback((itemId: string, memo: string) => {
-    setItems((prev) =>
-      prev.map((it) => (it.id === itemId ? { ...it, memo } : it)),
-    );
-    const prev = itemMemoTimers.current.get(itemId);
-    if (prev) clearTimeout(prev);
-    itemMemoTimers.current.set(
-      itemId,
-      setTimeout(() => {
-        void invoke("update_note_item_memo", { id: itemId, memo }).catch((e) =>
-          setError(String(e)),
-        );
-      }, 400),
-    );
-  }, []);
-
-  const setViewMode = useCallback(
-    async (mode: "list" | "grid") => {
-      if (!active) return;
-      try {
-        const next = await invoke<NoteRow>("set_note_view_mode", {
-          id: active.id,
-          viewMode: mode,
-        });
-        setActive(next);
-      } catch (e) {
-        setError(String(e));
-      }
-    },
-    [active],
-  );
-
-  const openKeepBadge = useCallback(async (path: string) => {
-    const target = path.trim();
-    if (!target) return;
-    try {
-      const lower = target.toLowerCase();
-      if (lower.startsWith("http://") || lower.startsWith("https://")) {
-        await invoke("open_web_url", { url: target });
-      } else {
-        await invoke("open_hit", { path: target });
-      }
-      setError("");
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
-  const openPath = useCallback(async (path: string) => {
-    if (!path) return;
-    try {
-      await invoke("open_hit", { path });
-      setError("");
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
-
   const previewItem = useCallback(
     async (row: NoteItemRow, snap: NoteItemSnapshot) => {
       const path = snap.path.trim();
@@ -1383,15 +1121,24 @@ export default function Notes() {
     [],
   );
 
-  const openFolder = useCallback(async (path: string) => {
-    if (!path) return;
-    try {
-      await invoke("open_containing_folder", { path });
-      setError("");
-    } catch (e) {
-      setError(String(e));
-    }
-  }, []);
+  const openKept = useCallback(
+    async (row: NoteItemRow, snap: NoteItemSnapshot) => {
+      const path = snap.path.trim();
+      if (!path) return;
+      const lower = path.toLowerCase();
+      if (lower.startsWith("http://") || lower.startsWith("https://")) {
+        try {
+          await invoke("open_web_url", { url: path });
+          setError("");
+        } catch (e) {
+          setError(String(e));
+        }
+        return;
+      }
+      await previewItem(row, snap);
+    },
+    [previewItem],
+  );
 
   const removeItem = useCallback(
     async (id: string) => {
@@ -1405,66 +1152,6 @@ export default function Notes() {
     [refresh],
   );
 
-  /** Only arm dragging when the press starts outside text/inputs, so selection still works. */
-  const onCardMouseDown = useCallback((e: ReactMouseEvent, id: string) => {
-    const el = e.target as HTMLElement | null;
-    const blocked = el?.closest(
-      "textarea, input, .notes-item-body, .notes-item-path, .notes-body-resize",
-    );
-    const handle = el?.closest(".notes-drag-handle");
-    setDraggableId(!handle && blocked ? null : id);
-  }, []);
-
-  const onDragStart = useCallback((e: DragEvent, id: string) => {
-    if (draggableId !== id) {
-      e.preventDefault();
-      return;
-    }
-    setDragId(id);
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", id);
-  }, [draggableId]);
-
-  const onDragOver = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-  }, []);
-
-  const onDrop = useCallback(
-    async (e: DragEvent, targetId: string) => {
-      e.preventDefault();
-      const sourceId = dragId || e.dataTransfer.getData("text/plain");
-      setDragId(null);
-      if (!active || !sourceId || sourceId === targetId) return;
-      const ids = items.map((it) => it.id);
-      const from = ids.indexOf(sourceId);
-      const to = ids.indexOf(targetId);
-      if (from < 0 || to < 0) return;
-      const next = [...ids];
-      next.splice(from, 1);
-      next.splice(to, 0, sourceId);
-      setItems((prev) => {
-        const map = new Map(prev.map((it) => [it.id, it]));
-        return next
-          .map((id, i) => {
-            const it = map.get(id);
-            return it ? { ...it, sortOrder: i } : null;
-          })
-          .filter(Boolean) as NoteItemRow[];
-      });
-      try {
-        await invoke("reorder_note_items", {
-          noteId: active.id,
-          orderedIds: next,
-        });
-      } catch (err) {
-        setError(String(err));
-        await refresh();
-      }
-    },
-    [active, dragId, items, refresh],
-  );
-
   const onNoteListMouseDown = useCallback((e: ReactMouseEvent, id: string) => {
     const el = e.target as HTMLElement | null;
     if (el?.closest(".notes-list-note-handle")) {
@@ -1472,6 +1159,11 @@ export default function Notes() {
       return;
     }
     setNoteDraggableId(null);
+  }, []);
+
+  const onNoteDragOver = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
   }, []);
 
   const onNoteDragStart = useCallback(
@@ -1624,57 +1316,6 @@ export default function Notes() {
     [active, attachItemsToChat, noteItemToAttach, parsedItems],
   );
 
-  const legalFormattedItems = useMemo(() => {
-    if (!legalMdFormat) return [];
-    const out: {
-      id: string;
-      html: string;
-      kind: LegalDisplayKind;
-      terms: string[];
-    }[] = [];
-    for (const { row, snap } of parsedItems) {
-      if (!snap.body) continue;
-      const formatted = formatLegalDisplayHtml(snap.path, snap.body);
-      if (!formatted) continue;
-      out.push({
-        id: row.id,
-        html: formatted.html,
-        kind: formatted.kind,
-        terms: legalMdHighlightTerms(row.query, snap.highlightTerms),
-      });
-    }
-    return out;
-  }, [legalMdFormat, parsedItems]);
-
-  const legalFormattedById = useMemo(() => {
-    const map = new Map<
-      string,
-      { html: string; kind: LegalDisplayKind; terms: string[] }
-    >();
-    for (const item of legalFormattedItems) {
-      map.set(item.id, {
-        html: item.html,
-        kind: item.kind,
-        terms: item.terms,
-      });
-    }
-    return map;
-  }, [legalFormattedItems]);
-
-  useLayoutEffect(() => {
-    if (!legalMdFormat || legalFormattedItems.length === 0) {
-      clearLegalMdHighlights();
-      return;
-    }
-    const entries: { el: HTMLElement; terms: string[] }[] = [];
-    for (const item of legalFormattedItems) {
-      const el = bodyRefs.current.get(item.id);
-      if (el) entries.push({ el, terms: item.terms });
-    }
-    applyLegalMdHighlights(entries);
-    return () => clearLegalMdHighlights();
-  }, [legalMdFormat, legalFormattedItems]);
-
   const exportActiveNoteText = useCallback(async () => {
     if (!active) return;
     const exportItems = parsedItems.map(({ row, snap }) => ({
@@ -1724,8 +1365,7 @@ export default function Notes() {
       className={[
         "notes",
         resizingSidebar ? "notes--resizing" : "",
-        resizingBodyId ? "notes--resizing-body" : "",
-        resizingSplit ? `notes--resizing-split notes--split-${splitDir}` : "",
+        resizingSplit ? "notes--resizing-split notes--split-row" : "",
         printOpts.path ? "" : "print-omit-path",
         printOpts.query ? "" : "print-omit-query",
         printOpts.itemMemo ? "" : "print-omit-item-memo",
@@ -1848,7 +1488,7 @@ export default function Notes() {
                   draggable={noteDraggableId === n.id}
                   onMouseDown={(e) => onNoteListMouseDown(e, n.id)}
                   onDragStart={(e) => onNoteDragStart(e, n.id)}
-                  onDragOver={onDragOver}
+                  onDragOver={onNoteDragOver}
                   onDrop={(e) => void onNoteDrop(e, n.id)}
                   onDragEnd={() => {
                     setNoteDragId(null);
@@ -2041,44 +1681,16 @@ export default function Notes() {
                     </div>
                   ) : null}
                 </div>
-                <div className="notes-view-toggle" role="group" aria-label="分割の向き">
-                  <button
-                    type="button"
-                    className={splitDirPref === "col" ? "active" : ""}
-                    disabled={forceCol}
-                    title={forceCol ? "幅が狭いため上下のみ" : "上下に分割"}
-                    onClick={() => setSplitDirPref("col")}
-                  >
-                    上下
-                  </button>
-                  <button
-                    type="button"
-                    className={splitDirPref === "row" && !forceCol ? "active" : ""}
-                    disabled={forceCol}
-                    title={forceCol ? "幅が狭いため上下のみ" : "左右に分割"}
-                    onClick={() => setSplitDirPref("row")}
-                  >
-                    左右
-                  </button>
-                </div>
               </div>
             </header>
 
             {error ? <p className="notes-error">{error}</p> : null}
             {chatNotice ? <p className="notes-chat-notice">{chatNotice}</p> : null}
 
-            <div
-              className={
-                splitDir === "row" ? "notes-split notes-split--row" : "notes-split notes-split--col"
-              }
-            >
+            <div className="notes-split notes-split--row">
               <section
                 className="notes-memo-pane notes-memo-block"
-                style={
-                  splitDir === "col"
-                    ? { flex: `${splitRatio} 1 0` }
-                    : { flex: `${splitRatio} 1 0`, width: 0 }
-                }
+                style={{ flex: `${splitRatio} 1 0`, width: 0 }}
               >
                 <div className="notes-pane-head">
                   <span className="notes-pane-head-title">メモ</span>
@@ -2155,249 +1767,50 @@ export default function Notes() {
               <div
                 className="notes-pane-splitter"
                 role="separator"
-                aria-orientation={splitDir === "col" ? "horizontal" : "vertical"}
+                aria-orientation="vertical"
                 aria-label="メモとキープの境界"
                 onMouseDown={onSplitResizeStart}
               />
               <section
                 className="notes-keep-pane"
-                style={
-                  splitDir === "col"
-                    ? { flex: `${1 - splitRatio} 1 0` }
-                    : { flex: `${1 - splitRatio} 1 0`, width: 0 }
-                }
+                style={{ flex: `${1 - splitRatio} 1 0`, width: 0 }}
               >
                 <div className="notes-pane-head">
                   <span className="notes-pane-head-title">
                     {items.length} 件キープ
                   </span>
-                  <div className="notes-pane-head-actions">
-                    <button
-                      type="button"
-                      className={
-                        legalMdFormat
-                          ? "notes-legal-toggle active"
-                          : "notes-legal-toggle"
-                      }
-                      aria-pressed={legalMdFormat}
-                      title="法令MD・裁判例を見やすく表示（表示のみ）"
-                      onClick={() => setLegalMdFormat((v) => !v)}
-                    >
-                      整形
-                    </button>
-                    <div className="notes-view-toggle" role="group" aria-label="キープの表示">
-                      <button
-                        type="button"
-                        className={viewMode === "list" ? "active" : ""}
-                        onClick={() => void setViewMode("list")}
-                      >
-                        リスト
-                      </button>
-                      <button
-                        type="button"
-                        className={viewMode === "grid" ? "active" : ""}
-                        onClick={() => void setViewMode("grid")}
-                      >
-                        グリッド
-                      </button>
-                    </div>
-                  </div>
                 </div>
                 <div className="notes-pane-body">
             {parsedItems.length === 0 ? (
               <p className="notes-empty-items">
-                まだキープがありません。検索の段落と、チャットの出典からキープできます。
+                まだキープがありません。検索結果からキープするか、チャットでノートを書くと引用した出典が入ります。
               </p>
             ) : (
-              <ul
-                className={
-                  viewMode === "grid" ? "notes-items notes-items--grid" : "notes-items"
-                }
-              >
+              <ul className="notes-items" aria-label="キープ">
                 {parsedItems.map(({ row, snap }) => {
-                  const legal = legalFormattedById.get(row.id);
-                  if (snap.badge) {
-                    const label = snap.title.trim() || snap.path.trim() || "出典";
-                    return (
-                      <li key={row.id} className="notes-item notes-item--badge">
-                        <button
-                          type="button"
-                          className="notes-keep-badge"
-                          title={snap.path}
-                          onClick={() => void openKeepBadge(snap.path)}
-                        >
-                          {label}
-                        </button>
-                        <button
-                          type="button"
-                          className="notes-icon-btn danger"
-                          title="キープを削除"
-                          aria-label="キープを削除"
-                          onClick={() => void removeItem(row.id)}
-                        >
-                          <IconTrash />
-                        </button>
-                      </li>
-                    );
-                  }
+                  const label = snap.title.trim() || snap.path.trim() || "出典";
+                  const web = snap.path.trim().toLowerCase().startsWith("http://")
+                    || snap.path.trim().toLowerCase().startsWith("https://");
                   return (
-                  <li
-                    key={row.id}
-                    className={
-                      dragId === row.id
-                        ? "notes-item notes-item--dragging"
-                        : "notes-item"
-                    }
-                    draggable={draggableId === row.id}
-                    onMouseDown={(e) => onCardMouseDown(e, row.id)}
-                    onDragStart={(e) => onDragStart(e, row.id)}
-                    onDragOver={onDragOver}
-                    onDrop={(e) => void onDrop(e, row.id)}
-                    onDragEnd={() => {
-                      setDragId(null);
-                      setDraggableId(null);
-                    }}
-                  >
-                    <div className="notes-item-top">
-                      <span
-                        className="notes-drag-handle"
-                        title="ドラッグで並べ替え"
-                        aria-hidden="true"
+                    <li key={row.id} className="notes-item notes-item--badge">
+                      <button
+                        type="button"
+                        className="notes-keep-badge"
+                        title={web ? "ページを開く" : "プレビュー"}
+                        onClick={() => void openKept(row, snap)}
                       >
-                        <IconGrip />
-                      </span>
-                      <div className="notes-item-title">
-                        <span className="notes-item-name">
-                          {snap.title || "（無題）"}
-                        </span>
-                        {snap.page != null ? (
-                          <span className="notes-item-page">p.{snap.page}</span>
-                        ) : null}
-                      </div>
-                      <div className="notes-item-actions">
-                        {snap.path.trim() ? (
-                          <button
-                            type="button"
-                            className="notes-icon-btn"
-                            title="プレビュー"
-                            aria-label="プレビュー"
-                            onClick={() => void previewItem(row, snap)}
-                          >
-                            <IconPreview />
-                          </button>
-                        ) : null}
-                        <button
-                          type="button"
-                          className="notes-icon-btn"
-                          title={isOutlookSnapshot(snap) ? "メールを開く" : "開く"}
-                          aria-label={isOutlookSnapshot(snap) ? "メールを開く" : "開く"}
-                          onClick={() => void openPath(snap.path)}
-                        >
-                          <IconOpenFile />
-                        </button>
-                        {!isOutlookSnapshot(snap) ? (
-                          <button
-                            type="button"
-                            className="notes-icon-btn"
-                            title="フォルダを開く"
-                            aria-label="フォルダを開く"
-                            onClick={() => void openFolder(snap.path)}
-                          >
-                            <IconFolder />
-                          </button>
-                        ) : null}
-                        <button
-                          type="button"
-                          className="notes-icon-btn danger"
-                          title="キープを削除"
-                          aria-label="キープを削除"
-                          onClick={() => void removeItem(row.id)}
-                        >
-                          <IconTrash />
-                        </button>
-                      </div>
-                    </div>
-                    <div
-                      className={
-                        isOutlookSnapshot(snap)
-                          ? "notes-item-path notes-item-path--mail"
-                          : "notes-item-path"
-                      }
-                      title={snap.path}
-                    >
-                      {noteItemSourceLabel(snap)}
-                    </div>
-                    <div
-                      className={
-                        resizingBodyId === row.id
-                          ? "notes-item-body-wrap is-resizing"
-                          : "notes-item-body-wrap"
-                      }
-                    >
-                      {legal ? (
-                        <div
-                          className={
-                            legal.kind === "court"
-                              ? "notes-item-body notes-item-body--legal-md notes-item-body--court-case md-body md-body--compact"
-                              : "notes-item-body notes-item-body--legal-md md-body md-body--compact"
-                          }
-                          ref={(node) => {
-                            if (node) bodyRefs.current.set(row.id, node);
-                            else bodyRefs.current.delete(row.id);
-                          }}
-                          style={
-                            bodyHeights[row.id] != null
-                              ? {
-                                  height: bodyHeights[row.id],
-                                  maxHeight: "none",
-                                }
-                              : undefined
-                          }
-                          dangerouslySetInnerHTML={{ __html: legal.html }}
-                        />
-                      ) : (
-                        <div
-                          className="notes-item-body"
-                          ref={(node) => {
-                            if (node) bodyRefs.current.set(row.id, node);
-                            else bodyRefs.current.delete(row.id);
-                          }}
-                          style={
-                            bodyHeights[row.id] != null
-                              ? {
-                                  height: bodyHeights[row.id],
-                                  maxHeight: "none",
-                                }
-                              : undefined
-                          }
-                        >
-                          {snap.body
-                            ? highlightText(snap.body, row.query, snap.highlightTerms)
-                            : "（本文なし）"}
-                        </div>
-                      )}
-                      <div
-                        className="notes-body-resize"
-                        role="separator"
-                        aria-orientation="horizontal"
-                        aria-label="スニペットの高さを変更"
-                        title="ドラッグで高さ変更"
-                        onMouseDown={(e) => onBodyResizeStart(e, row.id)}
-                      />
-                    </div>
-                    <div className="notes-item-meta">
-                      {row.query ? (
-                        <span className="notes-item-query">検索: {row.query}</span>
-                      ) : null}
-                    </div>
-                    <textarea
-                      className="notes-item-memo"
-                      value={row.memo}
-                      placeholder="メモ（任意）"
-                      rows={1}
-                      onChange={(e) => onItemMemoChange(row.id, e.target.value)}
-                    />
-                  </li>
+                        {label}
+                      </button>
+                      <button
+                        type="button"
+                        className="notes-icon-btn danger"
+                        title="キープを削除"
+                        aria-label="キープを削除"
+                        onClick={() => void removeItem(row.id)}
+                      >
+                        <IconTrash />
+                      </button>
+                    </li>
                   );
                 })}
               </ul>
