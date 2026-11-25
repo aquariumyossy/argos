@@ -42,8 +42,19 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-/// Full-memo `read_note` / `write_note` without `heading` is refused above this.
-pub const NOTE_FULL_CHAR_CAP: usize = 12_000;
+/// Full read and full rewrite stay allowed above this size. The tool result
+/// only suggests moving the extra material into another note.
+pub const NOTE_SPLIT_HINT_CHARS: usize = 20_000;
+
+pub fn note_split_hint(chars: usize) -> Option<&'static str> {
+    if chars > NOTE_SPLIT_HINT_CHARS {
+        Some(
+            "このノートは2万字を超えています。読み書きはそのままできます。長くて扱いにくいときは、別のノートに分けてください。",
+        )
+    } else {
+        None
+    }
+}
 /// After prefix/suffix trim, skip LCS when either side exceeds this many lines.
 const DIFF_LCS_LINE_CAP: usize = 1_500;
 /// Merge change islands separated by this many equal lines or fewer.

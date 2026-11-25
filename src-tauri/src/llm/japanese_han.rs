@@ -138,8 +138,7 @@ pub fn foreign_char_notice(parts: &[impl AsRef<str>]) -> Option<String> {
 /// Model-authored strings a write tool would put into a file or a note.
 ///
 /// `find` and `match` are the document text the tool has to locate, so they
-/// are not the model's own writing. A heading used to find a note section is
-/// the same kind of locator.
+/// are not the model's own writing.
 pub fn authored_tool_texts(name: &str, args: &Value) -> Vec<String> {
     match name {
         "edit_office" => edit_office_authored(args),

@@ -106,7 +106,7 @@ pub const LLM_JA_HINT: &str =
     "書き言葉はすべて日本語にします。簡体字・繁体字・旧字体や日本語にない漢字、ハングル・キリル文字などの他の文字体系は、本文・コメント・チャットの報告・ツールの引数にも使いません。「기타」のような他言語の単語を日本語の文の中に混ぜません。";
 pub const LLM_JA_SENTINEL: &str = "書き言葉はすべて日本語にします";
 pub const LLM_NOTE_HINT: &str =
-    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。版の履歴に残ります。調査の質問では、先に list_notes の query で関連ノートを探し、ノートで足りないときだけ索引やウェブを検索してください。ノートを答えに使ったら、その出典番号を付けてください。読む前に消さないでください。全文を書き換えるときは、変えない箇所もそのまま含めてください。対象ノートが無いときは list_notes か create_note を使います。";
+    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。版の履歴に残ります。調査の質問では、先に list_notes の query で関連ノートを探し、ノートで足りないときだけ索引やウェブを検索してください。ノートを答えに使ったら、その出典番号を付けてください。既存のノートを変えるときは、先に read_note で全文を読み、write_note にメモ全体を渡してください。変えない箇所もそのまま含めてください。見出しだけの書き換えはできません。対象ノートが無いときは list_notes か create_note を使います。";
 pub const LLM_NOTE_SENTINEL: &str = "書いた内容はすぐメモに反映されます";
 /// Appended on each request, including a prompt the user edited.
 pub const LLM_REREAD_HINT: &str =
@@ -3543,11 +3543,12 @@ impl Db {
         })
     }
 
+    /// Replace the whole memo. A second call replaces the first result.
+    /// The memo already stored is kept as its own history row.
     pub fn apply_llm_note_write(
         &self,
         id: &str,
         memo: &str,
-        heading: Option<&str>,
         title: Option<&str>,
     ) -> Result<NoteRow, String> {
         if memo.trim().is_empty() {
@@ -3557,41 +3558,11 @@ impl Db {
             .get_note(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "ノートが見つかりません".to_string())?;
-        let heading = heading.map(str::trim).filter(|s| !s.is_empty());
-        let next = if let Some(h) = heading {
-            let secs = notes_md::split_sections(&note.memo);
-            match notes_md::find_section(&secs, h) {
-                Ok(s) => {
-                    let new_text = notes_md::normalize_section_text(h, memo, s.level);
-                    notes_md::replace_section(&note.memo, h, &new_text)
-                        .map_err(|e| e.message(h))?
-                }
-                Err(notes_md::SectionError::Duplicate) => {
-                    return Err(notes_md::SectionError::Duplicate.message(h));
-                }
-                Err(notes_md::SectionError::Missing) => {
-                    let piece = notes_md::normalize_section_text(h, memo, 2);
-                    let mut out = note.memo.clone();
-                    if !out.is_empty() && !out.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    out.push_str(&piece);
-                    out
-                }
-            }
-        } else {
-            if note.memo.chars().count() > notes_md::NOTE_FULL_CHAR_CAP {
-                return Err(
-                    "ノートが長いので heading を指定し、見出し単位で書いてください。".into(),
-                );
-            }
-            memo.to_string()
-        };
         let title = title.map(str::trim).filter(|s| !s.is_empty());
-        if next == note.memo && title.map(|t| t == note.title).unwrap_or(true) {
+        if memo == note.memo && title.map(|t| t == note.title).unwrap_or(true) {
             return Ok(note);
         }
-        self.apply_direct_note_text(id, &next, title, NOTE_ORIGIN_AI)
+        self.apply_direct_note_text(id, memo, title, NOTE_ORIGIN_AI)
     }
 
     pub fn ack_note_review(&self, id: &str, _memo_len: u32) -> Result<NoteReview, String> {
@@ -6336,7 +6307,7 @@ mod note_version_tests {
         let (dir, db) = temp_db();
         let note = db.create_note("事件A").unwrap();
         db.update_note_memo(&note.id, "元の本文\n").unwrap();
-        db.apply_llm_note_write(&note.id, "一回目\n", None, None)
+        db.apply_llm_note_write(&note.id, "一回目\n", None)
             .unwrap();
         let note = db.get_note(&note.id).unwrap().unwrap();
         assert_eq!(note.memo, "一回目\n");
@@ -6344,12 +6315,23 @@ mod note_version_tests {
         let history = db.list_note_history(&note.id).unwrap().unwrap();
         assert!(history.ai_updated_at.is_some());
         assert_eq!(history.versions.last().unwrap().source, NOTE_ORIGIN_AI);
-        db.apply_llm_note_write(&note.id, "二回目\n", None, None)
+        db.apply_llm_note_write(&note.id, "二回目\n", None)
             .unwrap();
         let stored = version_memos(&db, &note.id);
         assert_eq!(stored.last().unwrap().1, "二回目\n");
         assert!(stored.iter().any(|(_, memo)| memo == "元の本文\n"));
         assert!(stored.iter().any(|(_, memo)| memo == "一回目\n"));
+        assert!(!db.get_note(&note.id).unwrap().unwrap().memo.contains("一回目"));
+        let first = db.list_note_history(&note.id).unwrap().unwrap();
+        let first_id = first
+            .versions
+            .iter()
+            .find(|v| v.memo_len == "一回目\n".chars().count() as u32)
+            .unwrap()
+            .id
+            .clone();
+        let restored = db.revert_note_to_version(&note.id, &first_id).unwrap();
+        assert_eq!(restored.memo, "一回目\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6388,7 +6370,7 @@ mod note_version_tests {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
         db.update_note_memo(&note.id, "before\n").unwrap();
-        db.apply_llm_note_write(&note.id, "after\n", None, None)
+        db.apply_llm_note_write(&note.id, "after\n", None)
             .unwrap();
         db.ack_note_review(&note.id, 0).unwrap();
         assert!(!db.get_note_review(&note.id).unwrap().unwrap().has_review);
@@ -6424,7 +6406,7 @@ mod note_version_tests {
         let note = db.create_note("n").unwrap();
         db.update_note_memo(&note.id, "同じ\n").unwrap();
         let before = version_memos(&db, &note.id).len();
-        db.apply_llm_note_write(&note.id, "同じ\n", None, None)
+        db.apply_llm_note_write(&note.id, "同じ\n", None)
             .unwrap();
         assert_eq!(version_memos(&db, &note.id).len(), before);
         assert!(!db.get_note_review(&note.id).unwrap().unwrap().has_review);
@@ -6436,28 +6418,25 @@ mod note_version_tests {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
         let err = db
-            .apply_llm_note_write(&note.id, "  \n", None, None)
+            .apply_llm_note_write(&note.id, "  \n", None)
             .unwrap_err();
         assert!(err.contains("空"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn long_note_requires_heading_and_the_section_is_versioned() {
+    fn long_note_is_replaced_in_full_and_the_old_text_stays_in_history() {
         let (dir, db) = temp_db();
         let note = db.create_note("n").unwrap();
-        let long = "あ".repeat(notes_md::NOTE_FULL_CHAR_CAP + 1);
+        let long = "あ".repeat(notes_md::NOTE_SPLIT_HINT_CHARS + 1);
         db.update_note_memo(&note.id, &long).unwrap();
-        let err = db
-            .apply_llm_note_write(&note.id, "短い\n", None, None)
-            .unwrap_err();
-        assert!(err.contains("heading"));
-        db.apply_llm_note_write(&note.id, "追記区画", Some("新見出し"), None)
-            .unwrap();
+        let rewritten = format!("短い全文\n{long}");
+        db.apply_llm_note_write(&note.id, &rewritten, None).unwrap();
         let note = db.get_note(&note.id).unwrap().unwrap();
-        assert!(note.memo.contains("新見出し"));
+        assert_eq!(note.memo, rewritten);
         let history = db.list_note_history(&note.id).unwrap().unwrap();
         assert_eq!(history.versions.last().unwrap().source, NOTE_ORIGIN_AI);
+        assert!(history.versions.iter().any(|v| v.memo_len == long.chars().count() as u32));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6521,7 +6500,7 @@ mod note_version_tests {
         let (dir, db) = temp_db();
         let note = db.create_note("事件").unwrap();
         db.update_note_memo(&note.id, "保存済み\n").unwrap();
-        db.apply_llm_note_write(&note.id, "AIの本文\n", None, None)
+        db.apply_llm_note_write(&note.id, "AIの本文\n", None)
             .unwrap();
         assert!(db
             .keep_unsaved_note_memo(&note.id, "保存済み\n下書き")
@@ -6555,7 +6534,7 @@ mod note_version_tests {
         let (dir, db) = temp_db();
         let note = db.create_note("事件").unwrap();
         db.update_note_memo(&note.id, "保存済み\n").unwrap();
-        db.apply_llm_note_write(&note.id, "AIの本文\n", None, None)
+        db.apply_llm_note_write(&note.id, "AIの本文\n", None)
             .unwrap();
         db.update_note_memo(&note.id, "保存済み\n下書き").unwrap();
         assert_eq!(
