@@ -138,26 +138,12 @@ afterEach(() => {
 });
 
 describe("chat note memory", () => {
-  it("keeps a web citation as a badge and summarizes the conversation into a note", async () => {
+  it("shows a citation badge without a keep button and summarizes into a note", async () => {
     render(<Chat />);
-    const keep = await screen.findByRole("button", { name: "この出典をノートにキープ" });
-    fireEvent.click(keep);
-    fireEvent.click(await screen.findByRole("menuitem", { name: "新しいノート" }));
-    await vi.waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith(
-        "keep_to_note",
-        expect.objectContaining({
-          payload: expect.objectContaining({
-            badge: true,
-            silent: true,
-            noteId: "new",
-            path: "https://example.com/law",
-            title: "解説",
-            source: "web",
-          }),
-        }),
-      );
-    });
+    const cite = await screen.findByRole("button", { name: "[1] 解説" });
+    expect(screen.queryByRole("button", { name: "この出典をノートにキープ" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "キープ" })).toBeNull();
+    fireEvent.click(cite);
 
     fireEvent.click(
       screen.getByRole("button", { name: "ここまでの会話を要約してノートへ" }),

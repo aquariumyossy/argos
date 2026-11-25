@@ -12,7 +12,7 @@ use crate::llm::context::{
     estimate_tokens, fit_injected_turn, fit_tool_text, is_synthetic_user_turn, meter_question,
     meter_request_tokens, meter_usage_tokens, parse_cited_nos, sent_usage_tokens,
     silent_end_notice, citation_retry_warranted, sources_for_citation_retry, sources_for_consumed,
-    summary_trigger_reached,
+    summary_trigger_reached, thread_sources_cited_in_answer,
     tool_schema_tokens, ChatTurn,
     ContextBudget, PHANTOM_CITE_HINT, PHANTOM_CITE_HINT_NO_TOOLS, REASONING_CARRY_CAP,
     STOP_TOOLS_HINT,
@@ -2080,6 +2080,26 @@ async fn llm_send_inner<R: Runtime>(
                 .db
                 .consume_llm_sources(&cited, &user_message.id, &assistant.id)
                 .map_err(|e| e.to_string())?;
+        }
+        if !wrote_note_ids.is_empty() {
+            let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+            let mut keep_cited = thread_sources_cited_in_answer(&all, &result_text);
+            for (id, cite_no) in thread_sources_cited_in_answer(&all, &cited_body) {
+                if !keep_cited.iter().any(|(kept, _)| kept == &id) {
+                    keep_cited.push((id, cite_no));
+                }
+            }
+            if !keep_cited.is_empty() {
+                let _ = crate::note_keep::keep_cited_on_notes(
+                    &state.db,
+                    &wrote_note_ids,
+                    &all,
+                    &keep_cited,
+                );
+                for id in &wrote_note_ids {
+                    crate::commands::emit_note_updated_from(app, id, "items", "");
+                }
+            }
         }
     }
     let _ = state.db.delete_uncited_tool_sources(&thread.id);
