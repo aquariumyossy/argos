@@ -1,6 +1,6 @@
 //! LLM tool-calling: index search and unit preview.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -466,7 +466,7 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_WRITE_NOTE,
-            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で read_note していないノートは変更しない。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
+            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で、前のモデル呼び出しが受け取った read_note の全文があるノートだけを変更する。同じ応答の中の read_note や、前の送信の読み取り、省略された本文では書けない。読んだ後にノートが変わっていたら、もう一度 read_note してから書く。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2065,6 +2065,15 @@ fn keep_from_index_id(state: &AppState, id: &str) -> Result<crate::note_keep::Ke
     })
 }
 
+/// Memo and title at the moment `read_note` returned. A later user edit changes it.
+pub fn note_content_stamp(memo: &str, title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    memo.hash(&mut hasher);
+    title.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// `note_id:` line in a full `read_note` result. Context trimming drops the line
 /// together with the body, which withdraws permission to write.
 pub fn note_id_in_read_result(content: &str) -> Option<String> {
@@ -2151,17 +2160,26 @@ fn tool_write_note(
     state: &AppState,
     thread_id: &str,
     args: &Value,
-    read_notes: &HashSet<String>,
+    read_stamps: &HashMap<String, u64>,
 ) -> ToolExec {
     let note = match resolve_note(state, thread_id, args) {
         Ok(n) => n,
         Err(e) => return ToolExec::text(e),
     };
-    if !read_notes.contains(&note.id) {
-        return ToolExec::text(format!(
-            "この送信ではノート『{}』（id={}）の全文をまだ読んでいません。ノートは変更していません。先に read_note を呼んでください。",
-            note.title, note.id
-        ));
+    match read_stamps.get(&note.id) {
+        None => {
+            return ToolExec::text(format!(
+                "この送信では、前のモデル呼び出しで返った read_note の全文がありません。同じ応答で読んだもの、前の送信の読み取り、省略された本文では書けません。ノート『{}』（id={}）は変更していません。先に read_note を呼んでください。",
+                note.title, note.id
+            ));
+        }
+        Some(stamp) if *stamp != note_content_stamp(&note.memo, &note.title) => {
+            return ToolExec::text(format!(
+                "読んだ後にノート『{}』（id={}）が変わっています。ノートは変更していません。もう一度 read_note を呼んでください。",
+                note.title, note.id
+            ));
+        }
+        Some(_) => {}
     }
     let memo = args
         .get("memo")
@@ -3107,7 +3125,7 @@ pub fn execute_tool(
     thread_scope: Option<&str>,
     web_search: bool,
     request_id: &str,
-    read_notes: &HashSet<String>,
+    read_stamps: &HashMap<String, u64>,
 ) -> ToolExec {
     match execute_tool_inner(
         state,
@@ -3117,7 +3135,7 @@ pub fn execute_tool(
         thread_scope,
         web_search,
         request_id,
-        read_notes,
+        read_stamps,
     ) {
         Ok(exec) => exec,
         Err(e) => ToolExec {
@@ -3136,7 +3154,7 @@ fn execute_tool_inner(
     thread_scope: Option<&str>,
     web_search: bool,
     _request_id: &str,
-    read_notes: &HashSet<String>,
+    read_stamps: &HashMap<String, u64>,
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     if let Some(message) = crate::llm::japanese_han::foreign_char_tool_error(name, &args) {
@@ -3586,7 +3604,7 @@ fn execute_tool_inner(
         TOOL_LIST_NOTES => Ok(tool_list_notes(state, thread_id, &args)),
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
-        TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args, read_notes)),
+        TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args, read_stamps)),
         TOOL_LIST_OUTPUT => Ok(ToolExec::text(crate::llm::output_files::list_for_tool(
             &state.data_dir,
             &args,
