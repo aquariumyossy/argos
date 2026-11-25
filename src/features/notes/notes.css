@@ -399,27 +399,62 @@
 .notes-item--badge {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  min-width: 0;
+  padding: 4px 8px;
 }
 
 .notes-keep-badge {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid var(--line);
   background: var(--bg-elevated, transparent);
   color: inherit;
+  border-radius: 999px;
+  padding: 2px 2px 2px 12px;
+  gap: 4px;
+}
+
+.notes-keep-badge:hover {
+  border-color: var(--accent);
+}
+
+.notes-keep-badge-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
   font: inherit;
   font-size: 0.85rem;
-  border-radius: 999px;
-  padding: 4px 12px;
-  max-width: 100%;
+  line-height: 1.4;
+  text-align: left;
+  padding: 2px 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
 }
 
-.notes-keep-badge:hover {
-  border-color: var(--accent);
+.notes-keep-badge-remove {
+  flex: 0 0 auto;
+  width: 1.7em;
+  height: 1.7em;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+}
+
+.notes-keep-badge-remove:hover {
+  color: var(--danger);
 }
 
 .notes-pane-body {

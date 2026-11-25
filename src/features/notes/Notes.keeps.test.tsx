@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Notes from "./Notes";
 
@@ -97,7 +97,25 @@ describe("note keeps", () => {
   it("shows every keep as a badge in a left-right layout", async () => {
     render(<Notes />);
     const file = await screen.findByRole("button", { name: "契約書" });
+    expect(
+      document.querySelector(".notes-memo-pane .notes-pane-head-title")?.textContent,
+    ).toBe("ノート");
+    expect(
+      document.querySelector(".notes-keep-pane .notes-pane-head-title")?.textContent?.replace(/\s+/g, " ").trim(),
+    ).toBe("出典 2 件");
     const page = screen.getByRole("button", { name: "解説" });
+    const keepPane = document.querySelector(".notes-keep-pane");
+    if (!keepPane) throw new Error("出典ペインがありません");
+    const removes = within(keepPane as HTMLElement).getAllByRole("button", { name: "削除" });
+    expect(removes).toHaveLength(2);
+    fireEvent.click(removes[1]);
+    await vi.waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("remove_note_item", { id: "i2" });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "open_web_url",
+      expect.anything(),
+    );
     expect(screen.queryByText("この本文は出さない")).toBeNull();
     expect(screen.queryByRole("button", { name: "上下" })).toBeNull();
     expect(screen.queryByRole("button", { name: "左右" })).toBeNull();
