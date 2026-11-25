@@ -1,6 +1,6 @@
 //! LLM tool-calling: index search and unit preview.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -192,6 +192,26 @@ pub fn tools_schema(
     look_image: bool,
 ) -> Value {
     tools_schema_with(web_search, remote_index, remote_only, look_image, true)
+}
+
+/// `write_note` alone. One follow-up call may offer only this after a full
+/// `read_note` has already used the tool-result budget.
+pub fn write_note_only_schema() -> Value {
+    let full = tools_schema(false, false, false, false);
+    let Some(tools) = full.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        tools
+            .iter()
+            .filter(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+                    == Some(TOOL_WRITE_NOTE)
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 /// `index_search` is the per-thread flag. When it is false, `search_index` is left out.
@@ -426,15 +446,11 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_READ_NOTE,
-            "description": "ノートの見出し一覧と本文を読む。note_id を省略したら対象ノート。heading を指定するとその区画だけ。長いノートは全文が返らないので heading を指定して読む。",
+            "description": "ノートの全文を読む。note_id を省略したら対象ノート。長いノートも全文を返す。書き換える前に、この送信で必ずこれを呼ぶ。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note_id": { "type": "string", "description": "ノート id。空なら対象ノート。" },
-                    "heading": {
-                        "type": "string",
-                        "description": "ATX見出し（# の行）。空なら全文（短いノートのみ）。"
-                    }
+                    "note_id": { "type": "string", "description": "ノート id。空なら対象ノート。" }
                 }
             }
         }
@@ -443,7 +459,7 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_CREATE_NOTE,
-            "description": "ノートを新規作成してメモを書き、この会話の対象にする。書いた内容はすぐ反映され、版の履歴に残る。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
+            "description": "ノートを新規作成し、memo をその全文として書く。この会話の対象にする。書いた内容はすぐ反映され、版の履歴に残る。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -470,14 +486,13 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_WRITE_NOTE,
-            "description": "ノートのメモを書き換える。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。heading があればその区画だけ置換（無ければ新設）。全文置換するときは変えない箇所も残してメモ全体を渡す。長いノートは heading 必須。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
+            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で、前のモデル呼び出しが受け取った read_note の全文があるノートだけを変更する。同じ応答の中の read_note や、前の送信の読み取り、省略された本文では書けない。読んだ後にノートが変わっていたら、もう一度 read_note してから書く。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "note_id": { "type": "string", "description": "ノート id。空なら対象ノート。" },
                     "title": { "type": "string", "description": "題名を変えるとき" },
-                    "heading": { "type": "string", "description": "対象の見出し。空なら全文置換。" },
-                    "memo": { "type": "string", "description": "新しい本文（Markdown）。全文置換ならメモ全体。" },
+                    "memo": { "type": "string", "description": "新しいメモ全文（Markdown）。ここに無い箇所は消える。" },
                     "keeps": {
                         "type": "array",
                         "description": "一緒にキープする出典。索引は id（paragraph_id）。ウェブは url と title。",
@@ -1499,7 +1514,7 @@ pub fn format_note_target_system_line(title: &str, memo: &str) -> String {
         format!("見出し: {}。", heads.join("、"))
     };
     format!(
-        "\n対象ノートは「{title}」。{outline}create_note / read_note / write_note でメモを読めます。書いた内容はすぐ反映され、版の履歴に残ります。"
+        "\n対象ノートは「{title}」。{outline}変えるときは read_note で全文を読んでから write_note で全文を書き換えてください。変えない箇所も残してください。書いた内容はすぐ反映され、版の履歴に残ります。"
     )
 }
 
@@ -2070,16 +2085,34 @@ fn keep_from_index_id(state: &AppState, id: &str) -> Result<crate::note_keep::Ke
     })
 }
 
+/// Memo and title at the moment `read_note` returned. A later user edit changes it.
+pub fn note_content_stamp(memo: &str, title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    memo.hash(&mut hasher);
+    title.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `note_id:` line in a full `read_note` result. Context trimming drops the line
+/// together with the body, which withdraws permission to write.
+pub fn note_id_in_read_result(content: &str) -> Option<String> {
+    for line in content.lines() {
+        if let Some(id) = line.trim().strip_prefix("note_id:") {
+            let id = id.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn tool_read_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
     let note = match resolve_note(state, thread_id, args) {
         Ok(n) => n,
         Err(e) => return ToolExec::text(e),
     };
-    let heading = args
-        .get("heading")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
     let chars = note.memo.chars().count();
     let outline = crate::notes_md::outline(&note.memo);
     let outline_line = if outline.is_empty() {
@@ -2087,32 +2120,13 @@ fn tool_read_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
     } else {
         format!("見出し: {}", outline.join("、"))
     };
-    let head = format!(
-        "ノート『{}』 id={}\n{outline_line}\n文字数: {chars}",
+    let mut head = format!(
+        "ノート『{}』\nnote_id:{}\n{outline_line}\n文字数: {chars}",
         note.title, note.id
     );
-    if let Some(h) = heading {
-        let secs = crate::notes_md::split_sections(&note.memo);
-        let text = match crate::notes_md::find_section(&secs, h) {
-            Ok(s) => s.text.clone(),
-            Err(e) => {
-                return ToolExec::text(format!("{}\n{head}", e.message(h)));
-            }
-        };
-        let body = cap_chars(&text, crate::notes_md::NOTE_FULL_CHAR_CAP);
-        return with_note_cite(
-            state,
-            thread_id,
-            &note.id,
-            &note.title,
-            &body,
-            format!("{head}\n\n{body}"),
-        );
-    }
-    if chars > crate::notes_md::NOTE_FULL_CHAR_CAP {
-        return ToolExec::text(format!(
-            "{head}\n\nノートが長いため全文は返しません。heading を指定して区画ごとに読み、write_note も heading 付きで書いてください。"
-        ));
+    if let Some(hint) = crate::notes_md::note_split_hint(chars) {
+        head.push('\n');
+        head.push_str(hint);
     }
     with_note_cite(
         state,
@@ -2142,13 +2156,16 @@ fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec
         Ok(n) => n,
         Err(e) => return ToolExec::text(format!("ノートの作成に失敗しました: {e}")),
     };
-    match state.db.apply_llm_note_write(&note.id, memo, None, None) {
+    match state.db.apply_llm_note_write(&note.id, memo, None) {
         Ok(note) => {
             bind_thread_note(state, thread_id, &note.id);
             let keeps = apply_note_keeps(state, &note.id, args);
+            let hint = crate::notes_md::note_split_hint(note.memo.chars().count())
+                .map(|line| format!("\n{line}"))
+                .unwrap_or_default();
             ToolExec {
                 content: format!(
-                    "ノート『{}』を作成してメモに書きました。id={}。反映済みです。履歴に残っています。{keeps}",
+                    "ノート『{}』を作成してメモに書きました。id={}。反映済みです。履歴に残っています。{keeps}{hint}",
                     note.title, note.id
                 ),
                 consumed: Vec::new(),
@@ -2159,11 +2176,31 @@ fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec
     }
 }
 
-fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
+fn tool_write_note(
+    state: &AppState,
+    thread_id: &str,
+    args: &Value,
+    read_stamps: &HashMap<String, u64>,
+) -> ToolExec {
     let note = match resolve_note(state, thread_id, args) {
         Ok(n) => n,
         Err(e) => return ToolExec::text(e),
     };
+    match read_stamps.get(&note.id) {
+        None => {
+            return ToolExec::text(format!(
+                "この送信では、前のモデル呼び出しで返った read_note の全文がありません。同じ応答で読んだもの、前の送信の読み取り、省略された本文では書けません。ノート『{}』（id={}）は変更していません。先に read_note を呼んでください。",
+                note.title, note.id
+            ));
+        }
+        Some(stamp) if *stamp != note_content_stamp(&note.memo, &note.title) => {
+            return ToolExec::text(format!(
+                "読んだ後にノート『{}』（id={}）が変わっています。ノートは変更していません。もう一度 read_note を呼んでください。",
+                note.title, note.id
+            ));
+        }
+        Some(_) => {}
+    }
     let memo = args
         .get("memo")
         .and_then(|v| v.as_str())
@@ -2172,31 +2209,27 @@ fn tool_write_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
     if memo.trim().is_empty() {
         return ToolExec::text("memo が空です。書き込みません。");
     }
-    let heading = args
-        .get("heading")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
     let title = args
         .get("title")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    match state
-        .db
-        .apply_llm_note_write(&note.id, memo, heading, title)
-    {
+    match state.db.apply_llm_note_write(&note.id, memo, title) {
         Ok(note) => {
             bind_thread_note(state, thread_id, &note.id);
             let keeps = apply_note_keeps(state, &note.id, args);
+            let hint = crate::notes_md::note_split_hint(note.memo.chars().count())
+                .map(|line| format!("\n{line}"))
+                .unwrap_or_default();
             let content = format!(
-                "ノート『{}』のメモを更新しました。id={}。反映済みです。履歴に残っています。{keeps}",
+                "ノート『{}』のメモ全体を置き換えました。id={}。反映済みです。履歴に残っています。{keeps}{hint}",
                 note.title, note.id
             );
             ToolExec {
                 content,
                 consumed: Vec::new(),
-                saved_file: None, wrote_note_id: Some(note.id),
+                saved_file: None,
+                wrote_note_id: Some(note.id),
             }
         }
         Err(e) => ToolExec::text(e),
@@ -3112,6 +3145,7 @@ pub fn execute_tool(
     thread_scope: Option<&str>,
     web_search: bool,
     request_id: &str,
+    read_stamps: &HashMap<String, u64>,
 ) -> ToolExec {
     match execute_tool_inner(
         state,
@@ -3121,6 +3155,7 @@ pub fn execute_tool(
         thread_scope,
         web_search,
         request_id,
+        read_stamps,
     ) {
         Ok(exec) => exec,
         Err(e) => ToolExec {
@@ -3139,6 +3174,7 @@ fn execute_tool_inner(
     thread_scope: Option<&str>,
     web_search: bool,
     _request_id: &str,
+    read_stamps: &HashMap<String, u64>,
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     if let Some(message) = crate::llm::japanese_han::foreign_char_tool_error(name, &args) {
@@ -3588,7 +3624,7 @@ fn execute_tool_inner(
         TOOL_LIST_NOTES => Ok(tool_list_notes(state, thread_id, &args)),
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
-        TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args)),
+        TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args, read_stamps)),
         TOOL_LIST_OUTPUT => Ok(ToolExec::text(crate::llm::output_files::list_for_tool(
             &state.data_dir,
             &args,

@@ -254,9 +254,10 @@ pub fn fit_followup_request(turns: &mut [ChatTurn], ceiling: usize) {
         .map(turn_tokens)
         .sum();
     let room = ceiling.saturating_sub(non_tool);
-    // A read_note body is the whole note. A shortened prefix looks complete, so a
-    // later headingless write can delete the tail. Drop whole notes until the rest
-    // can fit, then give the freed room to the other tool results.
+    // A read_note body is the whole note. A shortened prefix looks complete, and
+    // write_note replaces the entire memo, so a cut body would erase the tail.
+    // Drop whole notes until the rest can fit, then give the freed room to the
+    // other tool results.
     let mut guard = 0;
     while read_notes_exceed_room(turns, room) && guard < 64 {
         guard += 1;
@@ -417,7 +418,7 @@ fn is_read_note_turn(turn: &ChatTurn) -> bool {
     turn.role == "tool" && turn.name.as_deref() == Some(crate::llm::tools::TOOL_READ_NOTE)
 }
 
-const READ_NOTE_OMITTED: &str = "（文脈の上限に達したため、ノート本文は省略しました。全文置換はせず、heading を指定して読み直してください）";
+const READ_NOTE_OMITTED: &str = "（文脈の上限に達したため、ノート本文は省略しました。全文が見えていないので write_note はできません。ノートを別のノートに分けて短くしてください。）";
 
 pub(crate) const TOOL_RESULT_OMITTED: &str = "（文脈の上限に達したため、この結果は省略しました）";
 

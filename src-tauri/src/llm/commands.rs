@@ -199,6 +199,7 @@ async fn execute_tool_off_runtime(
     thread_scope: Option<String>,
     web_search: bool,
     request_id: String,
+    read_stamps: std::collections::HashMap<String, u64>,
 ) -> ToolExec {
     match tokio::task::spawn_blocking(move || {
         tools::execute_tool(
@@ -209,6 +210,7 @@ async fn execute_tool_off_runtime(
             thread_scope.as_deref(),
             web_search,
             &request_id,
+            &read_stamps,
         )
     })
     .await
@@ -221,6 +223,45 @@ async fn execute_tool_off_runtime(
             wrote_note_id: None,
         },
     }
+}
+
+/// A `read_note` this send actually executed. History replay is not recorded here.
+#[derive(Clone)]
+struct ThisSendRead {
+    tool_call_id: String,
+    note_id: String,
+    /// Memo and title when the result was produced. Refreshed after this send's own write.
+    stamp: u64,
+    /// Characters stored for the model. A shorter turn was truncated or omitted.
+    content_chars: usize,
+}
+
+/// Stamps the model may write from. The read must already be in `turns` (an earlier
+/// model call of this send) and still be the full result.
+fn stamps_granted_for_write(
+    turns: &[ChatTurn],
+    reads: &[ThisSendRead],
+) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    for turn in turns {
+        if turn.name.as_deref() != Some(tools::TOOL_READ_NOTE) {
+            continue;
+        }
+        let Some(call_id) = turn.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(read) = reads.iter().find(|read| read.tool_call_id == call_id) else {
+            continue;
+        };
+        if turn.content.chars().count() != read.content_chars {
+            continue;
+        }
+        if tools::note_id_in_read_result(&turn.content).as_deref() != Some(read.note_id.as_str()) {
+            continue;
+        }
+        out.insert(read.note_id.clone(), read.stamp);
+    }
+    out
 }
 
 fn emit_chat_reset<R: Runtime>(app: &AppHandle<R>, request_id: &str, thread_id: &str) {
@@ -1024,6 +1065,7 @@ async fn llm_send_inner<R: Runtime>(
     let system = plan.system;
     let web_search = plan.web_search;
     let tools_schema = plan.tools_schema;
+    let write_note_schema = tools::write_note_only_schema();
     let Some(split) = plan.split else {
         discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
@@ -1211,6 +1253,9 @@ async fn llm_send_inner<R: Runtime>(
     let mut busy = busy.expect("llm send owns the busy guard");
 
     let mut use_tools = true;
+    // A full read_note may spend the tool budget. The next model call can still
+    // call write_note once. After that call, the budget rule applies again.
+    let mut note_write_after_read = false;
     let mut retried_without_tools = false;
     let mut phantom_retried = false;
     let mut rounds = 0usize;
@@ -1225,8 +1270,10 @@ async fn llm_send_inner<R: Runtime>(
     let mut source_turn_injected = false;
     // In-turn tool results spend the allowance left after the attachment excerpt.
     let mut tool_used = 0usize;
-    let mut read_note_called = false;
     let mut wrote_note_ids: Vec<String> = Vec::new();
+    // Reads executed in this send. A write may use one only after a later model call
+    // has already received the full result.
+    let mut this_send_reads: Vec<ThisSendRead> = Vec::new();
     // Set after a vision model rejects the image. Further look_image calls
     // return the same text and do not send the pixels again.
     let mut vision_blocked = false;
@@ -1248,8 +1295,16 @@ async fn llm_send_inner<R: Runtime>(
         if cut_hold.tools_off {
             use_tools = false;
         }
+        let offer_note_write = note_write_after_read && !cut_hold.tools_off;
+        if note_write_after_read {
+            note_write_after_read = false;
+        }
+        if offer_note_write {
+            use_tools = true;
+        }
         if use_tools && !unlimited_rounds && rounds >= max_rounds {
             // One answer from what this turn already collected. No further tool calls.
+            note_write_after_read = false;
             use_tools = false;
             round_limit_final = true;
             if !source_turn_injected {
@@ -1300,15 +1355,16 @@ async fn llm_send_inner<R: Runtime>(
             } else {
                 &settings
             };
+            let schema = if offer_note_write {
+                &write_note_schema
+            } else {
+                &tools_schema
+            };
             let streamed = llm::stream_chat(
                 call_settings,
                 &turns_now,
                 cancel.clone(),
-                if request.tools {
-                    Some(&tools_schema)
-                } else {
-                    None
-                },
+                if request.tools { Some(schema) } else { None },
                 llm::runaway_chars_for(&settings.llm_base_url),
                 None,
                 None,
@@ -1583,6 +1639,7 @@ async fn llm_send_inner<R: Runtime>(
                     current_turns.push(assistant_turn);
                     let mut read_url_in_round = 0usize;
                     let mut cancel_tools = false;
+                    let mut read_full_note = false;
                     for tc in out.tool_calls {
                         if cancel_tools {
                             let content =
@@ -1678,9 +1735,7 @@ async fn llm_send_inner<R: Runtime>(
                         if tc.name == tools::TOOL_READ_URL {
                             read_url_in_round += 1;
                         }
-                        if tc.name == tools::TOOL_READ_NOTE {
-                            read_note_called = true;
-                        }
+                        let read_stamps = stamps_granted_for_write(&turns_now, &this_send_reads);
                         let run = if tc.name == tools::TOOL_LOOK_IMAGE {
                             run_look_image(
                                 state_arc.clone(),
@@ -1699,6 +1754,7 @@ async fn llm_send_inner<R: Runtime>(
                                     thread_scope.clone(),
                                     web_search,
                                     request_id.clone(),
+                                    read_stamps,
                                 )
                                 .await,
                             )
@@ -1729,18 +1785,36 @@ async fn llm_send_inner<R: Runtime>(
                         emit_sources_updated(&app, &thread.id);
                         if let Some(nid) = exec.wrote_note_id.clone() {
                             after_llm_note_write(&app, state.as_ref(), &thread.id, &nid);
+                            if let Ok(Some(note)) = state.db.get_note(&nid) {
+                                let stamp = tools::note_content_stamp(&note.memo, &note.title);
+                                for read in &mut this_send_reads {
+                                    if read.note_id == nid {
+                                        read.stamp = stamp;
+                                    }
+                                }
+                            }
                             if !wrote_note_ids.iter().any(|x| x == &nid) {
                                 wrote_note_ids.push(nid);
                             }
                         }
                         let saved_file = exec.saved_file.clone();
-                        let mut content = exec.content;
-                        if tc.name == tools::TOOL_WRITE_NOTE && !read_note_called {
-                            content.push_str(
-                                "\n（警告: この請求では read_note の前に書きました。読んでいない部分を消していないか確認してください。）",
-                            );
+                        let content = exec.content;
+                        if tc.name == tools::TOOL_READ_NOTE {
+                            if let Some(note_id) = tools::note_id_in_read_result(&content) {
+                                if let Ok(Some(note)) = state.db.get_note(&note_id) {
+                                    this_send_reads.push(ThisSendRead {
+                                        tool_call_id: tc.id.clone(),
+                                        note_id,
+                                        stamp: tools::note_content_stamp(&note.memo, &note.title),
+                                        content_chars: content.chars().count(),
+                                    });
+                                    read_full_note = true;
+                                }
+                            }
                         }
-                        let content = if tc.name == tools::TOOL_READ_NOTE {
+                        let content = if tc.name == tools::TOOL_READ_NOTE
+                            || tc.name == tools::TOOL_WRITE_NOTE
+                        {
                             content
                         } else if tc.name == crate::llm::output_files::TOOL_READ_OUTPUT
                             && crate::llm::output_files::is_html_source_payload(&content)
@@ -1805,21 +1879,26 @@ async fn llm_send_inner<R: Runtime>(
                         use_tools = false;
                     }
                     // The reserve is spent; answer from what the rounds already produced.
+                    // A full read_note that just landed still gets one write_note call.
                     if tool_used >= tool_budget {
                         use_tools = false;
-                        if !source_turn_injected {
-                            let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
-                            source_turn_injected = inject_final_source_turn(
-                                &mut current_turns,
-                                &all,
-                                &consumed,
-                                true,
-                                inject_budget,
-                            );
-                        }
-                        if !source_turn_injected {
-                            current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
-                            source_turn_injected = true;
+                        if read_full_note && !offer_note_write {
+                            note_write_after_read = true;
+                        } else {
+                            if !source_turn_injected {
+                                let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                                source_turn_injected = inject_final_source_turn(
+                                    &mut current_turns,
+                                    &all,
+                                    &consumed,
+                                    true,
+                                    inject_budget,
+                                );
+                            }
+                            if !source_turn_injected {
+                                current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
+                                source_turn_injected = true;
+                            }
                         }
                     }
                     continue;
@@ -5491,6 +5570,7 @@ mod tests {
             None,
             true,
             "req",
+            &std::collections::HashMap::new(),
         );
         assert!(
             searched.content.contains("索引"),
@@ -5509,6 +5589,7 @@ mod tests {
             None,
             true,
             "req",
+            &std::collections::HashMap::new(),
         );
         assert!(blocked.content.contains("インデックス検索はオフです"));
         assert!(blocked.consumed.is_empty());
@@ -5520,6 +5601,7 @@ mod tests {
             None,
             true,
             "req",
+            &std::collections::HashMap::new(),
         );
         assert!(web.content.contains("ウェブ検索に失敗"));
         assert!(!web.content.contains("索引ヒット"), "{}", web.content);
@@ -5533,6 +5615,7 @@ mod tests {
             None,
             false,
             "req",
+            &std::collections::HashMap::new(),
         );
         assert!(read.content.contains("条項本文"), "{}", read.content);
         let left = state.db.list_llm_sources(&created.id).unwrap();
@@ -7037,6 +7120,374 @@ mod tests {
         assert!(body.contains("解除の要件は？"), "{body}");
         assert!(body.contains("重大な不履行のときです。"), "{body}");
         assert!(!body.contains("検索結果の本文"), "{body}");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn read_turn(content: &str, call_id: &str) -> ChatTurn {
+        let mut turn = ChatTurn::text("tool", content);
+        turn.name = Some(tools::TOOL_READ_NOTE.into());
+        turn.tool_call_id = Some(call_id.into());
+        turn
+    }
+
+    fn write_note(
+        state: &std::sync::Arc<crate::state::AppState>,
+        thread_id: &str,
+        memo: &str,
+        stamps: &std::collections::HashMap<String, u64>,
+    ) -> tools::ToolExec {
+        tools::execute_tool(
+            state,
+            thread_id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({ "heading": "3-5", "memo": memo }).to_string(),
+            None,
+            false,
+            "req",
+            stamps,
+        )
+    }
+
+    #[test]
+    fn note_write_uses_only_a_full_read_from_an_earlier_call_this_send() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-note-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        let original = "## 3.\n元\n### 3-1\n子";
+        state.db.update_note_memo(&note.id, original).unwrap();
+        state
+            .db
+            .set_llm_thread_note(&thread.id, &note.id)
+            .unwrap();
+        let none = std::collections::HashMap::new();
+
+        let unread = write_note(&state, &thread.id, "追記だけ", &none);
+        assert!(unread.content.contains("read_note"), "{}", unread.content);
+        assert!(unread.wrote_note_id.is_none());
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, original);
+
+        let read = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_READ_NOTE,
+            r#"{"heading":"3"}"#,
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(read.content.contains("### 3-1"), "{}", read.content);
+        let fresh = state.db.get_note(&note.id).unwrap().unwrap();
+        let recorded = ThisSendRead {
+            tool_call_id: "call-read".into(),
+            note_id: note.id.clone(),
+            stamp: tools::note_content_stamp(&fresh.memo, &fresh.title),
+            content_chars: read.content.chars().count(),
+        };
+        let seen = read_turn(&read.content, "call-read");
+
+        let previous = stamps_granted_for_write(
+            std::slice::from_ref(&read_turn(&read.content, "older-call")),
+            &[recorded.clone()],
+        );
+        assert!(previous.is_empty(), "a replayed read is not this send");
+        let from_history = write_note(&state, &thread.id, "追記だけ", &previous);
+        assert!(from_history.wrote_note_id.is_none(), "{}", from_history.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, original);
+
+        let same_response = stamps_granted_for_write(
+            &[ChatTurn::text("user", "読んで書いて")],
+            &[recorded.clone()],
+        );
+        assert!(
+            same_response.is_empty(),
+            "a read in the same response is not in that prompt"
+        );
+        let too_soon = write_note(&state, &thread.id, "追記だけ", &same_response);
+        assert!(too_soon.wrote_note_id.is_none(), "{}", too_soon.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, original);
+
+        let mut truncated = seen.clone();
+        truncated.content.pop();
+        let cut = stamps_granted_for_write(std::slice::from_ref(&truncated), &[recorded.clone()]);
+        assert!(cut.is_empty(), "a shortened read does not grant a write");
+        let cut_write = write_note(&state, &thread.id, "追記だけ", &cut);
+        assert!(cut_write.wrote_note_id.is_none(), "{}", cut_write.content);
+
+        let granted = stamps_granted_for_write(std::slice::from_ref(&seen), &[recorded.clone()]);
+        assert_eq!(granted.get(&note.id), Some(&recorded.stamp));
+        state
+            .db
+            .update_note_memo(&note.id, "利用者が直した")
+            .unwrap();
+        let stale = write_note(&state, &thread.id, "モデルの全文", &granted);
+        assert!(stale.content.contains("変わって"), "{}", stale.content);
+        assert!(stale.wrote_note_id.is_none());
+        assert_eq!(
+            state.db.get_note(&note.id).unwrap().unwrap().memo,
+            "利用者が直した"
+        );
+
+        let reread = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_READ_NOTE,
+            "{}",
+            None,
+            false,
+            "req",
+            &none,
+        );
+        let edited = state.db.get_note(&note.id).unwrap().unwrap();
+        let mut current = ThisSendRead {
+            tool_call_id: "call-reread".into(),
+            note_id: note.id.clone(),
+            stamp: tools::note_content_stamp(&edited.memo, &edited.title),
+            content_chars: reread.content.chars().count(),
+        };
+        let prompt = read_turn(&reread.content, "call-reread");
+        let ready = stamps_granted_for_write(std::slice::from_ref(&prompt), &[current.clone()]);
+        let first_memo = "## 3.\n一度目\n### 3-1\n子";
+        let first = write_note(&state, &thread.id, first_memo, &ready);
+        assert!(first.wrote_note_id.is_some(), "{}", first.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, first_memo);
+
+        let written = state.db.get_note(&note.id).unwrap().unwrap();
+        current.stamp = tools::note_content_stamp(&written.memo, &written.title);
+        let again = stamps_granted_for_write(std::slice::from_ref(&prompt), &[current]);
+        let second = write_note(&state, &thread.id, "## 3.\n二度目", &again);
+        assert!(second.wrote_note_id.is_some(), "{}", second.content);
+        let memo = state.db.get_note(&note.id).unwrap().unwrap().memo;
+        assert_eq!(memo, "## 3.\n二度目");
+        assert!(!memo.contains("一度目"));
+        assert!(!memo.contains("### 3-1"));
+
+        let history = state.db.list_note_history(&note.id).unwrap().unwrap();
+        let prior = history
+            .versions
+            .iter()
+            .find(|v| v.memo_len == first_memo.chars().count() as u32)
+            .expect("the first write stays in history");
+        let restored = state.db.revert_note_to_version(&note.id, &prior.id).unwrap();
+        assert_eq!(restored.memo, first_memo);
+
+        let long = "あ".repeat(crate::notes_md::NOTE_SPLIT_HINT_CHARS + 1);
+        state.db.update_note_memo(&note.id, &long).unwrap();
+        let long_read = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_READ_NOTE,
+            "{}",
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(long_read.content.contains(&long), "the long note is returned whole");
+        assert!(long_read.content.contains("2万字"), "{}", long_read.content);
+        let under = "い".repeat(12_001);
+        state.db.update_note_memo(&note.id, &under).unwrap();
+        let under_read = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_READ_NOTE,
+            "{}",
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(under_read.content.contains(&under));
+        assert!(!under_read.content.contains("2万字"), "{}", under_read.content);
+        let long_note = state.db.get_note(&note.id).unwrap().unwrap();
+        let long_grant = ThisSendRead {
+            tool_call_id: "call-long".into(),
+            note_id: note.id.clone(),
+            stamp: tools::note_content_stamp(&long_note.memo, &long_note.title),
+            content_chars: under_read.content.chars().count(),
+        };
+        let long_ok = stamps_granted_for_write(
+            std::slice::from_ref(&read_turn(&under_read.content, "call-long")),
+            &[long_grant],
+        );
+        let wrote = write_note(&state, &thread.id, &long, &long_ok);
+        assert!(wrote.wrote_note_id.is_some(), "{}", wrote.content);
+        assert!(wrote.content.contains("2万字"), "{}", wrote.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, long);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn note_tool_call(id: &str, name: &str, arguments: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_full_read_still_allows_one_write_after_the_tool_budget() {
+        let memo = "あ".repeat(14_000);
+        let rewritten = "書き直した本文";
+        let script = vec![
+            note_tool_call("read-1", "read_note", "{}"),
+            note_tool_call(
+                "write-1",
+                "write_note",
+                &serde_json::json!({ "memo": rewritten }).to_string(),
+            ),
+            content_stop("ノートを書き直しました。変えた箇所は本文の長さです。"),
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "argos-note-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (port, seen) = serve_script(script);
+        let state = test_state(&dir, port, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_max_context_tokens = 32_768;
+            settings.llm_thinking = "off".into();
+        }
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("長いノート").unwrap();
+        state.db.update_note_memo(&note.id, &memo).unwrap();
+        state
+            .db
+            .set_llm_thread_note(&thread.id, &note.id)
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            Some(thread.id.clone()),
+            "このノートを短く書き直して".into(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let saved = state.db.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(saved.memo, rewritten);
+        let requests = seen.lock().unwrap();
+        assert!(requests.len() >= 3, "read, write, then the result: {}", requests.len());
+        assert!(
+            requests[1].contains("write_note"),
+            "the call after the read must still offer write_note: {}",
+            requests[1].chars().take(500).collect::<String>()
+        );
+        let sample: String = memo.chars().take(8).collect();
+        assert!(
+            requests[1].contains(&sample),
+            "the write call must still see the note that was read"
+        );
+        assert!(
+            requests[2].contains("メモ全体を置き換えました"),
+            "the model must see that the write succeeded: {}",
+            requests[2].chars().rev().take(400).collect::<String>()
+        );
+        assert!(
+            !requests[2].contains("この結果は省略しました"),
+            "a successful write must not be replaced by the omission text"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_after_the_tool_budget_keeps_its_reason() {
+        let memo = "あ".repeat(14_000);
+        let edited = "利用者が直した";
+        let script = vec![
+            note_tool_call("read-1", "read_note", "{}"),
+            note_tool_call(
+                "write-1",
+                "write_note",
+                &serde_json::json!({ "memo": "書き直した本文" }).to_string(),
+            ),
+            content_stop("ノートは変えられませんでした。理由をそのまま伝えます。"),
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "argos-note-refuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let state = test_state(&dir, port, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_max_context_tokens = 32_768;
+            settings.llm_thinking = "off".into();
+        }
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("長いノート").unwrap();
+        state.db.update_note_memo(&note.id, &memo).unwrap();
+        state
+            .db
+            .set_llm_thread_note(&thread.id, &note.id)
+            .unwrap();
+        let db = state.db.clone();
+        let note_id = note.id.clone();
+        std::thread::spawn(move || {
+            for (i, response) in script.into_iter().enumerate() {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let buf = read_http_request(&mut sock);
+                if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    record.lock().unwrap().push(
+                        String::from_utf8_lossy(&buf[header_end + 4..]).into_owned(),
+                    );
+                }
+                if i == 1 {
+                    db.update_note_memo(&note_id, edited).unwrap();
+                }
+                let _ = std::io::Write::write_all(&mut sock, &response);
+                let _ = std::io::Write::flush(&mut sock);
+            }
+        });
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            Some(thread.id.clone()),
+            "このノートを短く書き直して".into(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, edited);
+        let requests = seen.lock().unwrap();
+        assert!(requests.len() >= 3, "read, refused write, then the reason: {}", requests.len());
+        assert!(
+            requests[2].contains("変わって"),
+            "the model must see why the write was refused"
+        );
+        assert!(
+            !requests[2].contains("この結果は省略しました"),
+            "a refused write must not be replaced by the omission text"
+        );
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
