@@ -1657,7 +1657,7 @@ export default function Notes() {
                 style={{ flex: `${splitRatio} 1 0`, width: 0 }}
               >
                 <div className="notes-pane-head">
-                  <span className="notes-pane-head-title">メモ</span>
+                  <span className="notes-pane-head-title">ノート</span>
                   <div className="notes-pane-head-actions">
                     <NoteHistoryControls
                       history={history}
@@ -1732,7 +1732,7 @@ export default function Notes() {
                 className="notes-pane-splitter"
                 role="separator"
                 aria-orientation="vertical"
-                aria-label="メモとキープの境界"
+                aria-label="ノートと出典の境界"
                 onMouseDown={onSplitResizeStart}
               />
               <section
@@ -1741,39 +1741,45 @@ export default function Notes() {
               >
                 <div className="notes-pane-head">
                   <span className="notes-pane-head-title">
-                    {items.length} 件キープ
+                    出典 {items.length} 件
                   </span>
                 </div>
                 <div className="notes-pane-body">
             {parsedItems.length === 0 ? (
               <p className="notes-empty-items">
-                まだキープがありません。検索結果からキープするか、チャットでノートを書くと引用した出典が入ります。
+                まだ出典がありません。検索結果から追加するか、チャットでノートを書くと引用した出典が入ります。
               </p>
             ) : (
-              <ul className="notes-items" aria-label="キープ">
+              <ul className="notes-items" aria-label="出典">
                 {parsedItems.map(({ row, snap }) => {
                   const label = snap.title.trim() || snap.path.trim() || "出典";
                   const web = snap.path.trim().toLowerCase().startsWith("http://")
                     || snap.path.trim().toLowerCase().startsWith("https://");
                   return (
                     <li key={row.id} className="notes-item notes-item--badge">
-                      <button
-                        type="button"
-                        className="notes-keep-badge"
-                        title={web ? "ページを開く" : "プレビュー"}
-                        onClick={() => void openKept(row, snap)}
-                      >
-                        {label}
-                      </button>
-                      <button
-                        type="button"
-                        className="notes-icon-btn danger"
-                        title="キープを削除"
-                        aria-label="キープを削除"
-                        onClick={() => void removeItem(row.id)}
-                      >
-                        <IconTrash />
-                      </button>
+                      <span className="notes-keep-badge">
+                        <button
+                          type="button"
+                          className="notes-keep-badge-open"
+                          title={web ? "ページを開く" : "プレビュー"}
+                          onClick={() => void openKept(row, snap)}
+                        >
+                          {label}
+                        </button>
+                        <button
+                          type="button"
+                          className="notes-keep-badge-remove"
+                          title="削除"
+                          aria-label="削除"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void removeItem(row.id);
+                          }}
+                        >
+                          ×
+                        </button>
+                      </span>
                     </li>
                   );
                 })}
