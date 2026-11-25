@@ -194,6 +194,26 @@ pub fn tools_schema(
     tools_schema_with(web_search, remote_index, remote_only, look_image, true)
 }
 
+/// `write_note` alone. One follow-up call may offer only this after a full
+/// `read_note` has already used the tool-result budget.
+pub fn write_note_only_schema() -> Value {
+    let full = tools_schema(false, false, false, false);
+    let Some(tools) = full.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        tools
+            .iter()
+            .filter(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(|name| name.as_str())
+                    == Some(TOOL_WRITE_NOTE)
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
 /// `index_search` is the per-thread flag. When it is false, `search_index` is left out.
 /// Web search then uses one `search_web` tool instead of the `search_index` sidecar.
 pub fn tools_schema_with(

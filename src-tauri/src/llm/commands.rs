@@ -1065,6 +1065,7 @@ async fn llm_send_inner<R: Runtime>(
     let system = plan.system;
     let web_search = plan.web_search;
     let tools_schema = plan.tools_schema;
+    let write_note_schema = tools::write_note_only_schema();
     let Some(split) = plan.split else {
         discard_refused_user_message(&state.db, &user_message.id);
         return Ok(send_error(
@@ -1252,6 +1253,9 @@ async fn llm_send_inner<R: Runtime>(
     let mut busy = busy.expect("llm send owns the busy guard");
 
     let mut use_tools = true;
+    // A full read_note may spend the tool budget. The next model call can still
+    // call write_note once. After that call, the budget rule applies again.
+    let mut note_write_after_read = false;
     let mut retried_without_tools = false;
     let mut phantom_retried = false;
     let mut rounds = 0usize;
@@ -1291,8 +1295,16 @@ async fn llm_send_inner<R: Runtime>(
         if cut_hold.tools_off {
             use_tools = false;
         }
+        let offer_note_write = note_write_after_read && !cut_hold.tools_off;
+        if note_write_after_read {
+            note_write_after_read = false;
+        }
+        if offer_note_write {
+            use_tools = true;
+        }
         if use_tools && !unlimited_rounds && rounds >= max_rounds {
             // One answer from what this turn already collected. No further tool calls.
+            note_write_after_read = false;
             use_tools = false;
             round_limit_final = true;
             if !source_turn_injected {
@@ -1343,15 +1355,16 @@ async fn llm_send_inner<R: Runtime>(
             } else {
                 &settings
             };
+            let schema = if offer_note_write {
+                &write_note_schema
+            } else {
+                &tools_schema
+            };
             let streamed = llm::stream_chat(
                 call_settings,
                 &turns_now,
                 cancel.clone(),
-                if request.tools {
-                    Some(&tools_schema)
-                } else {
-                    None
-                },
+                if request.tools { Some(schema) } else { None },
                 llm::runaway_chars_for(&settings.llm_base_url),
                 None,
                 None,
@@ -1626,6 +1639,7 @@ async fn llm_send_inner<R: Runtime>(
                     current_turns.push(assistant_turn);
                     let mut read_url_in_round = 0usize;
                     let mut cancel_tools = false;
+                    let mut read_full_note = false;
                     for tc in out.tool_calls {
                         if cancel_tools {
                             let content =
@@ -1794,6 +1808,7 @@ async fn llm_send_inner<R: Runtime>(
                                         stamp: tools::note_content_stamp(&note.memo, &note.title),
                                         content_chars: content.chars().count(),
                                     });
+                                    read_full_note = true;
                                 }
                             }
                         }
@@ -1862,21 +1877,26 @@ async fn llm_send_inner<R: Runtime>(
                         use_tools = false;
                     }
                     // The reserve is spent; answer from what the rounds already produced.
+                    // A full read_note that just landed still gets one write_note call.
                     if tool_used >= tool_budget {
                         use_tools = false;
-                        if !source_turn_injected {
-                            let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
-                            source_turn_injected = inject_final_source_turn(
-                                &mut current_turns,
-                                &all,
-                                &consumed,
-                                true,
-                                inject_budget,
-                            );
-                        }
-                        if !source_turn_injected {
-                            current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
-                            source_turn_injected = true;
+                        if read_full_note && !offer_note_write {
+                            note_write_after_read = true;
+                        } else {
+                            if !source_turn_injected {
+                                let all = state.db.list_llm_sources(&thread.id).unwrap_or_default();
+                                source_turn_injected = inject_final_source_turn(
+                                    &mut current_turns,
+                                    &all,
+                                    &consumed,
+                                    true,
+                                    inject_budget,
+                                );
+                            }
+                            if !source_turn_injected {
+                                current_turns.push(ChatTurn::text("user", STOP_TOOLS_HINT));
+                                source_turn_injected = true;
+                            }
                         }
                     }
                     continue;
@@ -7299,6 +7319,83 @@ mod tests {
         assert!(wrote.content.contains("2万字"), "{}", wrote.content);
         assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, long);
 
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn note_tool_call(id: &str, name: &str, arguments: &str) -> Vec<u8> {
+        sse_message(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_full_read_still_allows_one_write_after_the_tool_budget() {
+        let memo = "あ".repeat(14_000);
+        let rewritten = "書き直した本文";
+        let script = vec![
+            note_tool_call("read-1", "read_note", "{}"),
+            note_tool_call(
+                "write-1",
+                "write_note",
+                &serde_json::json!({ "memo": rewritten }).to_string(),
+            ),
+            content_stop("ノートを書き直しました。変えた箇所は本文の長さです。"),
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "argos-note-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (port, seen) = serve_script(script);
+        let state = test_state(&dir, port, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_max_context_tokens = 32_768;
+            settings.llm_thinking = "off".into();
+        }
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("長いノート").unwrap();
+        state.db.update_note_memo(&note.id, &memo).unwrap();
+        state
+            .db
+            .set_llm_thread_note(&thread.id, &note.id)
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            Some(thread.id.clone()),
+            "このノートを短く書き直して".into(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let saved = state.db.get_note(&note.id).unwrap().unwrap();
+        assert_eq!(saved.memo, rewritten);
+        let requests = seen.lock().unwrap();
+        assert!(requests.len() >= 2, "read then write: {}", requests.len());
+        assert!(
+            requests[1].contains("write_note"),
+            "the call after the read must still offer write_note: {}",
+            requests[1].chars().take(500).collect::<String>()
+        );
+        let sample: String = memo.chars().take(8).collect();
+        assert!(
+            requests[1].contains(&sample),
+            "the write call must still see the note that was read"
+        );
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
