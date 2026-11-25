@@ -1812,7 +1812,9 @@ async fn llm_send_inner<R: Runtime>(
                                 }
                             }
                         }
-                        let content = if tc.name == tools::TOOL_READ_NOTE {
+                        let content = if tc.name == tools::TOOL_READ_NOTE
+                            || tc.name == tools::TOOL_WRITE_NOTE
+                        {
                             content
                         } else if tc.name == crate::llm::output_files::TOOL_READ_OUTPUT
                             && crate::llm::output_files::is_html_source_payload(&content)
@@ -7385,7 +7387,7 @@ mod tests {
         let saved = state.db.get_note(&note.id).unwrap().unwrap();
         assert_eq!(saved.memo, rewritten);
         let requests = seen.lock().unwrap();
-        assert!(requests.len() >= 2, "read then write: {}", requests.len());
+        assert!(requests.len() >= 3, "read, write, then the result: {}", requests.len());
         assert!(
             requests[1].contains("write_note"),
             "the call after the read must still offer write_note: {}",
@@ -7395,6 +7397,96 @@ mod tests {
         assert!(
             requests[1].contains(&sample),
             "the write call must still see the note that was read"
+        );
+        assert!(
+            requests[2].contains("メモ全体を置き換えました"),
+            "the model must see that the write succeeded: {}",
+            requests[2].chars().rev().take(400).collect::<String>()
+        );
+        assert!(
+            !requests[2].contains("この結果は省略しました"),
+            "a successful write must not be replaced by the omission text"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_after_the_tool_budget_keeps_its_reason() {
+        let memo = "あ".repeat(14_000);
+        let edited = "利用者が直した";
+        let script = vec![
+            note_tool_call("read-1", "read_note", "{}"),
+            note_tool_call(
+                "write-1",
+                "write_note",
+                &serde_json::json!({ "memo": "書き直した本文" }).to_string(),
+            ),
+            content_stop("ノートは変えられませんでした。理由をそのまま伝えます。"),
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "argos-note-refuse-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let state = test_state(&dir, port, 8);
+        {
+            let mut settings = state.settings.write();
+            settings.llm_max_context_tokens = 32_768;
+            settings.llm_thinking = "off".into();
+        }
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("長いノート").unwrap();
+        state.db.update_note_memo(&note.id, &memo).unwrap();
+        state
+            .db
+            .set_llm_thread_note(&thread.id, &note.id)
+            .unwrap();
+        let db = state.db.clone();
+        let note_id = note.id.clone();
+        std::thread::spawn(move || {
+            for (i, response) in script.into_iter().enumerate() {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let buf = read_http_request(&mut sock);
+                if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    record.lock().unwrap().push(
+                        String::from_utf8_lossy(&buf[header_end + 4..]).into_owned(),
+                    );
+                }
+                if i == 1 {
+                    db.update_note_memo(&note_id, edited).unwrap();
+                }
+                let _ = std::io::Write::write_all(&mut sock, &response);
+                let _ = std::io::Write::flush(&mut sock);
+            }
+        });
+        let app = tauri::test::mock_app();
+        let result = llm_send_inner(
+            app.handle(),
+            &state,
+            Some(thread.id.clone()),
+            "このノートを短く書き直して".into(),
+            Some(false),
+        )
+        .await
+        .expect("llm_send");
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, edited);
+        let requests = seen.lock().unwrap();
+        assert!(requests.len() >= 3, "read, refused write, then the reason: {}", requests.len());
+        assert!(
+            requests[2].contains("変わって"),
+            "the model must see why the write was refused"
+        );
+        assert!(
+            !requests[2].contains("この結果は省略しました"),
+            "a refused write must not be replaced by the omission text"
         );
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
