@@ -40,10 +40,14 @@ pub fn badge_json(badge: &KeepBadge) -> Value {
     })
 }
 
-/// A cited web page or index hit, ready to keep. Notes and empty targets are skipped.
+/// A cited web page or index hit, ready to keep. Notes, pasted images, and empty
+/// targets are skipped. Scanned PDF pages share one badge per PDF path.
 pub fn badge_for_cited_source(row: &LlmSourceRow) -> Option<KeepBadge> {
-    if row.is_note() {
+    if row.is_note() || is_pasted_image(row) {
         return None;
+    }
+    if row.is_image() && crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id).is_some() {
+        return pdf_document_badge(row);
     }
     if row.is_web() {
         let url = row.path.trim();
@@ -103,6 +107,52 @@ pub fn badge_for_cited_source(row: &LlmSourceRow) -> Option<KeepBadge> {
 
 fn cap_keep_body(body: &str) -> String {
     body.trim().chars().take(400).collect()
+}
+
+/// A paste has no user-facing file. Its path and title are the label, such as
+/// `貼り付け画像1` or `貼り付け画像（日時）`.
+fn is_pasted_image(row: &LlmSourceRow) -> bool {
+    if !row.is_image() {
+        return false;
+    }
+    if crate::llm::transcript::parse_pdf_page_no(&row.paragraph_id).is_some() {
+        return false;
+    }
+    let path = row.path.trim();
+    let title = row.title.trim();
+    path.starts_with("貼り付け画像")
+        || title.starts_with("貼り付け画像")
+        || !looks_like_user_file(path)
+}
+
+fn looks_like_user_file(path: &str) -> bool {
+    let path = path.trim();
+    if path.is_empty() || is_http_url(path) {
+        return false;
+    }
+    path.contains('\\') || path.contains('/') || path.contains(':')
+}
+
+/// Dedup key is the PDF path, not `pdf-page:N`, so page 1 of another PDF is new.
+fn pdf_document_badge(row: &LlmSourceRow) -> Option<KeepBadge> {
+    let display = crate::pathutil::simplify_windows_path(row.path.trim());
+    if display.is_empty() || !looks_like_user_file(&display) {
+        return None;
+    }
+    let paragraph_id = format!("{}#pdf", display.to_ascii_lowercase());
+    let source = if row.is_remote() {
+        "remote".to_string()
+    } else {
+        "index".to_string()
+    };
+    Some(KeepBadge {
+        path: display.clone(),
+        title: file_title(&display),
+        source,
+        paragraph_id,
+        body: String::new(),
+        query: row.query.clone(),
+    })
 }
 
 /// Add the sources cited in the final answer to each note written in that turn.
@@ -357,6 +407,82 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&items[0].item_json).unwrap();
         assert_eq!(json["path"], r"C:\docs\契約書.txt");
         assert_eq!(json["paragraphId"], r"C:\docs\契約書.txt#3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pasted_images_are_not_auto_kept() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件").unwrap();
+        let short = llm_source("p1", "image", "貼り付け画像1", "", "貼り付け画像1", "書き起こし");
+        let stamped = llm_source(
+            "p2",
+            "image",
+            "貼り付け画像（2026-11-12 11時59分01秒）",
+            "",
+            "貼り付け画像（2026-11-12 11時59分01秒）",
+            "書き起こし",
+        );
+        assert!(badge_for_cited_source(&short).is_none());
+        assert!(badge_for_cited_source(&stamped).is_none());
+        let added = keep_cited_on_notes(
+            &db,
+            &[note.id.clone()],
+            &[short, stamped],
+            &[("p1".into(), 1), ("p2".into(), 2)],
+        );
+        assert_eq!(added, 0);
+        assert!(db.list_note_items(&note.id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scanned_pdf_pages_collapse_to_one_badge_per_file() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件").unwrap();
+        let page1 = llm_source(
+            "a1",
+            "image",
+            r"C:\docs\scan.pdf",
+            "pdf-page:1",
+            "scan.pdf（1ページ目）",
+            "一枚目",
+        );
+        let page2 = llm_source(
+            "a2",
+            "image",
+            r"C:\docs\scan.pdf",
+            "pdf-page:2",
+            "scan.pdf（2ページ目）",
+            "二枚目",
+        );
+        let other = llm_source(
+            "b1",
+            "image",
+            r"C:\other\scan.pdf",
+            "pdf-page:1",
+            "scan.pdf（1ページ目）",
+            "別の原本",
+        );
+        let added = keep_cited_on_notes(
+            &db,
+            &[note.id.clone()],
+            &[page1, page2, other],
+            &[("a1".into(), 1), ("a2".into(), 2), ("b1".into(), 3)],
+        );
+        assert_eq!(added, 2);
+        let items = db.list_note_items(&note.id).unwrap();
+        assert_eq!(items.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&items[0].item_json).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&items[1].item_json).unwrap();
+        assert_eq!(first["path"], r"C:\docs\scan.pdf");
+        assert_eq!(first["title"], "scan.pdf");
+        assert_eq!(first["paragraphId"], r"c:\docs\scan.pdf#pdf");
+        assert_eq!(items[0].paragraph_id, r"c:\docs\scan.pdf#pdf");
+        assert_eq!(second["path"], r"C:\other\scan.pdf");
+        assert_eq!(second["paragraphId"], r"c:\other\scan.pdf#pdf");
+        assert_ne!(first["paragraphId"], second["paragraphId"]);
+        assert!(!first["paragraphId"].as_str().unwrap_or("").starts_with("pdf-page:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
