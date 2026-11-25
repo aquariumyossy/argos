@@ -432,7 +432,7 @@ export default function PreviewView({
   }, [preview, target]);
 
   const openFolder = useCallback(async () => {
-    if (!preview || !target || isOutlookHit(preview)) return;
+    if (!preview || !target) return;
     setActionError("");
     try {
       let path = preview.path;
@@ -630,7 +630,7 @@ export default function PreviewView({
       }
       if (e.key === "Enter" && e.shiftKey) {
         e.preventDefault();
-        if (!isOutlookHit(preview)) void openFolder();
+        void openFolder();
         return;
       }
       if (e.key === "Enter") {
@@ -679,14 +679,14 @@ export default function PreviewView({
           <button
             type="button"
             className="hit-action-btn"
-            title={mail ? "メールを開く (Enter)" : "ファイルを開く (Enter)"}
-            aria-label={mail ? "メールを開く" : "ファイルを開く"}
+            title={mail ? "Outlookで開く (Enter)" : "ファイルを開く (Enter)"}
+            aria-label={mail ? "Outlookで開く" : "ファイルを開く"}
             onClick={() => void openFile()}
             disabled={!preview}
           >
             <IconOpenFile />
           </button>
-          {preview && !mail ? (
+          {preview ? (
             <button
               type="button"
               className="hit-action-btn"

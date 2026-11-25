@@ -322,6 +322,45 @@ mod tests {
     }
 
     #[test]
+    fn a_later_note_answer_keeps_a_source_cited_on_an_earlier_turn() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件").unwrap();
+        let mut earlier = llm_source(
+            "h1",
+            "text",
+            r"C:\docs\契約書.txt",
+            r"C:\docs\契約書.txt#3",
+            "契約書.txt",
+            "解除できる",
+        );
+        earlier.cite_no = 1;
+        earlier.injected_user_message_id = "u1".into();
+        let mut unused = llm_source(
+            "w2",
+            "web",
+            "https://example.com/other",
+            "",
+            "別ページ",
+            "本文",
+        );
+        unused.cite_no = 2;
+        let sources = [earlier, unused];
+        let this_turn_consumed: Vec<(String, i64)> = Vec::new();
+        let answer = "まとめました [1]";
+        assert!(crate::llm::context::consumed_cited_in_answer(&this_turn_consumed, answer).is_empty());
+        let cited = crate::llm::context::thread_sources_cited_in_answer(&sources, answer);
+        assert_eq!(cited, vec![("h1".into(), 1)]);
+        let added = keep_cited_on_notes(&db, &[note.id.clone()], &sources, &cited);
+        assert_eq!(added, 1);
+        let items = db.list_note_items(&note.id).unwrap();
+        assert_eq!(items.len(), 1);
+        let json: serde_json::Value = serde_json::from_str(&items[0].item_json).unwrap();
+        assert_eq!(json["path"], r"C:\docs\契約書.txt");
+        assert_eq!(json["paragraphId"], r"C:\docs\契約書.txt#3");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn path_before_unit_keeps_a_hash_inside_the_path() {
         assert_eq!(
             path_before_unit(r"C:\docs\a#b.txt#12"),

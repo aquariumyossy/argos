@@ -727,6 +727,23 @@ pub fn consumed_cited_in_answer(consumed: &[(String, i64)], answer: &str) -> Vec
         .collect()
 }
 
+/// `[n]` in `answer` matched against every source in the thread, including ones
+/// cited on an earlier turn and not consumed again.
+pub fn thread_sources_cited_in_answer(
+    sources: &[LlmSourceRow],
+    answer: &str,
+) -> Vec<(String, i64)> {
+    let nos = parse_cited_nos(answer);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for source in sources {
+        if source.cite_no > 0 && nos.contains(&source.cite_no) && seen.insert(source.id.clone()) {
+            out.push((source.id.clone(), source.cite_no));
+        }
+    }
+    out
+}
+
 /// Note reads stay citation badges. They do not, by themselves, make an answer
 /// retry for a missing `[n]`. Search hits and other sources still do.
 pub fn sources_for_citation_retry(

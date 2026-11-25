@@ -104,6 +104,11 @@ describe("note keeps", () => {
     expect(screen.queryByRole("button", { name: "リスト" })).toBeNull();
     expect(screen.queryByRole("button", { name: "グリッド" })).toBeNull();
     expect(screen.queryByRole("button", { name: "整形" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "印刷" }));
+    expect(screen.queryByRole("checkbox", { name: "パス" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "検索クエリ" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "アイテムメモ" })).toBeNull();
+    expect(screen.getByRole("checkbox", { name: "ノートメモ" })).toBeTruthy();
     expect(document.querySelector(".notes-split--row")).not.toBeNull();
     expect(document.querySelector(".notes-split--col")).toBeNull();
 

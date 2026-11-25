@@ -95,16 +95,10 @@ function memoAttachBody(title: string, memo: string): string {
 }
 
 type PrintOpts = {
-  path: boolean;
-  query: boolean;
-  itemMemo: boolean;
   noteMemo: boolean;
 };
 
 const DEFAULT_PRINT_OPTS: PrintOpts = {
-  path: true,
-  query: true,
-  itemMemo: true,
   noteMemo: true,
 };
 
@@ -114,9 +108,6 @@ function loadPrintOpts(): PrintOpts {
     if (!raw) return { ...DEFAULT_PRINT_OPTS };
     const parsed = JSON.parse(raw) as Partial<PrintOpts>;
     return {
-      path: parsed.path !== false,
-      query: parsed.query !== false,
-      itemMemo: parsed.itemMemo !== false,
       noteMemo: parsed.noteMemo !== false,
     };
   } catch {
@@ -1366,9 +1357,6 @@ export default function Notes() {
         "notes",
         resizingSidebar ? "notes--resizing" : "",
         resizingSplit ? "notes--resizing-split notes--split-row" : "",
-        printOpts.path ? "" : "print-omit-path",
-        printOpts.query ? "" : "print-omit-query",
-        printOpts.itemMemo ? "" : "print-omit-item-memo",
         printOpts.noteMemo ? "" : "print-omit-note-memo",
       ]
         .filter(Boolean)
@@ -1639,30 +1627,6 @@ export default function Notes() {
                   {printMenuOpen ? (
                     <div className="notes-print-dropdown" role="menu">
                       <p className="notes-print-dropdown-title">印刷に含める項目</p>
-                      <label className="notes-print-opt">
-                        <input
-                          type="checkbox"
-                          checked={printOpts.path}
-                          onChange={() => togglePrintOpt("path")}
-                        />
-                        パス
-                      </label>
-                      <label className="notes-print-opt">
-                        <input
-                          type="checkbox"
-                          checked={printOpts.query}
-                          onChange={() => togglePrintOpt("query")}
-                        />
-                        検索クエリ
-                      </label>
-                      <label className="notes-print-opt">
-                        <input
-                          type="checkbox"
-                          checked={printOpts.itemMemo}
-                          onChange={() => togglePrintOpt("itemMemo")}
-                        />
-                        アイテムメモ
-                      </label>
                       <label className="notes-print-opt">
                         <input
                           type="checkbox"
