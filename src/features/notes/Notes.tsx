@@ -37,7 +37,7 @@ import {
   toggleTaskLine,
   type NoteTask,
 } from "./noteTasks";
-import { noteHeadings, type NoteHeading } from "./noteToc";
+import { noteHeadings, scrollTextareaToOffset, type NoteHeading } from "./noteToc";
 import "./notes.css";
 
 const SIDEBAR_MIN = 160;
@@ -384,26 +384,7 @@ export default function Notes() {
     const pane = memoPaneRef.current;
     const ta = memoTextareaRef.current;
     if (ta && pane?.contains(ta)) {
-      const value = ta.value;
-      let offset = 0;
-      let seen = 0;
-      while (seen < heading.line) {
-        const nl = value.indexOf("\n", offset);
-        if (nl < 0) {
-          offset = value.length;
-          break;
-        }
-        offset = nl + 1;
-        seen += 1;
-      }
-      ta.focus({ preventScroll: true });
-      ta.setSelectionRange(offset, offset);
-      const style = window.getComputedStyle(ta);
-      const parsed = Number.parseFloat(style.lineHeight);
-      const fontSize = Number.parseFloat(style.fontSize) || 16;
-      const lineHeight = Number.isFinite(parsed) ? parsed : fontSize * 1.4;
-      const pad = Number.parseFloat(style.paddingTop) || 0;
-      ta.scrollTop = Math.max(0, pad + heading.line * lineHeight - 8);
+      scrollTextareaToOffset(ta, heading.offset);
       return;
     }
     const preview = pane?.querySelector(".notes-memo-preview");
@@ -1812,7 +1793,7 @@ export default function Notes() {
                 ) : (
                   <ul className="notes-toc" aria-label="目次">
                     {headings.map((heading, index) => (
-                      <li key={`${heading.line}-${heading.level}-${heading.text}`}>
+                      <li key={`${heading.offset}-${heading.level}-${heading.text}`}>
                         <button
                           type="button"
                           style={{ paddingLeft: `${8 + (heading.level - 1) * 14}px` }}

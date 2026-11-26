@@ -396,7 +396,7 @@
   font-size: 0.8rem;
 }
 
-.notes-item--badge {
+.notes-item.notes-item--badge {
   display: flex;
   align-items: center;
   min-width: 0;
