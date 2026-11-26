@@ -1461,6 +1461,7 @@ pub fn revert_note_to_version(
 ) -> Result<NoteRow, String> {
     let note = state.db.revert_note_to_version(&note_id, &version_id)?;
     emit_note_updated(&app, &note.id, "memo");
+    emit_note_updated(&app, &note.id, "items");
     Ok(note)
 }
 

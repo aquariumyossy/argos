@@ -995,6 +995,18 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_note_versions_note
               ON note_versions(note_id, created_at);
+            CREATE TABLE IF NOT EXISTS note_version_items (
+              version_id TEXT NOT NULL,
+              item_id TEXT NOT NULL,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              query TEXT NOT NULL DEFAULT '',
+              paragraph_id TEXT NOT NULL DEFAULT '',
+              item_json TEXT NOT NULL DEFAULT '{}',
+              memo TEXT NOT NULL DEFAULT '',
+              created_at INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (version_id, item_id),
+              FOREIGN KEY(version_id) REFERENCES note_versions(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS llm_threads (
               id TEXT PRIMARY KEY,
               title TEXT NOT NULL DEFAULT '',
@@ -1282,6 +1294,10 @@ impl Db {
         let _ = conn.execute("ALTER TABLE notes ADD COLUMN llm_review_base TEXT", []);
         let _ = conn.execute(
             "ALTER TABLE notes ADD COLUMN ai_notice_pending INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE note_versions ADD COLUMN items_saved INTEGER NOT NULL DEFAULT 0",
             [],
         );
         import_legacy_note_reviews(&conn)?;
@@ -3326,6 +3342,7 @@ impl Db {
                     "UPDATE note_versions SET memo=?1, title=?2, created_at=?3 WHERE id=?4",
                     rusqlite::params![memo, title, now, version_id],
                 )?;
+                copy_note_items_to_version(&conn, version_id, id)?;
             } else {
                 if !latest_matches {
                     let snapshot = origin != NOTE_ORIGIN_MANUAL
@@ -3384,6 +3401,123 @@ impl Db {
             "UPDATE notes SET ai_notice_pending=0 WHERE id=?1",
             [id],
         )?;
+        Ok(())
+    }
+
+    /// これからメモや出典バッジを変える直前のバッジを、直前の版に残す。
+    pub fn remember_items_before_ai_edit(&self, note_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        let Some(note) = read_note_conn(&conn, note_id).map_err(|e| e.to_string())? else {
+            return Err("ノートが見つかりません".into());
+        };
+        let latest = latest_note_version_conn(&conn, note_id).map_err(|e| e.to_string())?;
+        if let Some(version) = latest {
+            if version.memo == note.memo && version.title == note.title {
+                copy_note_items_to_version(&conn, &version.id, note_id)
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+        let at = chrono::Utc::now().timestamp().saturating_sub(1);
+        insert_note_version_conn(
+            &conn,
+            note_id,
+            &note.memo,
+            &note.title,
+            NOTE_ORIGIN_MANUAL,
+            at,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// `tokens` は read_note に出した keep_id、またはそのときの 1 始まりの番号。
+    /// 番号は `numbered_ids`（読んだときの並び）で解決し、今の並びでは引き直さない。
+    pub fn plan_note_keep_removals(
+        &self,
+        note_id: &str,
+        tokens: &[String],
+        numbered_ids: &[String],
+    ) -> Result<NoteKeepPlan, rusqlite::Error> {
+        let items = self.list_note_items(note_id)?;
+        let mut ids = Vec::new();
+        let mut titles = Vec::new();
+        let mut unknown = Vec::new();
+        let mut paragraph_ids = Vec::new();
+        for raw in tokens {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let token = token.strip_prefix("keep_id=").unwrap_or(token);
+            let found = items.iter().find(|item| item.id == token).or_else(|| {
+                let n = token.parse::<usize>().ok().filter(|n| *n >= 1)?;
+                let id = numbered_ids.get(n - 1)?;
+                items.iter().find(|item| &item.id == id)
+            });
+            match found {
+                Some(item) if ids.iter().any(|id| id == &item.id) => {}
+                Some(item) => {
+                    ids.push(item.id.clone());
+                    titles.push(note_item_label(item));
+                    paragraph_ids.push(item.paragraph_id.clone());
+                }
+                None => unknown.push(token.to_string()),
+            }
+        }
+        Ok(NoteKeepPlan {
+            ids,
+            titles,
+            unknown,
+            paragraph_ids,
+        })
+    }
+
+    pub fn delete_note_items(&self, ids: &[String]) -> Result<(), rusqlite::Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        for id in ids {
+            conn.execute("DELETE FROM note_items WHERE id=?1", [id])?;
+        }
+        Ok(())
+    }
+
+    /// 変更後の出典バッジを版に残す。メモが変わって新しい版が既にあるときはその版を更新し、
+    /// バッジだけ変えたときは新しい版を足す。
+    pub fn seal_ai_note_items(
+        &self,
+        note_id: &str,
+        wrote_new_version: bool,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock();
+        if wrote_new_version {
+            if let Some(latest) =
+                latest_note_version_conn(&conn, note_id).map_err(|e| e.to_string())?
+            {
+                copy_note_items_to_version(&conn, &latest.id, note_id)
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
+        let Some(note) = read_note_conn(&conn, note_id).map_err(|e| e.to_string())? else {
+            return Err("ノートが見つかりません".into());
+        };
+        let now = chrono::Utc::now().timestamp();
+        insert_note_version_conn(
+            &conn,
+            note_id,
+            &note.memo,
+            &note.title,
+            NOTE_ORIGIN_AI,
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE notes SET ai_notice_pending=1, updated_at=?2 WHERE id=?1",
+            rusqlite::params![note_id, now],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -3469,7 +3603,76 @@ impl Db {
         if version.note_id != note_id {
             return Err("版が見つかりません".into());
         }
-        self.apply_direct_note_text(note_id, &version.memo, Some(&version.title), NOTE_ORIGIN_REVERT)
+        let conn = self.conn.lock();
+        let current = read_note_conn(&conn, note_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| e.to_string())?;
+        let wrote = (|| -> Result<(), rusqlite::Error> {
+            // Keep the live memo and badges before they are replaced, unless the
+            // newest version already has that same text and badge list.
+            if !current_matches_latest(&conn, &current)? {
+                let latest = latest_note_version_conn(&conn, note_id)?;
+                let mut snap_at = now.saturating_sub(1);
+                if let Some(latest) = &latest {
+                    if latest.created_at > snap_at {
+                        snap_at = latest.created_at;
+                    }
+                }
+                insert_note_version_conn(
+                    &conn,
+                    note_id,
+                    &current.memo,
+                    &current.title,
+                    NOTE_ORIGIN_MANUAL,
+                    snap_at,
+                )?;
+            }
+            if version_saved_items(&conn, &version.id)? {
+                restore_version_items(&conn, &version.id, note_id)?;
+            }
+            if current.memo != version.memo || current.title != version.title {
+                let mut revert_at = now.max(1);
+                if let Some(latest) = latest_note_version_conn(&conn, note_id)? {
+                    if latest.created_at >= revert_at {
+                        revert_at = latest.created_at.saturating_add(1);
+                    }
+                }
+                insert_note_version_conn(
+                    &conn,
+                    note_id,
+                    &version.memo,
+                    &version.title,
+                    NOTE_ORIGIN_REVERT,
+                    revert_at,
+                )?;
+                conn.execute(
+                    "UPDATE notes
+                     SET memo=?1, title=?2, updated_at=?3, ai_notice_pending=0, llm_review_base=NULL
+                     WHERE id=?4",
+                    rusqlite::params![version.memo, version.title, revert_at, note_id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE notes SET updated_at=?1 WHERE id=?2",
+                    rusqlite::params![now, note_id],
+                )?;
+            }
+            Ok(())
+        })();
+        match wrote {
+            Ok(()) => conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e.to_string());
+            }
+        }
+        drop(conn);
+        self.get_note(note_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "ノートが見つかりません".to_string())
     }
 
     fn get_note_version(&self, id: &str) -> Result<Option<NoteVersionStored>, rusqlite::Error> {
@@ -5544,6 +5747,14 @@ pub struct NoteHistory {
     pub ai_updated_at: Option<i64>,
 }
 
+/// 外す出典バッジの解決結果。`unknown` は渡されたがノートに無かった指定。
+pub struct NoteKeepPlan {
+    pub ids: Vec<String>,
+    pub titles: Vec<String>,
+    pub unknown: Vec<String>,
+    pub paragraph_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteVersionDiff {
@@ -5647,9 +5858,128 @@ fn insert_note_version_conn(
 ) -> Result<(), rusqlite::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO note_versions(id, note_id, memo, title, source, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO note_versions(id, note_id, memo, title, source, created_at, items_saved)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)",
         rusqlite::params![id, note_id, memo, title, source, created_at],
+    )?;
+    copy_note_items_to_version(conn, &id, note_id)?;
+    Ok(())
+}
+
+fn copy_note_items_to_version(
+    conn: &rusqlite::Connection,
+    version_id: &str,
+    note_id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM note_version_items WHERE version_id=?1",
+        [version_id],
+    )?;
+    conn.execute(
+        "INSERT INTO note_version_items(
+            version_id, item_id, sort_order, query, paragraph_id, item_json, memo, created_at
+         )
+         SELECT ?1, id, sort_order, query, paragraph_id, item_json, memo, created_at
+         FROM note_items WHERE note_id=?2",
+        rusqlite::params![version_id, note_id],
+    )?;
+    conn.execute(
+        "UPDATE note_versions SET items_saved=1 WHERE id=?1",
+        [version_id],
+    )?;
+    Ok(())
+}
+
+fn current_matches_latest(
+    conn: &rusqlite::Connection,
+    note: &NoteRow,
+) -> Result<bool, rusqlite::Error> {
+    let Some(latest) = latest_note_version_conn(conn, &note.id)? else {
+        return Ok(false);
+    };
+    if latest.memo != note.memo || latest.title != note.title {
+        return Ok(false);
+    }
+    version_items_match_live(conn, &latest.id, &note.id)
+}
+
+fn version_items_match_live(
+    conn: &rusqlite::Connection,
+    version_id: &str,
+    note_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let live = note_item_identity(conn, note_id)?;
+    if !version_saved_items(conn, version_id)? {
+        return Ok(live.is_empty());
+    }
+    let saved = version_item_identity(conn, version_id)?;
+    Ok(live == saved)
+}
+
+fn note_item_identity(
+    conn: &rusqlite::Connection,
+    note_id: &str,
+) -> Result<Vec<(String, i64, String, String, String, String)>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, sort_order, query, paragraph_id, item_json, memo
+         FROM note_items WHERE note_id=?1 ORDER BY sort_order ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([note_id], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+fn version_item_identity(
+    conn: &rusqlite::Connection,
+    version_id: &str,
+) -> Result<Vec<(String, i64, String, String, String, String)>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT item_id, sort_order, query, paragraph_id, item_json, memo
+         FROM note_version_items WHERE version_id=?1 ORDER BY sort_order ASC, item_id ASC",
+    )?;
+    let rows = stmt.query_map([version_id], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+fn version_saved_items(conn: &rusqlite::Connection, version_id: &str) -> Result<bool, rusqlite::Error> {
+    let saved: i64 = conn.query_row(
+        "SELECT items_saved FROM note_versions WHERE id=?1",
+        [version_id],
+        |row| row.get(0),
+    )?;
+    Ok(saved != 0)
+}
+
+fn restore_version_items(
+    conn: &rusqlite::Connection,
+    version_id: &str,
+    note_id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM note_items WHERE note_id=?1", [note_id])?;
+    conn.execute(
+        "INSERT INTO note_items(
+            id, note_id, sort_order, query, paragraph_id, item_json, memo, created_at
+         )
+         SELECT item_id, ?2, sort_order, query, paragraph_id, item_json, memo, created_at
+         FROM note_version_items WHERE version_id=?1",
+        rusqlite::params![version_id, note_id],
     )?;
     Ok(())
 }
@@ -5712,6 +6042,27 @@ pub struct NoteItemRow {
     pub item_json: String,
     pub memo: String,
     pub created_at: i64,
+}
+
+pub(crate) fn note_item_label(item: &NoteItemRow) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(&item.item_json).unwrap_or(serde_json::Value::Null);
+    let title = parsed
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    let path = parsed
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !path.is_empty() {
+        return path.to_string();
+    }
+    item.id.clone()
 }
 
 const ACTIVE_NOTE_ID_KEY: &str = "active_note_id";
@@ -6397,6 +6748,57 @@ mod note_version_tests {
         let diff = db.note_version_diff(&note.id, &before.id).unwrap();
         assert!(!diff.hunks.is_empty());
         let _ = memos(&db, &note.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_saves_a_badge_added_after_the_version() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("n").unwrap();
+        db.update_note_memo(&note.id, "古い\n").unwrap();
+        db.apply_llm_note_write(&note.id, "新しい\n", None).unwrap();
+        let badge = db
+            .insert_keep_json(
+                &note.id,
+                "",
+                "https://example.com/later",
+                r#"{"title":"あとから","path":"https://example.com/later","badge":true}"#,
+            )
+            .unwrap();
+        let history = db.list_note_history(&note.id).unwrap().unwrap();
+        let older = history
+            .versions
+            .iter()
+            .find(|v| v.memo_len == "古い\n".chars().count() as u32)
+            .unwrap()
+            .id
+            .clone();
+        db.revert_note_to_version(&note.id, &older).unwrap();
+        assert_eq!(db.get_note(&note.id).unwrap().unwrap().memo, "古い\n");
+        assert!(db.list_note_items(&note.id).unwrap().is_empty());
+
+        let saved = {
+            let conn = db.conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT note_versions.id, note_versions.memo
+                     FROM note_versions
+                     JOIN note_version_items ON note_version_items.version_id = note_versions.id
+                     WHERE note_versions.note_id=?1 AND note_version_items.item_id=?2",
+                )
+                .unwrap();
+            let hit: (String, String) = stmt
+                .query_row([&note.id, &badge.item.id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            hit
+        };
+        assert_eq!(saved.1, "新しい\n");
+        db.revert_note_to_version(&note.id, &saved.0).unwrap();
+        assert_eq!(db.get_note(&note.id).unwrap().unwrap().memo, "新しい\n");
+        let items = db.list_note_items(&note.id).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].id, badge.item.id);
+        assert_eq!(items[0].paragraph_id, "https://example.com/later");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

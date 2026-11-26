@@ -199,7 +199,7 @@ async fn execute_tool_off_runtime(
     thread_scope: Option<String>,
     web_search: bool,
     request_id: String,
-    read_stamps: std::collections::HashMap<String, u64>,
+    read_stamps: std::collections::HashMap<String, tools::NoteReadGrant>,
 ) -> ToolExec {
     match tokio::task::spawn_blocking(move || {
         tools::execute_tool(
@@ -220,7 +220,7 @@ async fn execute_tool_off_runtime(
             content: format!("ツール実行に失敗しました: {e}"),
             consumed: Vec::new(),
             saved_file: None,
-            wrote_note_id: None,
+            wrote_note_id: None, removed_keep_keys: Vec::new(),
         },
     }
 }
@@ -232,6 +232,10 @@ struct ThisSendRead {
     note_id: String,
     /// Memo and title when the result was produced. Refreshed after this send's own write.
     stamp: u64,
+    /// Keep ids in the order `read_note` showed. Numbers in remove_keeps use this list.
+    badge_ids: Vec<String>,
+    /// Keep ids last confirmed. Refreshed after this send's own write.
+    badge_now: Vec<String>,
     /// Characters stored for the model. A shorter turn was truncated or omitted.
     content_chars: usize,
 }
@@ -241,7 +245,7 @@ struct ThisSendRead {
 fn stamps_granted_for_write(
     turns: &[ChatTurn],
     reads: &[ThisSendRead],
-) -> std::collections::HashMap<String, u64> {
+) -> std::collections::HashMap<String, tools::NoteReadGrant> {
     let mut out = std::collections::HashMap::new();
     for turn in turns {
         if turn.name.as_deref() != Some(tools::TOOL_READ_NOTE) {
@@ -259,7 +263,14 @@ fn stamps_granted_for_write(
         if tools::note_id_in_read_result(&turn.content).as_deref() != Some(read.note_id.as_str()) {
             continue;
         }
-        out.insert(read.note_id.clone(), read.stamp);
+        out.insert(
+            read.note_id.clone(),
+            tools::NoteReadGrant {
+                content_stamp: read.stamp,
+                badge_ids: read.badge_ids.clone(),
+                badge_now: read.badge_now.clone(),
+            },
+        );
     }
     out
 }
@@ -1271,6 +1282,8 @@ async fn llm_send_inner<R: Runtime>(
     // In-turn tool results spend the allowance left after the attachment excerpt.
     let mut tool_used = 0usize;
     let mut wrote_note_ids: Vec<String> = Vec::new();
+    let mut removed_keeps: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     // Reads executed in this send. A write may use one only after a later model call
     // has already received the full result.
     let mut this_send_reads: Vec<ThisSendRead> = Vec::new();
@@ -1787,11 +1800,21 @@ async fn llm_send_inner<R: Runtime>(
                             after_llm_note_write(&app, state.as_ref(), &thread.id, &nid);
                             if let Ok(Some(note)) = state.db.get_note(&nid) {
                                 let stamp = tools::note_content_stamp(&note.memo, &note.title);
+                                let badges = tools::ordered_note_badge_ids(state.as_ref(), &nid);
                                 for read in &mut this_send_reads {
                                     if read.note_id == nid {
                                         read.stamp = stamp;
+                                        read.badge_now = badges.clone();
                                     }
                                 }
+                            }
+                            if !exec.removed_keep_keys.is_empty() {
+                                removed_keeps.entry(nid.clone()).or_default().extend(
+                                    exec.removed_keep_keys
+                                        .iter()
+                                        .filter(|key| !key.is_empty())
+                                        .cloned(),
+                                );
                             }
                             if !wrote_note_ids.iter().any(|x| x == &nid) {
                                 wrote_note_ids.push(nid);
@@ -1802,10 +1825,14 @@ async fn llm_send_inner<R: Runtime>(
                         if tc.name == tools::TOOL_READ_NOTE {
                             if let Some(note_id) = tools::note_id_in_read_result(&content) {
                                 if let Ok(Some(note)) = state.db.get_note(&note_id) {
+                                    let badges =
+                                        tools::ordered_note_badge_ids(state.as_ref(), &note_id);
                                     this_send_reads.push(ThisSendRead {
                                         tool_call_id: tc.id.clone(),
                                         note_id,
                                         stamp: tools::note_content_stamp(&note.memo, &note.title),
+                                        badge_now: badges.clone(),
+                                        badge_ids: badges,
                                         content_chars: content.chars().count(),
                                     });
                                     read_full_note = true;
@@ -2174,6 +2201,7 @@ async fn llm_send_inner<R: Runtime>(
                     &wrote_note_ids,
                     &all,
                     &keep_cited,
+                    &removed_keeps,
                 );
                 for id in &wrote_note_ids {
                     crate::commands::emit_note_updated_from(app, id, "items", "");
@@ -7135,7 +7163,7 @@ mod tests {
         state: &std::sync::Arc<crate::state::AppState>,
         thread_id: &str,
         memo: &str,
-        stamps: &std::collections::HashMap<String, u64>,
+        stamps: &std::collections::HashMap<String, tools::NoteReadGrant>,
     ) -> tools::ToolExec {
         tools::execute_tool(
             state,
@@ -7188,6 +7216,8 @@ mod tests {
             tool_call_id: "call-read".into(),
             note_id: note.id.clone(),
             stamp: tools::note_content_stamp(&fresh.memo, &fresh.title),
+            badge_ids: Vec::new(),
+            badge_now: Vec::new(),
             content_chars: read.content.chars().count(),
         };
         let seen = read_turn(&read.content, "call-read");
@@ -7221,7 +7251,10 @@ mod tests {
         assert!(cut_write.wrote_note_id.is_none(), "{}", cut_write.content);
 
         let granted = stamps_granted_for_write(std::slice::from_ref(&seen), &[recorded.clone()]);
-        assert_eq!(granted.get(&note.id), Some(&recorded.stamp));
+        assert_eq!(
+            granted.get(&note.id).map(|grant| grant.content_stamp),
+            Some(recorded.stamp)
+        );
         state
             .db
             .update_note_memo(&note.id, "利用者が直した")
@@ -7249,6 +7282,8 @@ mod tests {
             tool_call_id: "call-reread".into(),
             note_id: note.id.clone(),
             stamp: tools::note_content_stamp(&edited.memo, &edited.title),
+            badge_ids: Vec::new(),
+            badge_now: Vec::new(),
             content_chars: reread.content.chars().count(),
         };
         let prompt = read_turn(&reread.content, "call-reread");
@@ -7310,6 +7345,8 @@ mod tests {
             tool_call_id: "call-long".into(),
             note_id: note.id.clone(),
             stamp: tools::note_content_stamp(&long_note.memo, &long_note.title),
+            badge_ids: Vec::new(),
+            badge_now: Vec::new(),
             content_chars: under_read.content.chars().count(),
         };
         let long_ok = stamps_granted_for_write(
@@ -7321,6 +7358,404 @@ mod tests {
         assert!(wrote.content.contains("2万字"), "{}", wrote.content);
         assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, long);
 
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn web_badge(title: &str, url: &str) -> crate::note_keep::KeepBadge {
+        crate::note_keep::KeepBadge {
+            path: url.to_string(),
+            title: title.to_string(),
+            source: "web".into(),
+            paragraph_id: url.to_string(),
+            body: String::new(),
+            query: String::new(),
+        }
+    }
+
+    fn badge_grant(
+        state: &std::sync::Arc<crate::state::AppState>,
+        note_id: &str,
+        memo: &str,
+        title: &str,
+    ) -> std::collections::HashMap<String, tools::NoteReadGrant> {
+        std::collections::HashMap::from([(
+            note_id.to_string(),
+            tools::NoteReadGrant::from_note(
+                memo,
+                title,
+                tools::ordered_note_badge_ids(state, note_id),
+            ),
+        )])
+    }
+
+    #[test]
+    fn write_note_removes_badges_and_history_restores_them() {
+        let dir = std::env::temp_dir().join(format!("argos-note-unkeep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        let original = "本文";
+        state.db.update_note_memo(&note.id, original).unwrap();
+        state.db.set_llm_thread_note(&thread.id, &note.id).unwrap();
+        let keep_id = crate::note_keep::add_badge(
+            &state.db,
+            &note.id,
+            &web_badge("契約書", "https://example.com/contract"),
+        )
+        .unwrap()
+        .item
+        .id;
+        let none = std::collections::HashMap::new();
+
+        let read = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_READ_NOTE,
+            "{}",
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(
+            read.content.contains(&format!("1. keep_id={keep_id} 契約書")),
+            "{}",
+            read.content
+        );
+
+        let blocked = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": original,
+                "remove_keeps": [keep_id],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(blocked.content.contains("変更していません"), "{}", blocked.content);
+        assert_eq!(state.db.list_note_items(&note.id).unwrap().len(), 1);
+
+        let empty = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": "  ",
+                "remove_keeps": ["1"],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &badge_grant(&state, &note.id, original, &note.title),
+        );
+        assert!(empty.content.contains("空"), "{}", empty.content);
+        assert_eq!(state.db.list_note_items(&note.id).unwrap().len(), 1);
+
+        let removed = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": original,
+                "remove_keeps": [keep_id],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &badge_grant(&state, &note.id, original, &note.title),
+        );
+        assert!(removed.wrote_note_id.is_some(), "{}", removed.content);
+        assert!(removed.content.contains("出典バッジを外しました: 契約書"), "{}", removed.content);
+        assert!(state.db.list_note_items(&note.id).unwrap().is_empty());
+
+        let history = state.db.list_note_history(&note.id).unwrap().unwrap();
+        let prior = history
+            .versions
+            .iter()
+            .rev()
+            .find(|v| v.source != "ai")
+            .expect("the pre-write version stays");
+        state.db.revert_note_to_version(&note.id, &prior.id).unwrap();
+        let restored = state.db.list_note_items(&note.id).unwrap();
+        assert_eq!(restored.len(), 1, "{restored:?}");
+        assert_eq!(restored[0].id, keep_id);
+
+        let second = crate::note_keep::add_badge(
+            &state.db,
+            &note.id,
+            &web_badge("判例", "https://example.com/case"),
+        )
+        .unwrap()
+        .item
+        .id;
+        let current = state.db.get_note(&note.id).unwrap().unwrap();
+        let both = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": "書き直した本文",
+                "remove_keeps": [keep_id],
+                "keeps": [{ "url": "https://example.com/statute", "title": "条文" }],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &badge_grant(&state, &note.id, &current.memo, &current.title),
+        );
+        assert!(both.content.contains("出典バッジを外しました: 契約書"), "{}", both.content);
+        assert!(both.content.contains("キープに追加しました: 条文"), "{}", both.content);
+        let titles = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"判例".to_string()), "{titles:?}");
+        assert!(titles.contains(&"条文".to_string()), "{titles:?}");
+        assert!(!titles.contains(&"契約書".to_string()), "{titles:?}");
+        assert!(
+            state.db.list_note_items(&note.id).unwrap().iter().any(|item| item.id == second),
+            "the badge that was not removed stays"
+        );
+
+        let unknown = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": "未知のidのあと",
+                "remove_keeps": ["does-not-exist", 99],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &badge_grant(&state, &note.id, "書き直した本文", &current.title),
+        );
+        assert!(unknown.content.contains("出典バッジが見つかりません: does-not-exist"), "{}", unknown.content);
+        assert!(unknown.content.contains("出典バッジが見つかりません: 99"), "{}", unknown.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, "未知のidのあと");
+        let still = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert!(still.contains(&"判例".to_string()) && still.contains(&"条文".to_string()), "{still:?}");
+
+        let history = state.db.list_note_history(&note.id).unwrap().unwrap();
+        let before_edit = history
+            .versions
+            .iter()
+            .rev()
+            .find(|v| v.memo_len == original.chars().count() as u32)
+            .expect("the version from before the add-and-remove write");
+        state
+            .db
+            .revert_note_to_version(&note.id, &before_edit.id)
+            .unwrap();
+        let brought_back = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert!(brought_back.contains(&"契約書".to_string()), "{brought_back:?}");
+        assert!(brought_back.contains(&"判例".to_string()), "{brought_back:?}");
+        assert!(!brought_back.contains(&"条文".to_string()), "{brought_back:?}");
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, original);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remove_refuses_when_badges_changed_and_keeps_read_numbers_across_writes() {
+        let dir = std::env::temp_dir().join(format!("argos-note-stale-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        let memo = "本文";
+        state.db.update_note_memo(&note.id, memo).unwrap();
+        state.db.set_llm_thread_note(&thread.id, &note.id).unwrap();
+        let mut ids = Vec::new();
+        for (title, url) in [
+            ("甲", "https://example.com/a"),
+            ("乙", "https://example.com/b"),
+            ("丙", "https://example.com/c"),
+        ] {
+            ids.push(
+                crate::note_keep::add_badge(&state.db, &note.id, &web_badge(title, url))
+                    .unwrap()
+                    .item
+                    .id,
+            );
+        }
+        let read = tools::NoteReadGrant::from_note(memo, &note.title, ids.clone());
+        let stale = std::collections::HashMap::from([(note.id.clone(), read.clone())]);
+        state.db.remove_note_item(&ids[0]).unwrap();
+        let refused = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({ "memo": memo, "remove_keeps": ["2"] }).to_string(),
+            None,
+            false,
+            "req",
+            &stale,
+        );
+        assert!(refused.content.contains("出典バッジ"), "{}", refused.content);
+        assert!(refused.content.contains("read_note"), "{}", refused.content);
+        assert!(refused.wrote_note_id.is_none(), "{}", refused.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, memo);
+        let left = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec![ids[1].clone(), ids[2].clone()], "{left:?}");
+
+        for item in state.db.list_note_items(&note.id).unwrap() {
+            state.db.remove_note_item(&item.id).unwrap();
+        }
+        let mut ids = Vec::new();
+        for (title, url) in [
+            ("甲", "https://example.com/a"),
+            ("乙", "https://example.com/b"),
+            ("丙", "https://example.com/c"),
+        ] {
+            ids.push(
+                crate::note_keep::add_badge(&state.db, &note.id, &web_badge(title, url))
+                    .unwrap()
+                    .item
+                    .id,
+            );
+        }
+        let mut chained = tools::NoteReadGrant::from_note(memo, &note.title, ids);
+        let first = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({ "memo": memo, "remove_keeps": ["1"] }).to_string(),
+            None,
+            false,
+            "req",
+            &std::collections::HashMap::from([(note.id.clone(), chained.clone())]),
+        );
+        assert!(first.wrote_note_id.is_some(), "{}", first.content);
+        chained.badge_now = tools::ordered_note_badge_ids(&state, &note.id);
+        let second = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({ "memo": memo, "remove_keeps": ["2"] }).to_string(),
+            None,
+            false,
+            "req",
+            &std::collections::HashMap::from([(note.id.clone(), chained)]),
+        );
+        assert!(second.wrote_note_id.is_some(), "{}", second.content);
+        assert!(second.content.contains("出典バッジを外しました: 乙"), "{}", second.content);
+        let titles = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["丙".to_string()], "{titles:?}");
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_badge_is_not_auto_kept_again_this_send() {
+        let dir = std::env::temp_dir().join(format!("argos-note-unkeep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        let other = state.db.create_note("別").unwrap();
+        let memo = "本文";
+        state.db.update_note_memo(&note.id, memo).unwrap();
+        state.db.set_llm_thread_note(&thread.id, &note.id).unwrap();
+        let law = "https://example.com/law";
+        crate::note_keep::add_badge(&state.db, &note.id, &web_badge("解説", law)).unwrap();
+        let removed = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({ "memo": memo, "remove_keeps": ["1"] }).to_string(),
+            None,
+            false,
+            "req",
+            &badge_grant(&state, &note.id, memo, &note.title),
+        );
+        assert!(removed.wrote_note_id.is_some(), "{}", removed.content);
+        assert_eq!(removed.removed_keep_keys, vec![law.to_string()]);
+        assert!(state.db.list_note_items(&note.id).unwrap().is_empty());
+        let web = crate::db::LlmSourceRow {
+            id: "w1".into(),
+            thread_id: thread.id.clone(),
+            sort_order: 0,
+            origin: "tool".into(),
+            path: law.into(),
+            title: "解説".into(),
+            paragraph_id: String::new(),
+            body: "本文".into(),
+            query: String::new(),
+            created_at: 1,
+            grain: "unit".into(),
+            unit_body: String::new(),
+            injected_user_message_id: String::new(),
+            cited_assistant_message_id: String::new(),
+            cite_no: 1,
+            kind: "web".into(),
+            stored_relpath: String::new(),
+            ocr_status: String::new(),
+        };
+        let file = crate::db::LlmSourceRow {
+            id: "h1".into(),
+            path: r"C:\docs\契約書.txt".into(),
+            title: "契約書".into(),
+            paragraph_id: r"C:\docs\契約書.txt#3".into(),
+            kind: "text".into(),
+            cite_no: 2,
+            ..web.clone()
+        };
+        let mut skip = std::collections::HashMap::new();
+        skip.insert(
+            note.id.clone(),
+            removed.removed_keep_keys.into_iter().collect(),
+        );
+        let added = crate::note_keep::keep_cited_on_notes(
+            &state.db,
+            &[note.id.clone(), other.id.clone()],
+            &[web, file],
+            &[("w1".into(), 1), ("h1".into(), 2)],
+            &skip,
+        );
+        assert_eq!(added, 3);
+        let kept = state.db.list_note_items(&note.id).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].paragraph_id, r"C:\docs\契約書.txt#3");
+        assert_eq!(state.db.list_note_items(&other.id).unwrap().len(), 2);
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
