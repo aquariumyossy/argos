@@ -76,35 +76,15 @@ function walk(
   return cursor;
 }
 
-/** LF text plus a map back to indexes in the original memo (CRLF or CR). */
-function normalizeNewlines(src: string): { text: string; toOrig: (offset: number) => number } {
-  if (!src.includes("\r")) return { text: src, toOrig: (offset) => offset };
-  const text = src.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const toOrigAt = new Uint32Array(text.length + 1);
-  let orig = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (src.charCodeAt(orig) === 13 && src.charCodeAt(orig + 1) === 10) orig += 1;
-    toOrigAt[i] = orig;
-    orig += 1;
-  }
-  toOrigAt[text.length] = src.length;
-  return {
-    text,
-    toOrig: (offset) => toOrigAt[Math.max(0, Math.min(offset, text.length))] ?? src.length,
-  };
-}
-
 /**
  * Headings in the same order the note preview renders them.
  * Uses the preview's marked lexer, so fences, setext, and nested headings match.
+ * Offsets are in LF coordinates, the same as a textarea value (browsers drop CR).
  */
 export function noteHeadings(md: string): NoteHeading[] {
-  const { text, toOrig } = normalizeNewlines(md);
+  const text = md.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const out: NoteHeading[] = [];
   walk(lexNoteMemo(text), text, 0, text.length, out);
-  if (text !== md) {
-    for (const heading of out) heading.offset = toOrig(heading.offset);
-  }
   return out;
 }
 

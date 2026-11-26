@@ -85,20 +85,34 @@ describe("noteHeadings", () => {
     expectParity("> - # item\n>   本文\n>\n> tail\n\n# 外");
   });
 
-  it("keeps the same headings and original offsets when the memo uses CRLF", () => {
+  it("keeps the same headings when the memo uses CRLF", () => {
     const lf = "> 前文です。\n> # 引用\n> 本文\n\n# 外\n- 一行目\n  継続\n\n  # 項目\n";
     const crlf = lf.replace(/\n/g, "\r\n");
     expectParity(crlf);
     const fromLf = noteHeadings(lf);
     const fromCrlf = noteHeadings(crlf);
-    expect(fromCrlf.map(({ level, text }) => ({ level, text }))).toEqual(
-      fromLf.map(({ level, text }) => ({ level, text })),
-    );
-    for (const heading of fromCrlf) {
-      const slice = crlf.slice(heading.offset, heading.offset + 80);
-      expect(slice.includes("#")).toBe(true);
-      if (heading.text) expect(slice.includes(heading.text)).toBe(true);
+    expect(fromCrlf).toEqual(fromLf);
+  });
+
+  it("matches a CRLF note's heading offset to the LF textarea value", () => {
+    const crlf = "前文\r\n\r\n# 見出し\r\n> # 引用\r\n> 本文\r\n";
+    const ta = document.createElement("textarea");
+    ta.value = crlf;
+    const headings = noteHeadings(crlf);
+    expect(ta.value.includes("\r")).toBe(false);
+    for (const heading of headings) {
+      expect(ta.value.slice(heading.offset, heading.offset + 80)).toContain(
+        heading.text === "" ? "#" : heading.text,
+      );
+      expect(heading.offset).toBeLessThan(ta.value.length);
     }
+    const top = headings.find((h) => h.text === "見出し");
+    const quoted = headings.find((h) => h.text === "引用");
+    expect(top).toBeTruthy();
+    expect(quoted).toBeTruthy();
+    expect(top?.offset).toBe(ta.value.indexOf("# 見出し"));
+    expect(quoted?.offset).toBe(ta.value.indexOf("# 引用"));
+    expect(crlf.indexOf("# 見出し")).toBeGreaterThan(top?.offset ?? 0);
   });
 });
 
@@ -140,10 +154,11 @@ describe("noteHeadings performance", () => {
     for (const heading of crlfRun.headings) {
       expect(heading.offset).toBeGreaterThan(prev);
       prev = heading.offset;
-      const slice = crlf.slice(heading.offset, heading.offset + 40);
+      const slice = lf.slice(heading.offset, heading.offset + 40);
       expect(slice.includes("#")).toBe(true);
       expect(slice.includes(heading.text)).toBe(true);
     }
+    expect(crlfRun.headings.map((h) => h.offset)).toEqual(lfRun.headings.map((h) => h.offset));
     // Previously about 75ms (LF) and 220ms (CRLF). The marked lexer is most of what remains.
     expect(lfRun.ms, `LF ${lfRun.ms.toFixed(1)}ms`).toBeLessThan(30);
     expect(crlfRun.ms, `CRLF ${crlfRun.ms.toFixed(1)}ms`).toBeLessThan(30);
