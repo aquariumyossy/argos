@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useDeferredValue,
   useMemo,
   useRef,
   useState,
@@ -334,7 +335,6 @@ function IconSettings() {
 export default function Notes() {
   const [notes, setNotes] = useState<NoteRow[]>([]);
   const [active, setActive] = useState<NoteRow | null>(null);
-  const headings = useMemo(() => noteHeadings(active?.memo ?? ""), [active?.memo]);
   const [items, setItems] = useState<NoteItemRow[]>([]);
   const [error, setError] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -355,6 +355,11 @@ export default function Notes() {
   const [history, setHistory] = useState<NoteHistory | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [rightTab, setRightTab] = useState<"sources" | "toc">("sources");
+  const deferredMemo = useDeferredValue(active?.memo ?? "");
+  const headings = useMemo(
+    () => (rightTab === "toc" ? noteHeadings(deferredMemo) : []),
+    [rightTab, deferredMemo],
+  );
   const [diffVersionId, setDiffVersionId] = useState<string | null>(null);
   const [versionDiff, setVersionDiff] = useState<{
     memo: string;

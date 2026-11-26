@@ -72,6 +72,82 @@ describe("noteHeadings", () => {
   it("includes an empty hash heading so the preview index still lines up", () => {
     expectParity("# \n# 次");
   });
+
+  it("matches a heading after several quoted lines", () => {
+    expectParity("> 前文です。\n> 次の行です。\n>\n> # 見出し\n> 続きです。\n\n# 外");
+  });
+
+  it("matches a heading in a list item that has a continuation line", () => {
+    expectParity("- 一行目です\n  継続行です\n\n  # 見出し\n  さらに続く\n\n# 外");
+  });
+
+  it("matches a heading in a list inside a blockquote", () => {
+    expectParity("> - # item\n>   本文\n>\n> tail\n\n# 外");
+  });
+
+  it("keeps the same headings and original offsets when the memo uses CRLF", () => {
+    const lf = "> 前文です。\n> # 引用\n> 本文\n\n# 外\n- 一行目\n  継続\n\n  # 項目\n";
+    const crlf = lf.replace(/\n/g, "\r\n");
+    expectParity(crlf);
+    const fromLf = noteHeadings(lf);
+    const fromCrlf = noteHeadings(crlf);
+    expect(fromCrlf.map(({ level, text }) => ({ level, text }))).toEqual(
+      fromLf.map(({ level, text }) => ({ level, text })),
+    );
+    for (const heading of fromCrlf) {
+      const slice = crlf.slice(heading.offset, heading.offset + 80);
+      expect(slice.includes("#")).toBe(true);
+      if (heading.text) expect(slice.includes(heading.text)).toBe(true);
+    }
+  });
+});
+
+describe("noteHeadings performance", () => {
+  it("extracts headings from a 100k-character note of quotes and lists within a few milliseconds", () => {
+    const quote = `> ${"甲は乙に対し金員の支払を求める。".repeat(6)}\n> ${"判決の理由は次のとおりである。".repeat(6)}`;
+    const list = `- ${"争点は次のとおりである。".repeat(4)}\n  ${"継続して主張する。".repeat(4)}`;
+    const nested = `> - ${"引用の中の項目である。".repeat(4)}\n>   ${"引用の継続行である。".repeat(4)}\n>   # 引用中の見出し`;
+    const parts: string[] = [];
+    let size = 0;
+    let n = 0;
+    while (size < 100_000) {
+      const chunk = `# 見出し ${n}\n${quote}\n>\n> # 条 ${n}\n> なお書き。\n\n${list}\n\n${nested}\n\n`;
+      parts.push(chunk);
+      size += chunk.length;
+      n += 1;
+    }
+    const lf = parts.join("");
+    const crlf = lf.replace(/\n/g, "\r\n");
+    expect(lf.length).toBeGreaterThanOrEqual(100_000);
+    expect(crlf.length).toBeGreaterThan(lf.length);
+
+    const measure = (src: string) => {
+      let headings = noteHeadings(src);
+      const samples: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        const start = performance.now();
+        headings = noteHeadings(src);
+        samples.push(performance.now() - start);
+      }
+      samples.sort((a, b) => a - b);
+      return { ms: samples[1] ?? samples[0] ?? 0, headings };
+    };
+    const lfRun = measure(lf);
+    const crlfRun = measure(crlf);
+    expect(lfRun.headings.length).toBeGreaterThan(50);
+    expect(crlfRun.headings.map((h) => h.text)).toEqual(lfRun.headings.map((h) => h.text));
+    let prev = -1;
+    for (const heading of crlfRun.headings) {
+      expect(heading.offset).toBeGreaterThan(prev);
+      prev = heading.offset;
+      const slice = crlf.slice(heading.offset, heading.offset + 40);
+      expect(slice.includes("#")).toBe(true);
+      expect(slice.includes(heading.text)).toBe(true);
+    }
+    // Previously about 75ms (LF) and 220ms (CRLF). The marked lexer is most of what remains.
+    expect(lfRun.ms, `LF ${lfRun.ms.toFixed(1)}ms`).toBeLessThan(30);
+    expect(crlfRun.ms, `CRLF ${crlfRun.ms.toFixed(1)}ms`).toBeLessThan(30);
+  });
 });
 
 describe("scrollTextareaToOffset", () => {
