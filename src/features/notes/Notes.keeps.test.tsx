@@ -100,9 +100,10 @@ describe("note keeps", () => {
     expect(
       document.querySelector(".notes-memo-pane .notes-pane-head-title")?.textContent,
     ).toBe("ノート");
-    expect(
-      document.querySelector(".notes-keep-pane .notes-pane-head-title")?.textContent?.replace(/\s+/g, " ").trim(),
-    ).toBe("出典 2 件");
+    expect(screen.getByRole("tab", { name: "出典 2 件" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "目次" })).toBeTruthy();
     const page = screen.getByRole("button", { name: "解説" });
     const keepPane = document.querySelector(".notes-keep-pane");
     if (!keepPane) throw new Error("出典ペインがありません");
@@ -149,5 +150,15 @@ describe("note keeps", () => {
         }),
       );
     });
+
+    fireEvent.click(screen.getByRole("tab", { name: "目次" }));
+    expect(screen.getByText("見出しがありません")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "編集" }));
+    fireEvent.change(screen.getByPlaceholderText("このノートについてのメモ（Markdown）"), {
+      target: { value: "本文\n## 争点\n詳細" },
+    });
+    expect(screen.getByRole("button", { name: "争点" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "出典 2 件" }));
+    expect(screen.getByRole("button", { name: "契約書" })).toBeTruthy();
   });
 });

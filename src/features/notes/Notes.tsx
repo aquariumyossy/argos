@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useDeferredValue,
   useMemo,
   useRef,
   useState,
@@ -37,6 +38,7 @@ import {
   toggleTaskLine,
   type NoteTask,
 } from "./noteTasks";
+import { noteHeadings, scrollTextareaToOffset, type NoteHeading } from "./noteToc";
 import "./notes.css";
 
 const SIDEBAR_MIN = 160;
@@ -352,6 +354,12 @@ export default function Notes() {
   const [sidebarFilter, setSidebarFilter] = useState<SidebarFilter>(loadSidebarFilter);
   const [history, setHistory] = useState<NoteHistory | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [rightTab, setRightTab] = useState<"sources" | "toc">("sources");
+  const deferredMemo = useDeferredValue(active?.memo ?? "");
+  const headings = useMemo(
+    () => (rightTab === "toc" ? noteHeadings(deferredMemo) : []),
+    [rightTab, deferredMemo],
+  );
   const [diffVersionId, setDiffVersionId] = useState<string | null>(null);
   const [versionDiff, setVersionDiff] = useState<{
     memo: string;
@@ -376,6 +384,18 @@ export default function Notes() {
   const activeRef = useRef<NoteRow | null>(null);
   const mainRef = useRef<HTMLElement | null>(null);
   const memoTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const memoPaneRef = useRef<HTMLElement | null>(null);
+  const scrollNoteToHeading = useCallback((heading: NoteHeading, index: number) => {
+    const pane = memoPaneRef.current;
+    const ta = memoTextareaRef.current;
+    if (ta && pane?.contains(ta)) {
+      scrollTextareaToOffset(ta, heading.offset);
+      return;
+    }
+    const preview = pane?.querySelector(".notes-memo-preview");
+    const el = preview?.querySelectorAll("h1, h2, h3, h4, h5, h6").item(index);
+    el?.scrollIntoView({ block: "start" });
+  }, []);
   const memoViewRef = useRef<{
     start: number;
     end: number;
@@ -1653,6 +1673,7 @@ export default function Notes() {
 
             <div className="notes-split notes-split--row">
               <section
+                ref={memoPaneRef}
                 className="notes-memo-pane notes-memo-block"
                 style={{ flex: `${splitRatio} 1 0`, width: 0 }}
               >
@@ -1740,11 +1761,62 @@ export default function Notes() {
                 style={{ flex: `${1 - splitRatio} 1 0`, width: 0 }}
               >
                 <div className="notes-pane-head">
-                  <span className="notes-pane-head-title">
-                    出典 {items.length} 件
-                  </span>
+                  <div className="notes-right-tabs" role="tablist" aria-label="出典と目次">
+                    <button
+                      type="button"
+                      role="tab"
+                      className="notes-right-tab"
+                      id="notes-tab-sources"
+                      aria-selected={rightTab === "sources"}
+                      aria-controls="notes-panel-sources"
+                      onClick={() => setRightTab("sources")}
+                    >
+                      出典 {items.length} 件
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      className="notes-right-tab"
+                      id="notes-tab-toc"
+                      aria-selected={rightTab === "toc"}
+                      aria-controls="notes-panel-toc"
+                      onClick={() => setRightTab("toc")}
+                    >
+                      目次
+                    </button>
+                  </div>
                 </div>
                 <div className="notes-pane-body">
+            {rightTab === "toc" ? (
+              <div
+                role="tabpanel"
+                id="notes-panel-toc"
+                aria-labelledby="notes-tab-toc"
+              >
+                {headings.length === 0 ? (
+                  <p className="notes-toc-empty">見出しがありません</p>
+                ) : (
+                  <ul className="notes-toc" aria-label="目次">
+                    {headings.map((heading, index) => (
+                      <li key={`${heading.offset}-${heading.level}-${heading.text}`}>
+                        <button
+                          type="button"
+                          style={{ paddingLeft: `${8 + (heading.level - 1) * 14}px` }}
+                          onClick={() => scrollNoteToHeading(heading, index)}
+                        >
+                          {heading.text}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : (
+              <div
+                role="tabpanel"
+                id="notes-panel-sources"
+                aria-labelledby="notes-tab-sources"
+              >
             {parsedItems.length === 0 ? (
               <p className="notes-empty-items">
                 まだ出典がありません。検索結果から追加するか、チャットでノートを書くと引用した出典が入ります。
@@ -1784,6 +1856,8 @@ export default function Notes() {
                   );
                 })}
               </ul>
+            )}
+              </div>
             )}
                 </div>
               </section>

@@ -117,6 +117,21 @@ export function resetNoteMemoCheckboxSeq() {
   checkboxSeq = 0;
 }
 
+/** Block token from the same marked instance the note preview uses. */
+export type NoteMemoToken = {
+  type: string;
+  raw: string;
+  text?: string;
+  depth?: number;
+  tokens?: NoteMemoToken[];
+  items?: NoteMemoToken[];
+};
+
+/** Lex with the preview's gfm + breaks options. Fences stay code tokens. */
+export function lexNoteMemo(src: string): NoteMemoToken[] {
+  return noteMarked.lexer(src) as unknown as NoteMemoToken[];
+}
+
 export function renderNoteMemoHtml(text: string): string {
   const html = noteMarked.parse(text, { async: false }) as string;
   const doc = new DOMParser().parseFromString(
