@@ -7325,6 +7325,222 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn web_badge(title: &str, url: &str) -> crate::note_keep::KeepBadge {
+        crate::note_keep::KeepBadge {
+            path: url.to_string(),
+            title: title.to_string(),
+            source: "web".into(),
+            paragraph_id: url.to_string(),
+            body: String::new(),
+            query: String::new(),
+        }
+    }
+
+    #[test]
+    fn write_note_removes_badges_and_history_restores_them() {
+        let dir = std::env::temp_dir().join(format!("argos-note-unkeep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        let thread = state.db.create_llm_thread("編集", true).unwrap();
+        let note = state.db.create_note("準備書面").unwrap();
+        let original = "本文";
+        state.db.update_note_memo(&note.id, original).unwrap();
+        state.db.set_llm_thread_note(&thread.id, &note.id).unwrap();
+        let keep_id = crate::note_keep::add_badge(
+            &state.db,
+            &note.id,
+            &web_badge("契約書", "https://example.com/contract"),
+        )
+        .unwrap()
+        .item
+        .id;
+        let none = std::collections::HashMap::new();
+
+        let read = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_READ_NOTE,
+            "{}",
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(
+            read.content.contains(&format!("1. keep_id={keep_id} 契約書")),
+            "{}",
+            read.content
+        );
+
+        let blocked = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": original,
+                "remove_keeps": [keep_id],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &none,
+        );
+        assert!(blocked.content.contains("変更していません"), "{}", blocked.content);
+        assert_eq!(state.db.list_note_items(&note.id).unwrap().len(), 1);
+
+        let empty = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": "  ",
+                "remove_keeps": ["1"],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &std::collections::HashMap::from([(
+                note.id.clone(),
+                tools::note_content_stamp(original, &note.title),
+            )]),
+        );
+        assert!(empty.content.contains("空"), "{}", empty.content);
+        assert_eq!(state.db.list_note_items(&note.id).unwrap().len(), 1);
+
+        let removed = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": original,
+                "remove_keeps": [keep_id],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &std::collections::HashMap::from([(
+                note.id.clone(),
+                tools::note_content_stamp(original, &note.title),
+            )]),
+        );
+        assert!(removed.wrote_note_id.is_some(), "{}", removed.content);
+        assert!(removed.content.contains("出典バッジを外しました: 契約書"), "{}", removed.content);
+        assert!(state.db.list_note_items(&note.id).unwrap().is_empty());
+
+        let history = state.db.list_note_history(&note.id).unwrap().unwrap();
+        let prior = history
+            .versions
+            .iter()
+            .rev()
+            .find(|v| v.source != "ai")
+            .expect("the pre-write version stays");
+        state.db.revert_note_to_version(&note.id, &prior.id).unwrap();
+        let restored = state.db.list_note_items(&note.id).unwrap();
+        assert_eq!(restored.len(), 1, "{restored:?}");
+        assert_eq!(restored[0].id, keep_id);
+
+        let second = crate::note_keep::add_badge(
+            &state.db,
+            &note.id,
+            &web_badge("判例", "https://example.com/case"),
+        )
+        .unwrap()
+        .item
+        .id;
+        let current = state.db.get_note(&note.id).unwrap().unwrap();
+        let both = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": "書き直した本文",
+                "remove_keeps": [keep_id],
+                "keeps": [{ "url": "https://example.com/statute", "title": "条文" }],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &std::collections::HashMap::from([(
+                note.id.clone(),
+                tools::note_content_stamp(&current.memo, &current.title),
+            )]),
+        );
+        assert!(both.content.contains("出典バッジを外しました: 契約書"), "{}", both.content);
+        assert!(both.content.contains("キープに追加しました: 条文"), "{}", both.content);
+        let titles = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"判例".to_string()), "{titles:?}");
+        assert!(titles.contains(&"条文".to_string()), "{titles:?}");
+        assert!(!titles.contains(&"契約書".to_string()), "{titles:?}");
+        assert!(
+            state.db.list_note_items(&note.id).unwrap().iter().any(|item| item.id == second),
+            "the badge that was not removed stays"
+        );
+
+        let unknown = tools::execute_tool(
+            &state,
+            &thread.id,
+            tools::TOOL_WRITE_NOTE,
+            &serde_json::json!({
+                "memo": "未知のidのあと",
+                "remove_keeps": ["does-not-exist", 99],
+            })
+            .to_string(),
+            None,
+            false,
+            "req",
+            &std::collections::HashMap::from([(
+                note.id.clone(),
+                tools::note_content_stamp("書き直した本文", &current.title),
+            )]),
+        );
+        assert!(unknown.content.contains("出典バッジが見つかりません: does-not-exist"), "{}", unknown.content);
+        assert!(unknown.content.contains("出典バッジが見つかりません: 99"), "{}", unknown.content);
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, "未知のidのあと");
+        let still = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert!(still.contains(&"判例".to_string()) && still.contains(&"条文".to_string()), "{still:?}");
+
+        let history = state.db.list_note_history(&note.id).unwrap().unwrap();
+        let before_edit = history
+            .versions
+            .iter()
+            .rev()
+            .find(|v| v.memo_len == original.chars().count() as u32)
+            .expect("the version from before the add-and-remove write");
+        state
+            .db
+            .revert_note_to_version(&note.id, &before_edit.id)
+            .unwrap();
+        let brought_back = state
+            .db
+            .list_note_items(&note.id)
+            .unwrap()
+            .into_iter()
+            .map(|item| crate::db::note_item_label(&item))
+            .collect::<Vec<_>>();
+        assert!(brought_back.contains(&"契約書".to_string()), "{brought_back:?}");
+        assert!(brought_back.contains(&"判例".to_string()), "{brought_back:?}");
+        assert!(!brought_back.contains(&"条文".to_string()), "{brought_back:?}");
+        assert_eq!(state.db.get_note(&note.id).unwrap().unwrap().memo, original);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn note_tool_call(id: &str, name: &str, arguments: &str) -> Vec<u8> {
         sse_message(serde_json::json!({
             "choices": [{

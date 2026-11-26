@@ -486,7 +486,7 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_WRITE_NOTE,
-            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で、前のモデル呼び出しが受け取った read_note の全文があるノートだけを変更する。同じ応答の中の read_note や、前の送信の読み取り、省略された本文では書けない。読んだ後にノートが変わっていたら、もう一度 read_note してから書く。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
+            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で、前のモデル呼び出しが受け取った read_note の全文があるノートだけを変更する。同じ応答の中の read_note や、前の送信の読み取り、省略された本文では書けない。読んだ後にノートが変わっていたら、もう一度 read_note してから書く。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。remove_keeps に read_note の出典バッジの keep_id（または番号）を渡すと、そのバッジを外す。同じ呼び出しで足すことも外すこともできる。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -504,6 +504,11 @@ pub fn tools_schema_with(
                                 "title": { "type": "string", "description": "ウェブページの題名" }
                             }
                         }
+                    },
+                    "remove_keeps": {
+                        "type": "array",
+                        "description": "外す出典バッジ。read_note の keep_id、または出典バッジの番号。",
+                        "items": { "type": "string" }
                     }
                 },
                 "required": ["memo"]
@@ -2128,14 +2133,69 @@ fn tool_read_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
         head.push('\n');
         head.push_str(hint);
     }
+    let badges = format_note_badges(state, &note.id);
     with_note_cite(
         state,
         thread_id,
         &note.id,
         &note.title,
         &note.memo,
-        format!("{head}\n\n{}", note.memo),
+        format!("{head}\n{badges}\n\n{}", note.memo),
     )
+}
+
+fn format_note_badges(state: &AppState, note_id: &str) -> String {
+    let items = match state.db.list_note_items(note_id) {
+        Ok(items) => items,
+        Err(_) => return "出典バッジ: （なし）".to_string(),
+    };
+    if items.is_empty() {
+        return "出典バッジ: （なし）".to_string();
+    }
+    let mut lines = vec!["出典バッジ:".to_string()];
+    for (i, item) in items.iter().enumerate() {
+        lines.push(format!(
+            "{}. keep_id={} {}",
+            i + 1,
+            item.id,
+            crate::db::note_item_label(item)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn remove_keep_tokens(args: &Value) -> Vec<String> {
+    args.get("remove_keeps")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    if let Some(text) = item.as_str() {
+                        Some(text.to_string())
+                    } else if let Some(n) = item.as_i64() {
+                        Some(n.to_string())
+                    } else if let Some(n) = item.as_u64() {
+                        Some(n.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn note_item_ids(state: &AppState, note_id: &str) -> Vec<String> {
+    let mut ids = state
+        .db
+        .list_note_items(note_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec {
@@ -2214,15 +2274,42 @@ fn tool_write_note(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let tokens = remove_keep_tokens(args);
+    let plan = match state.db.plan_note_keep_removals(&note.id, &tokens) {
+        Ok(plan) => plan,
+        Err(e) => return ToolExec::text(format!("出典バッジの確認に失敗しました: {e}")),
+    };
+    let before_items = note_item_ids(state, &note.id);
+    let before_memo = note.memo.clone();
+    let before_title = note.title.clone();
+    if let Err(e) = state.db.remember_items_before_ai_edit(&note.id) {
+        return ToolExec::text(format!("履歴の保存に失敗しました: {e}"));
+    }
+    if let Err(e) = state.db.delete_note_items(&plan.ids) {
+        return ToolExec::text(format!("出典バッジを外せませんでした: {e}"));
+    }
     match state.db.apply_llm_note_write(&note.id, memo, title) {
         Ok(note) => {
             bind_thread_note(state, thread_id, &note.id);
             let keeps = apply_note_keeps(state, &note.id, args);
+            let memo_changed = note.memo != before_memo || note.title != before_title;
+            if note_item_ids(state, &note.id) != before_items {
+                if let Err(e) = state.db.seal_ai_note_items(&note.id, memo_changed) {
+                    return ToolExec::text(format!("出典バッジの履歴を保存できませんでした: {e}"));
+                }
+            }
+            let mut removed = String::new();
+            for title in &plan.titles {
+                removed.push_str(&format!("\n出典バッジを外しました: {title}"));
+            }
+            for token in &plan.unknown {
+                removed.push_str(&format!("\n出典バッジが見つかりません: {token}"));
+            }
             let hint = crate::notes_md::note_split_hint(note.memo.chars().count())
                 .map(|line| format!("\n{line}"))
                 .unwrap_or_default();
             let content = format!(
-                "ノート『{}』のメモ全体を置き換えました。id={}。反映済みです。履歴に残っています。{keeps}{hint}",
+                "ノート『{}』のメモ全体を置き換えました。id={}。反映済みです。履歴に残っています。{removed}{keeps}{hint}",
                 note.title, note.id
             );
             ToolExec {
