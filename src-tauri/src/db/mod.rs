@@ -3430,16 +3430,19 @@ impl Db {
         .map_err(|e| e.to_string())
     }
 
-    /// `tokens` は read_note に出した keep_id、または 1 始まりの番号。
+    /// `tokens` は read_note に出した keep_id、またはそのときの 1 始まりの番号。
+    /// 番号は `numbered_ids`（読んだときの並び）で解決し、今の並びでは引き直さない。
     pub fn plan_note_keep_removals(
         &self,
         note_id: &str,
         tokens: &[String],
+        numbered_ids: &[String],
     ) -> Result<NoteKeepPlan, rusqlite::Error> {
         let items = self.list_note_items(note_id)?;
         let mut ids = Vec::new();
         let mut titles = Vec::new();
         let mut unknown = Vec::new();
+        let mut paragraph_ids = Vec::new();
         for raw in tokens {
             let token = raw.trim();
             if token.is_empty() {
@@ -3447,22 +3450,26 @@ impl Db {
             }
             let token = token.strip_prefix("keep_id=").unwrap_or(token);
             let found = items.iter().find(|item| item.id == token).or_else(|| {
-                token
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| *n >= 1)
-                    .and_then(|n| items.get(n - 1))
+                let n = token.parse::<usize>().ok().filter(|n| *n >= 1)?;
+                let id = numbered_ids.get(n - 1)?;
+                items.iter().find(|item| &item.id == id)
             });
             match found {
                 Some(item) if ids.iter().any(|id| id == &item.id) => {}
                 Some(item) => {
                     ids.push(item.id.clone());
                     titles.push(note_item_label(item));
+                    paragraph_ids.push(item.paragraph_id.clone());
                 }
                 None => unknown.push(token.to_string()),
             }
         }
-        Ok(NoteKeepPlan { ids, titles, unknown })
+        Ok(NoteKeepPlan {
+            ids,
+            titles,
+            unknown,
+            paragraph_ids,
+        })
     }
 
     pub fn delete_note_items(&self, ids: &[String]) -> Result<(), rusqlite::Error> {
@@ -5682,6 +5689,7 @@ pub struct NoteKeepPlan {
     pub ids: Vec<String>,
     pub titles: Vec<String>,
     pub unknown: Vec<String>,
+    pub paragraph_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

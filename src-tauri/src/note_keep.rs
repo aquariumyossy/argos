@@ -3,7 +3,7 @@
 //! Paragraph keeps from the search popup stay as cards. A badge stores the
 //! same note item row, with `badge: true`, and opens the file or the page.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::db::{Db, LlmSourceRow, NoteItemRow};
 use serde_json::{json, Value};
@@ -156,12 +156,14 @@ fn pdf_document_badge(row: &LlmSourceRow) -> Option<KeepBadge> {
 }
 
 /// Add the sources cited in the final answer to each note written in that turn.
-/// Search hits that were not cited are left out.
+/// Search hits that were not cited are left out. `skip` lists paragraph ids this
+/// send already removed from that note, so auto-keep does not put them back.
 pub fn keep_cited_on_notes(
     db: &Db,
     note_ids: &[String],
     sources: &[LlmSourceRow],
     cited: &[(String, i64)],
+    skip: &HashMap<String, HashSet<String>>,
 ) -> usize {
     let wanted: HashSet<&str> = cited.iter().map(|(id, _)| id.as_str()).collect();
     let mut added = 0usize;
@@ -169,6 +171,7 @@ pub fn keep_cited_on_notes(
         if note_id.trim().is_empty() {
             continue;
         }
+        let skipped = skip.get(note_id);
         for source in sources {
             if !wanted.contains(source.id.as_str()) {
                 continue;
@@ -176,6 +179,9 @@ pub fn keep_cited_on_notes(
             let Some(badge) = badge_for_cited_source(source) else {
                 continue;
             };
+            if skipped.is_some_and(|keys| keys.contains(badge.paragraph_id.as_str())) {
+                continue;
+            }
             if let Ok(insert) = add_badge(db, note_id, &badge) {
                 if insert.created {
                     added += 1;
@@ -355,6 +361,7 @@ mod tests {
             &[note.id.clone()],
             &[web, index, unused, note_src],
             &cited,
+            &HashMap::new(),
         );
         assert_eq!(added, 2);
         let items = db.list_note_items(&note.id).unwrap();
@@ -367,7 +374,7 @@ mod tests {
         assert_eq!(index_json["badge"], true);
         assert_eq!(index_json["path"], r"C:\docs\契約書.txt");
         assert_eq!(index_json["paragraphId"], r"C:\docs\契約書.txt#3");
-        assert!(keep_cited_on_notes(&db, &[note.id], &[], &cited) == 0);
+        assert!(keep_cited_on_notes(&db, &[note.id], &[], &cited, &HashMap::new()) == 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -400,7 +407,7 @@ mod tests {
         assert!(crate::llm::context::consumed_cited_in_answer(&this_turn_consumed, answer).is_empty());
         let cited = crate::llm::context::thread_sources_cited_in_answer(&sources, answer);
         assert_eq!(cited, vec![("h1".into(), 1)]);
-        let added = keep_cited_on_notes(&db, &[note.id.clone()], &sources, &cited);
+        let added = keep_cited_on_notes(&db, &[note.id.clone()], &sources, &cited, &HashMap::new());
         assert_eq!(added, 1);
         let items = db.list_note_items(&note.id).unwrap();
         assert_eq!(items.len(), 1);
@@ -430,6 +437,7 @@ mod tests {
             &[note.id.clone()],
             &[short, stamped],
             &[("p1".into(), 1), ("p2".into(), 2)],
+            &HashMap::new(),
         );
         assert_eq!(added, 0);
         assert!(db.list_note_items(&note.id).unwrap().is_empty());
@@ -469,6 +477,7 @@ mod tests {
             &[note.id.clone()],
             &[page1, page2, other],
             &[("a1".into(), 1), ("a2".into(), 2), ("b1".into(), 3)],
+            &HashMap::new(),
         );
         assert_eq!(added, 2);
         let items = db.list_note_items(&note.id).unwrap();
@@ -483,6 +492,47 @@ mod tests {
         assert_eq!(second["paragraphId"], r"c:\other\scan.pdf#pdf");
         assert_ne!(first["paragraphId"], second["paragraphId"]);
         assert!(!first["paragraphId"].as_str().unwrap_or("").starts_with("pdf-page:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_source_is_not_auto_kept_on_that_note() {
+        let (dir, db) = temp_db();
+        let note = db.create_note("事件").unwrap();
+        let other = db.create_note("別").unwrap();
+        let web = llm_source(
+            "w1",
+            "web",
+            "https://example.com/law",
+            "",
+            "解説",
+            "本文",
+        );
+        let index = llm_source(
+            "h1",
+            "text",
+            r"C:\docs\契約書.txt",
+            r"C:\docs\契約書.txt#3",
+            "契約書.txt",
+            "本文",
+        );
+        let mut skip = HashMap::new();
+        skip.insert(
+            note.id.clone(),
+            HashSet::from(["https://example.com/law".to_string()]),
+        );
+        let added = keep_cited_on_notes(
+            &db,
+            &[note.id.clone(), other.id.clone()],
+            &[web, index],
+            &[("w1".into(), 1), ("h1".into(), 2)],
+            &skip,
+        );
+        assert_eq!(added, 3);
+        let kept = db.list_note_items(&note.id).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].paragraph_id, r"C:\docs\契約書.txt#3");
+        assert_eq!(db.list_note_items(&other.id).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

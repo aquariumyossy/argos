@@ -618,6 +618,8 @@ pub struct ToolExec {
     pub content: String,
     pub consumed: Vec<(String, i64)>,
     pub wrote_note_id: Option<String>,
+    /// Paragraph ids removed by this `write_note`. Auto-keep must not add them back.
+    pub removed_keep_keys: Vec<String>,
     /// Set only by `create_docx` / `create_xlsx` / `create_html`. Never parsed out of tool text.
     pub saved_file: Option<crate::llm::create_office::SavedOfficeFile>,
 }
@@ -627,7 +629,7 @@ impl ToolExec {
         Self {
             content: content.into(),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None,
+            saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
         }
     }
 }
@@ -1943,7 +1945,7 @@ fn tool_list_notes(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
         content,
         consumed,
         saved_file: None,
-        wrote_note_id: None,
+        wrote_note_id: None, removed_keep_keys: Vec::new(),
     }
 }
 
@@ -1976,7 +1978,7 @@ fn with_note_cite(state: &AppState, thread_id: &str, note_id: &str, title: &str,
         content,
         consumed,
         saved_file: None,
-        wrote_note_id: None,
+        wrote_note_id: None, removed_keep_keys: Vec::new(),
     }
 }
 
@@ -2097,6 +2099,36 @@ pub fn note_content_stamp(memo: &str, title: &str) -> u64 {
     memo.hash(&mut hasher);
     title.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Ordered keep ids `read_note` showed, and the ids last confirmed this send.
+/// Numbers in `remove_keeps` stay tied to `badge_ids`. `badge_now` is refreshed
+/// after this send's own write so the next write is not refused for our edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteReadGrant {
+    pub content_stamp: u64,
+    pub badge_ids: Vec<String>,
+    pub badge_now: Vec<String>,
+}
+
+impl NoteReadGrant {
+    pub fn from_note(memo: &str, title: &str, badge_ids: Vec<String>) -> Self {
+        Self {
+            content_stamp: note_content_stamp(memo, title),
+            badge_now: badge_ids.clone(),
+            badge_ids,
+        }
+    }
+}
+
+pub fn ordered_note_badge_ids(state: &AppState, note_id: &str) -> Vec<String> {
+    state
+        .db
+        .list_note_items(note_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.id)
+        .collect()
 }
 
 /// `note_id:` line in a full `read_note` result. Context trimming drops the line
@@ -2229,7 +2261,7 @@ fn tool_create_note(state: &AppState, thread_id: &str, args: &Value) -> ToolExec
                     note.title, note.id
                 ),
                 consumed: Vec::new(),
-                saved_file: None, wrote_note_id: Some(note.id),
+                saved_file: None, wrote_note_id: Some(note.id), removed_keep_keys: Vec::new(),
             }
         }
         Err(e) => ToolExec::text(format!("ノートの作成に失敗しました: {e}")),
@@ -2240,27 +2272,27 @@ fn tool_write_note(
     state: &AppState,
     thread_id: &str,
     args: &Value,
-    read_stamps: &HashMap<String, u64>,
+    read_stamps: &HashMap<String, NoteReadGrant>,
 ) -> ToolExec {
     let note = match resolve_note(state, thread_id, args) {
         Ok(n) => n,
         Err(e) => return ToolExec::text(e),
     };
-    match read_stamps.get(&note.id) {
+    let grant = match read_stamps.get(&note.id) {
         None => {
             return ToolExec::text(format!(
                 "この送信では、前のモデル呼び出しで返った read_note の全文がありません。同じ応答で読んだもの、前の送信の読み取り、省略された本文では書けません。ノート『{}』（id={}）は変更していません。先に read_note を呼んでください。",
                 note.title, note.id
             ));
         }
-        Some(stamp) if *stamp != note_content_stamp(&note.memo, &note.title) => {
+        Some(grant) if grant.content_stamp != note_content_stamp(&note.memo, &note.title) => {
             return ToolExec::text(format!(
                 "読んだ後にノート『{}』（id={}）が変わっています。ノートは変更していません。もう一度 read_note を呼んでください。",
                 note.title, note.id
             ));
         }
-        Some(_) => {}
-    }
+        Some(grant) => grant,
+    };
     let memo = args
         .get("memo")
         .and_then(|v| v.as_str())
@@ -2275,7 +2307,16 @@ fn tool_write_note(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let tokens = remove_keep_tokens(args);
-    let plan = match state.db.plan_note_keep_removals(&note.id, &tokens) {
+    if !tokens.is_empty() && ordered_note_badge_ids(state, &note.id) != grant.badge_now {
+        return ToolExec::text(format!(
+            "読んだ後にノート『{}』（id={}）の出典バッジが変わっています。ノートは変更していません。もう一度 read_note を呼んでください。",
+            note.title, note.id
+        ));
+    }
+    let plan = match state
+        .db
+        .plan_note_keep_removals(&note.id, &tokens, &grant.badge_ids)
+    {
         Ok(plan) => plan,
         Err(e) => return ToolExec::text(format!("出典バッジの確認に失敗しました: {e}")),
     };
@@ -2317,6 +2358,7 @@ fn tool_write_note(
                 consumed: Vec::new(),
                 saved_file: None,
                 wrote_note_id: Some(note.id),
+                removed_keep_keys: plan.paragraph_ids,
             }
         }
         Err(e) => ToolExec::text(e),
@@ -2504,7 +2546,7 @@ fn read_saved_selection(
     ToolExec {
         content: format_sources(&rows),
         consumed,
-        saved_file: None, wrote_note_id: None,
+        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
     }
 }
 
@@ -2639,7 +2681,7 @@ fn finish_read(content: impl Into<String>, consumed: Vec<(String, i64)>) -> Tool
     ToolExec {
         content: content.into(),
         consumed,
-        saved_file: None, wrote_note_id: None,
+        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
     }
 }
 
@@ -3147,7 +3189,7 @@ fn office_tool_exec(wrote: crate::llm::create_office::OfficeToolResult) -> ToolE
     ToolExec {
         content: wrote.message,
         consumed: Vec::new(),
-        wrote_note_id: None,
+        wrote_note_id: None, removed_keep_keys: Vec::new(),
         saved_file: wrote.saved,
     }
 }
@@ -3220,7 +3262,7 @@ fn tool_search_web(
         content,
         consumed,
         saved_file: None,
-        wrote_note_id: None,
+        wrote_note_id: None, removed_keep_keys: Vec::new(),
     })
 }
 
@@ -3232,7 +3274,7 @@ pub fn execute_tool(
     thread_scope: Option<&str>,
     web_search: bool,
     request_id: &str,
-    read_stamps: &HashMap<String, u64>,
+    read_stamps: &HashMap<String, NoteReadGrant>,
 ) -> ToolExec {
     match execute_tool_inner(
         state,
@@ -3248,7 +3290,7 @@ pub fn execute_tool(
         Err(e) => ToolExec {
             content: format!("ツールエラー: {e}"),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None,
+            saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
         },
     }
 }
@@ -3261,7 +3303,7 @@ fn execute_tool_inner(
     thread_scope: Option<&str>,
     web_search: bool,
     _request_id: &str,
-    read_stamps: &HashMap<String, u64>,
+    read_stamps: &HashMap<String, NoteReadGrant>,
 ) -> Result<ToolExec, String> {
     let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
     if let Some(message) = crate::llm::japanese_han::foreign_char_tool_error(name, &args) {
@@ -3287,7 +3329,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "query が空です。".into(),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                 });
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
@@ -3315,7 +3357,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: e,
                         consumed: Vec::new(),
-                        saved_file: None, wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                     });
                 }
             };
@@ -3534,7 +3576,7 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                saved_file: None, wrote_note_id: None,
+                saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
             })
         }
         TOOL_READ => {
@@ -3551,7 +3593,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: "paragraph_id が空です。".into(),
                         consumed: Vec::new(),
-                        saved_file: None, wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                     });
                 }
                 ReadRoute::Paragraph(id) => id,
@@ -3561,7 +3603,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: format!("段落 {paragraph_id} は索引にありません。"),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                 });
             };
             let mut new_rows = Vec::new();
@@ -3613,7 +3655,7 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                saved_file: None, wrote_note_id: None,
+                saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
             })
         }
         TOOL_READ_URL => {
@@ -3621,7 +3663,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "ウェブ検索がオフです。".into(),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                 });
             }
             let url = args
@@ -3634,7 +3676,7 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "url が空です。".into(),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None,
+                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                 });
             }
             if let Some(existing) = state
@@ -3650,7 +3692,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: already_line(&existing),
                         consumed,
-                        saved_file: None, wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                     });
                 }
             }
@@ -3665,7 +3707,7 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: format!("URL を読めません: {e}"),
                         consumed: Vec::new(),
-                        saved_file: None, wrote_note_id: None,
+                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
                     });
                 }
             };
@@ -3705,7 +3747,7 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                saved_file: None, wrote_note_id: None,
+                saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
             })
         }
         TOOL_LIST_NOTES => Ok(tool_list_notes(state, thread_id, &args)),
@@ -3742,7 +3784,7 @@ fn execute_tool_inner(
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None,
+            saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
         }),
     }
 }
