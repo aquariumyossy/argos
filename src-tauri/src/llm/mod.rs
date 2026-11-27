@@ -12,6 +12,7 @@ pub mod note_summary;
 pub mod grain;
 pub mod han_fix;
 pub mod http_error;
+pub mod indexed_office;
 pub mod japanese_han;
 pub mod output_files;
 pub mod pdf_win;
