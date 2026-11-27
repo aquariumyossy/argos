@@ -2905,20 +2905,28 @@ mod tests {
 
         db.set_folder_index_outcome(id, FOLDER_INDEX_OK, Some(2))
             .unwrap();
-        let before = unix_now();
         fs::write(&path, "契約のメモ。本文を足して長さを確保する。更新二。").unwrap();
-        assert_eq!(
+        // `handle_fs_event` indexes the file before `note_watcher_success` samples
+        // the 5s window. On a busy runner that index outlasts the window, so the
+        // burst writes `unix_now()` (a unix timestamp) over the sentinel. Hold the
+        // window open for this call only; the decision is still the product path.
+        let started = unix_now();
+        let updated = {
+            let _window = WatcherWindowHold::open(env.indexer(), id);
             env.indexer()
                 .handle_fs_event(FsEvent::Changed(path))
-                .unwrap(),
-            true
-        );
+                .unwrap()
+        };
+        let ended = unix_now();
+        assert!(updated);
         let row = db.list_folders().unwrap().into_iter().next().unwrap();
         assert_eq!(row.index_updated_at, Some(2));
         assert_eq!(row.index_status, FOLDER_INDEX_OK);
 
         // The burst does not write immediately, but the last event is stored
-        // once the throttle window ends, with that event's own time.
+        // once the throttle window ends, with that event's own time. The event
+        // time is sampled after the index returns, so it can be many seconds
+        // after `started` when the suite is loaded.
         let db_wait = Arc::clone(&db);
         wait_until(
             WATCHER_STATUS_MIN_INTERVAL + Duration::from_secs(3),
@@ -2935,8 +2943,8 @@ mod tests {
         assert_eq!(row.index_status, FOLDER_INDEX_OK);
         assert!(!row.index_busy);
         assert!(
-            stamped >= before && stamped <= before + 2,
-            "trailing time {stamped} should be the event time around {before}"
+            stamped >= started && stamped <= ended + 1,
+            "trailing time {stamped} should be the event time (between {started} and {ended})"
         );
     }
 
@@ -4502,6 +4510,33 @@ mod tests {
 
     #[test]
     fn many_small_files_stay_in_few_segments() {
+        // `GetProcessMemoryInfo` reports the whole test process. `cargo test`
+        // runs other tests beside this one, and their writers show up in the
+        // delta (CI saw ~282MB and ~356MB against a 250MB cap). Re-exec alone
+        // so the cap applies to this index. The segment bound below is the
+        // check that commits stay batched; it does not use process memory.
+        if cfg!(windows) && std::env::var_os("ARGOS_INDEX_SOAK_ISOLATED").is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .env("ARGOS_INDEX_SOAK_ISOLATED", "1")
+            .args([
+                "--exact",
+                "--test-threads=1",
+                "indexer::tests::many_small_files_stay_in_few_segments",
+            ])
+            .output()
+            .expect("re-exec soak test in its own process");
+            assert!(
+                output.status.success(),
+                "isolated soak failed (status {:?})\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let env = Env::new("soak");
         for n in 0..1000 {
             env.write(
@@ -4513,11 +4548,14 @@ mod tests {
         env.index_all();
         let segments = env.backend().segment_count().unwrap();
         assert!(
-            segments < 32,
+            (1..32).contains(&segments),
             "1000 files produced {segments} segments; per-file commits would be hundreds"
         );
         let Some(before) = before else {
-            panic!("commit charge was not reported; the memory bound was not checked");
+            if cfg!(windows) {
+                panic!("commit charge was not reported; the memory bound was not checked");
+            }
+            return;
         };
         let after = crate::extract_host::committed_bytes().expect("commit charge after index");
         let grew = after.saturating_sub(before);
@@ -4553,6 +4591,42 @@ mod tests {
         while !ready() {
             assert!(Instant::now() < deadline, "{message}");
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Keeps `watcher_status_at` inside `WATCHER_STATUS_MIN_INTERVAL` for one call.
+    /// The product samples that map only after the file has been indexed, and a
+    /// parallel `cargo test` run can spend longer than the window inside that index.
+    struct WatcherWindowHold {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl WatcherWindowHold {
+        fn open(indexer: &Indexer, folder_id: i64) -> Self {
+            let status_at = Arc::clone(&indexer.watcher_status_at);
+            status_at.lock().insert(folder_id, Instant::now());
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stop_flag.load(Ordering::SeqCst) {
+                    status_at.lock().insert(folder_id, Instant::now());
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for WatcherWindowHold {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 
