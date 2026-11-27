@@ -506,9 +506,10 @@ mod tests {
         assert!(copied.saved.is_some(), "{}", copied.message);
         let saved = copied.saved.unwrap();
         assert_eq!(saved.name, "カバーレター.docx");
+        let output = fs::canonicalize(data_dir.join("output")).unwrap();
         assert_eq!(
-            Path::new(&saved.path).parent().unwrap(),
-            data_dir.join("output")
+            fs::canonicalize(Path::new(&saved.path).parent().unwrap()).unwrap(),
+            output
         );
         assert_eq!(fs::read(&src).unwrap(), original);
         assert_eq!(fs::read(&saved.path).unwrap(), original);
@@ -547,7 +548,7 @@ mod tests {
         )
         .expect("edit_office edits the working copy");
         assert!(edited.filename.contains("編集済み"), "{}", edited.filename);
-        assert!(edited.path.starts_with(data_dir.join("output")));
+        assert!(fs::canonicalize(&edited.path).unwrap().starts_with(&output));
         assert!(read_entry(&edited.path, "word/document.xml").contains("佐藤花子"));
         assert!(!read_entry(&edited.path, "word/document.xml").contains("山田太郎"));
         assert_eq!(fs::read(&src).unwrap(), original, "indexed original stays");
