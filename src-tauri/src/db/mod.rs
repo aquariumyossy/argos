@@ -2314,6 +2314,40 @@ impl Db {
         Ok(None)
     }
 
+    /// Indexed file row for a path search results already show.
+    ///
+    /// Exact match on the simplified path, then ASCII case-insensitive match.
+    /// Does not open the file and does not follow a path that is not stored.
+    pub fn find_indexed_file(&self, path: &str) -> Result<Option<IndexedFileRow>, rusqlite::Error> {
+        let simplified = crate::pathutil::simplify_windows_path(path);
+        let conn = self.conn.lock();
+        if let Some(row) = indexed_file_exact(&conn, &simplified)? {
+            return Ok(Some(row));
+        }
+        if simplified != path {
+            if let Some(row) = indexed_file_exact(&conn, path)? {
+                return Ok(Some(row));
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, path, COALESCE(ext, ''), COALESCE(status, '')
+             FROM files WHERE lower(path) = lower(?1)",
+        )?;
+        let rows = stmt.query_map([&simplified], indexed_file_from_row)?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row?);
+        }
+        let want = simplified;
+        let mut same: Vec<IndexedFileRow> = found
+            .into_iter()
+            .filter(|row| {
+                crate::pathutil::simplify_windows_path(&row.path).eq_ignore_ascii_case(&want)
+            })
+            .collect();
+        Ok(same.pop())
+    }
+
     pub fn upsert_file(
         &self,
         folder_id: i64,
@@ -6073,6 +6107,39 @@ pub struct FileMeta {
     pub size: i64,
     pub mtime: i64,
     pub content_hash: String,
+}
+
+/// One `files` row. `path` is the indexed path search results show, not a path the caller invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedFileRow {
+    pub folder_id: i64,
+    pub path: String,
+    pub ext: String,
+    pub status: String,
+}
+
+fn indexed_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedFileRow> {
+    Ok(IndexedFileRow {
+        folder_id: row.get(0)?,
+        path: row.get(1)?,
+        ext: row.get(2)?,
+        status: row.get(3)?,
+    })
+}
+
+fn indexed_file_exact(
+    conn: &rusqlite::Connection,
+    path: &str,
+) -> Result<Option<IndexedFileRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT folder_id, path, COALESCE(ext, ''), COALESCE(status, '')
+         FROM files WHERE path=?1",
+    )?;
+    let mut rows = stmt.query_map([path], indexed_file_from_row)?;
+    if let Some(row) = rows.next() {
+        return Ok(Some(row?));
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]

@@ -8,6 +8,7 @@ use crate::db::LlmSourceRow;
 use crate::llm::context::format_sources;
 pub use crate::llm::create_html::{TOOL_CREATE_HTML, TOOL_EDIT_HTML};
 pub use crate::llm::create_office::{TOOL_CREATE_DOCX, TOOL_CREATE_XLSX};
+pub use crate::llm::indexed_office::TOOL_COPY_INDEXED_OFFICE;
 pub use crate::llm::output_files::{TOOL_LIST_OUTPUT, TOOL_READ_OUTPUT};
 use crate::search::{self, SearchHit};
 use crate::state::AppState;
@@ -515,6 +516,9 @@ pub fn tools_schema_with(
             }
         }
     }));
+    if index_search {
+        tools.push(crate::llm::indexed_office::tool_schema());
+    }
     tools.push(json!({
         "type": "function",
         "function": {
@@ -620,7 +624,8 @@ pub struct ToolExec {
     pub wrote_note_id: Option<String>,
     /// Paragraph ids removed by this `write_note`. Auto-keep must not add them back.
     pub removed_keep_keys: Vec<String>,
-    /// Set only by `create_docx` / `create_xlsx` / `create_html`. Never parsed out of tool text.
+    /// Set only by `create_docx` / `create_xlsx` / `create_html` / `copy_indexed_office`.
+    /// Never parsed out of tool text.
     pub saved_file: Option<crate::llm::create_office::SavedOfficeFile>,
 }
 
@@ -3185,6 +3190,14 @@ fn tool_law_article(state: &AppState, args: &Value) -> ToolExec {
     ToolExec::text(crate::statute::format_tool_result(&articles, omitted))
 }
 
+pub(crate) fn office_saved_notice(
+    tool_name: &str,
+    saved: Option<&crate::llm::create_office::SavedOfficeFile>,
+) -> Option<String> {
+    crate::llm::create_office::notice_for_tool(tool_name, saved)
+        .or_else(|| crate::llm::indexed_office::notice_for_tool(tool_name, saved))
+}
+
 fn office_tool_exec(wrote: crate::llm::create_office::OfficeToolResult) -> ToolExec {
     ToolExec {
         content: wrote.message,
@@ -3768,6 +3781,11 @@ fn execute_tool_inner(
         }
         TOOL_EDIT_OFFICE => Ok(ToolExec::text(crate::office_edit::edit_from_tool(
             state, thread_id, &args,
+        ))),
+        TOOL_COPY_INDEXED_OFFICE => Ok(office_tool_exec(crate::llm::indexed_office::exec(
+            &state.db,
+            &state.data_dir,
+            &args,
         ))),
         TOOL_CREATE_DOCX => Ok(office_tool_exec(crate::llm::create_office::exec_docx(
             state, &args,
@@ -5963,7 +5981,10 @@ mod tests {
             .position(|name| name == TOOL_SEARCH)
             .unwrap();
         web_expected[at] = TOOL_SEARCH_WEB.to_string();
+        web_expected.retain(|name| name != TOOL_COPY_INDEXED_OFFICE);
         assert_eq!(web_names, web_expected);
+        assert!(both_names.contains(&TOOL_COPY_INDEXED_OFFICE.to_string()));
+        assert!(!web_names.contains(&TOOL_COPY_INDEXED_OFFICE.to_string()));
         let web_text = web_only.to_string();
         assert!(!web_text.contains(TOOL_SEARCH), "{web_text}");
         assert!(web_text.contains("公開ウェブだけを検索する"));
@@ -5976,8 +5997,10 @@ mod tests {
         assert!(web_text.contains(TOOL_LIST_CALENDAR));
 
         let mut off_expected = index_names.clone();
-        off_expected.retain(|name| name != TOOL_SEARCH);
+        off_expected.retain(|name| name != TOOL_SEARCH && name != TOOL_COPY_INDEXED_OFFICE);
         assert_eq!(neither_names, off_expected);
+        assert!(index_names.contains(&TOOL_COPY_INDEXED_OFFICE.to_string()));
+        assert!(!neither_names.contains(&TOOL_COPY_INDEXED_OFFICE.to_string()));
         let neither_text = neither.to_string();
         assert!(!neither_text.contains(TOOL_SEARCH), "{neither_text}");
         assert!(!neither_text.contains(TOOL_SEARCH_WEB), "{neither_text}");

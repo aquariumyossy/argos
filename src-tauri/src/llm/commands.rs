@@ -896,6 +896,9 @@ fn plan_chat_request(
         system.push_str(&tools::format_search_date_system_line(
             settings.mail_days_back,
         ));
+        if !system.contains(crate::llm::indexed_office::LLM_INDEXED_COPY_SENTINEL) {
+            system.push_str(&crate::llm::indexed_office::format_system_line());
+        }
     }
     system.push_str(&tools::format_calendar_system_line_for(index_search));
     let web_search = web_search && !settings.searxng_url.trim().is_empty();
@@ -1869,7 +1872,7 @@ async fn llm_send_inner<R: Runtime>(
                         };
                         store_turn(&state.db, &thread.id, &tool_turn)?;
                         current_turns.push(tool_turn);
-                        if let Some(notice) = crate::llm::create_office::notice_for_tool(
+                        if let Some(notice) = tools::office_saved_notice(
                             &tc.name,
                             saved_file.as_ref(),
                         ) {
@@ -5519,6 +5522,7 @@ mod tests {
         expected.push_str(&tools::format_search_date_system_line(
             settings.mail_days_back,
         ));
+        expected.push_str(&crate::llm::indexed_office::format_system_line());
         expected.push_str(&tools::format_calendar_system_line());
         expected.push_str(&tools::format_web_search_system_line());
 
@@ -5565,6 +5569,7 @@ mod tests {
                 .position(|name| name == tools::TOOL_SEARCH)
                 .unwrap();
             names[at] = tools::TOOL_SEARCH_WEB.to_string();
+            names.retain(|name| name != tools::TOOL_COPY_INDEXED_OFFICE);
             names
         });
         assert!(!web_only.tools_schema.to_string().contains("search_index"));
