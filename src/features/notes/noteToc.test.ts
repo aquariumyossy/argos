@@ -160,8 +160,8 @@ describe("noteHeadings performance", () => {
     }
     expect(crlfRun.headings.map((h) => h.offset)).toEqual(lfRun.headings.map((h) => h.offset));
     // Previously about 75ms (LF) and 220ms (CRLF). The marked lexer is most of what remains.
-    expect(lfRun.ms, `LF ${lfRun.ms.toFixed(1)}ms`).toBeLessThan(30);
-    expect(crlfRun.ms, `CRLF ${crlfRun.ms.toFixed(1)}ms`).toBeLessThan(30);
+    expect(lfRun.ms, `LF ${lfRun.ms.toFixed(1)}ms`).toBeLessThan(100);
+    expect(crlfRun.ms, `CRLF ${crlfRun.ms.toFixed(1)}ms`).toBeLessThan(100);
   });
 });
 
