@@ -21,7 +21,7 @@ pub const OFFICE_MARKER: &str = "[[argos-office]]";
 
 pub const LLM_OFFICE_SENTINEL: &str = "新しい Word と Excel を作るツールがあります";
 pub const LLM_OFFICE_HINT: &str = "\
-新しい Word と Excel を作るツールがあります。ユーザーがファイルの作成を求めたときだけ create_docx と create_xlsx を使い、保存したファイル名を回答に書いてください。これらのツールは既存ファイルを編集しません。";
+新しい Word と Excel を作るツールがあります。作成を求められたときだけ create_docx と create_xlsx を使います。";
 
 const MAX_DOCX_BLOCKS: usize = 80;
 const MAX_TABLE_ROWS: usize = 40;
@@ -198,6 +198,80 @@ fn strip_verbatim_text(path: &str) -> String {
 fn starts_with_ignore_ascii(text: &str, prefix: &str) -> bool {
     text.len() >= prefix.len()
         && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+pub(crate) fn bare_output_name_owned(raw: &str) -> Result<String, String> {
+    bare_output_name(raw).map(str::to_string)
+}
+
+/// A new output name. Same limits as [`file_stem`], but an illegal name is
+/// rejected instead of rewritten.
+pub(crate) fn validate_new_output_name(raw: &str) -> Result<String, String> {
+    validate_output_name(raw, false)
+}
+
+/// Like [`validate_new_output_name`], but a stem longer than [`MAX_STEM_CHARS`]
+/// is allowed. Used when the name is the file already being updated.
+pub(crate) fn validate_existing_output_name(raw: &str) -> Result<String, String> {
+    validate_output_name(raw, true)
+}
+
+fn validate_output_name(raw: &str, skip_length: bool) -> Result<String, String> {
+    let name = bare_output_name_owned(raw)?;
+    let stem = &name[..name.rfind('.').unwrap_or(name.len())];
+    if output_stem_is_invalid(stem, skip_length) {
+        return Err("ファイル名が無効です。".into());
+    }
+    Ok(name)
+}
+
+fn output_stem_is_invalid(stem: &str, skip_length: bool) -> bool {
+    if stem.is_empty() || (!skip_length && stem.chars().count() > MAX_STEM_CHARS) {
+        return true;
+    }
+    if stem.chars().any(|c| {
+        c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return true;
+    }
+    let trimmed = stem.trim().trim_end_matches(['.', ' ']).trim();
+    if trimmed != stem || stem.contains("..") || stem.starts_with('.') {
+        return true;
+    }
+    reserved_output_stem(stem)
+}
+
+fn reserved_output_stem(stem: &str) -> bool {
+    let head = stem.split('.').next().unwrap_or(stem);
+    is_reserved_stem(stem) || is_reserved_stem(head)
+}
+
+pub(crate) fn is_sharing_or_lock_error(err: &std::io::Error) -> bool {
+    err.raw_os_error().is_some_and(is_file_in_use_code)
+}
+
+pub(crate) fn message_is_sharing_or_lock(message: &str) -> bool {
+    [5, 32, 33]
+        .into_iter()
+        .any(|code| message_has_os_code(message, code))
+}
+
+fn is_file_in_use_code(code: i32) -> bool {
+    matches!(code, 5 | 32 | 33)
+}
+
+fn message_has_os_code(message: &str, code: i32) -> bool {
+    let token = format!("os error {code}");
+    let mut rest = message;
+    while let Some(index) = rest.find(&token) {
+        let after = &rest[index + token.len()..];
+        let next_is_digit = after.chars().next().is_some_and(|ch| ch.is_ascii_digit());
+        if !next_is_digit {
+            return true;
+        }
+        rest = &rest[index + token.len()..];
+    }
+    false
 }
 
 fn bare_output_name(raw: &str) -> Result<&str, String> {
@@ -2229,6 +2303,48 @@ fn save_package(
         return Err(format!("ファイルを保存できませんでした（{e}）。"));
     }
     Ok(dest)
+}
+
+/// Bare `.docx` / `.xlsx` / `.html` names in `dir`, skipping dotfiles.
+pub(crate) fn output_document_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if name.starts_with('.') || !is_output_document(&name) {
+            continue;
+        }
+        if entry.path().is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
+pub(crate) fn is_output_document(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".html")
+}
+
+pub(crate) fn name_taken_message(requested: &str, names: &[String]) -> String {
+    let mut lines = vec![
+        format!(
+            "「{}」は既にあります。ファイルは書いていません。",
+            single_line(requested)
+        ),
+        "既存のファイル名:".to_string(),
+    ];
+    if names.is_empty() {
+        lines.push("（なし）".into());
+    } else {
+        lines.extend(names.iter().cloned());
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {

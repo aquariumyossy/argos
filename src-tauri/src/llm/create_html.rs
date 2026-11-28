@@ -20,7 +20,7 @@ pub const TOOL_CREATE_HTML: &str = "create_html";
 pub const TOOL_EDIT_HTML: &str = "edit_html";
 pub const LLM_HTML_SENTINEL: &str = "新しい HTML を作るツールがあります";
 pub const LLM_HTML_HINT: &str = "\
-新しい HTML を作るツールがあります。画面で操作する小さな計算（手数料、歩合、日数、利息など）を求められたときだけ create_html を使い、CSS と JavaScript を含めてよいです。保存したファイル名を回答に書いてください。作り直すときは edit_html を使い、元のファイルは残して新しいファイルを保存します。プレビューから外部への通信はできません。";
+新しい HTML を作るツールがあります。画面の小さな計算を求められたときだけ create_html を使います。";
 
 const MAX_HTML_BYTES: usize = 512 * 1024;
 
@@ -86,9 +86,7 @@ pub fn edit_html_at(data_dir: &Path, args: &Value, stamp: &str) -> Result<HtmlEd
     let original = crate::extractor::decode_html_bytes(&original_bytes);
     let html = require_html(args)?;
     if submission_is_truncated(&original, &html) {
-        return Err(
-            "途中で切れた HTML は保存しません。元のファイルはそのままです。".into(),
-        );
+        return Err("途中で切れた HTML は保存しません。元のファイルはそのままです。".into());
     }
     let dir = output_dir(data_dir);
     fs::create_dir_all(&dir).map_err(|err| format!("出力フォルダを作れませんでした（{err}）。"))?;
@@ -239,7 +237,7 @@ fn edit_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_EDIT_HTML,
-            "description": "出力フォルダにある HTML を編集し、元ファイルは残して新しいファイルを保存する。filename は list_output_files で見たファイル名（例: 手数料計算.html）。パスは渡さない。html は編集後の完全な文書。途中で切れたソースや、元のファイルにある </html> や </body> を欠いた本文は保存しない。候補が複数あるときは呼ばず、名前・種類・更新日時を挙げて利用者に聞く。結果のファイル名を回答に書く。",
+            "description": "出力フォルダにある HTML を編集し、元ファイルは残して新しいファイルを保存する。filename は output_file で見たファイル名（例: 手数料計算.html）。パスは渡さない。html は編集後の完全な文書。途中で切れたソースや、元のファイルにある </html> や </body> を欠いた本文は保存しない。候補が複数あるときは呼ばず、名前・種類・更新日時を挙げて利用者に聞く。結果のファイル名を回答に書く。",
             "parameters": {
                 "type": "object",
                 "properties": {

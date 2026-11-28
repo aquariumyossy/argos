@@ -8,12 +8,12 @@ pub mod create_html;
 pub mod create_office;
 pub mod fetch_url;
 pub mod files;
-pub mod note_summary;
 pub mod grain;
 pub mod han_fix;
 pub mod http_error;
 pub mod indexed_office;
 pub mod japanese_han;
+pub mod note_summary;
 pub mod output_files;
 pub mod pdf_win;
 pub mod searxng;
@@ -2506,8 +2506,7 @@ mod tests {
             1,
             "{def}"
         );
-        assert!(def.contains("articles"));
-        assert!(def.contains("start と end"));
+        assert!(!def.contains("start と end"), "{def}");
         let mut custom = Settings::default();
         custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
         let sys = system_for_request(&custom);
@@ -2564,10 +2563,8 @@ mod tests {
             1,
             "{def}"
         );
-        assert!(def.contains("チャットで利用者に聞いてください"), "{def}");
-        assert!(def.contains("dc:creator"), "{def}");
-        assert!(def.contains("推測"), "{def}");
-        assert!(def.contains("この2項目は変えません"), "{def}");
+        assert!(!def.contains("dc:creator"), "{def}");
+        assert!(def.contains("edit_office の説明に従ってください"), "{def}");
         let mut custom = Settings::default();
         custom.llm_system_prompt = "事務所の独自ルールだけを守ってください。".into();
         let sys = system_for_request(&custom);

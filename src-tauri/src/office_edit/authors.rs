@@ -17,7 +17,7 @@ use super::ChangeStats;
 pub const LLM_DOC_AUTHOR_SENTINEL: &str =
     "作成者と最終更新者を変えるか、何を書くかが利用者の指示から明らかでないときは";
 pub const LLM_DOC_AUTHOR_HINT: &str = "\
-Word の文書プロパティにある作成者（dc:creator）と最終更新者（cp:lastModifiedBy）は、edit_office の creator、clear_creator、last_modified_by、clear_last_modified_by を指定したときだけ変えます。本文や他の文字列の置換が同じ名前に当たっても、この2項目は変えません。題名などそれ以外の文書プロパティは置換の対象のままです。指定しなければ元の文書のままです。変更履歴の作成者（設定の名前、空なら Argos）とは別です。今の値は、添付した .docx の出典と read_output_file の結果に出ます。作成者と最終更新者を変えるか、何を書くかが利用者の指示から明らかでないときは、名前を推測して入れたり消したりせず、チャットで利用者に聞いてください。";
+作成者と最終更新者を変えるか、何を書くかが利用者の指示から明らかでないときは、edit_office の説明に従ってください。";
 
 const MAX_AUTHOR_CHARS: usize = 200;
 const CORE_PART: &str = "docProps/core.xml";

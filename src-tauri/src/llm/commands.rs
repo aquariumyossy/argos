@@ -1846,7 +1846,8 @@ async fn llm_send_inner<R: Runtime>(
                             || tc.name == tools::TOOL_WRITE_NOTE
                         {
                             content
-                        } else if tc.name == crate::llm::output_files::TOOL_READ_OUTPUT
+                        } else if (tc.name == crate::llm::output_files::TOOL_OUTPUT_FILE
+                            || tc.name == "read_output_file")
                             && crate::llm::output_files::is_html_source_payload(&content)
                         {
                             crate::llm::output_files::deliver_html_read(
@@ -7928,6 +7929,52 @@ mod tests {
             !requests[2].contains("この結果は省略しました"),
             "a refused write must not be replaced by the omission text"
         );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_output_tool_names_list_and_read_through_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "argos-output-alias-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = test_state(&dir, 9, 8);
+        let out = crate::llm::create_office::output_dir(&state.data_dir);
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("表.html"), "<p>甲</p>").unwrap();
+        let stamps = std::collections::HashMap::new();
+        let listed = crate::llm::tools::execute_tool(
+            &state,
+            "t",
+            "list_output_files",
+            "{}",
+            None,
+            false,
+            "r",
+            &stamps,
+        );
+        assert!(listed.content.contains("表.html"), "{}", listed.content);
+        assert!(!listed.content.contains("未知のツール"), "{}", listed.content);
+        let read = crate::llm::tools::execute_tool(
+            &state,
+            "t",
+            "read_output_file",
+            r#"{"filename":"表.html"}"#,
+            None,
+            false,
+            "r",
+            &stamps,
+        );
+        assert!(read.content.contains("甲"), "{}", read.content);
+        assert!(!read.content.contains("未知のツール"), "{}", read.content);
+        let schema = crate::llm::tools::tools_schema(false, false, false, false).to_string();
+        assert!(!schema.contains("list_output_files"), "{schema}");
+        assert!(!schema.contains("read_output_file"), "{schema}");
         drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }

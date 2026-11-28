@@ -35,7 +35,7 @@ pub fn tool_schema() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_COPY_INDEXED_OFFICE,
-            "description": "索引にある .docx / .xlsx の原本を、出力フォルダへ作業コピーとして複製する。原本は変更しない。path には search_index の出典に書かれたパス、または paragraph_id を渡す。返ったファイル名を edit_office の filename に渡して編集する。メール、ウェブ、このPCに無いファイルは複製しない。",
+            "description": "索引にある .docx / .xlsx の原本を、出力フォルダへ作業コピーとして複製する。原本は変更しない。path は search_index の出典のパス、または paragraph_id。返ったファイル名を edit_office の filename に渡す。メール、ウェブ、このPCに無いファイルは複製しない。",
             "parameters": {
                 "type": "object",
                 "properties": {
