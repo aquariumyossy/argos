@@ -207,16 +207,26 @@ pub(crate) fn bare_output_name_owned(raw: &str) -> Result<String, String> {
 /// A new output name. Same limits as [`file_stem`], but an illegal name is
 /// rejected instead of rewritten.
 pub(crate) fn validate_new_output_name(raw: &str) -> Result<String, String> {
+    validate_output_name(raw, false)
+}
+
+/// Like [`validate_new_output_name`], but a stem longer than [`MAX_STEM_CHARS`]
+/// is allowed. Used when the name is the file already being updated.
+pub(crate) fn validate_existing_output_name(raw: &str) -> Result<String, String> {
+    validate_output_name(raw, true)
+}
+
+fn validate_output_name(raw: &str, skip_length: bool) -> Result<String, String> {
     let name = bare_output_name_owned(raw)?;
     let stem = &name[..name.rfind('.').unwrap_or(name.len())];
-    if output_stem_is_invalid(stem) {
+    if output_stem_is_invalid(stem, skip_length) {
         return Err("ファイル名が無効です。".into());
     }
     Ok(name)
 }
 
-fn output_stem_is_invalid(stem: &str) -> bool {
-    if stem.is_empty() || stem.chars().count() > MAX_STEM_CHARS {
+fn output_stem_is_invalid(stem: &str, skip_length: bool) -> bool {
+    if stem.is_empty() || (!skip_length && stem.chars().count() > MAX_STEM_CHARS) {
         return true;
     }
     if stem.chars().any(|c| {
@@ -228,15 +238,40 @@ fn output_stem_is_invalid(stem: &str) -> bool {
     if trimmed != stem || stem.contains("..") || stem.starts_with('.') {
         return true;
     }
-    is_reserved_stem(stem)
+    reserved_output_stem(stem)
+}
+
+fn reserved_output_stem(stem: &str) -> bool {
+    let head = stem.split('.').next().unwrap_or(stem);
+    is_reserved_stem(stem) || is_reserved_stem(head)
 }
 
 pub(crate) fn is_sharing_or_lock_error(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(32) | Some(33))
+    err.raw_os_error().is_some_and(is_file_in_use_code)
 }
 
 pub(crate) fn message_is_sharing_or_lock(message: &str) -> bool {
-    message.contains("os error 32") || message.contains("os error 33")
+    [5, 32, 33]
+        .into_iter()
+        .any(|code| message_has_os_code(message, code))
+}
+
+fn is_file_in_use_code(code: i32) -> bool {
+    matches!(code, 5 | 32 | 33)
+}
+
+fn message_has_os_code(message: &str, code: i32) -> bool {
+    let token = format!("os error {code}");
+    let mut rest = message;
+    while let Some(index) = rest.find(&token) {
+        let after = &rest[index + token.len()..];
+        let next_is_digit = after.chars().next().is_some_and(|ch| ch.is_ascii_digit());
+        if !next_is_digit {
+            return true;
+        }
+        rest = &rest[index + token.len()..];
+    }
+    false
 }
 
 fn bare_output_name(raw: &str) -> Result<&str, String> {

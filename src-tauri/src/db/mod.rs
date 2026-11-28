@@ -928,16 +928,24 @@ fn apply_output_file_rename_tx(
             )?;
         }
     }
-    let attached: Vec<(String, String)> = {
-        let mut stmt = conn.prepare("SELECT id, path FROM llm_thread_sources")?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let attached: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, path, title FROM llm_thread_sources")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (id, path) in attached {
-        if output_path_matches(&path, output_dir, old_name, old_paths) {
+    for (id, path, title) in attached {
+        if !output_path_matches(&path, output_dir, old_name, old_paths) {
+            continue;
+        }
+        if title == old_name {
             conn.execute(
                 "UPDATE llm_thread_sources SET path=?1, title=?2 WHERE id=?3",
                 rusqlite::params![new_path, new_name, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE llm_thread_sources SET path=?1 WHERE id=?2",
+                rusqlite::params![new_path, id],
             )?;
         }
     }

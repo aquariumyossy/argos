@@ -1640,7 +1640,7 @@ fn explicit_save(
     if raw.is_empty() {
         return Ok(None);
     }
-    let name = validate_explicit_name(read_path, &raw)?;
+    let name = validate_explicit_name(read_path, &raw, output_dir)?;
     let dest = output_dir.join(&name);
     let exists = dest.exists();
     let same = exists && same_file(&dest, read_path);
@@ -1656,10 +1656,17 @@ fn explicit_save(
     }))
 }
 
-fn validate_explicit_name(src: &Path, raw: &str) -> Result<String, String> {
-    let name = crate::llm::create_office::validate_new_output_name(raw)?;
+fn validate_explicit_name(src: &Path, raw: &str, output_dir: &Path) -> Result<String, String> {
+    let name = crate::llm::create_office::bare_output_name_owned(raw)?;
     let src_ext = extension_of(src);
     let new_ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let dest = output_dir.join(&name);
+    let same_existing = new_ext == src_ext && dest.exists() && same_file(&dest, src);
+    if same_existing {
+        crate::llm::create_office::validate_existing_output_name(&name)?;
+    } else {
+        crate::llm::create_office::validate_new_output_name(&name)?;
+    }
     if new_ext != src_ext {
         return Err("拡張子は変えられません。".into());
     }
@@ -1707,10 +1714,11 @@ fn place_explicit(
 }
 
 fn explicit_place_error(message: &str) -> String {
+    eprintln!("argos: explicit save failed: {message}");
     if crate::llm::create_office::message_is_sharing_or_lock(message) {
-        "ファイルが開かれているため、保存しませんでした。元のファイルはそのままです。".into()
+        "別のアプリ（Word や Excel など）で開かれている可能性があります。閉じてから、もう一度試してください。元のファイルはそのままです。".into()
     } else {
-        format!("保存しませんでした。元のファイルはそのままです。{message}")
+        "保存しませんでした。元のファイルはそのままです。".into()
     }
 }
 

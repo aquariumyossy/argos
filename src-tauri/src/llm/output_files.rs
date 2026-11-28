@@ -494,15 +494,17 @@ fn rename_step(from: &Path, to: &Path, step: RenameStep) -> Result<(), String> {
 }
 
 fn rename_failure_message(err: &std::io::Error) -> String {
+    let code = err.raw_os_error().unwrap_or(0);
+    eprintln!("argos: output rename failed (os error {code}): {err}");
     if crate::llm::create_office::is_sharing_or_lock_error(err) {
         locked_rename_message()
     } else {
-        format!("リネームできませんでした（{err}）。どちらのファイルも動かしていません。")
+        "リネームできませんでした。どちらのファイルも動かしていません。".into()
     }
 }
 
 fn locked_rename_message() -> String {
-    "ファイルが開かれているため、リネームしませんでした。どちらのファイルも動かしていません。"
+    "別のアプリ（Word や Excel など）で開かれている可能性があります。閉じてから、もう一度試してください。どちらのファイルも動かしていません。"
         .into()
 }
 
@@ -1197,6 +1199,16 @@ mod tests {
             "",
         )
         .unwrap();
+        db.insert_llm_source(
+            &thread.id,
+            "attach",
+            &old_path.to_string_lossy(),
+            "手元のメモ",
+            "custom",
+            "丁乙",
+            "",
+        )
+        .unwrap();
         let note = db.create_note("案件").unwrap();
         db.update_note_memo(&note.id, &format!("{old} を参照"))
             .unwrap();
@@ -1249,8 +1261,10 @@ mod tests {
             .unwrap();
         assert!(assistant.content.contains(&old), "{}", assistant.content);
         let sources = db.list_llm_sources(&thread.id).unwrap();
-        assert!(sources[0].path.ends_with(new), "{}", sources[0].path);
-        assert_eq!(sources[0].title, new);
+        let titled = sources.iter().find(|row| row.title == new).unwrap();
+        assert!(titled.path.ends_with(new), "{}", titled.path);
+        let custom = sources.iter().find(|row| row.title == "手元のメモ").unwrap();
+        assert!(custom.path.ends_with(new), "{}", custom.path);
         assert_eq!(
             db.get_note(&note.id).unwrap().unwrap().memo,
             format!("{old} を参照")
@@ -1563,6 +1577,7 @@ mod tests {
             "a>b.docx",
             "a|b.docx",
             "CON.docx",
+            "CON.v2.docx",
             "NUL.docx",
             "COM1.docx",
             "lpt9.docx",
@@ -1654,15 +1669,16 @@ mod tests {
         let dir = output_dir(&tmp.0);
         docx_with(&dir, "甲.docx", "甲の本文");
         let before = fs::read(dir.join("甲.docx")).unwrap();
-        super::fail_next_output_rename_os(2, 5);
+        super::fail_next_output_rename_os(2, 2);
         let err = rename_for_tool(
             &db,
             &tmp.0,
             &json!({"filename": "甲.docx", "new_filename": "乙.docx"}),
         );
-        assert!(err.contains("os error 5"), "{err}");
+        assert!(err.contains("リネームできませんでした"), "{err}");
         assert!(err.contains("動かしていません"), "{err}");
         assert!(!err.contains("開かれている"), "{err}");
+        assert!(!err.contains("os error"), "{err}");
         assert_eq!(fs::read(dir.join("甲.docx")).unwrap(), before);
         assert!(!dir.join("乙.docx").exists());
     }
@@ -1691,10 +1707,166 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(err.contains("os error 2"), "{err}");
+        assert!(err.contains("保存しませんでした"), "{err}");
         assert!(err.contains("そのまま"), "{err}");
         assert!(!err.contains("開かれている"), "{err}");
+        assert!(!err.contains("os error"), "{err}");
         assert_eq!(fs::read(dir.join("メモ.docx")).unwrap(), memo);
+        assert_eq!(fs::read(dir.join("先.docx")).unwrap(), prior);
+    }
+
+    #[test]
+    fn a_long_chain_file_can_be_saved_under_its_own_name() {
+        let tmp = Tmp::new();
+        let db = crate::db::Db::open(&tmp.0.join("argos.db")).unwrap();
+        let dir = output_dir(&tmp.0);
+        let stem = "あ".repeat(40);
+        let filename = format!("{stem}.docx");
+        docx_with(&dir, &filename, "甲乙");
+        let thread = db.create_llm_thread("long", false).unwrap();
+        let original = fs::read(dir.join(&filename)).unwrap();
+        let first = crate::office_edit::edit_in_thread(
+            &db,
+            &tmp.0,
+            "",
+            &thread.id,
+            &json!({"filename": filename, "replacements": [{"find": "甲", "replace": "丁"}]}),
+        )
+        .unwrap();
+        let chain = first.filename.clone();
+        let chain_stem = chain.rsplit_once('.').unwrap().0;
+        assert!(chain_stem.chars().count() > 60, "{chain}");
+        let continued = crate::office_edit::edit_in_thread(
+            &db,
+            &tmp.0,
+            "",
+            &thread.id,
+            &json!({
+                "filename": chain,
+                "new_filename": chain,
+                "replacements": [{"find": "乙", "replace": "戊"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(continued.filename, chain);
+        assert!(docx_text(&dir.join(&chain)).contains("丁戊"));
+        assert_eq!(fs::read(dir.join(&filename)).unwrap(), original);
+        let other = format!("{}.docx", "い".repeat(61));
+        let rejected = crate::office_edit::edit_in_thread(
+            &db,
+            &tmp.0,
+            "",
+            &thread.id,
+            &json!({
+                "filename": chain,
+                "new_filename": other,
+                "replacements": [{"find": "丁", "replace": "己"}]
+            }),
+        )
+        .unwrap_err();
+        assert!(rejected.contains("無効"), "{rejected}");
+        assert!(docx_text(&dir.join(&chain)).contains("丁戊"));
+    }
+
+    #[test]
+    fn reserved_names_with_extra_dots_are_rejected() {
+        let tmp = Tmp::new();
+        let db = crate::db::Db::open(&tmp.0.join("argos.db")).unwrap();
+        let dir = output_dir(&tmp.0);
+        docx_with(&dir, "メモ.docx", "甲乙");
+        let thread = db.create_llm_thread("dots", false).unwrap();
+        let before = fs::read(dir.join("メモ.docx")).unwrap();
+        for name in ["CON.v2.docx", "aux.v2.docx", "COM1.extra.docx", "lpt2.backup.docx"] {
+            let renamed = rename_for_tool(
+                &db,
+                &tmp.0,
+                &json!({"filename": "メモ.docx", "new_filename": name}),
+            );
+            assert!(renamed.contains("無効"), "{name}: {renamed}");
+            let edited = crate::office_edit::edit_in_thread(
+                &db,
+                &tmp.0,
+                "",
+                &thread.id,
+                &json!({
+                    "filename": "メモ.docx",
+                    "new_filename": name,
+                    "replacements": [{"find": "甲", "replace": "丁"}]
+                }),
+            )
+            .unwrap_err();
+            assert!(edited.contains("無効"), "{name}: {edited}");
+            assert_eq!(fs::read(dir.join("メモ.docx")).unwrap(), before, "{name}");
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        let ok = rename_for_tool(
+            &db,
+            &tmp.0,
+            &json!({"filename": "メモ.docx", "new_filename": "付録.v2.docx"}),
+        );
+        assert!(ok.contains("リネームしました"), "{ok}");
+        assert!(dir.join("付録.v2.docx").is_file());
+    }
+
+    #[test]
+    fn access_denied_is_reported_as_the_file_being_open() {
+        let err5 = std::io::Error::from_raw_os_error(5);
+        let err32 = std::io::Error::from_raw_os_error(32);
+        let err33 = std::io::Error::from_raw_os_error(33);
+        let err2 = std::io::Error::from_raw_os_error(2);
+        assert!(crate::llm::create_office::is_sharing_or_lock_error(&err5));
+        assert!(crate::llm::create_office::is_sharing_or_lock_error(&err32));
+        assert!(crate::llm::create_office::is_sharing_or_lock_error(&err33));
+        assert!(!crate::llm::create_office::is_sharing_or_lock_error(&err2));
+        assert!(crate::llm::create_office::message_is_sharing_or_lock(
+            "出力を保存できません（os error 5）。"
+        ));
+        assert!(!crate::llm::create_office::message_is_sharing_or_lock(
+            "出力を保存できません（os error 50）。"
+        ));
+
+        let tmp = Tmp::new();
+        let db = crate::db::Db::open(&tmp.0.join("argos.db")).unwrap();
+        let dir = output_dir(&tmp.0);
+        docx_with(&dir, "甲.docx", "甲の本文");
+        docx_with(&dir, "先.docx", "先の本文");
+        let before = fs::read(dir.join("甲.docx")).unwrap();
+        let prior = fs::read(dir.join("先.docx")).unwrap();
+        super::fail_next_output_rename_os(2, 5);
+        let renamed = rename_for_tool(
+            &db,
+            &tmp.0,
+            &json!({"filename": "甲.docx", "new_filename": "乙.docx"}),
+        );
+        assert!(renamed.contains("開かれている"), "{renamed}");
+        assert!(renamed.contains("Word"), "{renamed}");
+        assert!(renamed.contains("閉じて"), "{renamed}");
+        assert!(renamed.contains("動かしていません"), "{renamed}");
+        assert!(!renamed.contains("os error"), "{renamed}");
+        assert_eq!(fs::read(dir.join("甲.docx")).unwrap(), before);
+        assert!(!dir.join("乙.docx").exists());
+
+        let thread = db.create_llm_thread("denied", false).unwrap();
+        crate::office_edit::fail_next_replace_os_error(5);
+        let saved = crate::office_edit::edit_in_thread(
+            &db,
+            &tmp.0,
+            "",
+            &thread.id,
+            &json!({
+                "filename": "甲.docx",
+                "new_filename": "先.docx",
+                "overwrite": true,
+                "replacements": [{"find": "甲", "replace": "丁"}]
+            }),
+        )
+        .unwrap_err();
+        assert!(saved.contains("開かれている"), "{saved}");
+        assert!(saved.contains("Excel"), "{saved}");
+        assert!(saved.contains("閉じて"), "{saved}");
+        assert!(saved.contains("そのまま"), "{saved}");
+        assert!(!saved.contains("os error"), "{saved}");
+        assert_eq!(fs::read(dir.join("甲.docx")).unwrap(), before);
         assert_eq!(fs::read(dir.join("先.docx")).unwrap(), prior);
     }
 }
