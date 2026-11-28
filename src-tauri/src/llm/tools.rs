@@ -9,7 +9,7 @@ use crate::llm::context::format_sources;
 pub use crate::llm::create_html::{TOOL_CREATE_HTML, TOOL_EDIT_HTML};
 pub use crate::llm::create_office::{TOOL_CREATE_DOCX, TOOL_CREATE_XLSX};
 pub use crate::llm::indexed_office::TOOL_COPY_INDEXED_OFFICE;
-pub use crate::llm::output_files::{TOOL_LIST_OUTPUT, TOOL_READ_OUTPUT};
+pub use crate::llm::output_files::TOOL_OUTPUT_FILE;
 use crate::search::{self, SearchHit};
 use crate::state::AppState;
 
@@ -170,10 +170,8 @@ fn search_web_tool() -> Value {
         "type": "function",
         "function": {
             "name": TOOL_SEARCH_WEB,
-            "description": "公開ウェブだけを検索する。索引・ファイル・メールは検索しない。調査では先に list_notes の query で関連ノートを探す。ノートと添付出典で足りるときは呼ばない。\
-クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
-結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。\
-公開情報が必要で、ノートで足りないときはこのツールを呼ぶ。",
+            "description": "公開ウェブだけを検索する。索引・ファイル・メールは検索しない。添付出典で足りるときは呼ばない。\
+    クエリは単語を空白区切り（例: 『解雇 有効性 裁判例』）。結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -226,48 +224,22 @@ pub fn tools_schema_with(
 ) -> Value {
     let mut search_desc = if remote_only && web_search {
         "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
-クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
-「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
-時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
-「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
-送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。\
-公開情報が必要な質問ではこのツールを呼ぶ。ウェブ結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。"
+クエリは単語を空白区切り（例: 『解雇 有効性 裁判例』）。法令ファイルは『民法 第555条』。条文の本文は law_article。\
+時期は after / before（YYYY-MM-DD）。送信者は from。0件なら語を減らすか期間を広げる。ウェブ結果は（ウェブ）と付く。"
     } else if remote_only {
         "別PCの共有ファイルだけを検索する。このPCのファイルとメールは対象外。添付出典で足りるときは呼ばない。\
-クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
-「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
-時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
-「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
-送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
+クエリは単語を空白区切り（例: 『解雇 有効性 裁判例』）。法令ファイルは『民法 第555条』。条文の本文は law_article。\
+時期は after / before（YYYY-MM-DD）。送信者は from。0件なら語を減らすか期間を広げる。"
     } else if web_search {
         "Argosの索引を検索する（ファイルとメール）。ウェブ検索が有効なときは同じ語で公開ウェブも同時に検索する。添付出典で足りるときは呼ばない。\
-クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
-「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
-時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
-「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
-送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。\
-公開情報が必要な質問ではこのツールを呼ぶ。ウェブ結果はスニペットであり（ウェブ）と付く。本文が必要な URL は read_url に渡す。"
+クエリは単語を空白区切り（例: 『解雇 有効性 裁判例』）。法令ファイルは『民法 第555条』。条文の本文は law_article。\
+時期は after / before（YYYY-MM-DD）。送信者は from。0件なら語を減らすか期間を広げる。ウェブ結果は（ウェブ）と付く。"
     } else {
         "Argosの索引を検索する（ファイルとメール）。添付出典で足りるときは呼ばない。\
-クエリは調べたい語だけを空白区切りで並べる（例: 『解雇 有効性 裁判例』）。\
-「〜を教えて」「〜について調べて」のような文ではなく単語で指定する。\
-登録フォルダの法令ファイルを探すときは『民法 第555条』のように書く。条文の本文確認は law_article を使う。\
-時期や「直近」があるときだけ after / before を YYYY-MM-DD で渡し、期間内だけで検索する（新着スコア優遇はしない）。\
-「直近」はまず after を今日の30日前、sort は date。0件や件数不足なら after を90日前、次に1年前へ広げて再検索する。\
-送信者は from に表示名を入れる。0件のときは語を減らすか、期間を広げて試す。"
+クエリは単語を空白区切り（例: 『解雇 有効性 裁判例』）。法令ファイルは『民法 第555条』。条文の本文は law_article。\
+時期は after / before（YYYY-MM-DD）。送信者は from。0件なら語を減らすか期間を広げる。"
     }
     .to_string();
-    search_desc.insert_str(
-        0,
-        "調査では先に list_notes の query で関連ノートを探す。ノートで足りないときだけ使う。",
-    );
-    search_desc = search_desc.replace(
-        "公開情報が必要な質問ではこのツールを呼ぶ。",
-        "公開情報が必要で、ノートで足りないときはこのツールを呼ぶ。",
-    );
     if remote_index && !remote_only {
         search_desc.push_str(
             "別PCの共有フォルダも検索する。その出典には（リモート）が付く。メールと送信者はこのPCだけ。期間はホストが対応しているときだけ別PCにも効く。",
@@ -294,7 +266,7 @@ pub fn tools_schema_with(
                         "k": { "type": "integer", "description": "件数（1〜16）" },
                         "after": {
                             "type": "string",
-                            "description": "この日以降（YYYY-MM-DD、ローカル日付、含む）。直近なら今日の約30日前。"
+                            "description": "この日以降（YYYY-MM-DD、含む）。"
                         },
                         "before": {
                             "type": "string",
@@ -361,7 +333,7 @@ pub fn tools_schema_with(
             "function": {
                 "name": TOOL_READ,
                 "description": "段落の本文を読む。既読 [n] の原文は cite_no に n を渡すと、この会話に保存された本文を読む。\
-        添付された契約書などの文書について答えるときは、根拠にする条を articles で指定し、答える前に読み直す。\
+        根拠にする条は articles で指定する。答える前に読み直す。\
         条の見出しが無い文書は start と end で文字範囲を指定する。articles も範囲も省略すると保存された全文を返す。\
         出典に (paragraph_id: ...) と示された段落や、末尾が […] で切れている出典の続きは paragraph_id で索引から読む。",
                 "parameters": {
@@ -460,7 +432,7 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_CREATE_NOTE,
-            "description": "ノートを新規作成し、memo をその全文として書く。この会話の対象にする。書いた内容はすぐ反映され、版の履歴に残る。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
+            "description": "ノートを新規作成し、memo をその全文として書く。この会話の対象にする。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -487,7 +459,7 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_WRITE_NOTE,
-            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で、前のモデル呼び出しが受け取った read_note の全文があるノートだけを変更する。同じ応答の中の read_note や、前の送信の読み取り、省略された本文では書けない。読んだ後にノートが変わっていたら、もう一度 read_note してから書く。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。書いた内容はすぐ反映され、版の履歴に残る。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。remove_keeps に read_note の出典バッジの keep_id（または番号）を渡すと、そのバッジを外す。同じ呼び出しで足すことも外すこともできる。",
+            "description": "読んだノートのメモ全体を、渡した memo で置き換える。この送信で、前のモデル呼び出しが受け取った read_note の全文があるノートだけを変更する。同じ応答の中の read_note や、前の送信の読み取り、省略された本文では書けない。読んだ後にノートが変わっていたら、もう一度 read_note してから書く。memo は新しい全文で、残す箇所もそのまま書く。見出し単位の置換や追記はできない。同じ送信で再度書くと、直前の全文を新しい全文で上書きする。note_id を省略したら対象ノート。keeps に索引の id、またはウェブの url と title を渡すと、その出典をキープのバッジとして足す。remove_keeps に read_note の出典バッジの keep_id（または番号）を渡すと、そのバッジを外す。同じ呼び出しで足すことも外すこともできる。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -523,38 +495,37 @@ pub fn tools_schema_with(
         "type": "function",
         "function": {
             "name": TOOL_EDIT_OFFICE,
-            "description": "添付の .docx / .xlsx、または出力フォルダにある .docx / .xlsx を編集する。元の添付は変えない。最初の編集は新しいファイルを保存し、同じ会話の続きは、元のファイル名を渡しても、その編集済みファイルに上書きする。前回のファイルが開かれていて上書きできないときは、新しいファイルを保存する。同じ会話で元のファイル名を渡すと、その元ファイルの最新の編集済みを続ける。元の版からやり直すときだけ fresh を true にする。確認は取らない。書式・表・フォントは残し、文字を変える。Excel の数値セルも置換できる。1回の呼び出しに編集をすべて入れる。前回の編集でファイルが保存されて残った箇所を直すときは、元の添付からやり直さず、この会話の前回の出力ファイル名を filename に渡して続きを編集する。そのファイルがこの会話の edit_office で保存した編集済みファイルなら、新しいファイルは作らず前回の編集済みファイルに上書きする。元の添付や別の会話のファイルは上書きしない。結果が「見つかりませんでした」でファイルが保存されていないときは、直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。まだ編集していない添付は、その添付から作る。出力フォルダのファイルを直すときは、選んだそのファイルを編集する。.doc と .xls は対象外。\
-replacements は全文置換（当事者名・事件名・日付）。Word は本文・ヘッダー・フッター・脚注・文末脚注・テキストボックス・図形・コメント・変更履歴の文字（複数のランに分かれた名前を含む。テキストボックスと図形は本文・ヘッダー・フッター・脚注・文末脚注の中）。tracked を true にすると、Word の置換は直接書き換えず変更履歴（削除と挿入）として残す。各 replacement の comment があれば、その置換箇所にコメントを付ける。変更履歴とコメントの作成者は設定の名前で、空なら Argos。これは文書プロパティの作成者（dc:creator）や最終更新者（cp:lastModifiedBy）ではない。文書プロパティの作成者と最終更新者は creator、clear_creator、last_modified_by、clear_last_modified_by を渡したときだけ変える。本文や他の文字列の置換が同じ名前に当たっても、この2項目は変えない。題名などそれ以外の文書プロパティは置換の対象のまま。渡さなければ元のままにする。今の値は、添付した .docx の出典と read_output_file の結果に出る。作成者と最終更新者を変えるか、何を書くかが利用者の指示から明らかでないときは、名前を推測して入れたり消したりせず、チャットで利用者に聞いてください。Excel では tracked と comment は使えず、文字だけ置換したと結果に書く。グラフと SmartArt（図）は「このツールでは変更できない場所」のまま。Excel は全シートの文字セルとシート名に加え、数値のセルも置換できる。数値の検索と置換では桁区切りと円記号（, ， ¥ ￥）と全角数字を無視し、セル全体の数値と一致したときだけ数値のまま書き換える。計算式の入ったセルは変えない。\
-paragraphs は match を含む段落（Excel はセル）を text へ書き換え。match はその段落だけの文字列。\
-cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダのファイルは filename にファイル名だけを渡す（例: 売上集計.xlsx）。filename があるときは、同じ名前の添付や別の cite_no よりそのファイルを優先する。filename と cite_no が別のファイルなら編集しない。パスは渡さない。候補が複数あるときはこのツールを呼ばず、名前・種類・更新日時を挙げて利用者に聞く。検索フォルダのファイルは編集できない。残った旧文字列は結果に場所が付く。結果に出た別表記は、同じ語・名前の表記だと判断したものだけを、その文字列のまま別の find にする。署名欄の「甲　　　乙」や、日付と語にまたがる「日　本」のように別の文脈だと分かるものは送らない。「このツールでは変更できない場所」とあるものも送らない。直前の呼び出しでファイルが保存されていれば前回の出力を filename にし、保存されていなければ直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。保存したファイル名を答えに書く。",
+            "description": "添付の .docx / .xlsx、または出力フォルダにある .docx / .xlsx を編集する。元の添付は変えない。最初の編集は新しいファイルを保存し、同じ会話の続きは、元のファイル名を渡しても、その編集済みファイルに上書きする。前回のファイルが開かれていて上書きできないときは、新しいファイルを保存する。別の会話のファイルは上書きしない。元の版からやり直すときだけ fresh を true にする。確認は取らない。結果が「見つかりませんでした」でファイルが保存されていないときは、直前の呼び出しが対象にした同じファイル（元の添付、または filename に渡した出力ファイル）に対して呼び直す。残った箇所は、前回の出力ファイル名を filename に渡して続きを編集する。そのファイルがこの会話の編集結果なら、前回の編集済みファイルに上書きする。new_filename を渡すとその名前で保存する。拡張子は変えない。同名があるときは何も書かず既存のファイル名を返す。overwrite が true のときだけ置き換える。開かれていて失敗したときはどちらも動かさない。.doc と .xls は対象外。検索フォルダは編集できない。replacements は全文置換。Word は本文・ヘッダー・フッター・脚注・文末脚注・テキストボックス・図形・コメント・変更履歴の文字（複数ランを含む）。tracked を true にすると Word は変更履歴（削除と挿入）にする。comment があればその箇所にコメントを付ける。変更履歴とコメントの作成者は設定の名前で、空なら Argos。文書プロパティの作成者（dc:creator）と最終更新者（cp:lastModifiedBy）は creator、clear_creator、last_modified_by、clear_last_modified_by のときだけ変える。本文の置換が同じ名前に当たっても、この2項目は変えない。題名など他のプロパティは置換の対象。渡さなければ元のまま。今の値は添付の出典と output_file の read に出る。作成者と最終更新者を変えるか、何を書くかが利用者の指示から明らかでないときは、名前を推測して入れたり消したりせず、チャットで利用者に聞いてください。Excel では tracked と comment は使えず、文字だけ置換したと結果に書く。グラフと SmartArt は変更できない。Excel は数値のセルも置換できる。桁区切りと円記号と全角数字を無視し、セル全体が一致したときだけ数値のまま書く。計算式の入ったセルは変えない。paragraphs は match を含む段落（Excel はセル）を text にする。cite_no は出典 [n]。添付が1件なら省略できる。出力フォルダは filename にファイル名だけ。パスは渡さない。filename があるときは同名の添付や別の cite_no より優先する。別ファイルなら編集しない。候補が複数なら呼ばず、名前・種類・更新日時を挙げて利用者に聞く。残った旧文字列は結果に場所が付く。結果の別表記は、同じ語・名前の表記だと判断したものだけを、その文字列のまま別の find にする。署名欄の「甲　　　乙」や、日付と語にまたがる「日　本」のように別の文脈のものは送らない。「このツールでは変更できない場所」も送らない。保存したファイル名を答えに書く。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "cite_no": { "type": "integer", "description": "添付の出典番号 [n]。添付が1件なら省略できる。" },
-                    "filename": { "type": "string", "description": "添付のファイル名、または出力フォルダのファイル名。.docx か .xlsx。パスは渡さない。" },
-                    "path": { "type": "string", "description": "出典に書かれたフルパス。この会話の添付だけ。出力フォルダのファイルには使わない。" },
-                    "tracked": { "type": "boolean", "description": "true のとき Word の置換を変更履歴（削除と挿入）として記録する。Excel では使えない。" },
-                    "fresh": { "type": "boolean", "description": "true のとき元のファイルから新しい編集済みファイルを作る。同じ会話の続きを上書きしない。利用者が元の版からやり直すときだけ。" },
-                    "creator": { "type": "string", "description": "Word の作成者（dc:creator）に書く名前。渡したときだけ上書きする。空にはしない。消すときは clear_creator を使う。何を書くか不明なときは推測せず、チャットで利用者に聞く。" },
-                    "clear_creator": { "type": "boolean", "description": "true のとき Word の作成者（dc:creator）を空にする。creator と同時には指定しない。変えるべきか不明なときは指定せず、チャットで利用者に聞く。" },
-                    "last_modified_by": { "type": "string", "description": "Word の最終更新者（cp:lastModifiedBy）に書く名前。渡したときだけ上書きする。空にはしない。消すときは clear_last_modified_by を使う。" },
-                    "clear_last_modified_by": { "type": "boolean", "description": "true のとき Word の最終更新者（cp:lastModifiedBy）を空にする。last_modified_by と同時には指定しない。" },
+                    "cite_no": { "type": "integer", "description": "添付の出典番号 [n]。1件なら省略できる。" },
+                    "filename": { "type": "string", "description": "添付または出力フォルダのファイル名。パスは渡さない。" },
+                    "path": { "type": "string", "description": "この会話の添付のフルパス。出力フォルダには使わない。" },
+                    "tracked": { "type": "boolean", "description": "true なら Word の置換を変更履歴にする。" },
+                    "fresh": { "type": "boolean", "description": "true なら元の版から新しいファイルを作る。続きは上書きしない。" },
+                    "new_filename": { "type": "string", "description": "保存するファイル名。拡張子は変えない。同名があり overwrite でないときは何も書かない。" },
+                    "overwrite": { "type": "boolean", "description": "new_filename が既にあるとき true なら置き換える。" },
+                    "creator": { "type": "string", "description": "Word の作成者（dc:creator）。渡したときだけ。" },
+                    "clear_creator": { "type": "boolean", "description": "true なら作成者（dc:creator）を空にする。" },
+                    "last_modified_by": { "type": "string", "description": "Word の最終更新者（cp:lastModifiedBy）。渡したときだけ。" },
+                    "clear_last_modified_by": { "type": "boolean", "description": "true なら最終更新者（cp:lastModifiedBy）を空にする。" },
                     "replacements": {
                         "type": "array",
-                        "description": "文字列置換。find を replace にすべて置き換える。comment があればその箇所にコメントを付ける。",
+                        "description": "find を replace にすべて置き換える。comment はその箇所のコメント。",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "find": { "type": "string" },
                                 "replace": { "type": "string" },
-                                "comment": { "type": "string", "description": "任意。この置換箇所に付けるコメント。Excel では使えない。" }
+                                "comment": { "type": "string", "description": "任意。Excel では使えない。" }
                             },
                             "required": ["find", "replace"]
                         }
                     },
                     "paragraphs": {
                         "type": "array",
-                        "description": "段落（Excel はセル）の書き換え。match を含む段落を text にする。",
+                        "description": "match を含む段落（Excel はセル）を text にする。",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -634,7 +605,9 @@ impl ToolExec {
         Self {
             content: content.into(),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+            saved_file: None,
+            wrote_note_id: None,
+            removed_keep_keys: Vec::new(),
         }
     }
 }
@@ -883,7 +856,7 @@ pub fn topical_query(query: &str, mail_from: Option<&str>) -> String {
 }
 
 pub fn format_calendar_system_line() -> String {
-    "\n予定・期日・会議・今日・今週・明日は list_calendar を使う。資料が要るときだけ、返った件名や当事者名を search_index の query にする。search_index の「直近は30日前」はファイルとメール用で、予定には使わない。".into()
+    "\n予定・期日・会議・今日・今週・明日は list_calendar を使う。".into()
 }
 
 pub fn format_calendar_system_line_for(index_search: bool) -> String {
@@ -903,7 +876,7 @@ pub fn format_search_date_system_line(mail_days_back: u32) -> String {
 }
 
 pub fn format_web_search_system_line() -> String {
-    "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。調査では先に list_notes で関連ノートを探し、ノートと添付出典で足りるときはインデックスもウェブも検索しないでください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要で、ノートで足りないときは search_index を呼んでください。".into()
+    "\nウェブ検索が有効です。search_index を呼ぶと同じ語で公開ウェブも検索します。公開情報が必要で、ノートで足りないときは search_index を呼んでください。".into()
 }
 
 const INDEX_SEARCH_PROMPT_SENTENCE: &str =
@@ -937,7 +910,7 @@ pub fn apply_index_search_off(system: &mut String) {
 
 /// Web search without the index. Does not name `search_index`.
 pub fn format_web_only_system_line() -> String {
-    "\nウェブ検索が有効です。インデックス検索はオフです。公開ウェブは search_web で検索します。索引・ファイル・メールは検索しません。調査では先に list_notes で関連ノートを探し、ノートで足りるときはウェブも検索しないでください。ウェブ結果はスニペットであり判決全文ではありません（出典に（ウェブ）と付きます）。本文が必要なときはその URL を read_url に渡してください。ユーザーが貼った URL は既に出典に付いています。ウェブだけを根拠にするときは公開情報だと明示してください。公開情報が必要で、ノートで足りないときは search_web を呼んでください。".into()
+    "\nウェブ検索が有効です。インデックス検索はオフです。公開ウェブは search_web で検索します。索引・ファイル・メールは検索しません。公開情報が必要で、ノートで足りないときは search_web を呼んでください。".into()
 }
 
 pub fn thread_has_relook_image(sources: &[crate::db::LlmSourceRow]) -> bool {
@@ -947,7 +920,7 @@ pub fn thread_has_relook_image(sources: &[crate::db::LlmSourceRow]) -> bool {
 }
 
 pub fn format_look_image_system_line() -> String {
-    "\n添付画像の画素は会話に入っていない。入っているのは書き起こしだけである。書き起こしで足りないとき（矢印や線の接続、続柄、婚姻、死亡、相続、表の行と列）は look_image を呼ぶ。cite_no は出典番号、複数ページは page、focus は確認したい点。画像を送るのはその呼び出しだけ。見返せないときは書き起こしだけを根拠にして答える。".into()
+    "\n添付画像に入っているのは書き起こしだけである。足りないときは look_image を呼ぶ。画像を送るのはその呼び出しだけ。".into()
 }
 
 pub fn format_look_image_answer(label: &str, answer: &str) -> String {
@@ -1525,9 +1498,7 @@ pub fn format_note_target_system_line(title: &str, memo: &str) -> String {
     } else {
         format!("見出し: {}。", heads.join("、"))
     };
-    format!(
-        "\n対象ノートは「{title}」。{outline}変えるときは read_note で全文を読んでから write_note で全文を書き換えてください。変えない箇所も残してください。書いた内容はすぐ反映され、版の履歴に残ります。"
-    )
+    format!("\n対象ノートは「{title}」。{outline}")
 }
 
 fn scope_display(scope: &str) -> String {
@@ -1950,11 +1921,19 @@ fn tool_list_notes(state: &AppState, thread_id: &str, args: &Value) -> ToolExec 
         content,
         consumed,
         saved_file: None,
-        wrote_note_id: None, removed_keep_keys: Vec::new(),
+        wrote_note_id: None,
+        removed_keep_keys: Vec::new(),
     }
 }
 
-fn with_note_cite(state: &AppState, thread_id: &str, note_id: &str, title: &str, body: &str, text: String) -> ToolExec {
+fn with_note_cite(
+    state: &AppState,
+    thread_id: &str,
+    note_id: &str,
+    title: &str,
+    body: &str,
+    text: String,
+) -> ToolExec {
     let mut new_rows = Vec::new();
     let mut already = Vec::new();
     let mut consumed = Vec::new();
@@ -1983,7 +1962,8 @@ fn with_note_cite(state: &AppState, thread_id: &str, note_id: &str, title: &str,
         content,
         consumed,
         saved_file: None,
-        wrote_note_id: None, removed_keep_keys: Vec::new(),
+        wrote_note_id: None,
+        removed_keep_keys: Vec::new(),
     }
 }
 
@@ -2022,10 +2002,7 @@ fn keep_one(state: &AppState, note_id: &str, item: &Value) -> Result<String, Str
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("");
-    let title = item
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
     let badge = if !id.is_empty() {
         keep_from_index_id(state, id)?
     } else if !url.is_empty() {
@@ -2551,7 +2528,9 @@ fn read_saved_selection(
     ToolExec {
         content: format_sources(&rows),
         consumed,
-        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+        saved_file: None,
+        wrote_note_id: None,
+        removed_keep_keys: Vec::new(),
     }
 }
 
@@ -2686,7 +2665,9 @@ fn finish_read(content: impl Into<String>, consumed: Vec<(String, i64)>) -> Tool
     ToolExec {
         content: content.into(),
         consumed,
-        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+        saved_file: None,
+        wrote_note_id: None,
+        removed_keep_keys: Vec::new(),
     }
 }
 
@@ -3202,7 +3183,8 @@ fn office_tool_exec(wrote: crate::llm::create_office::OfficeToolResult) -> ToolE
     ToolExec {
         content: wrote.message,
         consumed: Vec::new(),
-        wrote_note_id: None, removed_keep_keys: Vec::new(),
+        wrote_note_id: None,
+        removed_keep_keys: Vec::new(),
         saved_file: wrote.saved,
     }
 }
@@ -3275,7 +3257,8 @@ fn tool_search_web(
         content,
         consumed,
         saved_file: None,
-        wrote_note_id: None, removed_keep_keys: Vec::new(),
+        wrote_note_id: None,
+        removed_keep_keys: Vec::new(),
     })
 }
 
@@ -3303,7 +3286,9 @@ pub fn execute_tool(
         Err(e) => ToolExec {
             content: format!("ツールエラー: {e}"),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+            saved_file: None,
+            wrote_note_id: None,
+            removed_keep_keys: Vec::new(),
         },
     }
 }
@@ -3342,7 +3327,9 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "query が空です。".into(),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                    saved_file: None,
+                    wrote_note_id: None,
+                    removed_keep_keys: Vec::new(),
                 });
             }
             let requested = args.get("path_prefix").and_then(|v| v.as_str());
@@ -3370,7 +3357,9 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: e,
                         consumed: Vec::new(),
-                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                        saved_file: None,
+                        wrote_note_id: None,
+                        removed_keep_keys: Vec::new(),
                     });
                 }
             };
@@ -3589,7 +3578,9 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                saved_file: None,
+                wrote_note_id: None,
+                removed_keep_keys: Vec::new(),
             })
         }
         TOOL_READ => {
@@ -3606,7 +3597,9 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: "paragraph_id が空です。".into(),
                         consumed: Vec::new(),
-                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                        saved_file: None,
+                        wrote_note_id: None,
+                        removed_keep_keys: Vec::new(),
                     });
                 }
                 ReadRoute::Paragraph(id) => id,
@@ -3616,7 +3609,9 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: format!("段落 {paragraph_id} は索引にありません。"),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                    saved_file: None,
+                    wrote_note_id: None,
+                    removed_keep_keys: Vec::new(),
                 });
             };
             let mut new_rows = Vec::new();
@@ -3668,7 +3663,9 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                saved_file: None,
+                wrote_note_id: None,
+                removed_keep_keys: Vec::new(),
             })
         }
         TOOL_READ_URL => {
@@ -3676,7 +3673,9 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "ウェブ検索がオフです。".into(),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                    saved_file: None,
+                    wrote_note_id: None,
+                    removed_keep_keys: Vec::new(),
                 });
             }
             let url = args
@@ -3689,7 +3688,9 @@ fn execute_tool_inner(
                 return Ok(ToolExec {
                     content: "url が空です。".into(),
                     consumed: Vec::new(),
-                    saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                    saved_file: None,
+                    wrote_note_id: None,
+                    removed_keep_keys: Vec::new(),
                 });
             }
             if let Some(existing) = state
@@ -3705,7 +3706,9 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: already_line(&existing),
                         consumed,
-                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                        saved_file: None,
+                        wrote_note_id: None,
+                        removed_keep_keys: Vec::new(),
                     });
                 }
             }
@@ -3720,7 +3723,9 @@ fn execute_tool_inner(
                     return Ok(ToolExec {
                         content: format!("URL を読めません: {e}"),
                         consumed: Vec::new(),
-                        saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                        saved_file: None,
+                        wrote_note_id: None,
+                        removed_keep_keys: Vec::new(),
                     });
                 }
             };
@@ -3760,20 +3765,19 @@ fn execute_tool_inner(
             Ok(ToolExec {
                 content,
                 consumed,
-                saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+                saved_file: None,
+                wrote_note_id: None,
+                removed_keep_keys: Vec::new(),
             })
         }
         TOOL_LIST_NOTES => Ok(tool_list_notes(state, thread_id, &args)),
         TOOL_READ_NOTE => Ok(tool_read_note(state, thread_id, &args)),
         TOOL_CREATE_NOTE => Ok(tool_create_note(state, thread_id, &args)),
         TOOL_WRITE_NOTE => Ok(tool_write_note(state, thread_id, &args, read_stamps)),
-        TOOL_LIST_OUTPUT => Ok(ToolExec::text(crate::llm::output_files::list_for_tool(
-            &state.data_dir,
-            &args,
-        ))),
-        TOOL_READ_OUTPUT => {
+        TOOL_OUTPUT_FILE => {
             let limit = state.settings.read().llm_max_context_tokens as usize;
-            Ok(ToolExec::text(crate::llm::output_files::read_for_tool(
+            Ok(ToolExec::text(crate::llm::output_files::exec(
+                &state.db,
                 &state.data_dir,
                 &args,
                 limit,
@@ -3794,15 +3798,19 @@ fn execute_tool_inner(
             state, &args,
         ))),
         TOOL_CREATE_HTML => Ok(office_tool_exec(crate::llm::create_html::exec_create(
-            &state.data_dir, &args,
+            &state.data_dir,
+            &args,
         ))),
         TOOL_EDIT_HTML => Ok(ToolExec::text(crate::llm::create_html::exec_edit(
-            &state.data_dir, &args,
+            &state.data_dir,
+            &args,
         ))),
         other => Ok(ToolExec {
             content: format!("未知のツールです: {other}"),
             consumed: Vec::new(),
-            saved_file: None, wrote_note_id: None, removed_keep_keys: Vec::new(),
+            saved_file: None,
+            wrote_note_id: None,
+            removed_keep_keys: Vec::new(),
         }),
     }
 }
@@ -5587,7 +5595,11 @@ mod tests {
     #[test]
     fn round_limit_names_a_drop_a_busy_server_and_a_timeout() {
         let dropped = round_limit_failure(8, crate::llm::http_error::DROPPED_MID_MESSAGE);
-        assert!(dropped.text.contains("接続が切れました"), "{}", dropped.text);
+        assert!(
+            dropped.text.contains("接続が切れました"),
+            "{}",
+            dropped.text
+        );
         assert!(
             !dropped.text.contains("応答を受け取れませんでした"),
             "{}",
@@ -5880,9 +5892,15 @@ mod tests {
             schema.contains(crate::office_edit::LLM_DOC_AUTHOR_SENTINEL),
             "{schema}"
         );
-        assert!(schema.contains("チャットで利用者に聞いてください"), "{schema}");
+        assert!(
+            schema.contains("チャットで利用者に聞いてください"),
+            "{schema}"
+        );
         assert!(schema.contains("この2項目は変えない"), "{schema}");
-        assert!(schema.contains("Excel では tracked と comment は使えず"), "{schema}");
+        assert!(
+            schema.contains("Excel では tracked と comment は使えず"),
+            "{schema}"
+        );
         assert!(schema.contains("数値のセルも置換できる"), "{schema}");
         assert!(schema.contains("計算式の入ったセルは変えない"), "{schema}");
         assert!(
@@ -5896,7 +5914,10 @@ mod tests {
         assert!(schema.contains("元の添付は変えない"), "{schema}");
         assert!(schema.contains("元のファイル名を渡しても"), "{schema}");
         assert!(schema.contains("fresh"), "{schema}");
-        assert!(schema.contains("最初の編集は新しいファイルを保存"), "{schema}");
+        assert!(
+            schema.contains("最初の編集は新しいファイルを保存"),
+            "{schema}"
+        );
         assert!(
             schema.contains("上書きできないときは、新しいファイルを保存する"),
             "{schema}"
@@ -5908,8 +5929,14 @@ mod tests {
         );
         assert!(schema.contains("filename に渡した出力ファイル"), "{schema}");
         assert!(!schema.contains("同じ元の添付に対して呼び直す"), "{schema}");
-        assert!(schema.contains("同じ語・名前の表記だと判断したものだけ"), "{schema}");
-        assert!(schema.contains("このツールでは変更できない場所"), "{schema}");
+        assert!(
+            schema.contains("同じ語・名前の表記だと判断したものだけ"),
+            "{schema}"
+        );
+        assert!(
+            schema.contains("このツールでは変更できない場所"),
+            "{schema}"
+        );
         assert!(schema.contains("甲"), "{schema}");
         assert!(schema.contains("日　本"), "{schema}");
         assert!(!schema.contains("前回の出力には重ねない"), "{schema}");
@@ -5948,8 +5975,10 @@ mod tests {
         assert!(!both.contains(TOOL_SEARCH_WEB));
         let line = format_web_search_system_line();
         assert!(line.contains("search_index を呼ぶと同じ語で公開ウェブも検索します"));
-        assert!(line.contains("公開情報が必要で、ノートで足りないときは search_index を呼んでください"));
-        assert!(line.contains("先に list_notes で関連ノートを探し"));
+        assert!(
+            line.contains("公開情報が必要で、ノートで足りないときは search_index を呼んでください")
+        );
+        assert!(crate::db::LLM_NOTE_HINT.contains("先に list_notes で関連ノートを探し"));
         assert_eq!(
             format_calendar_system_line_for(true),
             format_calendar_system_line()

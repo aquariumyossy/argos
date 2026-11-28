@@ -106,11 +106,11 @@ pub const LLM_JA_HINT: &str =
     "書き言葉はすべて日本語にします。簡体字・繁体字・旧字体や日本語にない漢字、ハングル・キリル文字などの他の文字体系は、本文・コメント・チャットの報告・ツールの引数にも使いません。「기타」のような他言語の単語を日本語の文の中に混ぜません。";
 pub const LLM_JA_SENTINEL: &str = "書き言葉はすべて日本語にします";
 pub const LLM_NOTE_HINT: &str =
-    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。版の履歴に残ります。調査の質問では、先に list_notes の query で関連ノートを探し、ノートで足りないときだけ索引やウェブを検索してください。ノートを答えに使ったら、その出典番号を付けてください。既存のノートを変えるときは、先に read_note で全文を読み、write_note にメモ全体を渡してください。変えない箇所もそのまま含めてください。見出しだけの書き換えはできません。対象ノートが無いときは list_notes か create_note を使います。";
+    "ノートを作る・読む・書き換えるツールがあります。書いた内容はすぐメモに反映されます。版の履歴に残ります。調査では先に list_notes で関連ノートを探し、ノートで足りないときだけ索引やウェブを検索してください。使ったノートには出典番号を付けてください。";
 pub const LLM_NOTE_SENTINEL: &str = "書いた内容はすぐメモに反映されます";
 /// Appended on each request, including a prompt the user edited.
 pub const LLM_REREAD_HINT: &str =
-    "添付された契約書などの文書について答えるときは、根拠にする条を read_unit で読み直してから答えてください。cite_no に出典番号、articles に条番号を渡します。条の見出しが無い文書は start と end で文字範囲を指定します。";
+    "添付された契約書などの文書について答えるときは、根拠にする条を read_unit で読み直してから答えてください。";
 pub const LLM_REREAD_SENTINEL: &str = "根拠にする条を read_unit で読み直して";
 /// Previous default, before third-party text and counts were called out.
 /// Unedited copies are replaced. A prompt the user changed is left alone.
@@ -856,6 +856,123 @@ fn seed_cite_ledgers(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error>
         }
     }
     Ok(())
+}
+
+fn apply_output_file_rename_tx(
+    conn: &rusqlite::Connection,
+    old_name: &str,
+    new_name: &str,
+    old_paths: &[String],
+    new_path: &str,
+    output_dir: &std::path::Path,
+    rewrite: impl Fn(&str) -> String,
+) -> Result<(), rusqlite::Error> {
+    if !old_name.eq_ignore_ascii_case(new_name) {
+        conn.execute(
+            "DELETE FROM llm_office_edits WHERE lower(output_name) = lower(?1)",
+            [new_name],
+        )?;
+    }
+    let threads: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT thread_id FROM llm_office_edits WHERE lower(output_name) = lower(?1)",
+        )?;
+        let rows = stmt.query_map([old_name], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let now = chrono::Utc::now().timestamp();
+    for thread_id in threads {
+        let source: String = conn.query_row(
+            "SELECT source_path FROM llm_office_edits
+             WHERE thread_id=?1 AND lower(output_name)=lower(?2)
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            rusqlite::params![thread_id, old_name],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "DELETE FROM llm_office_edits
+             WHERE thread_id=?1 AND lower(output_name)=lower(?2)",
+            rusqlite::params![thread_id, old_name],
+        )?;
+        conn.execute(
+            "INSERT INTO llm_office_edits(thread_id, output_name, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![thread_id, new_name, source, now],
+        )?;
+    }
+    let sources: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, source_path FROM llm_office_edits")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, source) in sources {
+        if output_path_matches(&source, output_dir, old_name, old_paths) {
+            conn.execute(
+                "UPDATE llm_office_edits SET source_path=?1 WHERE id=?2",
+                rusqlite::params![new_path, id],
+            )?;
+        }
+    }
+    let messages: Vec<(String, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, content FROM llm_messages WHERE role = 'tool' OR kind = ?1")?;
+        let rows = stmt.query_map([LLM_MESSAGE_NOTICE], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, content) in messages {
+        let next = rewrite(&content);
+        if next != content {
+            conn.execute(
+                "UPDATE llm_messages SET content=?1 WHERE id=?2",
+                rusqlite::params![next, id],
+            )?;
+        }
+    }
+    let attached: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM llm_thread_sources")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, path) in attached {
+        if output_path_matches(&path, output_dir, old_name, old_paths) {
+            conn.execute(
+                "UPDATE llm_thread_sources SET path=?1 WHERE id=?2",
+                rusqlite::params![new_path, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn output_path_matches(
+    path: &str,
+    output_dir: &std::path::Path,
+    old_name: &str,
+    old_paths: &[String],
+) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if old_paths.iter().any(|old| output_paths_equal(old, trimmed)) {
+        return true;
+    }
+    let file = std::path::Path::new(trimmed);
+    let Some(name) = file.file_name().and_then(|item| item.to_str()) else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case(old_name) {
+        return false;
+    }
+    let Some(parent) = file.parent() else {
+        return false;
+    };
+    output_paths_equal(&parent.to_string_lossy(), &output_dir.to_string_lossy())
+}
+
+fn output_paths_equal(left: &str, right: &str) -> bool {
+    crate::pathutil::normalize_for_compare(left)
+        .eq_ignore_ascii_case(&crate::pathutil::normalize_for_compare(right))
 }
 
 impl Db {
@@ -4383,6 +4500,104 @@ impl Db {
         }
         conn.execute("COMMIT", [])?;
         Ok(1)
+    }
+
+    /// After a rename in the output folder: retarget every thread's row for
+    /// `old_name` (delete and reinsert so the row stays newest), point
+    /// `source_path` values that were the old file at `new_path`, and rewrite
+    /// tool results and file cards. One transaction. `rewrite` sees message
+    /// text only and must not touch the database.
+    pub(crate) fn apply_output_file_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        old_paths: &[String],
+        new_path: &str,
+        output_dir: &std::path::Path,
+        rewrite: impl Fn(&str) -> String,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = apply_output_file_rename_tx(
+            &conn, old_name, new_name, old_paths, new_path, output_dir, rewrite,
+        );
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(err)
+            }
+        }
+    }
+
+    /// Point this chat's edit row at an explicit `edit_office` file name.
+    ///
+    /// Same retarget as [`Self::retarget_llm_office_edit`]: delete the old
+    /// output name in this thread and insert one row so it is the latest.
+    /// When `clear_destination` is set, rows in every thread that still name
+    /// that replaced file are removed first.
+    pub(crate) fn point_explicit_office_edit(
+        &self,
+        thread_id: &str,
+        from_name: &str,
+        to_name: &str,
+        source_path: &str,
+        clear_destination: bool,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = (|| {
+            if clear_destination && !from_name.eq_ignore_ascii_case(to_name) {
+                conn.execute(
+                    "DELETE FROM llm_office_edits WHERE lower(output_name) = lower(?1)",
+                    [to_name],
+                )?;
+            }
+            let existing = conn.query_row(
+                "SELECT source_path FROM llm_office_edits
+                 WHERE thread_id=?1 AND lower(output_name)=lower(?2)
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                rusqlite::params![thread_id, from_name],
+                |row| row.get::<_, String>(0),
+            );
+            let now = chrono::Utc::now().timestamp();
+            match existing {
+                Ok(kept_source) => {
+                    conn.execute(
+                        "DELETE FROM llm_office_edits
+                         WHERE thread_id=?1 AND lower(output_name)=lower(?2)",
+                        rusqlite::params![thread_id, from_name],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO llm_office_edits(thread_id, output_name, source_path, created_at)
+                         VALUES(?1, ?2, ?3, ?4)",
+                        rusqlite::params![thread_id, to_name, kept_source, now],
+                    )?;
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    conn.execute(
+                        "INSERT INTO llm_office_edits(thread_id, output_name, source_path, created_at)
+                         VALUES(?1, ?2, ?3, ?4)",
+                        rusqlite::params![thread_id, to_name, source_path, now],
+                    )?;
+                }
+                Err(err) => return Err(err),
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(err)
+            }
+        }
     }
 
     pub fn insert_llm_message(

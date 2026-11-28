@@ -21,7 +21,7 @@ pub const OFFICE_MARKER: &str = "[[argos-office]]";
 
 pub const LLM_OFFICE_SENTINEL: &str = "新しい Word と Excel を作るツールがあります";
 pub const LLM_OFFICE_HINT: &str = "\
-新しい Word と Excel を作るツールがあります。ユーザーがファイルの作成を求めたときだけ create_docx と create_xlsx を使い、保存したファイル名を回答に書いてください。これらのツールは既存ファイルを編集しません。";
+新しい Word と Excel を作るツールがあります。作成を求められたときだけ create_docx と create_xlsx を使います。";
 
 const MAX_DOCX_BLOCKS: usize = 80;
 const MAX_TABLE_ROWS: usize = 40;
@@ -198,6 +198,10 @@ fn strip_verbatim_text(path: &str) -> String {
 fn starts_with_ignore_ascii(text: &str, prefix: &str) -> bool {
     text.len() >= prefix.len()
         && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+pub(crate) fn bare_output_name_owned(raw: &str) -> Result<String, String> {
+    bare_output_name(raw).map(str::to_string)
 }
 
 fn bare_output_name(raw: &str) -> Result<&str, String> {
@@ -2229,6 +2233,48 @@ fn save_package(
         return Err(format!("ファイルを保存できませんでした（{e}）。"));
     }
     Ok(dest)
+}
+
+/// Bare `.docx` / `.xlsx` / `.html` names in `dir`, skipping dotfiles.
+pub(crate) fn output_document_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if name.starts_with('.') || !is_output_document(&name) {
+            continue;
+        }
+        if entry.path().is_file() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
+pub(crate) fn is_output_document(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".docx") || lower.ends_with(".xlsx") || lower.ends_with(".html")
+}
+
+pub(crate) fn name_taken_message(requested: &str, names: &[String]) -> String {
+    let mut lines = vec![
+        format!(
+            "「{}」は既にあります。ファイルは書いていません。",
+            single_line(requested)
+        ),
+        "既存のファイル名:".to_string(),
+    ];
+    if names.is_empty() {
+        lines.push("（なし）".into());
+    } else {
+        lines.extend(names.iter().cloned());
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {

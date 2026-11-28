@@ -220,12 +220,20 @@ pub(crate) fn edit_in_thread(
     } else {
         edit_target(&requested, &output_dir, &prior, &edits)
     };
+    let explicit = explicit_save(args, &read_path, &output_dir)?;
     let redirected = !fresh && !same_file(&requested, &read_path);
     let edited_name = read_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut outcome = match edit_path_mode(&read_path, &output_dir, &stamp, &request, overwrite) {
+    let mut outcome = match edit_path_mode_as(
+        &read_path,
+        &output_dir,
+        &stamp,
+        &request,
+        overwrite,
+        explicit.as_ref(),
+    ) {
         Ok(outcome) => outcome,
         Err(message) if redirected && message.contains("見つかりません") => {
             return Err(format!(
@@ -245,7 +253,23 @@ pub(crate) fn edit_in_thread(
             &format!("前回の編集済みファイル「{edited_name}」を編集した\n"),
         );
     }
-    if let Err(err) = remember_office_edit(db, thread_id, &requested, &read_path, &outcome) {
+    if let Some(save) = &explicit {
+        outcome.report.insert_str(
+            0,
+            &format!(
+                "指定したファイル名で保存しました。\n旧ファイル名: {edited_name}\n新ファイル名: {}\n",
+                save.filename
+            ),
+        );
+    }
+    if let Err(err) = remember_office_edit(
+        db,
+        thread_id,
+        &requested,
+        &read_path,
+        &outcome,
+        explicit.as_ref(),
+    ) {
         outcome
             .report
             .push_str(&format!("編集の記録を保存できませんでした（{err}）。\n"));
@@ -259,18 +283,35 @@ pub fn edit_path(
     stamp: &str,
     request: &EditRequest,
 ) -> Result<EditOutcome, String> {
-    edit_path_mode(src, output_dir, stamp, request, false)
+    edit_path_mode_as(src, output_dir, stamp, request, false, None)
 }
 
 /// `overwrite` replaces `src` only when the caller has already decided it is
 /// this chat's own `_編集済み` output. The file is written to a temp name in
 /// the same folder and renamed into place, so a failed edit leaves `src` as it was.
+pub(crate) struct ExplicitSave {
+    pub filename: String,
+    /// The destination already existed and is a different file.
+    pub replaced_existing: bool,
+}
+
 pub(crate) fn edit_path_mode(
     src: &Path,
     output_dir: &Path,
     stamp: &str,
     request: &EditRequest,
     overwrite: bool,
+) -> Result<EditOutcome, String> {
+    edit_path_mode_as(src, output_dir, stamp, request, overwrite, None)
+}
+
+pub(crate) fn edit_path_mode_as(
+    src: &Path,
+    output_dir: &Path,
+    stamp: &str,
+    request: &EditRequest,
+    overwrite: bool,
+    explicit: Option<&ExplicitSave>,
 ) -> Result<EditOutcome, String> {
     if request.replacements.is_empty()
         && request.paragraphs.is_empty()
@@ -335,9 +376,10 @@ pub(crate) fn edit_path_mode(
         return Err(message);
     }
     fs::create_dir_all(output_dir).map_err(|err| format!("出力フォルダを作れません（{err}）。"))?;
-    let replace_existing = overwrite && is_direct_output_file(src, output_dir);
     let filename = output_filename(src, stamp, &ext);
-    let (dest, notice) = if replace_existing {
+    let (dest, notice) = if let Some(save) = explicit {
+        place_explicit(output_dir, src, save, &entries)?
+    } else if overwrite && is_direct_output_file(src, output_dir) {
         match write_zip(src, &entries) {
             Ok(()) => (src.to_path_buf(), SaveNotice::Overwrote),
             Err(PlaceError::Replace(_)) => {
@@ -1088,7 +1130,10 @@ enum PropKind {
 
 /// `dc:creator` and `cp:lastModifiedBy` in the core properties part.
 pub(crate) fn is_document_author_leaf(part: &str, local: &str) -> bool {
-    let path = part.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase();
+    let path = part
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
     path == "docprops/core.xml" && matches!(local, "creator" | "lastModifiedBy")
 }
 
@@ -1508,12 +1553,13 @@ fn write_zip_file(path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(), Stri
     Ok(())
 }
 
-/// True when `src` is this chat's own `_編集済み` file in the output folder.
+/// True when `src` is an output-folder file named by this chat's `edit_office` result.
 ///
 /// `prior` is `(tool name, tool result)` from that chat only. A file saved by
-/// another tool, or named in another chat, does not qualify.
+/// another tool, or named in another chat, does not qualify. The `_編集済み（`
+/// suffix is not required: a rename keeps the chain on the `llm_office_edits` row.
 pub(crate) fn replaces_chat_output(src: &Path, output_dir: &Path, prior: &[(&str, &str)]) -> bool {
-    let Some(name) = edited_output_name(src, output_dir) else {
+    let Some(name) = direct_output_name(src, output_dir) else {
         return false;
     };
     prior
@@ -1532,10 +1578,7 @@ fn edit_target(
     prior: &[(&str, &str)],
     edits: &[crate::db::LlmOfficeEdit],
 ) -> (PathBuf, bool) {
-    if replaces_chat_output(requested, output_dir, prior) {
-        return (requested.to_path_buf(), true);
-    }
-    if let Some(name) = edited_output_name(requested, output_dir) {
+    if let Some(name) = direct_output_name(requested, output_dir) {
         if edits
             .iter()
             .any(|edit| edit.output_name.eq_ignore_ascii_case(name))
@@ -1543,10 +1586,10 @@ fn edit_target(
             return (requested.to_path_buf(), true);
         }
     }
+    if replaces_chat_output(requested, output_dir, prior) {
+        return (requested.to_path_buf(), true);
+    }
     for edit in edits.iter().rev() {
-        if !edit.output_name.contains(EDIT_MARK) {
-            continue;
-        }
         let output = output_dir.join(&edit.output_name);
         if !output.is_file() || same_file(requested, &output) {
             continue;
@@ -1558,12 +1601,79 @@ fn edit_target(
     (requested.to_path_buf(), false)
 }
 
-fn edited_output_name<'a>(src: &'a Path, output_dir: &Path) -> Option<&'a str> {
+fn direct_output_name<'a>(src: &'a Path, output_dir: &Path) -> Option<&'a str> {
     if !is_direct_output_file(src, output_dir) {
         return None;
     }
-    let name = src.file_name().and_then(|item| item.to_str())?;
-    name.contains(EDIT_MARK).then_some(name)
+    src.file_name().and_then(|item| item.to_str())
+}
+
+fn explicit_save(
+    args: &Value,
+    read_path: &Path,
+    output_dir: &Path,
+) -> Result<Option<ExplicitSave>, String> {
+    let raw = first_text(args, &["new_filename"]);
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let name = validate_explicit_name(read_path, &raw)?;
+    let dest = output_dir.join(&name);
+    let same = dest.exists() && same_file(&dest, read_path);
+    let replaced_existing = dest.exists() && !same;
+    if replaced_existing && !arg_bool(args.get("overwrite")) {
+        let names = crate::llm::create_office::output_document_names(output_dir);
+        return Err(crate::llm::create_office::name_taken_message(&name, &names));
+    }
+    Ok(Some(ExplicitSave {
+        filename: name,
+        replaced_existing,
+    }))
+}
+
+fn validate_explicit_name(src: &Path, raw: &str) -> Result<String, String> {
+    let name = crate::llm::create_office::bare_output_name_owned(raw)?;
+    let src_ext = extension_of(src);
+    let new_ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if new_ext != src_ext {
+        return Err("拡張子は変えられません。".into());
+    }
+    Ok(name)
+}
+
+fn place_explicit(
+    output_dir: &Path,
+    src: &Path,
+    save: &ExplicitSave,
+    entries: &[(String, Vec<u8>)],
+) -> Result<(PathBuf, SaveNotice), String> {
+    let dest = output_dir.join(&save.filename);
+    if dest.parent() != Some(output_dir) {
+        return Err("ファイル名だけを指定してください。".into());
+    }
+    let same = dest.exists() && same_file(&dest, src);
+    if dest.exists() && !same && !save.replaced_existing {
+        let names = crate::llm::create_office::output_document_names(output_dir);
+        return Err(crate::llm::create_office::name_taken_message(
+            &save.filename,
+            &names,
+        ));
+    }
+    let replacing = dest.exists();
+    match write_zip(&dest, entries) {
+        Ok(()) => Ok((
+            dest,
+            if replacing {
+                SaveNotice::Overwrote
+            } else {
+                SaveNotice::New
+            },
+        )),
+        Err(PlaceError::Replace(_)) => Err(
+            "ファイルが開かれているため、保存しませんでした。元のファイルはそのままです。".into(),
+        ),
+        Err(PlaceError::Write(message)) => Err(message),
+    }
 }
 
 fn remember_office_edit(
@@ -1572,12 +1682,24 @@ fn remember_office_edit(
     requested: &Path,
     read_path: &Path,
     outcome: &EditOutcome,
+    explicit: Option<&ExplicitSave>,
 ) -> Result<(), String> {
     let read_name = read_path
         .file_name()
         .and_then(|item| item.to_str())
         .unwrap_or("");
     let source = path_key(requested);
+    if let Some(save) = explicit {
+        return db
+            .point_explicit_office_edit(
+                thread_id,
+                read_name,
+                &save.filename,
+                &source,
+                save.replaced_existing,
+            )
+            .map_err(|err| err.to_string());
+    }
     let retargeted = match outcome.save {
         SaveNotice::New => false,
         SaveNotice::Overwrote | SaveNotice::Opened => {

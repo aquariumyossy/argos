@@ -1846,7 +1846,7 @@ async fn llm_send_inner<R: Runtime>(
                             || tc.name == tools::TOOL_WRITE_NOTE
                         {
                             content
-                        } else if tc.name == crate::llm::output_files::TOOL_READ_OUTPUT
+                        } else if tc.name == crate::llm::output_files::TOOL_OUTPUT_FILE
                             && crate::llm::output_files::is_html_source_payload(&content)
                         {
                             crate::llm::output_files::deliver_html_read(
