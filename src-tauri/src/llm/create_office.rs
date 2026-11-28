@@ -204,6 +204,41 @@ pub(crate) fn bare_output_name_owned(raw: &str) -> Result<String, String> {
     bare_output_name(raw).map(str::to_string)
 }
 
+/// A new output name. Same limits as [`file_stem`], but an illegal name is
+/// rejected instead of rewritten.
+pub(crate) fn validate_new_output_name(raw: &str) -> Result<String, String> {
+    let name = bare_output_name_owned(raw)?;
+    let stem = &name[..name.rfind('.').unwrap_or(name.len())];
+    if output_stem_is_invalid(stem) {
+        return Err("ファイル名が無効です。".into());
+    }
+    Ok(name)
+}
+
+fn output_stem_is_invalid(stem: &str) -> bool {
+    if stem.is_empty() || stem.chars().count() > MAX_STEM_CHARS {
+        return true;
+    }
+    if stem.chars().any(|c| {
+        c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return true;
+    }
+    let trimmed = stem.trim().trim_end_matches(['.', ' ']).trim();
+    if trimmed != stem || stem.contains("..") || stem.starts_with('.') {
+        return true;
+    }
+    is_reserved_stem(stem)
+}
+
+pub(crate) fn is_sharing_or_lock_error(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(32) | Some(33))
+}
+
+pub(crate) fn message_is_sharing_or_lock(message: &str) -> bool {
+    message.contains("os error 32") || message.contains("os error 33")
+}
+
 fn bare_output_name(raw: &str) -> Result<&str, String> {
     let name = raw.trim();
     if name.is_empty()

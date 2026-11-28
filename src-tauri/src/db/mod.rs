@@ -936,8 +936,8 @@ fn apply_output_file_rename_tx(
     for (id, path) in attached {
         if output_path_matches(&path, output_dir, old_name, old_paths) {
             conn.execute(
-                "UPDATE llm_thread_sources SET path=?1 WHERE id=?2",
-                rusqlite::params![new_path, id],
+                "UPDATE llm_thread_sources SET path=?1, title=?2 WHERE id=?3",
+                rusqlite::params![new_path, new_name, id],
             )?;
         }
     }

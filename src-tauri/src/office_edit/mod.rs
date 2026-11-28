@@ -220,7 +220,7 @@ pub(crate) fn edit_in_thread(
     } else {
         edit_target(&requested, &output_dir, &prior, &edits)
     };
-    let explicit = explicit_save(args, &read_path, &output_dir)?;
+    let explicit = explicit_save(args, &read_path, &output_dir, overwrite)?;
     let redirected = !fresh && !same_file(&requested, &read_path);
     let edited_name = read_path
         .file_name()
@@ -286,15 +286,17 @@ pub fn edit_path(
     edit_path_mode_as(src, output_dir, stamp, request, false, None)
 }
 
+pub(crate) struct ExplicitSave {
+    pub filename: String,
+    /// The destination already existed and this is not the chat's own chain file.
+    pub replaced_existing: bool,
+    /// Writing back onto the file this chat is already continuing.
+    pub allow_inplace: bool,
+}
+
 /// `overwrite` replaces `src` only when the caller has already decided it is
 /// this chat's own `_編集済み` output. The file is written to a temp name in
 /// the same folder and renamed into place, so a failed edit leaves `src` as it was.
-pub(crate) struct ExplicitSave {
-    pub filename: String,
-    /// The destination already existed and is a different file.
-    pub replaced_existing: bool,
-}
-
 pub(crate) fn edit_path_mode(
     src: &Path,
     output_dir: &Path,
@@ -1481,7 +1483,8 @@ fn rename_onto(tmp: &Path, dest: &Path) -> Result<(), String> {
     let mut last = String::new();
     for attempt in 0..RENAME_ATTEMPTS {
         if forced_replace_failure(dest) {
-            last = "出力を保存できません（os error 5）。".into();
+            let code = forced_replace_code();
+            last = format!("出力を保存できません（os error {code}）。");
         } else {
             match fs::rename(tmp, dest) {
                 Ok(()) => return Ok(()),
@@ -1510,6 +1513,17 @@ fn forced_replace_failure(dest: &Path) -> bool {
 #[cfg(test)]
 thread_local! {
     static FORCE_REPLACE_FAILURE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static FORCE_REPLACE_CODE: std::cell::Cell<i32> = const { std::cell::Cell::new(32) };
+}
+
+#[cfg(test)]
+fn forced_replace_code() -> i32 {
+    FORCE_REPLACE_CODE.with(|code| code.get())
+}
+
+#[cfg(not(test))]
+fn forced_replace_code() -> i32 {
+    32
 }
 
 /// The next renames onto a file that already exists fail for every retry, as if
@@ -1522,7 +1536,15 @@ pub(crate) fn fail_next_replace_of_existing_file() {
 /// Fail the next `times` renames onto an existing file. One failure is retried.
 #[cfg(test)]
 pub(crate) fn fail_replace_of_existing_file_times(times: u32) {
+    FORCE_REPLACE_CODE.with(|code| code.set(32));
     FORCE_REPLACE_FAILURE.with(|left| left.set(times));
+}
+
+/// Fail the next replace with a raw OS code that is not a sharing violation.
+#[cfg(test)]
+pub(crate) fn fail_next_replace_os_error(code: i32) {
+    FORCE_REPLACE_CODE.with(|slot| slot.set(code));
+    FORCE_REPLACE_FAILURE.with(|left| left.set(RENAME_ATTEMPTS));
 }
 
 #[cfg(test)]
@@ -1612,6 +1634,7 @@ fn explicit_save(
     args: &Value,
     read_path: &Path,
     output_dir: &Path,
+    chain_overwrite: bool,
 ) -> Result<Option<ExplicitSave>, String> {
     let raw = first_text(args, &["new_filename"]);
     if raw.is_empty() {
@@ -1619,20 +1642,22 @@ fn explicit_save(
     }
     let name = validate_explicit_name(read_path, &raw)?;
     let dest = output_dir.join(&name);
-    let same = dest.exists() && same_file(&dest, read_path);
-    let replaced_existing = dest.exists() && !same;
-    if replaced_existing && !arg_bool(args.get("overwrite")) {
+    let exists = dest.exists();
+    let same = exists && same_file(&dest, read_path);
+    let allow_inplace = same && chain_overwrite;
+    if exists && !allow_inplace && !arg_bool(args.get("overwrite")) {
         let names = crate::llm::create_office::output_document_names(output_dir);
         return Err(crate::llm::create_office::name_taken_message(&name, &names));
     }
     Ok(Some(ExplicitSave {
         filename: name,
-        replaced_existing,
+        replaced_existing: exists && !allow_inplace,
+        allow_inplace,
     }))
 }
 
 fn validate_explicit_name(src: &Path, raw: &str) -> Result<String, String> {
-    let name = crate::llm::create_office::bare_output_name_owned(raw)?;
+    let name = crate::llm::create_office::validate_new_output_name(raw)?;
     let src_ext = extension_of(src);
     let new_ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if new_ext != src_ext {
@@ -1651,28 +1676,41 @@ fn place_explicit(
     if dest.parent() != Some(output_dir) {
         return Err("ファイル名だけを指定してください。".into());
     }
-    let same = dest.exists() && same_file(&dest, src);
-    if dest.exists() && !same && !save.replaced_existing {
+    let exists = dest.exists();
+    let same = exists && same_file(&dest, src);
+    if exists && !same && !save.replaced_existing {
         let names = crate::llm::create_office::output_document_names(output_dir);
         return Err(crate::llm::create_office::name_taken_message(
             &save.filename,
             &names,
         ));
     }
-    let replacing = dest.exists();
+    if exists && same && !save.allow_inplace && !save.replaced_existing {
+        let names = crate::llm::create_office::output_document_names(output_dir);
+        return Err(crate::llm::create_office::name_taken_message(
+            &save.filename,
+            &names,
+        ));
+    }
     match write_zip(&dest, entries) {
         Ok(()) => Ok((
             dest,
-            if replacing {
+            if exists {
                 SaveNotice::Overwrote
             } else {
                 SaveNotice::New
             },
         )),
-        Err(PlaceError::Replace(_)) => Err(
-            "ファイルが開かれているため、保存しませんでした。元のファイルはそのままです。".into(),
-        ),
+        Err(PlaceError::Replace(message)) => Err(explicit_place_error(&message)),
         Err(PlaceError::Write(message)) => Err(message),
+    }
+}
+
+fn explicit_place_error(message: &str) -> String {
+    if crate::llm::create_office::message_is_sharing_or_lock(message) {
+        "ファイルが開かれているため、保存しませんでした。元のファイルはそのままです。".into()
+    } else {
+        format!("保存しませんでした。元のファイルはそのままです。{message}")
     }
 }
 
